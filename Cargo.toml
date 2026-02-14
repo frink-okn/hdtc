@@ -1,0 +1,26 @@
+[package]
+name = "hdtc"
+version = "0.1.0"
+edition = "2021"
+description = "HDT Creator - converts RDF files to HDT format"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+crc = "3"
+flate2 = "1"
+bzip2 = "0.5"
+xz2 = "0.1"
+memmap2 = "0.9"
+rayon = "1"
+tempfile = "3"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+walkdir = "2"
+oxrdfio = "0.2"
+indicatif = "0.17"
+
+[profile.release]
+lto = true
+codegen-units = 1
