@@ -50,22 +50,44 @@ Build `hdtc`, a Rust CLI tool that converts RDF files to HDT format, optimized f
 ## Phase 2: Low-Level HDT Building Blocks
 
 ### 2.1 Binary Encoding Utilities (`src/io/`)
-- **VByte**: Variable-byte integer encoding/decoding (MSB continuation bit, 7 data bits, LE order)
-- **LogArray** (Log64): Bit-packed integer arrays with configurable bits-per-entry, metadata preamble (format byte + VByte count + CRC8), data payload + CRC32C
-- **Bitmap**: Bit sequences, metadata preamble (format byte + VByte count + CRC8), data payload + CRC32C
-- **CRC**: CRC8-CCITT (poly 0x07), CRC16-ANSI (poly 0x8005), CRC32C (poly 0x1EDC6F41) — use `crc` crate
-- **Control Information**: `$HDT` magic, type byte, null-terminated format URI, semicolon-separated properties, null terminator, CRC16
-- Full unit tests for each primitive, including round-trip and known-value tests
+- **VByte**: Variable-byte integer encoding/decoding. MSB=1 means LAST byte (termination bit), MSB=0 means more bytes follow. 7 data bits per byte, little-endian order.
+- **LogArray** (Log64): Bit-packed integer arrays. Preamble: type byte (0x01) + raw byte `bits_per_entry` (NOT VByte) + VByte `num_entries` + CRC8. Data: `ceil(num_entries * bits_per_entry / 8)` bytes (byte-packed, NOT padded to 64-bit words) + CRC32C.
+- **Bitmap**: Bit sequences. Preamble: type byte (0x01) + VByte `num_bits` + CRC8. Data: `ceil(num_bits / 8)` bytes (byte-packed, NOT padded to 64-bit words) + CRC32C. Bits stored LSB-first within each byte.
+- **CRC**: CRC8-CCITT (poly 0x07), CRC16-ANSI (poly 0x8005), CRC32C (poly 0x1EDC6F41) — use `crc` crate. All CRCs stored as little-endian.
+- **Control Information**: `$HDT` magic (4 bytes), type byte (Global=1, Header=2, Dictionary=3, Triples=4), null-terminated format URI (angle-bracketed for URIs, e.g. `<http://purl.org/HDT/hdt#HDTv1>`), semicolon-separated key=value properties, null terminator, CRC16.
+- Full unit tests for each primitive, including round-trip and known-value tests against hdt-java output
 
 ### 2.2 Front-Coded Dictionary Section (`src/dictionary/`)
 - PFC (Plain Front Coding) encoder:
   - Block-based encoding with configurable block size (default 16)
   - First string in each block: stored verbatim + null terminator
   - Subsequent strings: VByte(shared_prefix_length) + suffix + null terminator
-  - Block offset index as LogArray
-  - Section layout: VByte(string_count) + VByte(buffer_length) + CRC8 + LogArray(block_offsets) + Buffer(encoded_strings) + CRC32C
+  - Block offset index as LogArray, with buffer_length appended as sentinel value
+  - Section preamble: type byte (0x02) + VByte(string_count) + VByte(buffer_length) + VByte(block_size) + CRC8
+  - Section layout: preamble + LogArray(block_offsets with sentinel) + Buffer(encoded_strings) + CRC32C
+  - Empty section handling: LogArray with bits_per_entry=0 and single entry [0] (hdt-java compatibility)
+  - Terms stored WITHOUT angle brackets in dictionary (URIs stored as plain strings, not `<uri>`)
 - PFC decoder (for testing/verification and potential read-back)
-- Unit tests with known byte sequences and round-trip verification
+- Unit tests with known byte sequences and round-trip verification against hdt-java output
+
+---
+
+## Format Corrections from Reverse-Engineering hdt-java
+
+The following corrections were discovered by generating an HDT file with hdt-java and comparing byte-by-byte against our initial implementation. All have been applied to the relevant plan sections above.
+
+1. **VByte MSB semantics inverted**: MSB=1 means LAST byte (termination), not continuation. Opposite of typical VByte conventions.
+2. **Bitmap bit semantics inverted**: Bit=1 marks the LAST child of a parent node, not the first. This applies to both BitmapY and BitmapZ.
+3. **Control type bytes off by one**: Global=1, Header=2, Dictionary=3, Triples=4 (not 0-3).
+4. **LogArray preamble reordered**: `bits_per_entry` is a raw byte (not VByte-encoded), and comes before the VByte-encoded `num_entries`.
+5. **Data byte-packing**: LogArray and Bitmap data are byte-packed (`ceil(bits/8)` bytes), NOT padded to 64-bit word boundaries.
+6. **PFC section type byte**: Each PFC section starts with type byte 0x02 before the VByte fields.
+7. **PFC block_size in preamble**: The block size is VByte-encoded after string_count and buffer_length (was missing).
+8. **Block offset sentinel**: The buffer_length is appended as a final entry in the block offsets LogArray.
+9. **Triples write order**: BitmapY, BitmapZ, ArrayY, ArrayZ (bitmaps first, then arrays — NOT interleaved).
+10. **Control Information format URIs**: Wrapped in angle brackets (e.g. `<http://purl.org/HDT/hdt#HDTv1>`), except Header format which is plain `ntriples`.
+11. **Dictionary terms unbracketed**: URIs stored as plain strings without angle brackets in PFC sections.
+12. **Empty PFC sections**: Use a LogArray with bits_per_entry=0 and a single entry [0].
 
 ---
 
@@ -149,11 +171,12 @@ Build `hdtc`, a Rust CLI tool that converts RDF files to HDT format, optimized f
 - Track previous subject and predicate to detect boundaries
 - Build four structures incrementally:
   - **ArrayY (Sp)**: append predicate ID whenever (subject, predicate) changes
-  - **BitmapY (Bp)**: set bit=1 when subject changes, bit=0 otherwise
+  - **BitmapY (Bp)**: bit=1 marks the LAST predicate of each subject (hdt-java convention). Set retroactively when subject changes.
   - **ArrayZ (So)**: append object ID for every triple
-  - **BitmapZ (Bo)**: set bit=1 when (subject, predicate) changes, bit=0 otherwise
-- Write to output file using LogArray and Bitmap binary formats
-- Control Information: format=`http://purl.org/HDT/hdt#triplesBitmap`, order=SPO (1), numTriples=count
+  - **BitmapZ (Bo)**: bit=1 marks the LAST object of each (subject, predicate) pair. Set retroactively when (subject, predicate) changes.
+- After loop, explicitly mark the final entries in both bitmaps with bit=1
+- Write order within triples section: **BitmapY, BitmapZ, ArrayY, ArrayZ** (NOT interleaved — bitmaps first, then arrays)
+- Control Information: format=`<http://purl.org/HDT/hdt#triplesBitmap>`, order=SPO (1), numTriples=count
 
 ---
 
@@ -170,10 +193,10 @@ Build `hdtc`, a Rust CLI tool that converts RDF files to HDT format, optimized f
 - Control Information: type=Header (1), format=`ntriples`, property `length`=byte_count
 
 ### 5.2 File Assembly Order
-1. **Global Control Information**: type=Global (0), format=`http://purl.org/HDT/hdt#HDTv1`, properties: BaseURI, Software
-2. **Header**: Control Info + N-Triples metadata bytes
-3. **Dictionary**: Control Info (format=`http://purl.org/HDT/hdt#dictionaryFour`, mapping=1, elements=total) + Shared PFC + Subjects PFC + Predicates PFC + Objects PFC
-4. **Triples**: Control Info + BitmapY + ArrayY + BitmapZ + ArrayZ
+1. **Global Control Information**: type=Global (1), format=`<http://purl.org/HDT/hdt#HDTv1>`, properties: BaseURI, Software
+2. **Header**: Control Info (type=2, format=`ntriples`) + N-Triples metadata bytes
+3. **Dictionary**: Control Info (type=3, format=`<http://purl.org/HDT/hdt#dictionaryFour>`, mapping=1, elements=total) + Shared PFC + Subjects PFC + Predicates PFC + Objects PFC
+4. **Triples**: Control Info (type=4, format=`<http://purl.org/HDT/hdt#triplesBitmap>`) + BitmapY + BitmapZ + ArrayY + ArrayZ
 
 ### 5.3 Verification
 - Read back the generated HDT file section by section
