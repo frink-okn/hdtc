@@ -20,19 +20,19 @@ const HDT_MAGIC: &[u8; 4] = b"$HDT";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ControlType {
-    Global = 0,
-    Header = 1,
-    Dictionary = 2,
-    Triples = 3,
+    Global = 1,
+    Header = 2,
+    Dictionary = 3,
+    Triples = 4,
 }
 
 impl ControlType {
     fn from_byte(b: u8) -> io::Result<Self> {
         match b {
-            0 => Ok(Self::Global),
-            1 => Ok(Self::Header),
-            2 => Ok(Self::Dictionary),
-            3 => Ok(Self::Triples),
+            1 => Ok(Self::Global),
+            2 => Ok(Self::Header),
+            3 => Ok(Self::Dictionary),
+            4 => Ok(Self::Triples),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("Unknown control type byte: {b}"),
@@ -188,7 +188,7 @@ mod tests {
 
     #[test]
     fn test_roundtrip_global() {
-        let mut ci = ControlInfo::new(ControlType::Global, "http://purl.org/HDT/hdt#HDTv1");
+        let mut ci = ControlInfo::new(ControlType::Global, "<http://purl.org/HDT/hdt#HDTv1>");
         ci.set_property("BaseURI", "http://example.org");
         ci.set_property("Software", "hdtc");
 
@@ -199,7 +199,7 @@ mod tests {
         let ci2 = ControlInfo::read_from(&mut cursor).unwrap();
 
         assert_eq!(ci2.control_type, ControlType::Global);
-        assert_eq!(ci2.format, "http://purl.org/HDT/hdt#HDTv1");
+        assert_eq!(ci2.format, "<http://purl.org/HDT/hdt#HDTv1>");
         assert_eq!(ci2.get_property("BaseURI"), Some("http://example.org"));
         assert_eq!(ci2.get_property("Software"), Some("hdtc"));
     }
@@ -238,7 +238,7 @@ mod tests {
 
     #[test]
     fn test_crc_corruption() {
-        let ci = ControlInfo::new(ControlType::Dictionary, "http://purl.org/HDT/hdt#dictionaryFour");
+        let ci = ControlInfo::new(ControlType::Dictionary, "<http://purl.org/HDT/hdt#dictionaryFour>");
 
         let mut buf = Vec::new();
         ci.write_to(&mut buf).unwrap();

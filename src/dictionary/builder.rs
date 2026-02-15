@@ -333,7 +333,7 @@ mod tests {
     #[test]
     fn test_term_record_roundtrip() {
         let record = TermRecord {
-            term: "<http://example.org/test>".into(),
+            term: "http://example.org/test".into(),
             roles: ROLE_SUBJECT | ROLE_OBJECT,
         };
 

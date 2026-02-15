@@ -4,8 +4,10 @@
 //! where the bit width is `ceil(log2(max_value + 1))`.
 //!
 //! Binary format:
-//! - Preamble: format byte (TYPE_LOG = 1) + VByte(num_entries) + VByte(bits_per_entry) + CRC8
-//! - Data: bit-packed entries in little-endian u64 words + CRC32C
+//! - Preamble: format byte (TYPE_LOG = 1) + bits_per_entry (raw byte) + VByte(num_entries) + CRC8
+//! - Data: bit-packed entries in little-endian byte-packed format + CRC32C
+//!
+//! Data size is ceil(total_bits / 8) bytes (byte-packed, NOT padded to 64-bit words).
 
 #![allow(dead_code)]
 
@@ -32,6 +34,12 @@ fn words_needed(count: u64, bits: u8) -> u64 {
     (total_bits + 63) / 64
 }
 
+/// Number of bytes needed to store `count` entries at `bits` bits each (byte-packed).
+fn bytes_needed(count: u64, bits: u8) -> u64 {
+    let total_bits = count * bits as u64;
+    (total_bits + 7) / 8
+}
+
 /// Writer for building a LogArray incrementally.
 pub struct LogArrayWriter {
     entries: Vec<u64>,
@@ -40,8 +48,9 @@ pub struct LogArrayWriter {
 
 impl LogArrayWriter {
     /// Create a new LogArrayWriter with the specified bits per entry.
+    /// A bits_per_entry of 0 is allowed (all entries are implicitly 0).
     pub fn new(bits_per_entry: u8) -> Self {
-        assert!(bits_per_entry > 0 && bits_per_entry <= 64);
+        assert!(bits_per_entry <= 64);
         Self {
             entries: Vec::new(),
             bits_per_entry,
@@ -80,11 +89,11 @@ impl LogArrayWriter {
 
     /// Serialize the LogArray to a writer.
     pub fn write_to<W: Write>(&self, writer: &mut W) -> io::Result<()> {
-        // Build preamble: type + VByte(num_entries) + VByte(bits_per_entry)
+        // Build preamble: type + numbits (raw byte) + VByte(num_entries)
         let mut preamble = Vec::new();
         preamble.push(TYPE_LOG);
+        preamble.push(self.bits_per_entry);
         preamble.extend_from_slice(&encode_vbyte(self.entries.len() as u64));
-        preamble.extend_from_slice(&encode_vbyte(self.bits_per_entry as u64));
 
         // Write preamble + CRC8
         writer.write_all(&preamble)?;
@@ -93,25 +102,32 @@ impl LogArrayWriter {
 
         // Pack entries into u64 words
         let num_words = words_needed(self.entries.len() as u64, self.bits_per_entry) as usize;
-        let mut words = vec![0u64; num_words];
+        let data_byte_count = bytes_needed(self.entries.len() as u64, self.bits_per_entry) as usize;
+        let mut data = Vec::with_capacity(data_byte_count);
 
-        for (i, &value) in self.entries.iter().enumerate() {
-            let bit_pos = i as u64 * self.bits_per_entry as u64;
-            let word_idx = (bit_pos / 64) as usize;
-            let bit_offset = (bit_pos % 64) as u32;
+        if self.bits_per_entry > 0 {
+            let mut words = vec![0u64; num_words];
 
-            words[word_idx] |= value << bit_offset;
+            for (i, &value) in self.entries.iter().enumerate() {
+                let bit_pos = i as u64 * self.bits_per_entry as u64;
+                let word_idx = (bit_pos / 64) as usize;
+                let bit_offset = (bit_pos % 64) as u32;
 
-            // Handle overflow into next word
-            if bit_offset + self.bits_per_entry as u32 > 64 && word_idx + 1 < num_words {
-                words[word_idx + 1] |= value >> (64 - bit_offset);
+                words[word_idx] |= value << bit_offset;
+
+                // Handle overflow into next word
+                if bit_offset + self.bits_per_entry as u32 > 64 && word_idx + 1 < num_words {
+                    words[word_idx + 1] |= value >> (64 - bit_offset);
+                }
             }
-        }
 
-        // Serialize words as little-endian bytes
-        let mut data = Vec::with_capacity(num_words * 8);
-        for &word in &words {
-            data.extend_from_slice(&word.to_le_bytes());
+            // Serialize as byte-packed data (not padded to 64-bit word boundaries)
+            for (wi, &word) in words.iter().enumerate() {
+                let word_bytes = word.to_le_bytes();
+                let remaining = data_byte_count - wi * 8;
+                let take = remaining.min(8);
+                data.extend_from_slice(&word_bytes[..take]);
+            }
         }
 
         // Write data + CRC32C
@@ -147,11 +163,14 @@ impl LogArrayReader {
         }
         preamble_buf.push(type_byte[0]);
 
+        // Read bits_per_entry (raw byte, not VByte)
+        let mut bits_byte = [0u8; 1];
+        reader.read_exact(&mut bits_byte)?;
+        let bits_per_entry = bits_byte[0];
+        preamble_buf.push(bits_per_entry);
+
         // Read num_entries VByte
         let num_entries = read_vbyte_tracking(reader, &mut preamble_buf)?;
-
-        // Read bits_per_entry VByte
-        let bits_per_entry = read_vbyte_tracking(reader, &mut preamble_buf)? as u8;
 
         // Read and verify CRC8
         let mut crc_byte = [0u8; 1];
@@ -167,10 +186,10 @@ impl LogArrayReader {
             ));
         }
 
-        // Read data words
+        // Read byte-packed data
         let num_words = words_needed(num_entries, bits_per_entry) as usize;
-        let data_bytes = num_words * 8;
-        let mut data = vec![0u8; data_bytes];
+        let data_byte_count = bytes_needed(num_entries, bits_per_entry) as usize;
+        let mut data = vec![0u8; data_byte_count];
         reader.read_exact(&mut data)?;
 
         // Read and verify CRC32C
@@ -185,10 +204,14 @@ impl LogArrayReader {
             ));
         }
 
-        // Parse words
+        // Parse into u64 words (last word may be constructed from fewer than 8 bytes)
         let mut words = Vec::with_capacity(num_words);
-        for chunk in data.chunks_exact(8) {
-            words.push(u64::from_le_bytes(chunk.try_into().unwrap()));
+        for wi in 0..num_words {
+            let start = wi * 8;
+            let end = (start + 8).min(data_byte_count);
+            let mut word_bytes = [0u8; 8];
+            word_bytes[..end - start].copy_from_slice(&data[start..end]);
+            words.push(u64::from_le_bytes(word_bytes));
         }
 
         Ok(Self {
@@ -201,6 +224,10 @@ impl LogArrayReader {
     /// Get the value at the given index.
     pub fn get(&self, index: u64) -> u64 {
         assert!(index < self.num_entries, "Index out of bounds");
+
+        if self.bits_per_entry == 0 {
+            return 0;
+        }
 
         let bit_pos = index * self.bits_per_entry as u64;
         let word_idx = (bit_pos / 64) as usize;
@@ -251,7 +278,8 @@ fn read_vbyte_tracking<R: Read>(reader: &mut R, buf: &mut Vec<u8>) -> io::Result
         let byte = byte_buf[0];
         buf.push(byte);
         value |= ((byte & 0x7F) as u64) << shift;
-        if byte & 0x80 == 0 {
+        if byte & 0x80 != 0 {
+            // MSB=1: last byte
             return Ok(value);
         }
         shift += 7;

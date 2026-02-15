@@ -4,7 +4,9 @@
 //!
 //! Binary format:
 //! - Preamble: format byte (TYPE_BITMAP = 1) + VByte(num_bits) + CRC8
-//! - Data: bits packed into little-endian u64 words + CRC32C
+//! - Data: bits byte-packed in little-endian order + CRC32C
+//!
+//! Data size is ceil(num_bits / 8) bytes (byte-packed, NOT padded to 64-bit words).
 
 #![allow(dead_code)]
 
@@ -78,17 +80,21 @@ impl BitmapWriter {
         let crc = crc8(&preamble);
         writer.write_all(&[crc])?;
 
-        // Serialize words as little-endian bytes
+        // Serialize as byte-packed data (not padded to 64-bit word boundaries)
         let num_words = if self.num_bits == 0 {
             0
         } else {
             ((self.num_bits - 1) / 64 + 1) as usize
         };
+        let data_byte_count = ((self.num_bits + 7) / 8) as usize;
 
-        let mut data = Vec::with_capacity(num_words * 8);
+        let mut data = Vec::with_capacity(data_byte_count);
         for i in 0..num_words {
             let word = if i < self.bits.len() { self.bits[i] } else { 0 };
-            data.extend_from_slice(&word.to_le_bytes());
+            let word_bytes = word.to_le_bytes();
+            let remaining = data_byte_count - i * 8;
+            let take = remaining.min(8);
+            data.extend_from_slice(&word_bytes[..take]);
         }
 
         // Write data + CRC32C
@@ -143,14 +149,14 @@ impl BitmapReader {
             ));
         }
 
-        // Read data
+        // Read byte-packed data
         let num_words = if num_bits == 0 {
             0
         } else {
             ((num_bits - 1) / 64 + 1) as usize
         };
-        let data_bytes = num_words * 8;
-        let mut data = vec![0u8; data_bytes];
+        let data_byte_count = ((num_bits + 7) / 8) as usize;
+        let mut data = vec![0u8; data_byte_count];
         reader.read_exact(&mut data)?;
 
         // Read and verify CRC32C
@@ -165,9 +171,14 @@ impl BitmapReader {
             ));
         }
 
+        // Parse into u64 words (last word may be constructed from fewer than 8 bytes)
         let mut words = Vec::with_capacity(num_words);
-        for chunk in data.chunks_exact(8) {
-            words.push(u64::from_le_bytes(chunk.try_into().unwrap()));
+        for wi in 0..num_words {
+            let start = wi * 8;
+            let end = (start + 8).min(data_byte_count);
+            let mut word_bytes = [0u8; 8];
+            word_bytes[..end - start].copy_from_slice(&data[start..end]);
+            words.push(u64::from_le_bytes(word_bytes));
         }
 
         Ok(Self { words, num_bits })
@@ -250,7 +261,8 @@ fn read_vbyte_tracking<R: Read>(reader: &mut R, buf: &mut Vec<u8>) -> io::Result
         let byte = byte_buf[0];
         buf.push(byte);
         value |= ((byte & 0x7F) as u64) << shift;
-        if byte & 0x80 == 0 {
+        if byte & 0x80 != 0 {
+            // MSB=1: last byte
             return Ok(value);
         }
         shift += 7;
@@ -390,8 +402,8 @@ mod tests {
         let mut buf = Vec::new();
         writer.write_to(&mut buf).unwrap();
 
-        // Corrupt data
-        let data_start = buf.len() - 12; // 8 bytes data + 4 bytes CRC
+        // Corrupt data (3 bits = 1 byte of data + 4 bytes CRC32C)
+        let data_start = buf.len() - 5;
         buf[data_start] ^= 0xFF;
 
         let mut cursor = Cursor::new(&buf);

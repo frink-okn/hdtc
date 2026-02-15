@@ -37,7 +37,7 @@ Multi-pass, disk-backed approach for scalability:
 - **CRCs**: CRC8-CCITT (0x07) after preambles, CRC16-ANSI (0x8005) after control info, CRC32C (0x1EDC6F41) after data payloads
 - **VByte**: MSB=1 means more bytes follow, 7 bits per byte, little-endian order
 - **Dictionary ID scheme**: Shared IDs [1..m], Subject-only IDs [m+1..], Object-only IDs [m+1..] (mapping 1), Predicates have separate ID space
-- **BitmapTriples**: Three-level tree (S->P->O). ArrayY/BitmapY for predicates, ArrayZ/BitmapZ for objects. Bit=1 marks first child of parent.
+- **BitmapTriples**: Three-level tree (S->P->O). ArrayY/BitmapY for predicates, ArrayZ/BitmapZ for objects. Bit=1 marks last child of parent (hdt-java convention).
 
 ## Conventions
 

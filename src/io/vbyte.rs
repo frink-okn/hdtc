@@ -1,7 +1,7 @@
 //! Variable-byte (VByte) integer encoding for HDT.
 //!
-//! Each byte uses 7 data bits (little-endian order). The MSB is a continuation
-//! bit: 1 means more bytes follow, 0 means this is the last byte.
+//! Each byte uses 7 data bits (little-endian order). The MSB is a termination
+//! bit: 1 means this is the last byte, 0 means more bytes follow.
 
 #![allow(dead_code)]
 
@@ -11,13 +11,12 @@ use std::io::{self, Read, Write};
 pub fn encode_vbyte(mut value: u64) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(10);
     loop {
-        let mut byte = (value & 0x7F) as u8;
+        let byte = (value & 0x7F) as u8;
         value >>= 7;
         if value > 0 {
-            byte |= 0x80; // continuation bit
-            bytes.push(byte);
+            bytes.push(byte); // MSB=0: more bytes follow
         } else {
-            bytes.push(byte);
+            bytes.push(byte | 0x80); // MSB=1: last byte
             break;
         }
     }
@@ -32,7 +31,8 @@ pub fn decode_vbyte(data: &[u8]) -> io::Result<(u64, usize)> {
 
     for (i, &byte) in data.iter().enumerate() {
         value |= ((byte & 0x7F) as u64) << shift;
-        if byte & 0x80 == 0 {
+        if byte & 0x80 != 0 {
+            // MSB=1: last byte
             return Ok((value, i + 1));
         }
         shift += 7;
@@ -66,7 +66,8 @@ pub fn read_vbyte<R: Read>(reader: &mut R) -> io::Result<u64> {
         reader.read_exact(&mut buf)?;
         let byte = buf[0];
         value |= ((byte & 0x7F) as u64) << shift;
-        if byte & 0x80 == 0 {
+        if byte & 0x80 != 0 {
+            // MSB=1: last byte
             return Ok(value);
         }
         shift += 7;
@@ -86,30 +87,28 @@ mod tests {
 
     #[test]
     fn test_encode_zero() {
-        assert_eq!(encode_vbyte(0), vec![0x00]);
+        // 0 → single byte with MSB=1 (last): 0x80
+        assert_eq!(encode_vbyte(0), vec![0x80]);
     }
 
     #[test]
     fn test_encode_small() {
-        assert_eq!(encode_vbyte(1), vec![0x01]);
-        assert_eq!(encode_vbyte(127), vec![0x7F]);
+        assert_eq!(encode_vbyte(1), vec![0x81]);
+        assert_eq!(encode_vbyte(127), vec![0xFF]);
     }
 
     #[test]
     fn test_encode_two_bytes() {
-        // 128 = 0b10000000 -> byte0: 0x80 | 0x00 = 0x80, byte1: 0x01
-        assert_eq!(encode_vbyte(128), vec![0x80, 0x01]);
-        // 255 = 0b11111111 -> byte0: 0x80 | 0x7F = 0xFF, byte1: 0x01
-        assert_eq!(encode_vbyte(255), vec![0xFF, 0x01]);
+        // 128: byte0 = 0x00 (more), byte1 = 0x81 (last, value=1)
+        assert_eq!(encode_vbyte(128), vec![0x00, 0x81]);
+        // 255: byte0 = 0x7F (more), byte1 = 0x81 (last, value=1)
+        assert_eq!(encode_vbyte(255), vec![0x7F, 0x81]);
     }
 
     #[test]
     fn test_encode_large() {
-        // 16384 = 0x4000 = 0b100_0000000_0000000
-        // byte0: 0x80 | 0x00 = 0x80
-        // byte1: 0x80 | 0x00 = 0x80
-        // byte2: 0x01
-        assert_eq!(encode_vbyte(16384), vec![0x80, 0x80, 0x01]);
+        // 16384 = 0x4000: byte0 = 0x00, byte1 = 0x00, byte2 = 0x81
+        assert_eq!(encode_vbyte(16384), vec![0x00, 0x00, 0x81]);
     }
 
     #[test]
@@ -149,9 +148,16 @@ mod tests {
 
     #[test]
     fn test_decode_truncated() {
-        // Byte with continuation bit but no following byte
-        let data = [0x80u8];
+        // Byte with continuation bit (MSB=0) but no following byte
+        let data = [0x00u8];
         let mut cursor = Cursor::new(&data[..]);
         assert!(read_vbyte(&mut cursor).is_err());
+    }
+
+    #[test]
+    fn test_hdt_java_compatibility() {
+        // Verify we encode 333430 the same way hdt-java does: 76 2c 94
+        let encoded = encode_vbyte(333430);
+        assert_eq!(encoded, vec![0x76, 0x2c, 0x94]);
     }
 }

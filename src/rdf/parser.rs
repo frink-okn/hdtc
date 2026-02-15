@@ -2,7 +2,7 @@
 
 use crate::rdf::input::{Compression, RdfFormat, RdfInput};
 use anyhow::{Context, Result};
-use oxrdf::{GraphName, Term};
+use oxrdf::{GraphName, Literal, Term};
 use std::fs::File;
 use std::io::{BufReader, Read};
 
@@ -75,15 +75,15 @@ where
     for result in parser.for_reader(reader) {
         match result {
             Ok(quad) => {
-                let subject = term_to_string_with_blanks(
+                let subject = term_to_hdt_string(
                     &Term::from(quad.subject),
                     &blank_prefix,
                 );
-                let predicate = quad.predicate.to_string();
-                let object = term_to_string_with_blanks(&quad.object, &blank_prefix);
+                let predicate = quad.predicate.as_str().to_string();
+                let object = term_to_hdt_string(&quad.object, &blank_prefix);
                 let graph = match &quad.graph_name {
                     GraphName::DefaultGraph => None,
-                    GraphName::NamedNode(n) => Some(n.to_string()),
+                    GraphName::NamedNode(n) => Some(n.as_str().to_string()),
                     GraphName::BlankNode(b) => {
                         Some(format!("_:{}{}", blank_prefix, b.as_str()))
                     }
@@ -127,11 +127,32 @@ where
     Ok(stats)
 }
 
-/// Convert an oxrdf Term to its canonical string form, disambiguating blank nodes.
-fn term_to_string_with_blanks(term: &Term, blank_prefix: &str) -> String {
+/// Convert an oxrdf Term to its HDT dictionary string form.
+///
+/// URIs are stored without angle brackets. Literals use the HDT convention:
+/// bare datatype URIs without angle brackets in `^^type` annotations.
+fn term_to_hdt_string(term: &Term, blank_prefix: &str) -> String {
     match term {
         Term::BlankNode(b) => format!("_:{}{}", blank_prefix, b.as_str()),
-        other => other.to_string(),
+        Term::NamedNode(n) => n.as_str().to_string(),
+        Term::Literal(l) => literal_to_hdt_string(l),
+    }
+}
+
+/// Convert a literal to its HDT dictionary string form.
+///
+/// HDT stores typed literals with angle brackets around the datatype URI:
+/// `"value"^^<http://www.w3.org/2001/XMLSchema#integer>`
+fn literal_to_hdt_string(l: &Literal) -> String {
+    if let Some(lang) = l.language() {
+        format!("\"{}\"@{}", l.value(), lang)
+    } else {
+        let dt = l.datatype().as_str();
+        if dt == "http://www.w3.org/2001/XMLSchema#string" {
+            format!("\"{}\"", l.value())
+        } else {
+            format!("\"{}\"^^<{}>", l.value(), dt)
+        }
     }
 }
 
@@ -174,9 +195,9 @@ mod tests {
 
         assert_eq!(stats.quads, 2);
         assert_eq!(stats.errors, 0);
-        assert_eq!(quads[0].subject, "<http://example.org/s>");
-        assert_eq!(quads[0].predicate, "<http://example.org/p>");
-        assert_eq!(quads[0].object, "<http://example.org/o>");
+        assert_eq!(quads[0].subject, "http://example.org/s");
+        assert_eq!(quads[0].predicate, "http://example.org/p");
+        assert_eq!(quads[0].object, "http://example.org/o");
         assert!(quads[0].graph.is_none());
         assert_eq!(quads[1].object, "\"hello\"");
     }

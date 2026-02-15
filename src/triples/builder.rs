@@ -2,9 +2,9 @@
 //!
 //! Builds the four structures:
 //! - ArrayY (Sp): predicate ID sequence
-//! - BitmapY (Bp): marks first predicate for each subject (1 = new subject)
+//! - BitmapY (Bp): marks last predicate for each subject (1 = last predicate of subject)
 //! - ArrayZ (So): object ID sequence
-//! - BitmapZ (Bo): marks first object for each (subject,predicate) pair (1 = new pair)
+//! - BitmapZ (Bo): marks last object for each (subject,predicate) pair (1 = last object of pair)
 
 use crate::io::{BitmapWriter, LogArrayWriter};
 use crate::triples::id_triple::IdTriple;
@@ -37,9 +37,9 @@ pub struct BitmapTriplesData {
 pub fn build_bitmap_triples(
     sorted_triples: impl Iterator<Item = Result<IdTriple>>,
 ) -> Result<BitmapTriplesData> {
-    let mut bitmap_y = BitmapWriter::new();
+    let mut bitmap_y_bits: Vec<bool> = Vec::new();
     let mut array_y_entries: Vec<u64> = Vec::new();
-    let mut bitmap_z = BitmapWriter::new();
+    let mut bitmap_z_bits: Vec<bool> = Vec::new();
     let mut array_z_entries: Vec<u64> = Vec::new();
 
     let mut prev_subject: u64 = 0;
@@ -49,6 +49,10 @@ pub fn build_bitmap_triples(
     let mut max_predicate: u64 = 0;
     let mut max_object: u64 = 0;
 
+    // HDT convention: bit=1 marks the LAST child of a parent node.
+    // Since we process triples in order, we mark the end of each group
+    // retroactively when the next group starts, and mark the final
+    // entries after the loop.
     for result in sorted_triples {
         let triple = result?;
 
@@ -59,28 +63,39 @@ pub fn build_bitmap_triples(
         if triple.subject != prev_subject {
             // New subject
             if num_triples > 0 {
-                // The previous predicate entry ended
+                // Mark end of previous subject's last predicate
+                *bitmap_y_bits.last_mut().unwrap() = true;
+                // Mark end of previous (S,P) pair's last object
+                *bitmap_z_bits.last_mut().unwrap() = true;
             }
-            bitmap_y.push_one();
+            bitmap_y_bits.push(false);
             array_y_entries.push(triple.predicate);
-            bitmap_z.push_one();
+            bitmap_z_bits.push(false);
             array_z_entries.push(triple.object);
             prev_subject = triple.subject;
             prev_predicate = triple.predicate;
         } else if triple.predicate != prev_predicate {
             // Same subject, new predicate
-            bitmap_y.push_zero();
+            // Mark end of previous (S,P) pair's last object
+            *bitmap_z_bits.last_mut().unwrap() = true;
+            bitmap_y_bits.push(false);
             array_y_entries.push(triple.predicate);
-            bitmap_z.push_one();
+            bitmap_z_bits.push(false);
             array_z_entries.push(triple.object);
             prev_predicate = triple.predicate;
         } else {
             // Same subject and predicate, new object
-            bitmap_z.push_zero();
+            bitmap_z_bits.push(false);
             array_z_entries.push(triple.object);
         }
 
         num_triples += 1;
+    }
+
+    // Mark end of the final groups
+    if num_triples > 0 {
+        *bitmap_y_bits.last_mut().unwrap() = true;
+        *bitmap_z_bits.last_mut().unwrap() = true;
     }
 
     tracing::info!("BitmapTriples: {num_triples} triples encoded");
@@ -103,9 +118,17 @@ pub fn build_bitmap_triples(
     array_z_writer.write_to(&mut array_z_buf)?;
 
     // Encode bitmaps
+    let mut bitmap_y = BitmapWriter::new();
+    for &b in &bitmap_y_bits {
+        bitmap_y.push(b);
+    }
     let mut bitmap_y_buf = Vec::new();
     bitmap_y.write_to(&mut bitmap_y_buf)?;
 
+    let mut bitmap_z = BitmapWriter::new();
+    for &b in &bitmap_z_bits {
+        bitmap_z.push(b);
+    }
     let mut bitmap_z_buf = Vec::new();
     bitmap_z.write_to(&mut bitmap_z_buf)?;
 
@@ -138,17 +161,17 @@ mod tests {
         let result = build_bitmap_triples(triples.into_iter()).unwrap();
         assert_eq!(result.num_triples, 1);
 
-        // BitmapY should be [1] (one subject)
+        // BitmapY should be [1] (last predicate of subject 1)
         let by = BitmapReader::read_from(&mut Cursor::new(&result.bitmap_y)).unwrap();
         assert_eq!(by.len(), 1);
-        assert!(by.get(0)); // 1 = new subject
+        assert!(by.get(0));
 
         // ArrayY should be [1] (predicate 1)
         let ay = LogArrayReader::read_from(&mut Cursor::new(&result.array_y)).unwrap();
         assert_eq!(ay.len(), 1);
         assert_eq!(ay.get(0), 1);
 
-        // BitmapZ should be [1] (one SP pair)
+        // BitmapZ should be [1] (last object of (1,1))
         let bz = BitmapReader::read_from(&mut Cursor::new(&result.bitmap_z)).unwrap();
         assert_eq!(bz.len(), 1);
         assert!(bz.get(0));
@@ -175,12 +198,14 @@ mod tests {
         let result = build_bitmap_triples(triples.into_iter()).unwrap();
         assert_eq!(result.num_triples, 4);
 
-        // BitmapY: [1, 0, 1] (subject changes at pos 0 and 2)
+        // BitmapY: [0, 1, 1] (bit=1 marks last predicate of each subject)
+        // S=1 has predicates at pos 0,1 -> pos 1 is last
+        // S=2 has predicate at pos 2 -> pos 2 is last
         let by = BitmapReader::read_from(&mut Cursor::new(&result.bitmap_y)).unwrap();
         assert_eq!(by.len(), 3);
-        assert!(by.get(0));   // S=1 start
-        assert!(!by.get(1));  // S=1, P=2
-        assert!(by.get(2));   // S=2 start
+        assert!(!by.get(0));  // S=1, P=1 (not last pred of S=1)
+        assert!(by.get(1));   // S=1, P=2 (last pred of S=1)
+        assert!(by.get(2));   // S=2, P=1 (last pred of S=2)
 
         // ArrayY: [1, 2, 1] (predicates)
         let ay = LogArrayReader::read_from(&mut Cursor::new(&result.array_y)).unwrap();
@@ -189,13 +214,16 @@ mod tests {
         assert_eq!(ay.get(1), 2);
         assert_eq!(ay.get(2), 1);
 
-        // BitmapZ: [1, 0, 1, 1] (new SP pair at pos 0, 2, 3)
+        // BitmapZ: [0, 1, 1, 1] (bit=1 marks last object of each (S,P) pair)
+        // (1,1) has objects at pos 0,1 -> pos 1 is last
+        // (1,2) has object at pos 2 -> pos 2 is last
+        // (2,1) has object at pos 3 -> pos 3 is last
         let bz = BitmapReader::read_from(&mut Cursor::new(&result.bitmap_z)).unwrap();
         assert_eq!(bz.len(), 4);
-        assert!(bz.get(0));   // S=1,P=1 start
-        assert!(!bz.get(1));  // S=1,P=1,O=2
-        assert!(bz.get(2));   // S=1,P=2 start
-        assert!(bz.get(3));   // S=2,P=1 start
+        assert!(!bz.get(0));  // (1,1) O=1 (not last)
+        assert!(bz.get(1));   // (1,1) O=2 (last obj of (1,1))
+        assert!(bz.get(2));   // (1,2) O=3 (last obj of (1,2))
+        assert!(bz.get(3));   // (2,1) O=1 (last obj of (2,1))
 
         // ArrayZ: [1, 2, 3, 1] (objects)
         let az = LogArrayReader::read_from(&mut Cursor::new(&result.array_z)).unwrap();

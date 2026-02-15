@@ -5,13 +5,16 @@
 //! - Subsequent strings: VByte(shared_prefix_length) + suffix + null terminator
 //!
 //! Section layout:
-//! VByte(string_count) + VByte(buffer_length) + CRC8
+//! type_byte(0x02) + VByte(string_count) + VByte(buffer_length) + VByte(block_size) + CRC8
 //! + LogArray(block_offsets) + Buffer(encoded_strings) + CRC32C
 
 use crate::io::crc_utils::{crc8, crc32c};
 use crate::io::log_array::LogArrayWriter;
 use crate::io::vbyte::encode_vbyte;
 use std::io::{self, Write};
+
+/// PFC dictionary section type byte, written before each section.
+const PFC_SECTION_TYPE: u8 = 0x02;
 
 /// Default number of strings per block.
 const DEFAULT_BLOCK_SIZE: usize = 16;
@@ -83,27 +86,33 @@ impl PfcEncoder {
             }
         }
 
-        // Write preamble: VByte(string_count) + VByte(buffer_length)
+        // Write preamble: type_byte + VByte(string_count) + VByte(buffer_length) + VByte(block_size)
         let mut preamble = Vec::new();
+        preamble.push(PFC_SECTION_TYPE);
         preamble.extend_from_slice(&encode_vbyte(self.strings.len() as u64));
         preamble.extend_from_slice(&encode_vbyte(buffer.len() as u64));
+        preamble.extend_from_slice(&encode_vbyte(self.block_size as u64));
 
-        // Write preamble + CRC8
+        // Write preamble + CRC8 (CRC covers type byte + VByte fields)
         writer.write_all(&preamble)?;
         let crc = crc8(&preamble);
         writer.write_all(&[crc])?;
 
-        // Write block offsets as LogArray
+        // Write block offsets as LogArray (with sentinel = buffer_length at end)
         if !block_offsets.is_empty() {
-            let max_offset = *block_offsets.last().unwrap();
-            let mut log_array = LogArrayWriter::for_max_value(max_offset.max(1));
+            let sentinel = buffer.len() as u64;
+            let max_offset = sentinel.max(1);
+            let mut log_array = LogArrayWriter::for_max_value(max_offset);
             for &offset in &block_offsets {
                 log_array.push(offset);
             }
+            log_array.push(sentinel);
             log_array.write_to(writer)?;
         } else {
-            // Empty array - still need to write a valid LogArray
-            let log_array = LogArrayWriter::new(1);
+            // Empty section: write LogArray with sentinel entry (0) using 0 bits per entry,
+            // matching hdt-java's format for empty PFC sections.
+            let mut log_array = LogArrayWriter::new(0);
+            log_array.push(0);
             log_array.write_to(writer)?;
         }
 
@@ -146,8 +155,15 @@ mod tests {
     impl PfcDecoder {
         fn read_from<R: Read>(reader: &mut R) -> io::Result<Self> {
             let mut preamble_buf = Vec::new();
+
+            // Read type byte (0x02 = PFC)
+            let mut type_byte = [0u8; 1];
+            reader.read_exact(&mut type_byte)?;
+            preamble_buf.push(type_byte[0]);
+
             let string_count = read_vbyte_tracking(reader, &mut preamble_buf)?;
             let buffer_length = read_vbyte_tracking(reader, &mut preamble_buf)?;
+            let _block_size = read_vbyte_tracking(reader, &mut preamble_buf)?;
 
             let mut crc_byte = [0u8; 1];
             reader.read_exact(&mut crc_byte)?;
@@ -251,7 +267,8 @@ mod tests {
             let byte = byte_buf[0];
             buf.push(byte);
             value |= ((byte & 0x7F) as u64) << shift;
-            if byte & 0x80 == 0 {
+            if byte & 0x80 != 0 {
+                // MSB=1: last byte
                 return Ok(value);
             }
             shift += 7;
@@ -351,10 +368,10 @@ mod tests {
         let mut strings = vec![
             "\"literal value\"",
             "\"literal with lang\"@en",
-            "\"typed literal\"^^<http://www.w3.org/2001/XMLSchema#string>",
-            "<http://example.org/resource1>",
-            "<http://example.org/resource2>",
-            "<http://example.org/resource3>",
+            "\"typed literal\"^^<http://www.w3.org/2001/XMLSchema#date>",
+            "http://example.org/resource1",
+            "http://example.org/resource2",
+            "http://example.org/resource3",
             "_:blank1",
             "_:blank2",
         ];
