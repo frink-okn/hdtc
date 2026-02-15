@@ -5,6 +5,8 @@
 //! - CRC16-ANSI (poly 0x8005): after Control Information blocks
 //! - CRC32C (poly 0x1EDC6F41): after data payloads
 
+#![allow(dead_code)]
+
 use crc::{Crc, CRC_32_ISCSI};
 use std::io::{self, Write};
 

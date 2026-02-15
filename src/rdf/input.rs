@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
@@ -16,6 +16,7 @@ pub enum RdfFormat {
 
 impl RdfFormat {
     /// Returns true if this format can contain quad (named graph) information.
+    #[allow(dead_code)]
     pub fn is_quad_format(self) -> bool {
         matches!(self, RdfFormat::NQuads | RdfFormat::TriG)
     }

@@ -3,6 +3,8 @@
 //! Each byte uses 7 data bits (little-endian order). The MSB is a continuation
 //! bit: 1 means more bytes follow, 0 means this is the last byte.
 
+#![allow(dead_code)]
+
 use std::io::{self, Read, Write};
 
 /// Encode a u64 value as VByte, returning the bytes.

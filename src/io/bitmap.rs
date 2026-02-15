@@ -6,8 +6,10 @@
 //! - Preamble: format byte (TYPE_BITMAP = 1) + VByte(num_bits) + CRC8
 //! - Data: bits packed into little-endian u64 words + CRC32C
 
+#![allow(dead_code)]
+
 use crate::io::crc_utils::{crc8, crc32c};
-use crate::io::vbyte::{encode_vbyte, read_vbyte};
+use crate::io::vbyte::encode_vbyte;
 use std::io::{self, Read, Write};
 
 /// Format type byte for Bitmap (same as LogArray uses type 1, bitmap also uses 1

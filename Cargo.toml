@@ -1,7 +1,7 @@
 [package]
 name = "hdtc"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 description = "HDT Creator - converts RDF files to HDT format"
 
 [dependencies]
@@ -19,6 +19,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 walkdir = "2"
 oxrdfio = "0.2"
+oxrdf = "0.3"
 indicatif = "0.17"
 
 [profile.release]

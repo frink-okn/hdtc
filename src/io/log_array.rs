@@ -7,8 +7,10 @@
 //! - Preamble: format byte (TYPE_LOG = 1) + VByte(num_entries) + VByte(bits_per_entry) + CRC8
 //! - Data: bit-packed entries in little-endian u64 words + CRC32C
 
+#![allow(dead_code)]
+
 use crate::io::crc_utils::{crc8, crc32c};
-use crate::io::vbyte::{encode_vbyte, decode_vbyte};
+use crate::io::vbyte::encode_vbyte;
 use std::io::{self, Read, Write};
 
 /// Format type byte for LogArray.

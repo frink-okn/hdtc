@@ -41,7 +41,7 @@ Multi-pass, disk-backed approach for scalability:
 
 ## Conventions
 
-- Rust 2021 edition
+- Rust 2024 edition (requires Rust 1.85+)
 - Error handling: `anyhow` for application errors, `thiserror` for library-style error types
 - Logging: `tracing` crate
 - Testing: standard `#[cfg(test)]` modules + integration tests in `tests/`

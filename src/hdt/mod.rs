@@ -1,1 +1,3 @@
-// HDT file assembly: header, dictionary, triples sections
+pub(crate) mod writer;
+
+pub use writer::write_hdt;

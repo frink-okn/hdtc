@@ -7,6 +7,8 @@
 //! - Properties: semicolon-separated key=value pairs, null-terminated
 //! - CRC16-ANSI checksum over everything from magic through properties (inclusive)
 
+#![allow(dead_code)]
+
 use crate::io::crc_utils::crc16;
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
