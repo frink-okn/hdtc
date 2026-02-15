@@ -15,7 +15,7 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 /// How many records per block in the sparse index.
-const BLOCK_SIZE: usize = 1024;
+const BLOCK_SIZE: usize = 128;
 
 /// Dictionary section identifiers for term-to-ID mapping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
