@@ -14,8 +14,28 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-/// How many records per block in the sparse index.
-const BLOCK_SIZE: usize = 128;
+/// Default block size for testing and small datasets.
+#[allow(dead_code)]
+pub const DEFAULT_BLOCK_SIZE: usize = 128;
+
+/// Choose optimal block size based on total term count.
+/// Balances lookup speed (smaller blocks) vs memory usage (larger blocks).
+///
+/// Memory estimates for SST sparse index:
+/// - 100M terms: 64 -> ~12MB, 128 -> ~6MB
+/// - 1B terms: 128 -> ~95MB, 256 -> ~48MB
+/// - 10B terms: 256 -> ~390MB, 512 -> ~195MB
+/// - 50B terms: 512 -> ~1.5GB, 1024 -> ~780MB
+/// - 100B terms: 1024 -> ~1.2GB, 2048 -> ~600MB
+pub fn optimal_block_size(term_count: u64) -> usize {
+    match term_count {
+        0..=100_000_000 => 64,        // <100M: ultra-fast, ~12MB index
+        100_000_001..=1_000_000_000 => 128,   // 100M-1B: fast, ~95MB index
+        1_000_000_001..=10_000_000_000 => 256,  // 1B-10B: ~390MB index
+        10_000_000_001..=50_000_000_000 => 512, // 10B-50B: ~1.5GB index
+        _ => 1024,                    // 50B+: ~12GB index for 100B terms
+    }
+}
 
 /// Dictionary section identifiers for term-to-ID mapping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +75,7 @@ pub struct SstWriter {
     index: Vec<IndexEntry>,
     record_count: usize,
     bytes_written: u64,
+    block_size: usize,
 }
 
 /// A sparse index entry: the key at the start of each block and its file offset.
@@ -65,8 +86,8 @@ pub struct IndexEntry {
 }
 
 impl SstWriter {
-    /// Create a new SST writer at the given path.
-    pub fn new(path: impl AsRef<Path>) -> Result<Self> {
+    /// Create a new SST writer at the given path with the specified block size.
+    pub fn new(path: impl AsRef<Path>, block_size: usize) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let file = File::create(&path)
             .with_context(|| format!("Failed to create SST file {}", path.display()))?;
@@ -77,13 +98,14 @@ impl SstWriter {
             index: Vec::new(),
             record_count: 0,
             bytes_written: 0,
+            block_size,
         })
     }
 
     /// Write a record to the SST. Entries MUST be written in sorted key order.
     pub fn write_entry(&mut self, key: &[u8], section: DictSection, id: u64) -> Result<()> {
         // Record sparse index entry at block boundaries
-        if self.record_count % BLOCK_SIZE == 0 {
+        if self.record_count % self.block_size == 0 {
             self.index.push(IndexEntry {
                 key: key.to_vec(),
                 offset: self.bytes_written,
@@ -219,7 +241,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let sst_path = temp_dir.path().join("test.sst");
 
-        let mut writer = SstWriter::new(&sst_path).unwrap();
+        let mut writer = SstWriter::new(&sst_path, DEFAULT_BLOCK_SIZE).unwrap();
         for &(key, section, id) in entries {
             writer.write_entry(key.as_bytes(), section, id).unwrap();
         }
@@ -264,8 +286,8 @@ mod tests {
 
     #[test]
     fn test_many_entries_across_blocks() {
-        // Create more entries than BLOCK_SIZE to test multi-block lookup
-        let entries: Vec<(String, DictSection, u64)> = (0..BLOCK_SIZE * 3 + 50)
+        // Create more entries than DEFAULT_BLOCK_SIZE to test multi-block lookup
+        let entries: Vec<(String, DictSection, u64)> = (0..DEFAULT_BLOCK_SIZE * 3 + 50)
             .map(|i| {
                 (
                     format!("<http://example.org/resource{i:06}>"),
@@ -286,7 +308,7 @@ mod tests {
         let result = reader.get(entries[0].0.as_bytes()).unwrap();
         assert_eq!(result.local_id, 1);
 
-        let mid = BLOCK_SIZE + 500;
+        let mid = DEFAULT_BLOCK_SIZE + 50;
         let result = reader.get(entries[mid].0.as_bytes()).unwrap();
         assert_eq!(result.local_id, mid as u64 + 1);
 

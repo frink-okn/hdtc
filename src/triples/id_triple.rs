@@ -1,9 +1,10 @@
 //! ID triple generation (Pass 2): re-stream RDF and look up term IDs.
 
 use crate::dictionary::{resolve_global_id, DictCounts, SstReader};
-use crate::rdf::{stream_quads, RdfInput};
+use crate::rdf::{stream_quads, ExtractedQuad, RdfInput};
 use crate::sort::{ExternalSorter, Sortable};
 use anyhow::Result;
+use rayon::prelude::*;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::Path;
@@ -58,10 +59,16 @@ impl Sortable for IdTriple {
     }
 }
 
+/// Batch size for parallel SST lookups.
+const BATCH_SIZE: usize = 10_000;
+
 /// Generate sorted, deduplicated ID triples from RDF inputs.
 ///
 /// This is Pass 2: re-streams all input files, looks up subjects/objects in the SST
 /// and predicates in the in-memory HashMap, then externally sorts in SPO order.
+///
+/// Uses batched parallel processing: accumulates quads into batches, then performs
+/// SST lookups in parallel across all available cores.
 pub fn generate_id_triples(
     inputs: &[RdfInput],
     sst: &SstReader,
@@ -82,50 +89,36 @@ pub fn generate_id_triples(
     for (file_index, input) in inputs.iter().enumerate() {
         tracing::info!("  Re-reading {}", input.path.display());
 
+        let mut quad_batch: Vec<ExtractedQuad> = Vec::with_capacity(BATCH_SIZE);
+
         stream_quads(input, file_index, base_uri, |quad| {
-            // Look up subject (in SST)
-            let s_id = match sst.get(quad.subject.as_bytes()) {
-                Some(tid) => resolve_global_id(&tid, counts, true),
-                None => {
-                    lookup_failures += 1;
-                    if lookup_failures <= 5 {
-                        tracing::warn!("Subject not found in dictionary: {}", quad.subject);
-                    }
-                    return Ok(());
+            quad_batch.push(quad);
+
+            if quad_batch.len() >= BATCH_SIZE {
+                // Process batch in parallel
+                let (triples, failures) = process_quad_batch(&quad_batch, sst, predicate_ids, counts);
+
+                // Push results to sorter
+                for triple in triples {
+                    sorter.push(triple, &mut buffer, &mut mem_used)?;
+                    triple_count += 1;
                 }
-            };
 
-            // Look up predicate (in memory HashMap)
-            let p_id = match predicate_ids.get(&quad.predicate) {
-                Some(&id) => id,
-                None => {
-                    lookup_failures += 1;
-                    if lookup_failures <= 5 {
-                        tracing::warn!("Predicate not found in dictionary: {}", quad.predicate);
-                    }
-                    return Ok(());
-                }
-            };
-
-            // Look up object (in SST)
-            let o_id = match sst.get(quad.object.as_bytes()) {
-                Some(tid) => resolve_global_id(&tid, counts, false),
-                None => {
-                    lookup_failures += 1;
-                    return Ok(());
-                }
-            };
-
-            let triple = IdTriple {
-                subject: s_id,
-                predicate: p_id,
-                object: o_id,
-            };
-
-            sorter.push(triple, &mut buffer, &mut mem_used)?;
-            triple_count += 1;
+                lookup_failures += failures;
+                quad_batch.clear();
+            }
             Ok(())
         })?;
+
+        // Process final partial batch
+        if !quad_batch.is_empty() {
+            let (triples, failures) = process_quad_batch(&quad_batch, sst, predicate_ids, counts);
+            for triple in triples {
+                sorter.push(triple, &mut buffer, &mut mem_used)?;
+                triple_count += 1;
+            }
+            lookup_failures += failures;
+        }
     }
 
     if lookup_failures > 0 {
@@ -140,6 +133,56 @@ pub fn generate_id_triples(
         inner: merged,
         prev: None,
     })
+}
+
+/// Process a batch of quads in parallel, performing SST lookups across all cores.
+/// Returns (successful_triples, lookup_failure_count).
+fn process_quad_batch(
+    quads: &[ExtractedQuad],
+    sst: &SstReader,
+    predicate_ids: &HashMap<String, u64>,
+    counts: &DictCounts,
+) -> (Vec<IdTriple>, u64) {
+    let results: Vec<Option<IdTriple>> = quads
+        .par_iter()
+        .map(|quad| {
+            // Look up subject (in SST)
+            let s_id = match sst.get(quad.subject.as_bytes()) {
+                Some(tid) => resolve_global_id(&tid, counts, true),
+                None => return None,
+            };
+
+            // Look up predicate (in memory HashMap)
+            let p_id = match predicate_ids.get(&quad.predicate) {
+                Some(&id) => id,
+                None => return None,
+            };
+
+            // Look up object (in SST)
+            let o_id = match sst.get(quad.object.as_bytes()) {
+                Some(tid) => resolve_global_id(&tid, counts, false),
+                None => return None,
+            };
+
+            Some(IdTriple {
+                subject: s_id,
+                predicate: p_id,
+                object: o_id,
+            })
+        })
+        .collect();
+
+    let mut triples = Vec::with_capacity(results.len());
+    let mut failures = 0u64;
+
+    for result in results {
+        match result {
+            Some(triple) => triples.push(triple),
+            None => failures += 1,
+        }
+    }
+
+    (triples, failures)
 }
 
 /// Iterator over sorted, deduplicated ID triples.

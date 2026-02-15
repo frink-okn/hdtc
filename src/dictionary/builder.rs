@@ -114,6 +114,7 @@ pub fn build_dictionary(
     memory_budget: usize,
     include_graphs: bool,
     base_uri: Option<&str>,
+    sst_block_size: Option<usize>,
 ) -> Result<DictBuildResult> {
     tracing::info!("Pass 1: Extracting and sorting terms...");
 
@@ -179,9 +180,6 @@ pub fn build_dictionary(
     tracing::info!("Pass 1b: Merging and deduplicating terms...");
 
     // Step 3: Deduplicate and partition
-    let sst_path = temp_dir.join("term_lookup.sst");
-    let mut sst_writer = SstWriter::new(&sst_path)?;
-
     let mut shared_enc = PfcEncoder::new();
     let mut subjects_enc = PfcEncoder::new();
     let mut predicates_enc = PfcEncoder::new();
@@ -193,10 +191,14 @@ pub fn build_dictionary(
     let mut prev_term: Option<String> = None;
     let mut prev_roles: u8 = 0;
 
+    // Buffer terms to write to SST after we know total count
+    let mut sst_entries: Vec<(Vec<u8>, DictSection, u64)> = Vec::new();
+
     // Closure to process a completed (deduplicated) term.
     // Predicates go into the in-memory HashMap (separate ID space).
-    // Subjects/objects go into the SST (one entry per term, no duplicates).
-    let process_term = |term: &str, roles: u8, counts: &mut DictCounts, sst_writer: &mut SstWriter,
+    // Subjects/objects are buffered for SST (one entry per term, no duplicates).
+    let process_term = |term: &str, roles: u8, counts: &mut DictCounts,
+                            sst_entries: &mut Vec<(Vec<u8>, DictSection, u64)>,
                             predicate_ids: &mut HashMap<String, u64>,
                             shared_enc: &mut PfcEncoder, subjects_enc: &mut PfcEncoder,
                             predicates_enc: &mut PfcEncoder, objects_enc: &mut PfcEncoder| -> Result<()> {
@@ -211,19 +213,19 @@ pub fn build_dictionary(
             predicate_ids.insert(term.to_string(), counts.predicates);
         }
 
-        // Subjects/objects: SST lookup (each term appears at most once)
+        // Subjects/objects: Buffer for SST (each term appears at most once)
         if is_subject && is_object {
             counts.shared += 1;
             shared_enc.push(term);
-            sst_writer.write_entry(term.as_bytes(), DictSection::Shared, counts.shared)?;
+            sst_entries.push((term.as_bytes().to_vec(), DictSection::Shared, counts.shared));
         } else if is_subject {
             counts.subjects += 1;
             subjects_enc.push(term);
-            sst_writer.write_entry(term.as_bytes(), DictSection::Subjects, counts.subjects)?;
+            sst_entries.push((term.as_bytes().to_vec(), DictSection::Subjects, counts.subjects));
         } else if is_object {
             counts.objects += 1;
             objects_enc.push(term);
-            sst_writer.write_entry(term.as_bytes(), DictSection::Objects, counts.objects)?;
+            sst_entries.push((term.as_bytes().to_vec(), DictSection::Objects, counts.objects));
         }
 
         Ok(())
@@ -241,7 +243,7 @@ pub fn build_dictionary(
                 // New term: process the previous one
                 if let Some(ref prev) = prev_term {
                     process_term(
-                        prev, prev_roles, &mut counts, &mut sst_writer, &mut predicate_ids,
+                        prev, prev_roles, &mut counts, &mut sst_entries, &mut predicate_ids,
                         &mut shared_enc, &mut subjects_enc, &mut predicates_enc, &mut objects_enc,
                     )?;
                 }
@@ -254,7 +256,7 @@ pub fn build_dictionary(
     // Process the last term
     if let Some(ref prev) = prev_term {
         process_term(
-            prev, prev_roles, &mut counts, &mut sst_writer, &mut predicate_ids,
+            prev, prev_roles, &mut counts, &mut sst_entries, &mut predicate_ids,
             &mut shared_enc, &mut subjects_enc, &mut predicates_enc, &mut objects_enc,
         )?;
     }
@@ -266,6 +268,25 @@ pub fn build_dictionary(
         counts.predicates,
         counts.objects
     );
+
+    // Step 3b: Write SST with optimal block size
+    let total_sst_terms = sst_entries.len() as u64;
+    let block_size = sst_block_size.unwrap_or_else(|| {
+        let size = crate::dictionary::sst::optimal_block_size(total_sst_terms);
+        let est_mem_mb = (total_sst_terms / size as u64) * 50 / 1_000_000;
+        tracing::info!(
+            "Auto-selected SST block size: {} (~{}MB index for {} terms)",
+            size, est_mem_mb, total_sst_terms
+        );
+        size
+    });
+
+    let sst_path = temp_dir.join("term_lookup.sst");
+    let mut sst_writer = SstWriter::new(&sst_path, block_size)?;
+
+    for (key, section, id) in sst_entries {
+        sst_writer.write_entry(&key, section, id)?;
+    }
 
     // Step 4: Encode PFC sections
     let mut sections = Vec::with_capacity(4);

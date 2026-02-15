@@ -1,6 +1,7 @@
 //! Generic external merge sort implementation.
 
 use anyhow::{Context, Result};
+use rayon::slice::ParallelSliceMut;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::fs::File;
@@ -9,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 /// Trait for items that can be externally sorted.
 /// Items must be serializable to/from bytes for disk storage.
-pub trait Sortable: Ord + Sized {
+pub trait Sortable: Ord + Sized + Send {
     /// Write this item to a writer. Must be self-delimiting.
     fn write_to<W: Write>(&self, writer: &mut W) -> Result<()>;
 
@@ -97,7 +98,7 @@ impl ExternalSorter {
 
     /// Sort and write a chunk to a temporary file.
     fn flush_chunk<T: Sortable>(&mut self, buffer: &mut Vec<T>) -> Result<()> {
-        buffer.sort();
+        buffer.par_sort_unstable();
 
         let chunk_path = self
             .temp_dir

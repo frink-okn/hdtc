@@ -15,7 +15,7 @@ Converts input RDF files (any standard format) to HDT binary format, optimized f
 - **Triples**: BitmapTriples encoding in SPO order
 - **Index**: Standard `.hdt.index.v1-1` (OPS order), implemented after core HDT generation is solid
 - **Quads**: HDTQ approach (ESWC 2018) - standard BitmapTriples + graph dictionary + compressed graph membership bitmaps
-- **Term-to-ID Lookup**: Custom sorted string table (SST) with sparse in-memory block index, memory-mapped via `memmap2`. Write-once during dictionary construction (entries arrive sorted), read-many during Pass 2. ~150MB index for 10B terms. 1 disk read per lookup vs 2-5 for LSM-based stores. No C++ dependency.
+- **Term-to-ID Lookup**: Custom sorted string table (SST) with sparse in-memory block index, memory-mapped via `memmap2`. Write-once during dictionary construction (entries arrive sorted), read-many during Pass 2. Adaptive block size balances speed vs memory: 64-128 for <1B terms (~100MB index), 256-512 for 1-50B terms (~1.5GB index), 1024 for 50B+ terms (~12GB index for 100B terms). Override with `--sst-block-size`. 1 disk read per lookup vs 2-5 for LSM-based stores. No C++ dependency.
 - **Compressed Input**: Transparently handle .gz, .bz2, .xz based on file extension
 - **Error Handling**: Skip malformed RDF with warning, report total skipped count at end
 - **All RDF formats**: N-Triples, N-Quads, Turtle, TriG, RDF/XML, JSON-LD, N3

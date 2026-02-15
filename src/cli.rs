@@ -51,6 +51,11 @@ pub struct Cli {
     #[arg(long, value_name = "MB")]
     pub memory_limit: Option<usize>,
 
+    /// SST block size (records per index entry). Smaller = faster lookups but more memory.
+    /// Auto-detected based on dataset size if not specified.
+    #[arg(long, value_name = "SIZE")]
+    pub sst_block_size: Option<usize>,
+
     /// Increase logging verbosity (-v for debug, -vv for trace)
     #[arg(short, long, action = clap::ArgAction::Count)]
     pub verbose: u8,

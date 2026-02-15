@@ -72,6 +72,7 @@ fn main() -> Result<()> {
         memory_budget,
         include_graphs,
         Some(base_uri),
+        cli.sst_block_size,
     )?;
 
     // Phase 4: Generate and sort ID triples
