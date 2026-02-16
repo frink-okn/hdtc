@@ -91,7 +91,6 @@ fn parser_stage(
     _include_graphs: bool,
     base_uri: String,
     batch_tx: Sender<BatchedQuads>,
-    _error_tx: Sender<anyhow::Error>,
 ) -> Result<()> {
     let mut current_batch = Vec::with_capacity(batch_size);
     let mut total_quads = 0u64;
@@ -130,7 +129,6 @@ fn parser_stage(
 fn vocab_builder_stage(
     batch_rx: Receiver<BatchedQuads>,
     processed_tx: Sender<ProcessedBatch>,
-    _error_tx: Sender<anyhow::Error>,
     include_graphs: bool,
 ) -> Result<()> {
     let mut batch_id = 0;
@@ -193,7 +191,6 @@ fn vocab_builder_stage(
 fn vocab_writer_stage(
     processed_rx: Receiver<ProcessedBatch>,
     complete_tx: Sender<BatchComplete>,
-    _error_tx: Sender<anyhow::Error>,
     temp_dir: PathBuf,
 ) -> Result<()> {
     for batch in processed_rx {
@@ -282,12 +279,10 @@ pub fn run_pipeline(
     let (batch_tx, batch_rx) = bounded::<BatchedQuads>(3); // 3 batches buffered
     let (processed_tx, processed_rx) = bounded::<ProcessedBatch>(2); // 2 processed batches buffered
     let (complete_tx, complete_rx) = bounded::<BatchComplete>(10); // 10 completion notifications
-    let (error_tx, error_rx) = crossbeam_channel::unbounded::<anyhow::Error>();
 
     // Spawn stages in separate threads
     let inputs_owned = inputs.to_vec();
     let base_uri_owned = base_uri.to_string();
-    let error_tx_parser = error_tx.clone();
     let parser_handle = std::thread::spawn(move || {
         if let Err(e) = parser_stage(
             inputs_owned,
@@ -295,7 +290,6 @@ pub fn run_pipeline(
             include_graphs,
             base_uri_owned,
             batch_tx,
-            error_tx_parser,
         ) {
             tracing::error!("Parser stage failed: {}", e);
             return Err(e);
@@ -303,9 +297,8 @@ pub fn run_pipeline(
         Ok(())
     });
 
-    let error_tx_builder = error_tx.clone();
     let builder_handle = std::thread::spawn(move || {
-        if let Err(e) = vocab_builder_stage(batch_rx, processed_tx, error_tx_builder, include_graphs) {
+        if let Err(e) = vocab_builder_stage(batch_rx, processed_tx, include_graphs) {
             tracing::error!("Vocab builder stage failed: {}", e);
             return Err(e);
         }
@@ -313,17 +306,13 @@ pub fn run_pipeline(
     });
 
     let temp_dir_owned = temp_dir.to_path_buf();
-    let error_tx_writer = error_tx.clone();
     let writer_handle = std::thread::spawn(move || {
-        if let Err(e) = vocab_writer_stage(processed_rx, complete_tx, error_tx_writer, temp_dir_owned) {
+        if let Err(e) = vocab_writer_stage(processed_rx, complete_tx, temp_dir_owned) {
             tracing::error!("Vocab writer stage failed: {}", e);
             return Err(e);
         }
         Ok(())
     });
-
-    // Drop error_tx so error_rx will disconnect when all senders are gone
-    drop(error_tx);
 
     // Collect batch completions
     let mut batches: Vec<BatchComplete> = Vec::new();
@@ -343,11 +332,6 @@ pub fn run_pipeline(
     writer_handle
         .join()
         .map_err(|_| anyhow::anyhow!("Writer thread panicked"))??;
-
-    // Check for any errors
-    if let Ok(err) = error_rx.try_recv() {
-        return Err(err);
-    }
 
     // Stage 4: Merge vocabularies and build global dictionary
     tracing::info!("Stage 4: Merging vocabularies");

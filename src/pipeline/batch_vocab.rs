@@ -68,6 +68,8 @@ pub struct BatchVocabBuilder<'bump> {
     next_so_id: LocalId,
     /// Next ID to assign (predicate ID space, separate)
     next_p_id: LocalId,
+    /// Count of unique terms across both maps
+    unique_term_count: usize,
     /// Accumulated triples with local IDs
     pub id_triples: Vec<LocalIdTriple>,
 }
@@ -85,6 +87,7 @@ impl<'bump> BatchVocabBuilder<'bump> {
             arena,
             next_so_id: 0,
             next_p_id: 0,
+            unique_term_count: 0,
             id_triples: Vec::new(),
         }
     }
@@ -101,6 +104,11 @@ impl<'bump> BatchVocabBuilder<'bump> {
                 return id;
             }
 
+            // New predicate term — only a new unique term if not already in SO map
+            if !self.so_term_map.contains_key(term) {
+                self.unique_term_count += 1;
+            }
+
             // Allocate term in arena
             let arena_term = self.arena.alloc_slice_copy(term);
             let id = self.next_p_id;
@@ -109,10 +117,14 @@ impl<'bump> BatchVocabBuilder<'bump> {
             id
         } else {
             // Subject/Object ID space
-            if let Some(&(id, _existing_roles)) = self.so_term_map.get(term) {
-                // Merge roles if term already exists
-                self.so_term_map.get_mut(term).unwrap().1 |= role;
-                return id;
+            if let Some((id, existing_roles)) = self.so_term_map.get_mut(term) {
+                *existing_roles |= role;
+                return *id;
+            }
+
+            // New SO term — only a new unique term if not already in P map
+            if !self.p_term_map.contains_key(term) {
+                self.unique_term_count += 1;
             }
 
             // Allocate term in arena
@@ -178,19 +190,8 @@ impl<'bump> BatchVocabBuilder<'bump> {
 
     /// Get statistics about this batch.
     pub fn stats(&self) -> BatchStats {
-        use std::collections::HashSet;
-
-        // Count unique terms across both hash maps
-        let mut unique_terms = HashSet::new();
-        for term in self.so_term_map.keys() {
-            unique_terms.insert(*term);
-        }
-        for term in self.p_term_map.keys() {
-            unique_terms.insert(*term);
-        }
-
         BatchStats {
-            num_terms: unique_terms.len(),
+            num_terms: self.unique_term_count,
             num_triples: self.id_triples.len(),
         }
     }

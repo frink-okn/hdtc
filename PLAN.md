@@ -69,8 +69,8 @@ if let Some(&(id, _existing_roles)) = self.so_term_map.get(term) {
 ```
 
 **Steps:**
-- [ ] Use hashbrown's `RawEntryMut` API or restructure to use `entry()` for a single lookup
-- [ ] Verify no regression in tests
+- [x] Use `get_mut` directly instead of `get` + `get_mut().unwrap()` for a single lookup
+- [x] Verify no regression in tests
 
 ### 2.2 Eliminate Redundant HashMap in `finish()`
 **Impact:** Saves ~250MB per batch of redundant allocation
@@ -118,8 +118,8 @@ The `error_tx`/`error_rx` channels (line 285-286) are created but all senders ar
 (prefixed `_error_tx`). Errors propagate via thread join handles already.
 
 **Steps:**
-- [ ] Remove `error_tx`, `error_rx`, and all `_error_tx` parameters from stage functions
-- [ ] Verify pipeline error propagation still works via thread joins
+- [x] Remove `error_tx`, `error_rx`, and all `_error_tx` parameters from stage functions
+- [x] Verify pipeline error propagation still works via thread joins
 
 ---
 
@@ -192,8 +192,8 @@ The `error_tx`/`error_rx` channels (line 285-286) are created but all senders ar
 `stats()` creates a HashSet to count unique terms across both maps.
 
 **Steps:**
-- [ ] Replace with `so_term_map.len() + p_term_map.len()` (nearly exact since terms in both maps are very rare)
-- [ ] Or track count incrementally in `get_or_assign_id` with a counter field
+- [x] Track count incrementally in `get_or_assign_id` with a `unique_term_count` field — on new insertion into either map, only increment if the term is absent from the other map
+- [x] Replace `stats()` HashSet construction with O(1) counter return
 
 ---
 
