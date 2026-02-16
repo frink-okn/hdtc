@@ -23,12 +23,26 @@ Converts input RDF files (any standard format) to HDT binary format, optimized f
 ## Architecture
 
 Multi-pass, disk-backed approach for scalability:
-1. Pass 1: Stream input, extract terms, write to temp files, external merge sort to build dictionary
+1. Pass 1: Stream input, extract terms, write to zstd-compressed temp files, external merge sort to build dictionary
 2. Write dictionary sections with PFC encoding, build sorted string table (SST) for term-to-ID lookup
 3. Pass 2: Stream input again, encode triples as integer IDs using SST lookups
-4. External sort ID-triples in SPO order, build BitmapTriples
+4. External sort ID-triples in SPO order (zstd-compressed chunks), build BitmapTriples
 5. Assemble HDT file (header + dictionary + triples)
 6. Optionally build OPS index (.hdt.index.v1-1)
+
+### Resource Requirements
+
+**Memory:** Default 4GB, configurable via `--memory-limit`. For 100B triples, recommend 16-32GB for optimal performance.
+
+**Temporary Disk Space:** Peak usage during Phase 1 (term extraction and sorting):
+- **Rule of thumb:** `Triples × 40 bytes` for typical RDF datasets (with zstd compression)
+- Examples: 500M triples ≈ 20GB, 10B triples ≈ 400GB, 100B triples ≈ 4TB
+- Varies by term uniqueness and compressibility: 25-60 bytes/triple (lower = more repeated terms)
+- External sort chunks are compressed with zstd level 1 (~67% space reduction vs uncompressed)
+- Specify temp directory with `--temp-dir` (uses system temp by default)
+- Temp files automatically cleaned up after completion
+
+**Output Size:** HDT file is typically 10-20% of uncompressed N-Triples size due to dictionary compression and BitmapTriples encoding.
 
 ## HDT Binary Format Reference
 
@@ -82,3 +96,4 @@ tests/
 | `flate2` | Gzip decompression |
 | `bzip2` | Bzip2 decompression |
 | `xz2` / `liblzma` | XZ/LZMA decompression |
+| `zstd` | Zstandard compression for temp chunk files |

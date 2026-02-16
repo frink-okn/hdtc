@@ -7,6 +7,7 @@ use std::collections::BinaryHeap;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use zstd::{Decoder, Encoder};
 
 /// Trait for items that can be externally sorted.
 /// Items must be serializable to/from bytes for disk storage.
@@ -96,25 +97,26 @@ impl ExternalSorter {
         self.merge()
     }
 
-    /// Sort and write a chunk to a temporary file.
+    /// Sort and write a chunk to a temporary file with zstd compression.
     fn flush_chunk<T: Sortable>(&mut self, buffer: &mut Vec<T>) -> Result<()> {
         buffer.par_sort_unstable();
 
         let chunk_path = self
             .temp_dir
-            .join(format!("sort_chunk_{:06}.tmp", self.chunk_counter));
+            .join(format!("sort_chunk_{:06}.tmp.zst", self.chunk_counter));
         self.chunk_counter += 1;
 
         let file = File::create(&chunk_path)
             .with_context(|| format!("Failed to create chunk file {}", chunk_path.display()))?;
-        let mut writer = BufWriter::with_capacity(256 * 1024, file);
+        let buf_writer = BufWriter::with_capacity(256 * 1024, file);
+        let mut encoder = Encoder::new(buf_writer, 1)?; // zstd level 1 for speed
 
         for item in buffer.drain(..) {
-            item.write_to(&mut writer)?;
+            item.write_to(&mut encoder)?;
         }
-        writer.flush()?;
+        encoder.finish()?;
 
-        tracing::debug!("Wrote sorted chunk: {}", chunk_path.display());
+        tracing::debug!("Wrote compressed chunk: {}", chunk_path.display());
         self.chunk_files.push(chunk_path);
         Ok(())
     }
@@ -125,8 +127,8 @@ impl ExternalSorter {
         for path in &self.chunk_files {
             let file = File::open(path)
                 .with_context(|| format!("Failed to open chunk file {}", path.display()))?;
-            let reader = BufReader::with_capacity(64 * 1024, file);
-            readers.push(reader);
+            let decoder = Decoder::new(file)?;
+            readers.push(decoder);
         }
         MergeIterator::new(readers)
     }
@@ -150,7 +152,7 @@ impl Drop for ExternalSorter {
 /// K-way merge iterator over sorted chunk files.
 pub struct MergeIterator<T: Sortable> {
     heap: BinaryHeap<HeapEntry<T>>,
-    readers: Vec<Option<BufReader<File>>>,
+    readers: Vec<Option<Decoder<'static, BufReader<File>>>>,
 }
 
 /// Entry in the merge heap. Wraps an item with its source chunk index.
@@ -182,9 +184,9 @@ impl<T: Sortable> Ord for HeapEntry<T> {
 }
 
 impl<T: Sortable> MergeIterator<T> {
-    fn new(mut readers: Vec<BufReader<File>>) -> Result<Self> {
+    fn new(mut readers: Vec<Decoder<'static, BufReader<File>>>) -> Result<Self> {
         let mut heap = BinaryHeap::with_capacity(readers.len());
-        let mut opt_readers: Vec<Option<BufReader<File>>> = Vec::with_capacity(readers.len());
+        let mut opt_readers: Vec<Option<Decoder<'static, BufReader<File>>>> = Vec::with_capacity(readers.len());
 
         for (i, mut reader) in readers.drain(..).enumerate() {
             match T::read_from(&mut reader) {

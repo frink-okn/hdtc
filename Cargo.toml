@@ -21,6 +21,7 @@ walkdir = "2"
 oxrdfio = "0.2"
 oxrdf = "0.3"
 indicatif = "0.17"
+zstd = "0.13"
 
 [dev-dependencies]
 hdt = "0.4"
