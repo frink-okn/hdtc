@@ -130,13 +130,13 @@ The `error_tx`/`error_rx` channels (line 285-286) are created but all senders ar
 **Files:** `src/dictionary/builder.rs`, `src/dictionary/sst.rs`, `src/triples/id_triple.rs`, `src/dictionary/mod.rs`, `src/triples/mod.rs`, `Cargo.toml`
 
 **Steps:**
-- [ ] Remove old `build_dictionary` function from `dictionary/builder.rs` (keep `DictCounts` and `resolve_global_id` if still referenced)
-- [ ] Remove `dictionary/sst.rs` entirely (SST not needed in single-pass pipeline)
-- [ ] Remove `generate_id_triples` and `SortedTriples` from `triples/id_triple.rs` (keep `IdTriple` struct and its `Sortable` impl)
-- [ ] Clean up `#[allow(dead_code)]` and `#[allow(unused_imports)]` annotations in mod files
-- [ ] Remove `memmap2` from `Cargo.toml` if no longer used by any live code
-- [ ] Remove dead `add_triple` method from `BatchVocabBuilder` (currently `#[allow(dead_code)]`)
-- [ ] Verify all 108 tests still pass after removal
+- [x] Remove old `build_dictionary` function from `dictionary/builder.rs` (kept `DictCounts`, removed `resolve_global_id` since it depended on removed SST types)
+- [x] Remove `dictionary/sst.rs` entirely (SST not needed in single-pass pipeline)
+- [x] Remove `generate_id_triples` and `SortedTriples` from `triples/id_triple.rs` (kept `IdTriple` struct and its `Sortable` impl)
+- [x] Clean up `#[allow(dead_code)]` and `#[allow(unused_imports)]` annotations in mod files
+- [x] Remove `memmap2` from `Cargo.toml` (no longer used by any live code)
+- [x] Remove dead `add_triple` method from `BatchVocabBuilder` (changed to `#[cfg(test)]` since used by tests)
+- [x] Verify all 101 tests still pass after removal (68 unit + 9 compat + 24 integration)
 
 ### 3.2 Introduce Named Structs for Tuple Types
 **Impact:** Readability and safety

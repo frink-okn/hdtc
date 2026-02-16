@@ -124,8 +124,8 @@ impl<'bump> BatchVocabBuilder<'bump> {
         }
     }
 
-    /// Add a triple to this batch.
-    #[allow(dead_code)]
+    /// Add a triple to this batch (test helper).
+    #[cfg(test)]
     pub fn add_triple(&mut self, subject: &[u8], predicate: &[u8], object: &[u8]) {
         let s_id = self.get_or_assign_id(subject, ROLE_SUBJECT);
         let p_id = self.get_or_assign_id(predicate, ROLE_PREDICATE);
