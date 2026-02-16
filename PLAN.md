@@ -1,346 +1,276 @@
-# Implementation Plan: hdtc (HDT Creator)
+# hdtc Performance & Quality Improvement Plan
 
-## Overview
+Based on review of QLever architecture recommendations (`qlever-notes.md`) against the current
+pipelined codebase. The old two-pass architecture has been replaced with a single-pass pipeline
+using batched hash maps, partial vocabulary merging, and parallel ID remapping. This plan covers
+the remaining improvements.
 
-Build `hdtc`, a Rust CLI tool that converts RDF files to HDT format, optimized for massive datasets (100B+ triples) under constrained memory (~20GB). The output HDT files must be fully compatible with existing HDT tools (hdt-java, hdt-cpp).
-
-## Resolved Decisions
-
-- **Compatibility**: Fully compatible with hdt-java/hdt-cpp (output loadable by those tools)
-- **Quads**: HDTQ approach (annotated triples + graph dictionary + compressed graph membership bitmaps)
-- **Error handling**: Skip malformed RDF with warning, report total skipped count at end
-- **Compressed input**: Transparently handle .gz, .bz2, .xz
-- **RDF formats**: All standard formats via oxrdfio (N-Triples, N-Quads, Turtle, TriG, RDF/XML, JSON-LD, N3)
-- **Term-to-ID lookup**: Custom sorted string table (SST) with sparse in-memory block index, memory-mapped via `memmap2`
-- **Index priority**: After core HDT generation is working and tested
+## Status Key
+- [ ] Not started
+- [x] Complete
 
 ---
 
-## Phase 1: Project Foundation
+## Phase 1: High-Impact Performance Fixes
 
-### 1.1 Project Setup
-- Initialize Cargo project
-- Add dependencies: `clap`, `oxrdfio`, `anyhow`, `thiserror`, `tracing`, `tracing-subscriber`, `crc`, `rayon`, `tempfile`, `memmap2`, `indicatif`, `flate2`, `bzip2`, `xz2`
-- Set up basic project structure with module stubs
+### 1.1 Stream BitmapTriples Construction
+**Impact:** Eliminates ~5.8GB peak memory for 550M triples
+**Files:** `src/triples/builder.rs`, `src/io/bitmap.rs`, `src/io/log_array.rs`
+**QLever ref:** Recommendation 3.3 (HIGH IMPACT)
 
-### 1.2 CLI Definition
-- Define CLI with `clap` derive API
-- Arguments:
-  - Input files/folders (positional, multiple)
-  - `--output` / `-o`: output HDT file path (required)
-  - `--mode`: `triples` or `quads` (default: triples)
-  - `--temp-dir`: location for temporary working files (default: system temp)
-  - `--index`: generate `.hdt.index.v1-1` file (flag)
-  - `--graph-map`: mapping of input files/folders to named graphs (for quads mode)
-  - `--default-graph`: URI for the default graph (for quads mode)
-  - `--threads`: number of threads (default: available cores)
-  - `--memory-limit`: soft memory limit for internal buffers
-  - `--base-uri`: base URI for the dataset
-  - Verbosity flags (`-v`, `-q`)
+Currently `build_bitmap_triples` accumulates four large vectors in memory:
+- `array_z_entries: Vec<u64>` — 550M x 8 bytes = 4.4GB
+- `array_y_entries: Vec<u64>` — ~100M x 8 bytes = 800MB
+- `bitmap_z_bits: Vec<bool>` — 550M x 1 byte = 550MB (wastes 7/8 of space)
+- `bitmap_y_bits: Vec<bool>` — ~100M x 1 byte = 100MB
 
-### 1.3 Input Discovery
-- Recursively walk input directories
-- Detect RDF format from file extensions (`.nt`, `.nq`, `.ttl`, `.trig`, `.rdf`, `.xml`, `.jsonld`, `.n3`)
-- Strip compression extensions to detect base format (e.g., `.nt.gz` -> N-Triples)
-- Open compressed files through appropriate decompression reader
-- Validate that input files exist and are readable
+Then it makes a second pass to feed them into LogArrayWriter/BitmapWriter.
 
----
+**Steps:**
+- [ ] Write directly to `BitmapWriter` as triples arrive (eliminate intermediate `Vec<bool>`)
+- [ ] Track `max_subject`, `max_predicate`, `max_object` during the external sort merge phase and pass them into the builder, so LogArrayWriter can be initialized with correct bit width upfront
+- [ ] Write directly to `LogArrayWriter` as triples arrive (eliminate intermediate `Vec<u64>`)
+- [ ] The BitmapTriples encoding is inherently streaming since triples arrive in SPO order: on subject change emit 1-bit to BitmapY; on predicate change within same subject emit 1-bit to BitmapY; for each triple push object to ArrayZ and 0/1 to BitmapZ
+- [ ] Update tests to verify identical output
 
-## Phase 2: Low-Level HDT Building Blocks
+### 1.2 Single-Pass Vocab Merge
+**Impact:** Eliminates ~50% of merge I/O (currently reads all partial vocab files twice)
+**Files:** `src/pipeline/vocab_merger.rs`
 
-### 2.1 Binary Encoding Utilities (`src/io/`)
-- **VByte**: Variable-byte integer encoding/decoding. MSB=1 means LAST byte (termination bit), MSB=0 means more bytes follow. 7 data bits per byte, little-endian order.
-- **LogArray** (Log64): Bit-packed integer arrays. Preamble: type byte (0x01) + raw byte `bits_per_entry` (NOT VByte) + VByte `num_entries` + CRC8. Data: `ceil(num_entries * bits_per_entry / 8)` bytes (byte-packed, NOT padded to 64-bit words) + CRC32C.
-- **Bitmap**: Bit sequences. Preamble: type byte (0x01) + VByte `num_bits` + CRC8. Data: `ceil(num_bits / 8)` bytes (byte-packed, NOT padded to 64-bit words) + CRC32C. Bits stored LSB-first within each byte.
-- **CRC**: CRC8-CCITT (poly 0x07), CRC16-ANSI (poly 0x8005), CRC32C (poly 0x1EDC6F41) — use `crc` crate. All CRCs stored as little-endian.
-- **Control Information**: `$HDT` magic (4 bytes), type byte (Global=1, Header=2, Dictionary=3, Triples=4), null-terminated format URI (angle-bracketed for URIs, e.g. `<http://purl.org/HDT/hdt#HDTv1>`), semicolon-separated key=value properties, null terminator, CRC16.
-- Full unit tests for each primitive, including round-trip and known-value tests against hdt-java output
+The current merger reads partial vocabularies twice:
+- Pass 1 (lines 211-280): Count terms per section (shared/subject-only/object-only)
+- Pass 2 (lines 286-381): Re-open files, re-merge, assign global IDs
 
-### 2.2 Front-Coded Dictionary Section (`src/dictionary/`)
-- PFC (Plain Front Coding) encoder:
-  - Block-based encoding with configurable block size (default 16)
-  - First string in each block: stored verbatim + null terminator
-  - Subsequent strings: VByte(shared_prefix_length) + suffix + null terminator
-  - Block offset index as LogArray, with buffer_length appended as sentinel value
-  - Section preamble: type byte (0x02) + VByte(string_count) + VByte(buffer_length) + VByte(block_size) + CRC8
-  - Section layout: preamble + LogArray(block_offsets with sentinel) + Buffer(encoded_strings) + CRC32C
-  - Empty section handling: LogArray with bits_per_entry=0 and single entry [0] (hdt-java compatibility)
-  - Terms stored WITHOUT angle brackets in dictionary (URIs stored as plain strings, not `<uri>`)
-- PFC decoder (for testing/verification and potential read-back)
-- Unit tests with known byte sequences and round-trip verification against hdt-java output
+This exists because subject-only IDs are offset by the shared count, which isn't known until
+all terms are counted.
+
+**Steps:**
+- [ ] Choose approach (recommended: Option A — buffer merged entries in memory during single merge pass, since deduplicated unique terms are modest in size, ~26M entries for 550M triples)
+- [ ] Option A: During the single merge, buffer merged `(term, roles, batch_sources)` entries. After merge completes, iterate buffer to assign global IDs.
+- [ ] Option B (alternative): Pre-count with a lightweight first pass reading only roles bytes (skip term data) then do a full second pass. Cheaper than current but still two passes.
+- [ ] Option C (alternative): Assign provisional IDs during single merge, then fix up subject-only and object-only offsets in the mapping arrays (no re-read of vocab files).
+- [ ] Remove the file re-open and second merge loop
+- [ ] Update tests to verify identical dictionary output
 
 ---
 
-## Format Corrections from Reverse-Engineering hdt-java
+## Phase 2: Medium-Impact Performance & Safety Fixes
 
-The following corrections were discovered by generating an HDT file with hdt-java and comparing byte-by-byte against our initial implementation. All have been applied to the relevant plan sections above.
+### 2.1 Fix Double Hash Lookup in `get_or_assign_id`
+**Impact:** CPU savings on the hottest code path (called 3x per triple, billions of times)
+**Files:** `src/pipeline/batch_vocab.rs`
 
-1. **VByte MSB semantics inverted**: MSB=1 means LAST byte (termination), not continuation. Opposite of typical VByte conventions.
-2. **Bitmap bit semantics inverted**: Bit=1 marks the LAST child of a parent node, not the first. This applies to both BitmapY and BitmapZ.
-3. **Control type bytes off by one**: Global=1, Header=2, Dictionary=3, Triples=4 (not 0-3).
-4. **LogArray preamble reordered**: `bits_per_entry` is a raw byte (not VByte-encoded), and comes before the VByte-encoded `num_entries`.
-5. **Data byte-packing**: LogArray and Bitmap data are byte-packed (`ceil(bits/8)` bytes), NOT padded to 64-bit word boundaries.
-6. **PFC section type byte**: Each PFC section starts with type byte 0x02 before the VByte fields.
-7. **PFC block_size in preamble**: The block size is VByte-encoded after string_count and buffer_length (was missing).
-8. **Block offset sentinel**: The buffer_length is appended as a final entry in the block offsets LogArray.
-9. **Triples write order**: BitmapY, BitmapZ, ArrayY, ArrayZ (bitmaps first, then arrays — NOT interleaved).
-10. **Control Information format URIs**: Wrapped in angle brackets (e.g. `<http://purl.org/HDT/hdt#HDTv1>`), except Header format which is plain `ntriples`.
-11. **Dictionary terms unbracketed**: URIs stored as plain strings without angle brackets in PFC sections.
-12. **Empty PFC sections**: Use a LogArray with bits_per_entry=0 and a single entry [0].
+Lines 112-115 hash the key twice — once for `get()`, once for `get_mut().unwrap()`:
+```rust
+if let Some(&(id, _existing_roles)) = self.so_term_map.get(term) {
+    self.so_term_map.get_mut(term).unwrap().1 |= role;
+    return id;
+}
+```
 
----
+**Steps:**
+- [ ] Use hashbrown's `RawEntryMut` API or restructure to use `entry()` for a single lookup
+- [ ] Verify no regression in tests
 
-## Phase 3: Dictionary Construction (Disk-Backed)
+### 2.2 Eliminate Redundant HashMap in `finish()`
+**Impact:** Saves ~250MB per batch of redundant allocation
+**Files:** `src/pipeline/batch_vocab.rs`
 
-### 3.1 Term Extraction (Pass 1a)
-- Stream all input RDF files using `oxrdfio` (streaming quad parser)
-- For each quad, extract subject, predicate, object (and graph in quads mode)
-- Serialize each term to its canonical N-Triples/N-Quads string form
-- Disambiguate blank nodes: prefix with per-file identifier (e.g., `_:f{file_index}_original_id`)
-- Accumulate `(term_string, role_flags)` records in memory buffer
-- Role flags: bitmask of Subject=0x01, Predicate=0x02, Object=0x04, Graph=0x08
-- When buffer reaches memory budget threshold, sort by term string, flush to temp file
-- Use length-prefixed binary format for temp records
+`finish()` (lines 147-176) creates a `std::collections::HashMap`, copies all terms from both
+hashbrown maps into it, then converts to Vec and sorts.
 
-### 3.2 External Merge Sort of Terms (Pass 1b)
-- K-way merge of sorted chunk files using a min-heap
-- During merge: deduplicate consecutive identical terms, OR their role flags together
-- Output: single sorted file of unique `(term_string, role_flags)` records
-- Multi-threaded: merge can use parallel readers with prefetching
+**Steps:**
+- [ ] Collect entries directly from `so_term_map` and `p_term_map` into a single `Vec`
+- [ ] For terms appearing in both maps (rare: term used as both predicate and subject/object), merge during the Vec construction
+- [ ] Sort the Vec directly — no intermediate HashMap needed
 
-### 3.3 Dictionary Partitioning and ID Assignment (Pass 1c)
-- Single scan through sorted unique terms
-- Partition by role flags:
-  - **Shared** (S∩O): terms with both Subject and Object flags → IDs [1..m]
-  - **Subjects-only**: Subject flag only → IDs [m+1..]
-  - **Predicates**: Predicate flag → separate ID space [1..p]
-  - **Objects-only**: Object flag only → IDs [m+1..] (mapping 1)
-  - **Graphs** (quads mode): Graph flag → separate ID space [1..g]
-- Write each partition to PFC-encoded dictionary section
-- Simultaneously write entries to sorted SST file for Pass 2 lookups
+### 2.3 Scale Arena Allocation to Batch Size
+**Impact:** Better memory efficiency (currently wastes up to 490MB on small batches)
+**Files:** `src/pipeline/mod.rs`
 
-### 3.4 Sorted String Table (SST) for Term-to-ID Lookup
-- Custom write-once, read-many data structure optimized for our exact access pattern
-- **Build** (during Phase 3.3, entries arrive already sorted from merge sort):
-  - Write `(term_string, section_id, term_id)` records sequentially to a flat file
-  - Records use length-prefixed format: `u32 key_len | key_bytes | u8 section | u64 id`
-  - Every Nth record (e.g., N=1024), emit a sparse index entry: `(key_hash, file_offset)`
-  - After all records written, write the sparse index as a separate file (or appended with offset marker)
-- **Sparse block index** (held in memory during Pass 2):
-  - Array of `(key_prefix_or_hash, file_offset)` entries
-  - For 10B unique terms with N=1024: ~10M index entries, ~150MB RAM
-  - Loaded into memory at start of Pass 2
-- **Lookup** (during Phase 4.1):
-  - Binary search the in-memory sparse index to find the enclosing block
-  - Seek to block offset in memory-mapped SST file
-  - Linear scan within the block (up to N records) comparing keys
-  - 1 page fault per lookup on average (OS page cache handles hot blocks)
-- **Memory mapping**: SST file opened via `memmap2` for zero-copy reads; OS manages page cache
-- **Advantages over RocksDB**:
-  - Zero write amplification (single sequential write pass)
-  - Single disk read per lookup (vs 2-5 for LSM tree)
-  - Predictable ~150MB memory footprint for index (vs multi-GB for RocksDB caches/bloom filters)
-  - No C++ dependency, no compaction overhead
-  - Trivial cleanup: delete the temp file
-- **Temporary**: SST file deleted after HDT generation completes
+Line 139 hardcodes `bumpalo::Bump::with_capacity(500_000_000)`.
+
+**Steps:**
+- [ ] Calculate arena capacity based on batch size: e.g., `batch_size * 100` bytes (estimated ~100 bytes per triple for unique term storage after dedup), with a floor of 10MB
+- [ ] Or simply use `Bump::new()` and let bumpalo grow dynamically (doubles on each grow, modest overhead)
+
+### 2.4 Add Bounds Checking in ID Remapper
+**Impact:** Safety — prevents silent corruption, gives actionable error messages on malformed data
+**Files:** `src/pipeline/id_remapper.rs`
+
+Lines 41-43 do direct array indexing without bounds checks:
+```rust
+let global_subject = mapping.so_map[local_triple.subject as usize];
+```
+
+**Steps:**
+- [ ] Replace direct indexing with `.get()` and descriptive error messages:
+  ```rust
+  let global_subject = *mapping.so_map.get(local_triple.subject as usize)
+      .ok_or_else(|| anyhow!("SO mapping missing for local ID {} in batch {}", ...))?;
+  ```
+
+### 2.5 Remove Unused Error Channel
+**Impact:** Code clarity
+**Files:** `src/pipeline/mod.rs`
+
+The `error_tx`/`error_rx` channels (line 285-286) are created but all senders are unused
+(prefixed `_error_tx`). Errors propagate via thread join handles already.
+
+**Steps:**
+- [ ] Remove `error_tx`, `error_rx`, and all `_error_tx` parameters from stage functions
+- [ ] Verify pipeline error propagation still works via thread joins
 
 ---
 
-## Phase 4: Triple Encoding
+## Phase 3: Code Quality & Type Safety
 
-### 4.1 ID Triple Generation (Pass 2)
-- Stream all input RDF files again using `oxrdfio`
-- Re-apply same blank node disambiguation (same per-file prefixing)
-- Look up each term in the SST to get `(section, id)`
-- Compute the global ID for subjects and objects:
-  - Shared terms: use shared ID directly
-  - Subject-only: shared_count + subject_only_index
-  - Object-only: shared_count + object_only_index (mapping 1)
-- Write `(subject_id: u64, predicate_id: u64, object_id: u64)` tuples to temp files (24 bytes each, fixed-width)
-- In quads mode: also write `(triple_index, graph_id)` pairs to a separate temp file
+### 3.1 Remove Dead Code from Old Architecture
+**Impact:** Maintainability — removes ~500 lines of unused code and stale dependencies
+**Files:** `src/dictionary/builder.rs`, `src/dictionary/sst.rs`, `src/triples/id_triple.rs`, `src/dictionary/mod.rs`, `src/triples/mod.rs`, `Cargo.toml`
 
-### 4.2 External Sort of ID Triples
-- External merge sort of the fixed-width `(s, p, o)` records in SPO order
-- Compare by S first, then P, then O
-- Deduplicate identical triples during merge (important: duplicates can arise from multiple input files)
-- Output: sorted, deduplicated ID triples in temp file
+**Steps:**
+- [ ] Remove old `build_dictionary` function from `dictionary/builder.rs` (keep `DictCounts` and `resolve_global_id` if still referenced)
+- [ ] Remove `dictionary/sst.rs` entirely (SST not needed in single-pass pipeline)
+- [ ] Remove `generate_id_triples` and `SortedTriples` from `triples/id_triple.rs` (keep `IdTriple` struct and its `Sortable` impl)
+- [ ] Clean up `#[allow(dead_code)]` and `#[allow(unused_imports)]` annotations in mod files
+- [ ] Remove `memmap2` from `Cargo.toml` if no longer used by any live code
+- [ ] Remove dead `add_triple` method from `BatchVocabBuilder` (currently `#[allow(dead_code)]`)
+- [ ] Verify all 108 tests still pass after removal
 
-### 4.3 BitmapTriples Construction
-- Stream sorted SPO triples sequentially
-- Track previous subject and predicate to detect boundaries
-- Build four structures incrementally:
-  - **ArrayY (Sp)**: append predicate ID whenever (subject, predicate) changes
-  - **BitmapY (Bp)**: bit=1 marks the LAST predicate of each subject (hdt-java convention). Set retroactively when subject changes.
-  - **ArrayZ (So)**: append object ID for every triple
-  - **BitmapZ (Bo)**: bit=1 marks the LAST object of each (subject, predicate) pair. Set retroactively when (subject, predicate) changes.
-- After loop, explicitly mark the final entries in both bitmaps with bit=1
-- Write order within triples section: **BitmapY, BitmapZ, ArrayY, ArrayZ** (NOT interleaved — bitmaps first, then arrays)
-- Control Information: format=`<http://purl.org/HDT/hdt#triplesBitmap>`, order=SPO (1), numTriples=count
+### 3.2 Introduce Named Structs for Tuple Types
+**Impact:** Readability and safety
+**Files:** `src/pipeline/mod.rs`, `src/pipeline/batch_vocab.rs`, `src/pipeline/vocab_merger.rs`
 
----
+`ProcessedBatch.vocab` is `Vec<(Vec<u8>, u8, Option<u32>, Option<u32>)>` — opaque tuple.
 
-## Phase 5: HDT File Assembly
+**Steps:**
+- [ ] Create a `VocabEntry` struct:
+  ```rust
+  struct VocabEntry {
+      term: Vec<u8>,
+      roles: u8,
+      so_local_id: Option<LocalId>,
+      p_local_id: Option<LocalId>,
+  }
+  ```
+- [ ] Replace all tuple uses with the named struct in `ProcessedBatch`, `PartialVocabWriter`, and `vocab_merger`
+- [ ] Similarly replace `batches_with_term: Vec<(usize, u8, Option<u32>, Option<u32>)>` in the merger with a named struct
 
-### 5.1 Header Section
-- Generate RDF metadata as N-Triples string using VoID vocabulary:
-  - `_:header rdf:type void:Dataset`
-  - `void:triples`, `void:distinctSubjects`, `void:properties`, `void:distinctObjects`
-  - `void:entities` (shared count)
-  - `dcterms:source` (base URI)
-  - `dcterms:issued` (generation timestamp)
-  - HDT properties: `hdtDictionary`, `hdtTriples` format URIs
-- Control Information: type=Header (1), format=`ntriples`, property `length`=byte_count
+### 3.3 Use Bitflags for Role Constants
+**Impact:** Type safety — prevents invalid role values at the type level
+**Files:** `src/pipeline/batch_vocab.rs`, `src/pipeline/vocab_merger.rs`, `src/pipeline/partial_vocab.rs`
 
-### 5.2 File Assembly Order
-1. **Global Control Information**: type=Global (1), format=`<http://purl.org/HDT/hdt#HDTv1>`, properties: BaseURI, Software
-2. **Header**: Control Info (type=2, format=`ntriples`) + N-Triples metadata bytes
-3. **Dictionary**: Control Info (type=3, format=`<http://purl.org/HDT/hdt#dictionaryFour>`, mapping=1, elements=total) + Shared PFC + Subjects PFC + Predicates PFC + Objects PFC
-4. **Triples**: Control Info (type=4, format=`<http://purl.org/HDT/hdt#triplesBitmap>`) + BitmapY + BitmapZ + ArrayY + ArrayZ
+**Steps:**
+- [ ] Add `bitflags` crate to dependencies (or use a simple newtype wrapper with const methods)
+- [ ] Replace `ROLE_SUBJECT: u8 = 0x01` etc. with a bitflags type:
+  ```rust
+  bitflags! {
+      struct Roles: u8 {
+          const SUBJECT   = 0x01;
+          const PREDICATE = 0x02;
+          const OBJECT    = 0x04;
+          const GRAPH     = 0x08;
+      }
+  }
+  ```
+- [ ] Update all role flag usage throughout the pipeline modules
 
-### 5.3 Verification
-- Read back the generated HDT file section by section
-- Verify all CRC checksums pass
-- Verify triple count matches expected
-- Verify dictionary section counts are consistent
+### 3.4 Use Newtypes for ID Spaces
+**Impact:** Prevents accidentally mixing subject/object IDs with predicate IDs
+**Files:** `src/pipeline/batch_vocab.rs`, `src/pipeline/id_remapper.rs`, `src/pipeline/vocab_merger.rs`
 
----
+**Steps:**
+- [ ] Evaluate whether converting `LocalId` from type alias to newtype (`struct LocalId(u32)`) is worth the ergonomic cost
+- [ ] If adopted, consider separate newtypes for SO local IDs vs P local IDs
+- [ ] If the ergonomic cost (`.0` everywhere, no arithmetic) is too high, document the convention instead
 
-## Phase 6: HDT Index Generation
+### 3.5 Fix Expensive `stats()` Method
+**Impact:** Minor CPU savings
+**Files:** `src/pipeline/batch_vocab.rs`
 
-*Implemented after core HDT generation is working and tested.*
+`stats()` creates a HashSet to count unique terms across both maps.
 
-### 6.1 OPS Index Construction
-- Re-sort the ID triples by (O, P, S) order using external merge sort (can reuse the ID triples from Phase 4)
-- Build index structures:
-  - **bitmapIndex** (BitSequence375): marks boundaries between object groups
-  - **arrayIndex** (LogSequence2): Y-axis position references for each entry
-  - **predicateIndex**: maps predicates to their positions
-  - **predicateCount**: occurrence count per predicate
-- Write `.hdt.index.v1-1` file with Control Information header
-
-### 6.2 Format Compatibility
-- Reverse-engineer the exact binary format from hdt-cpp source code
-- Verify generated index files are loadable by hdt-cpp/hdt-java
+**Steps:**
+- [ ] Replace with `so_term_map.len() + p_term_map.len()` (nearly exact since terms in both maps are very rare)
+- [ ] Or track count incrementally in `get_or_assign_id` with a counter field
 
 ---
 
-## Phase 7: HDTQ Quads Support
+## Phase 4: Future Performance Improvements
 
-*Implemented after triples HDT is fully working.*
+These are from the QLever analysis but are more complex and should only be pursued after
+benchmarking shows they're needed.
 
-### 7.1 Graph Dictionary
-- Fifth dictionary section for graph terms
-- PFC encoded, separate ID space [1..g]
+### 4.1 Parallel N-Triples/N-Quads Parsing
+**Impact:** ~3-4x parsing speedup for large N-Triples files
+**QLever ref:** Recommendation 3.4 (MEDIUM IMPACT)
+**Complexity:** High
 
-### 7.2 Graph Membership Tracking
-- During Pass 2 (ID generation), emit `(triple_index, graph_id)` pairs
-- Sort by triple_index
-- For each unique triple, build a set of graph IDs it belongs to
+**Steps:**
+- [ ] For N-Triples: split decompressed input at newline boundaries into ~10MB blocks
+- [ ] Parse blocks in parallel (one oxrdfio parser per block, or a simpler custom N-Triples parser)
+- [ ] Collect results into the batched hash map via a bounded channel
+- [ ] For Turtle/TriG: parse prefixes sequentially first, then parallel-parse the body with shared prefix map
 
-### 7.3 Quad Information Component
-- HDTQ Annotated Triples (HDT-AT) approach:
-  - For each triple, store a compressed bitset of graph memberships
-  - Use Roaring Bitmaps for efficient compression of sparse bitsets
-- Append after the standard Triples section in the HDT file
-- Add appropriate Control Information for the quad section
+### 4.2 Parallel K-Way Merge
+**Impact:** Modest — merge is no longer the bottleneck after batched hash maps
+**QLever ref:** Recommendation 3.7 (LOW IMPACT)
 
-### 7.4 Graph Mapping CLI
-- `--graph-map file1.nt=http://example.org/graph1` syntax
-- `--graph-map dir/=http://example.org/graphs/` for directories (appends filename)
-- `--default-graph http://example.org/default` for triples without explicit graph
+**Steps:**
+- [ ] Implement recursive binary merge tree with parallel internal nodes (QLever's approach)
 
----
+### 4.3 Double-Buffered Async I/O
+**Impact:** Modest — overlaps computation with disk writes
+**QLever ref:** Recommendation 3.8 (LOW IMPACT)
 
-## Phase 8: Performance and Polish
-
-### 8.1 Multi-Threading
-- **Parallel parsing**: Multiple input files parsed concurrently (bounded channel to back-pressure)
-- **Parallel chunk sorting**: Use `rayon` for in-memory sort of term chunks
-- **Parallel external merge**: K-way merge with prefetch threads
-- **Pipeline parallelism**: Overlap parsing with term extraction and chunk writing
-
-### 8.2 Progress Reporting
-- Phase-level progress bars (using `indicatif`)
-- Per-phase metrics: items processed, throughput (items/sec), elapsed time
-- Overall pipeline progress indicator
-- Memory usage reporting (via `jemalloc` stats or `/proc/self/status`)
-
-### 8.3 Memory Management
-- Configurable memory budget via `--memory-limit` (default: auto-detect ~50% of available RAM)
-- Budget split across sort buffers, SST block index, I/O buffers
-- Chunk flush threshold based on budget
-- Monitor and log actual memory usage periodically
+**Steps:**
+- [ ] Implement compute-batch-N-while-writing-batch-N-1 pattern for vocab writer stage
+- [ ] Apply to other stages where I/O and computation can overlap
 
 ---
 
-## Phase 9: Testing Strategy
+## Phase 5: Test Coverage Gaps
 
-### 9.1 Unit Tests (per module)
-- VByte encoding/decoding round-trips and known values
-- LogArray: various bit widths, boundary values, CRC verification
-- Bitmap: set/get bits, CRC verification
-- Control Information: write/read round-trip
-- PFC dictionary: encode/decode round-trips, known byte sequences from hdt-cpp
-- BitmapTriples: construction from small known triple sets, verify structure
-- CRC: verify against known checksums
+### 5.1 Pipeline Component Unit Tests
+**Impact:** Catches regressions in individual pipeline stages
+**Files:** New test modules in `src/pipeline/` submodules
 
-### 9.2 Integration Tests
-- Small hand-crafted RDF files (5-50 triples) -> HDT, verify structure
-- Multiple RDF formats as input (N-Triples, Turtle, RDF/XML, etc.)
-- Multiple input files merged correctly
-- Blank node disambiguation across files
-- Compressed input files (.gz, .bz2, .xz)
-- Duplicate triple elimination
-- Malformed input skipping with warning count
+- [ ] Test `BatchVocabBuilder` with terms appearing in multiple roles (subject+predicate, predicate+object, all three)
+- [ ] Test vocab merger with multiple batches containing overlapping terms, verify correct global IDs
+- [ ] Test ID remapper with known mappings and verify output triples are correct
+- [ ] Test pipeline with batches of exactly 1 triple (edge case)
+- [ ] Test pipeline with more batches than channel capacity (exercises backpressure)
 
-### 9.3 Compatibility Tests
-- Generate reference HDT files using hdt-java or hdt-cpp from same inputs
-- Verify our output is loadable by hdt-java/hdt-cpp
-- Structural comparison: same dictionary entries, same triple count, same ID assignments
-- If possible: load our HDT with the existing `hdt` Rust crate for querying verification
+### 5.2 Stress / Property Tests
+- [ ] Test with large synthetic datasets (100K+ triples) to verify memory stays bounded
+- [ ] Test with many batches (very small batch size) to exercise merge with many partial vocabularies
+- [ ] Test with a dataset where every term appears in every role (subject, predicate, and object)
 
-### 9.4 Scale Tests
-- Synthetic datasets: 1K, 100K, 10M, 100M triples
-- Verify memory usage stays within configured limits
-- Benchmark throughput and identify bottlenecks
-- Test with multiple concurrent input files
+### 5.3 Benchmarks
+- [ ] Add criterion benchmarks for the hot paths: hash map lookup, vocab merge, BitmapTriples construction
+- [ ] Establish baseline performance numbers for regression detection
 
 ---
 
-## Implementation Order
+## Recommended Execution Order
 
-The recommended order prioritizes getting a working end-to-end pipeline early, then layering on scale, quality, and features:
+Prioritized to maximize value with minimal risk at each step:
 
-1. **Phase 1** (Foundation) — project setup, CLI, input discovery
-2. **Phase 2** (Building blocks) — VByte, LogArray, Bitmap, CRC, Control Info, PFC
-3. **Phase 3** (Dictionary) — term extraction, external sort, partitioning, SST lookup
-4. **Phase 4** (Triples) — ID generation, external sort, BitmapTriples
-5. **Phase 5** (Assembly) — header, file assembly, verification
-6. **Phase 9.1-9.3** (Testing) — unit tests, integration tests, compatibility tests
-7. **Phase 8** (Performance) — multi-threading, progress, memory management
-8. **Phase 6** (Index) — OPS index generation
-9. **Phase 7** (Quads) — HDTQ support
-10. **Phase 9.4** (Scale tests) — large-scale benchmarking
-
----
-
-## Dependency Summary
-
-| Crate | Purpose |
-|-------|---------|
-| `clap` | CLI argument parsing (derive API) |
-| `oxrdfio` | RDF parsing (all standard formats, streaming) |
-| `anyhow` | Application error handling |
-| `thiserror` | Structured error types |
-| `tracing` / `tracing-subscriber` | Structured logging |
-| `crc` | CRC checksum computation (CRC8, CRC16, CRC32C) |
-| `rayon` | Data parallelism for sorting |
-| `tempfile` | Temporary file/directory management |
-| `memmap2` | Memory-mapped file I/O (SST lookup, potentially LogArray/Bitmap reads) |
-| `indicatif` | Progress bars and status |
-| `flate2` | Gzip decompression |
-| `bzip2` | Bzip2 decompression |
-| `xz2` / `liblzma` | XZ/LZMA decompression |
-| `roaring` | Roaring Bitmaps (for HDTQ graph membership) |
-| `walkdir` | Recursive directory traversal |
+| Step | Item | Rationale |
+|------|------|-----------|
+| 1 | Phase 3.1 — Remove dead code | Cleans up codebase, makes everything else easier to reason about |
+| 2 | Phase 2.5 — Remove error channel | Trivial cleanup, removes dead code |
+| 3 | Phase 3.5 — Fix `stats()` | Trivial fix |
+| 4 | Phase 2.1 — Fix double hash lookup | Small change, high-frequency hot path |
+| 5 | Phase 2.2 — Eliminate redundant HashMap in `finish()` | Moderate effort, clear memory win |
+| 6 | Phase 2.3 — Scale arena allocation | Small change |
+| 7 | Phase 2.4 — Bounds checking in remapper | Small safety improvement |
+| 8 | Phase 1.1 — Stream BitmapTriples | **Biggest single improvement** — eliminates ~5.8GB peak memory |
+| 9 | Phase 1.2 — Single-pass vocab merge | Second biggest improvement — halves merge I/O |
+| 10 | Phase 3.2 — Named structs | Can be done alongside other work |
+| 11 | Phase 3.3 — Bitflags for roles | Can be done alongside other work |
+| 12 | Phase 5.1 — Pipeline unit tests | Should accompany phases 8-9 |
+| 13 | Phase 3.4 — Newtype IDs | Evaluate after other changes settle |
+| 14 | Phase 5.2-5.3 — Stress tests & benchmarks | After core improvements are in |
+| 15 | Phase 4.1-4.3 — Parallel parsing etc. | Only if benchmarks show it's needed |
