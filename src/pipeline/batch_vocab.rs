@@ -156,34 +156,32 @@ impl<'bump> BatchVocabBuilder<'bump> {
     /// - Sorted vocabulary entries (term, roles, so_local_id, p_local_id)
     /// - Local-ID triples
     pub fn finish(self) -> (Vec<(Vec<u8>, u8, Option<LocalId>, Option<LocalId>)>, Vec<LocalIdTriple>) {
-        use std::collections::{HashMap as StdHashMap};
+        // Collect entries directly into a Vec — no intermediate HashMap needed.
+        let mut entries: Vec<(Vec<u8>, u8, Option<LocalId>, Option<LocalId>)> =
+            Vec::with_capacity(self.so_term_map.len() + self.p_term_map.len());
 
-        // Collect all unique terms with their roles and IDs
-        let mut term_info: StdHashMap<Vec<u8>, (u8, Option<LocalId>, Option<LocalId>)> = StdHashMap::new();
-
-        // Add SO terms with their tracked roles
-        for (term, &(so_id, roles)) in &self.so_term_map {
-            term_info.insert(term.to_vec(), (roles, Some(so_id), None));
+        for (term, (so_id, roles)) in self.so_term_map {
+            entries.push((term.to_vec(), roles, Some(so_id), None));
         }
 
-        // Add/merge P terms
-        for (term, &p_id) in &self.p_term_map {
-            term_info.entry(term.to_vec())
-                .and_modify(|(roles, _so_id, p_id_opt)| {
-                    *roles |= ROLE_PREDICATE;
-                    *p_id_opt = Some(p_id);
-                })
-                .or_insert((ROLE_PREDICATE, None, Some(p_id)));
+        for (term, p_id) in self.p_term_map {
+            entries.push((term.to_vec(), ROLE_PREDICATE, None, Some(p_id)));
         }
 
-        // Convert to sorted vec
-        let mut entries: Vec<_> = term_info
-            .into_iter()
-            .map(|(term, (roles, so_id, p_id))| (term, roles, so_id, p_id))
-            .collect();
-
-        // Sort by term bytes
+        // Sort by term bytes — duplicates (terms in both maps) become adjacent
         entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+        // Merge adjacent duplicates (terms appearing in both SO and P maps)
+        entries.dedup_by(|b, a| {
+            if a.0 == b.0 {
+                a.1 |= b.1; // merge roles
+                if a.2.is_none() { a.2 = b.2; } // take so_local_id
+                if a.3.is_none() { a.3 = b.3; } // take p_local_id
+                true
+            } else {
+                false
+            }
+        });
 
         (entries, self.id_triples)
     }

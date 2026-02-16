@@ -38,9 +38,21 @@ fn remap_batch(
         match LocalIdTriple::read_from(&mut decoder) {
             Ok(Some(local_triple)) => {
                 // Look up global IDs from mappings
-                let global_subject = mapping.so_map[local_triple.subject as usize];
-                let global_predicate = mapping.p_map[local_triple.predicate as usize];
-                let global_object = mapping.so_map[local_triple.object as usize];
+                let global_subject = *mapping.so_map.get(local_triple.subject as usize)
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "SO mapping missing for local subject ID {} in batch {} (map size: {})",
+                        local_triple.subject, batch_info.batch_id, mapping.so_map.len()
+                    ))?;
+                let global_predicate = *mapping.p_map.get(local_triple.predicate as usize)
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "P mapping missing for local predicate ID {} in batch {} (map size: {})",
+                        local_triple.predicate, batch_info.batch_id, mapping.p_map.len()
+                    ))?;
+                let global_object = *mapping.so_map.get(local_triple.object as usize)
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "SO mapping missing for local object ID {} in batch {} (map size: {})",
+                        local_triple.object, batch_info.batch_id, mapping.so_map.len()
+                    ))?;
 
                 let global_triple = IdTriple {
                     subject: global_subject,

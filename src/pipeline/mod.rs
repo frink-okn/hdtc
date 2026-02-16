@@ -134,7 +134,9 @@ fn vocab_builder_stage(
     let mut batch_id = 0;
 
     for quads_batch in batch_rx {
-        let arena = bumpalo::Bump::with_capacity(500_000_000); // 500MB arena
+        // ~100 bytes per triple for unique term storage after dedup, floor 10MB
+        let arena_cap = (quads_batch.len() * 100).max(10_000_000);
+        let arena = bumpalo::Bump::with_capacity(arena_cap);
         let expected_terms = (quads_batch.len() * 2).min(5_000_000); // Estimate unique terms
         let mut builder = BatchVocabBuilder::new(&arena, expected_terms);
 

@@ -80,9 +80,9 @@ if let Some(&(id, _existing_roles)) = self.so_term_map.get(term) {
 hashbrown maps into it, then converts to Vec and sorts.
 
 **Steps:**
-- [ ] Collect entries directly from `so_term_map` and `p_term_map` into a single `Vec`
-- [ ] For terms appearing in both maps (rare: term used as both predicate and subject/object), merge during the Vec construction
-- [ ] Sort the Vec directly — no intermediate HashMap needed
+- [x] Collect entries directly from `so_term_map` and `p_term_map` into a single `Vec`
+- [x] For terms appearing in both maps (rare: term used as both predicate and subject/object), merge during the Vec construction
+- [x] Sort the Vec directly — no intermediate HashMap needed
 
 ### 2.3 Scale Arena Allocation to Batch Size
 **Impact:** Better memory efficiency (currently wastes up to 490MB on small batches)
@@ -91,8 +91,8 @@ hashbrown maps into it, then converts to Vec and sorts.
 Line 139 hardcodes `bumpalo::Bump::with_capacity(500_000_000)`.
 
 **Steps:**
-- [ ] Calculate arena capacity based on batch size: e.g., `batch_size * 100` bytes (estimated ~100 bytes per triple for unique term storage after dedup), with a floor of 10MB
-- [ ] Or simply use `Bump::new()` and let bumpalo grow dynamically (doubles on each grow, modest overhead)
+- [x] Calculate arena capacity based on batch size: `batch_len * 100` bytes with a floor of 10MB
+- [ ] ~Or simply use `Bump::new()` and let bumpalo grow dynamically~ (not needed, used dynamic sizing instead)
 
 ### 2.4 Add Bounds Checking in ID Remapper
 **Impact:** Safety — prevents silent corruption, gives actionable error messages on malformed data
@@ -104,11 +104,7 @@ let global_subject = mapping.so_map[local_triple.subject as usize];
 ```
 
 **Steps:**
-- [ ] Replace direct indexing with `.get()` and descriptive error messages:
-  ```rust
-  let global_subject = *mapping.so_map.get(local_triple.subject as usize)
-      .ok_or_else(|| anyhow!("SO mapping missing for local ID {} in batch {}", ...))?;
-  ```
+- [x] Replace direct indexing with `.get()` and descriptive error messages (includes map size in error for debugging)
 
 ### 2.5 Remove Unused Error Channel
 **Impact:** Code clarity
@@ -259,13 +255,13 @@ Prioritized to maximize value with minimal risk at each step:
 
 | Step | Item | Rationale |
 |------|------|-----------|
-| 1 | Phase 3.1 — Remove dead code | Cleans up codebase, makes everything else easier to reason about |
-| 2 | Phase 2.5 — Remove error channel | Trivial cleanup, removes dead code |
-| 3 | Phase 3.5 — Fix `stats()` | Trivial fix |
-| 4 | Phase 2.1 — Fix double hash lookup | Small change, high-frequency hot path |
-| 5 | Phase 2.2 — Eliminate redundant HashMap in `finish()` | Moderate effort, clear memory win |
-| 6 | Phase 2.3 — Scale arena allocation | Small change |
-| 7 | Phase 2.4 — Bounds checking in remapper | Small safety improvement |
+| ~~1~~ | ~~Phase 3.1 — Remove dead code~~ | ~~Done~~ |
+| ~~2~~ | ~~Phase 2.5 — Remove error channel~~ | ~~Done~~ |
+| ~~3~~ | ~~Phase 3.5 — Fix `stats()`~~ | ~~Done~~ |
+| ~~4~~ | ~~Phase 2.1 — Fix double hash lookup~~ | ~~Done~~ |
+| ~~5~~ | ~~Phase 2.2 — Eliminate redundant HashMap in `finish()`~~ | ~~Done~~ |
+| ~~6~~ | ~~Phase 2.3 — Scale arena allocation~~ | ~~Done~~ |
+| ~~7~~ | ~~Phase 2.4 — Bounds checking in remapper~~ | ~~Done~~ |
 | 8 | Phase 1.1 — Stream BitmapTriples | **Biggest single improvement** — eliminates ~5.8GB peak memory |
 | 9 | Phase 1.2 — Single-pass vocab merge | Second biggest improvement — halves merge I/O |
 | 10 | Phase 3.2 — Named structs | Can be done alongside other work |
