@@ -54,6 +54,7 @@ impl PfcEncoder {
     }
 
     /// Number of strings added.
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.strings.len()
     }

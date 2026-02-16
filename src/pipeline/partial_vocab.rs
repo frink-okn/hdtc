@@ -83,7 +83,7 @@ impl PartialVocabWriter {
     }
 
     /// Finish writing and close the file.
-    pub fn finish(mut self) -> Result<()> {
+    pub fn finish(self) -> Result<()> {
         self.encoder.finish()?;
         Ok(())
     }
@@ -200,6 +200,7 @@ impl PartialVocabReader {
     }
 
     /// Get total number of entries in the file.
+    #[allow(dead_code)]
     pub fn total_entries(&self) -> u32 {
         self.count
     }

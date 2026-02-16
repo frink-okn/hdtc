@@ -109,7 +109,7 @@ impl<'bump> BatchVocabBuilder<'bump> {
             id
         } else {
             // Subject/Object ID space
-            if let Some(&(id, existing_roles)) = self.so_term_map.get(term) {
+            if let Some(&(id, _existing_roles)) = self.so_term_map.get(term) {
                 // Merge roles if term already exists
                 self.so_term_map.get_mut(term).unwrap().1 |= role;
                 return id;
@@ -125,6 +125,7 @@ impl<'bump> BatchVocabBuilder<'bump> {
     }
 
     /// Add a triple to this batch.
+    #[allow(dead_code)]
     pub fn add_triple(&mut self, subject: &[u8], predicate: &[u8], object: &[u8]) {
         let s_id = self.get_or_assign_id(subject, ROLE_SUBJECT);
         let p_id = self.get_or_assign_id(predicate, ROLE_PREDICATE);

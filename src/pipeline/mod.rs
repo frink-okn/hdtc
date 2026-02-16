@@ -25,9 +25,9 @@ use crate::triples::builder::BitmapTriplesData;
 use crate::triples::id_triple::IdTriple;
 use anyhow::{Context, Result};
 use crossbeam_channel::{bounded, Receiver, Sender};
-use std::path::{Path, PathBuf};
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::BufWriter;
+use std::path::{Path, PathBuf};
 
 use batch_vocab::{LocalIdTriple, ROLE_GRAPH, ROLE_OBJECT, ROLE_PREDICATE, ROLE_SUBJECT};
 
@@ -88,10 +88,10 @@ fn calculate_batch_size(memory_budget: usize) -> usize {
 fn parser_stage(
     inputs: Vec<RdfInput>,
     batch_size: usize,
-    include_graphs: bool,
+    _include_graphs: bool,
     base_uri: String,
     batch_tx: Sender<BatchedQuads>,
-    error_tx: Sender<anyhow::Error>,
+    _error_tx: Sender<anyhow::Error>,
 ) -> Result<()> {
     let mut current_batch = Vec::with_capacity(batch_size);
     let mut total_quads = 0u64;
@@ -130,7 +130,7 @@ fn parser_stage(
 fn vocab_builder_stage(
     batch_rx: Receiver<BatchedQuads>,
     processed_tx: Sender<ProcessedBatch>,
-    error_tx: Sender<anyhow::Error>,
+    _error_tx: Sender<anyhow::Error>,
     include_graphs: bool,
 ) -> Result<()> {
     let mut batch_id = 0;
@@ -193,7 +193,7 @@ fn vocab_builder_stage(
 fn vocab_writer_stage(
     processed_rx: Receiver<ProcessedBatch>,
     complete_tx: Sender<BatchComplete>,
-    error_tx: Sender<anyhow::Error>,
+    _error_tx: Sender<anyhow::Error>,
     temp_dir: PathBuf,
 ) -> Result<()> {
     for batch in processed_rx {

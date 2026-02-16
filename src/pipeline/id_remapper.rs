@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender};
 use std::fs::File;
 use std::io::BufReader;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// Information about a batch for remapping.
 pub struct BatchRemapInfo {
@@ -75,11 +75,6 @@ pub fn id_remapper_stage(
     global_triple_tx: Sender<IdTriple>,
     num_threads: usize,
 ) -> Result<u64> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::Arc;
-
-    let total_count = Arc::new(AtomicU64::new(0));
-
     // Use rayon to process batches in parallel
     let batches: Vec<_> = batch_remap_rx.iter().collect();
 

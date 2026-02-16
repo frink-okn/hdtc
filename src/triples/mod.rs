@@ -4,4 +4,8 @@ pub(crate) mod builder;
 #[allow(dead_code)]
 pub(crate) mod id_triple;
 
-// No public exports needed - pipeline uses types directly
+// Exports used by old code (kept for reference/testing)
+#[allow(unused_imports)]
+pub use builder::build_bitmap_triples;
+#[allow(unused_imports)]
+pub use id_triple::generate_id_triples;

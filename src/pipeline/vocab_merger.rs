@@ -2,7 +2,7 @@
 
 use crate::dictionary::pfc::PfcEncoder;
 use crate::dictionary::DictCounts;
-use crate::pipeline::{partial_vocab_path, PartialVocabEntry, PartialVocabReader};
+use crate::pipeline::PartialVocabReader;
 use anyhow::{Context, Result};
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
@@ -10,7 +10,7 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-use super::batch_vocab::{ROLE_GRAPH, ROLE_OBJECT, ROLE_PREDICATE, ROLE_SUBJECT};
+use super::batch_vocab::{ROLE_OBJECT, ROLE_PREDICATE, ROLE_SUBJECT};
 
 /// ID mapping for a single batch (local ID → global ID).
 #[derive(Debug, Clone)]
