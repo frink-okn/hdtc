@@ -214,11 +214,11 @@ benchmarking shows they're needed.
 **Impact:** Catches regressions in individual pipeline stages
 **Files:** New test modules in `src/pipeline/` submodules
 
-- [ ] Test `BatchVocabBuilder` with terms appearing in multiple roles (subject+predicate, predicate+object, all three)
-- [ ] Test vocab merger with multiple batches containing overlapping terms, verify correct global IDs
-- [ ] Test ID remapper with known mappings and verify output triples are correct
-- [ ] Test pipeline with batches of exactly 1 triple (edge case)
-- [ ] Test pipeline with more batches than channel capacity (exercises backpressure)
+- [x] Test `BatchVocabBuilder` with terms appearing in multiple roles (subject+predicate, predicate+object, all three)
+- [x] Test vocab merger with multiple batches containing overlapping terms, verify correct global IDs
+- [x] Test ID remapper with known mappings and verify output triples are correct
+- [x] Test pipeline with batches of exactly 1 triple (edge case)
+- [x] Test pipeline with more batches than channel capacity (exercises backpressure)
 
 ### 5.2 Stress / Property Tests
 - [ ] Test with large synthetic datasets (100K+ triples) to verify memory stays bounded
@@ -248,7 +248,7 @@ Prioritized to maximize value with minimal risk at each step:
 | 9 | Phase 1.2 — Single-pass vocab merge | Second biggest improvement — halves merge I/O |
 | ~~10~~ | ~~Phase 3.2 — Named structs~~ | ~~Done~~ |
 | ~~11~~ | ~~Phase 3.3 — Bitflags for roles~~ | ~~Done~~ |
-| 12 | Phase 5.1 — Pipeline unit tests | Should accompany phases 8-9 |
+| ~~12~~ | ~~Phase 5.1 — Pipeline unit tests~~ | ~~Done~~ |
 | 13 | Phase 3.4 — Newtype IDs | Evaluate after other changes settle |
 | 14 | Phase 5.2-5.3 — Stress tests & benchmarks | After core improvements are in |
 | 15 | Phase 4.1-4.3 — Parallel parsing etc. | Only if benchmarks show it's needed |

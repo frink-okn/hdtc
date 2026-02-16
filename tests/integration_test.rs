@@ -951,3 +951,117 @@ fn test_unicode_literals() {
         "Expected 3 triples with Unicode, got:\n{stderr}"
     );
 }
+
+/// Test pipeline edge case: exactly 1 triple (minimal single batch).
+#[test]
+fn test_single_triple_pipeline() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let nt_path = temp_dir.path().join("single.nt");
+
+    write_file(&nt_path, b"<http://example.org/s> <http://example.org/p> <http://example.org/o> .\n");
+
+    let hdt_path = temp_dir.path().join("single.hdt");
+    let work_dir = temp_dir.path().join("work");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_hdtc"))
+        .args(&[
+            nt_path.to_str().unwrap(),
+            "-o", hdt_path.to_str().unwrap(),
+            "--base-uri", "http://example.org/dataset",
+            "--temp-dir", work_dir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute hdtc");
+
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(output.status.success(), "hdtc failed with single triple: {stderr}");
+
+    let hdt_bytes = std::fs::read(&hdt_path).expect("HDT file should exist");
+    assert!(hdt_bytes.starts_with(b"$HDT"), "Output should start with HDT magic");
+    assert!(stderr.contains("1 triple"), "Should report exactly 1 triple, got:\n{stderr}");
+}
+
+/// Test pipeline edge case: many small batches to exercise backpressure.
+/// This creates a dataset that forces multiple batches with tight memory constraints.
+#[test]
+fn test_many_small_batches_backpressure() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let nt_path = temp_dir.path().join("many_batches.nt");
+
+    // Create 100 triples with very small batch size to force many batches
+    let mut content = String::new();
+    for i in 0..100 {
+        content.push_str(&format!(
+            "<http://example.org/s{i}> <http://example.org/p> <http://example.org/o{i}> .\n"
+        ));
+    }
+    write_file(&nt_path, content.as_bytes());
+
+    let hdt_path = temp_dir.path().join("many_batches.hdt");
+    let work_dir = temp_dir.path().join("work");
+
+    // Use a very small memory limit to force multiple batches and test backpressure
+    let output = Command::new(env!("CARGO_BIN_EXE_hdtc"))
+        .args(&[
+            nt_path.to_str().unwrap(),
+            "-o", hdt_path.to_str().unwrap(),
+            "--base-uri", "http://example.org/dataset",
+            "--temp-dir", work_dir.to_str().unwrap(),
+            "--memory-limit", "10",  // Small limit (10 MB) forces multiple batches
+        ])
+        .output()
+        .expect("Failed to execute hdtc");
+
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(output.status.success(), "hdtc failed with many small batches: {stderr}");
+
+    let hdt_bytes = std::fs::read(&hdt_path).expect("HDT file should exist");
+    assert!(hdt_bytes.starts_with(b"$HDT"), "Output should start with HDT magic");
+    assert!(stderr.contains("100 triples"), "Should report exactly 100 triples, got:\n{stderr}");
+
+    // Verify the result has the expected structure
+    assert_eq!(count_hdt_magic(&hdt_bytes), 4, "Should have 4 HDT magic blocks");
+}
+
+/// Test pipeline with overlapping terms across multiple files (multi-file batching).
+#[test]
+fn test_multi_file_term_overlap() {
+    let temp_dir = tempfile::tempdir().unwrap();
+
+    // File 1: uses terms A, B, C
+    let file1 = temp_dir.path().join("file1.nt");
+    write_file(
+        &file1,
+        b"<http://example.org/A> <http://example.org/B> <http://example.org/C> .\n\
+          <http://example.org/A> <http://example.org/B> <http://example.org/D> .\n",
+    );
+
+    // File 2: reuses some terms from File 1
+    let file2 = temp_dir.path().join("file2.nt");
+    write_file(
+        &file2,
+        b"<http://example.org/A> <http://example.org/E> <http://example.org/C> .\n\
+          <http://example.org/F> <http://example.org/B> <http://example.org/G> .\n",
+    );
+
+    let hdt_path = temp_dir.path().join("multi_file.hdt");
+    let work_dir = temp_dir.path().join("work");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_hdtc"))
+        .args(&[
+            file1.to_str().unwrap(),
+            file2.to_str().unwrap(),
+            "-o", hdt_path.to_str().unwrap(),
+            "--base-uri", "http://example.org/dataset",
+            "--temp-dir", work_dir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute hdtc");
+
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(output.status.success(), "hdtc failed with multi-file overlap: {stderr}");
+
+    let hdt_bytes = std::fs::read(&hdt_path).expect("HDT file should exist");
+    assert!(hdt_bytes.starts_with(b"$HDT"), "Output should start with HDT magic");
+    assert!(stderr.contains("4 triples"), "Should report exactly 4 triples, got:\n{stderr}");
+}

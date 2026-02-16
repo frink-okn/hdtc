@@ -494,3 +494,287 @@ fn assign_global_ids_and_record_mappings(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pipeline::partial_vocab::{PartialVocabWriter, PartialVocabEntry};
+    use tempfile::TempDir;
+
+    /// Create a test partial vocabulary file with given entries.
+    fn create_test_partial_vocab(
+        path: &Path,
+        entries: Vec<(&str, Roles, Option<u32>, Option<u32>)>,
+    ) -> Result<()> {
+        // Calculate max local IDs for the header
+        let mut max_so_id = 0u32;
+        let mut max_p_id = 0u32;
+        for (_, _, so_id, p_id) in &entries {
+            if let Some(id) = so_id {
+                max_so_id = max_so_id.max(*id);
+            }
+            if let Some(id) = p_id {
+                max_p_id = max_p_id.max(*id);
+            }
+        }
+
+        let mut writer = PartialVocabWriter::create(path)?;
+        writer.write_header(entries.len() as u32, max_so_id, max_p_id)?;
+
+        for (term, roles, so_id, p_id) in entries {
+            let entry = PartialVocabEntry::new(term.as_bytes().to_vec(), roles, so_id, p_id);
+            writer.write_entry(&entry)?;
+        }
+        writer.finish()?;
+        Ok(())
+    }
+
+    /// Test merging two batches with completely different terms.
+    #[test]
+    fn test_merge_disjoint_vocabularies() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let temp_path = temp_dir.path();
+
+        // Batch 0: terms a, b, c
+        let batch0_path = temp_path.join("batch0.vocab.zst");
+        create_test_partial_vocab(
+            &batch0_path,
+            vec![
+                ("a", Roles::SUBJECT, Some(0), None),
+                ("b", Roles::OBJECT, Some(1), None),
+                ("c", Roles::PREDICATE, None, Some(0)),
+            ],
+        )?;
+
+        // Batch 1: terms d, e, f
+        let batch1_path = temp_path.join("batch1.vocab.zst");
+        create_test_partial_vocab(
+            &batch1_path,
+            vec![
+                ("d", Roles::SUBJECT, Some(0), None),
+                ("e", Roles::OBJECT, Some(1), None),
+                ("f", Roles::PREDICATE, None, Some(0)),
+            ],
+        )?;
+
+        let batch_infos = vec![(0, batch0_path), (1, batch1_path)];
+        let result = merge_vocabularies(batch_infos, temp_path)?;
+
+        // Verify counts
+        assert_eq!(result.counts.shared, 0);
+        assert_eq!(result.counts.subjects, 2);
+        assert_eq!(result.counts.objects, 2);
+        assert_eq!(result.counts.predicates, 2);
+
+        // Verify ID mappings are correct
+        assert_eq!(result.id_mappings.len(), 2);
+
+        // Batch 0 mappings: a→1 (first subject), b→1 (first object, same ID offset), c→1 (first predicate)
+        assert_eq!(result.id_mappings[0].so_map[0], 1); // a (first subject-only)
+        assert_eq!(result.id_mappings[0].so_map[1], 1); // b (first object-only)
+        assert_eq!(result.id_mappings[0].p_map[0], 1);  // c (first predicate)
+
+        // Batch 1 mappings: d→2 (second subject), e→2 (second object, same ID offset), f→2 (second predicate)
+        assert_eq!(result.id_mappings[1].so_map[0], 2); // d (second subject-only)
+        assert_eq!(result.id_mappings[1].so_map[1], 2); // e (second object-only)
+        assert_eq!(result.id_mappings[1].p_map[0], 2);  // f (second predicate)
+
+        Ok(())
+    }
+
+    /// Test merging batches with overlapping terms.
+    #[test]
+    fn test_merge_overlapping_terms() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let temp_path = temp_dir.path();
+
+        // Batch 0: term "x" as subject, predicate as "p1"
+        let batch0_path = temp_path.join("batch0.vocab.zst");
+        create_test_partial_vocab(
+            &batch0_path,
+            vec![
+                ("p1", Roles::PREDICATE, None, Some(0)),
+                ("x", Roles::SUBJECT, Some(0), None),
+            ],
+        )?;
+
+        // Batch 1: term "x" as object, predicate as "p1"
+        let batch1_path = temp_path.join("batch1.vocab.zst");
+        create_test_partial_vocab(
+            &batch1_path,
+            vec![
+                ("p1", Roles::PREDICATE, None, Some(0)),
+                ("x", Roles::OBJECT, Some(0), None),
+            ],
+        )?;
+
+        let batch_infos = vec![(0, batch0_path), (1, batch1_path)];
+        let result = merge_vocabularies(batch_infos, temp_path)?;
+
+        // "x" should be shared (appears as both subject and object)
+        // "p1" should be a predicate
+        assert_eq!(result.counts.shared, 1); // x
+        assert_eq!(result.counts.subjects, 0);
+        assert_eq!(result.counts.objects, 0);
+        assert_eq!(result.counts.predicates, 1); // p1
+
+        // Both batches should map "x" to the same global ID (1, the shared ID)
+        assert_eq!(result.id_mappings[0].so_map[0], 1); // x from batch 0
+        assert_eq!(result.id_mappings[1].so_map[0], 1); // x from batch 1
+
+        // Both batches should map "p1" to the same global predicate ID (1)
+        assert_eq!(result.id_mappings[0].p_map[0], 1); // p1 from batch 0
+        assert_eq!(result.id_mappings[1].p_map[0], 1); // p1 from batch 1
+
+        Ok(())
+    }
+
+    /// Test merging with a term appearing in all three roles across batches.
+    #[test]
+    fn test_merge_multi_role_term() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let temp_path = temp_dir.path();
+
+        // Batch 0: "multi" as subject
+        let batch0_path = temp_path.join("batch0.vocab.zst");
+        create_test_partial_vocab(
+            &batch0_path,
+            vec![("multi", Roles::SUBJECT, Some(0), None)],
+        )?;
+
+        // Batch 1: "multi" as predicate
+        let batch1_path = temp_path.join("batch1.vocab.zst");
+        create_test_partial_vocab(
+            &batch1_path,
+            vec![("multi", Roles::PREDICATE, None, Some(0))],
+        )?;
+
+        // Batch 2: "multi" as object
+        let batch2_path = temp_path.join("batch2.vocab.zst");
+        create_test_partial_vocab(
+            &batch2_path,
+            vec![("multi", Roles::OBJECT, Some(0), None)],
+        )?;
+
+        let batch_infos = vec![
+            (0, batch0_path),
+            (1, batch1_path),
+            (2, batch2_path),
+        ];
+        let result = merge_vocabularies(batch_infos, temp_path)?;
+
+        // "multi" should be shared (appears as both subject and object)
+        // and also as predicate
+        assert_eq!(result.counts.shared, 1);
+        assert_eq!(result.counts.predicates, 1);
+
+        // Verify mappings for each batch
+        // Batch 0: "multi" as subject → global ID 1 (shared section starts at 1)
+        assert_eq!(result.id_mappings[0].so_map[0], 1);
+        // Batch 1: "multi" as predicate → global ID 1
+        assert_eq!(result.id_mappings[1].p_map[0], 1);
+        // Batch 2: "multi" as object → global ID 1 (shared)
+        assert_eq!(result.id_mappings[2].so_map[0], 1);
+
+        Ok(())
+    }
+
+    /// Test merging three batches with complex overlap patterns.
+    #[test]
+    fn test_merge_three_batches_complex() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let temp_path = temp_dir.path();
+
+        // Batch 0: a (subject), b (predicate)
+        let batch0_path = temp_path.join("batch0.vocab.zst");
+        create_test_partial_vocab(
+            &batch0_path,
+            vec![
+                ("a", Roles::SUBJECT, Some(0), None),
+                ("b", Roles::PREDICATE, None, Some(0)),
+            ],
+        )?;
+
+        // Batch 1: a (object), b (subject), c (predicate)
+        let batch1_path = temp_path.join("batch1.vocab.zst");
+        create_test_partial_vocab(
+            &batch1_path,
+            vec![
+                ("a", Roles::OBJECT, Some(0), None),
+                ("b", Roles::SUBJECT, Some(1), None),
+                ("c", Roles::PREDICATE, None, Some(0)),
+            ],
+        )?;
+
+        // Batch 2: b (object), d (subject)
+        let batch2_path = temp_path.join("batch2.vocab.zst");
+        create_test_partial_vocab(
+            &batch2_path,
+            vec![
+                ("b", Roles::OBJECT, Some(0), None),
+                ("d", Roles::SUBJECT, Some(1), None),
+            ],
+        )?;
+
+        let batch_infos = vec![
+            (0, batch0_path),
+            (1, batch1_path),
+            (2, batch2_path),
+        ];
+        let result = merge_vocabularies(batch_infos, temp_path)?;
+
+        // "a" shared (subject + object), "b" shared (subject + object) + predicate, "c" predicate, "d" subject
+        assert_eq!(result.counts.shared, 2);     // a, b
+        assert_eq!(result.counts.subjects, 1);   // d
+        assert_eq!(result.counts.predicates, 2); // b, c
+
+        // Verify ID mappings are consistent across batches
+        let a_global_b0 = result.id_mappings[0].so_map[0]; // a from batch 0 (subject)
+        let a_global_b1 = result.id_mappings[1].so_map[0]; // a from batch 1 (object)
+        assert_eq!(a_global_b0, a_global_b1, "a should map to same global ID whether it's subject or object");
+
+        // Verify that b appears as shared (not just in one role)
+        let b_so_id = result.id_mappings[1].so_map[1]; // b as subject/object from batch 1
+        assert!(b_so_id <= result.counts.shared as u64, "b's SO ID should be in shared section");
+
+        // Verify d is subject-only (not shared)
+        let d_id = result.id_mappings[2].so_map[1];
+        assert!(d_id > result.counts.shared as u64, "d should have subject-only ID");
+
+        Ok(())
+    }
+
+    /// Test merging with empty batch (edge case).
+    #[test]
+    fn test_merge_with_empty_batch() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let temp_path = temp_dir.path();
+
+        // Batch 0: term
+        let batch0_path = temp_path.join("batch0.vocab.zst");
+        create_test_partial_vocab(
+            &batch0_path,
+            vec![("term", Roles::SUBJECT, Some(0), None)],
+        )?;
+
+        // Batch 1: empty
+        let batch1_path = temp_path.join("batch1.vocab.zst");
+        create_test_partial_vocab(&batch1_path, vec![])?;
+
+        let batch_infos = vec![(0, batch0_path), (1, batch1_path)];
+        let result = merge_vocabularies(batch_infos, temp_path)?;
+
+        // Should only count terms from batch 0
+        assert_eq!(result.counts.shared, 0);
+        assert_eq!(result.counts.subjects, 1);
+
+        // Batch 0 should have a mapping
+        assert_eq!(result.id_mappings[0].so_map.len(), 1);
+
+        // Batch 1 might have pre-allocated but empty mapping (header said max_so_id = 0, max_p_id = 0)
+        // Just verify it exists and isn't panicking
+        assert_eq!(result.id_mappings.len(), 2);
+
+        Ok(())
+    }
+}

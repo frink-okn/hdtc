@@ -125,3 +125,227 @@ pub fn id_remapper_stage(
     tracing::info!("ID remapping complete: {} total triples remapped", total);
     Ok(total)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::path::Path;
+
+    /// Create a test ID mapping file.
+    fn create_test_mapping(path: &Path, so_map: Vec<u64>, p_map: Vec<u64>) -> Result<()> {
+        let file = std::fs::File::create(path)?;
+        let mut writer = std::io::BufWriter::new(file);
+        let mut encoder = zstd::Encoder::new(&mut writer, 3)?;
+
+        // Write batch ID (0)
+        encoder.write_all(&0u32.to_le_bytes())?;
+
+        // Write SO map
+        encoder.write_all(&(so_map.len() as u32).to_le_bytes())?;
+        for &id in &so_map {
+            encoder.write_all(&id.to_le_bytes())?;
+        }
+
+        // Write P map
+        encoder.write_all(&(p_map.len() as u32).to_le_bytes())?;
+        for &id in &p_map {
+            encoder.write_all(&id.to_le_bytes())?;
+        }
+
+        encoder.finish()?;
+        Ok(())
+    }
+
+    /// Create a test triples file with local IDs.
+    fn create_test_triples(path: &Path, triples: Vec<LocalIdTriple>) -> Result<()> {
+        let file = std::fs::File::create(path)?;
+        let writer = std::io::BufWriter::new(file);
+        let mut encoder = zstd::Encoder::new(writer, 3)?;
+
+        for triple in triples {
+            triple.write_to(&mut encoder)?;
+        }
+
+        encoder.finish()?;
+        Ok(())
+    }
+
+    /// Test remapping a single triple with known mapping.
+    #[test]
+    fn test_remap_single_triple() -> Result<()> {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new()?;
+        let temp_path = temp_dir.path();
+
+        // Create a mapping: local IDs 0,1,2 → global IDs 10,20,30
+        let mapping_path = temp_path.join("mapping.map.zst");
+        create_test_mapping(
+            &mapping_path,
+            vec![10u64, 11u64, 12u64],       // SO map
+            vec![20u64, 21u64],              // P map
+        )?;
+
+        // Create a triple: local (0, 0, 1)
+        let triples_path = temp_path.join("triples.bin.zst");
+        create_test_triples(
+            &triples_path,
+            vec![LocalIdTriple {
+                subject: 0,
+                predicate: 0,
+                object: 1,
+            }],
+        )?;
+
+        // Create a channel to receive remapped triples
+        let (tx, rx) = crossbeam_channel::bounded(10);
+
+        let batch_info = BatchRemapInfo {
+            batch_id: 0,
+            triples_path,
+            mapping_path,
+        };
+
+        // Remap the batch
+        let count = remap_batch(&batch_info, &tx)?;
+        drop(tx);
+
+        // Verify result
+        assert_eq!(count, 1);
+
+        let remapped = rx.recv().expect("Should receive remapped triple");
+        assert_eq!(remapped.subject, 10);
+        assert_eq!(remapped.predicate, 20);
+        assert_eq!(remapped.object, 11);
+
+        Ok(())
+    }
+
+    /// Test remapping multiple triples.
+    #[test]
+    fn test_remap_multiple_triples() -> Result<()> {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new()?;
+        let temp_path = temp_dir.path();
+
+        // Create a mapping
+        let mapping_path = temp_path.join("mapping.map.zst");
+        create_test_mapping(
+            &mapping_path,
+            vec![100u64, 101u64, 102u64, 103u64],
+            vec![200u64, 201u64],
+        )?;
+
+        // Create three triples
+        let triples_path = temp_path.join("triples.bin.zst");
+        create_test_triples(
+            &triples_path,
+            vec![
+                LocalIdTriple { subject: 0, predicate: 0, object: 1 },
+                LocalIdTriple { subject: 1, predicate: 1, object: 2 },
+                LocalIdTriple { subject: 2, predicate: 0, object: 3 },
+            ],
+        )?;
+
+        let (tx, rx) = crossbeam_channel::bounded(10);
+
+        let batch_info = BatchRemapInfo {
+            batch_id: 0,
+            triples_path,
+            mapping_path,
+        };
+
+        let count = remap_batch(&batch_info, &tx)?;
+        drop(tx);
+
+        assert_eq!(count, 3);
+
+        let remapped_triples: Vec<_> = rx.iter().collect();
+        assert_eq!(remapped_triples.len(), 3);
+
+        // Verify each triple
+        assert_eq!(remapped_triples[0], IdTriple { subject: 100, predicate: 200, object: 101 });
+        assert_eq!(remapped_triples[1], IdTriple { subject: 101, predicate: 201, object: 102 });
+        assert_eq!(remapped_triples[2], IdTriple { subject: 102, predicate: 200, object: 103 });
+
+        Ok(())
+    }
+
+    /// Test error handling for out-of-bounds local ID.
+    #[test]
+    fn test_remap_out_of_bounds_so_id() -> Result<()> {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new()?;
+        let temp_path = temp_dir.path();
+
+        // Create a small mapping: only 2 SO IDs
+        let mapping_path = temp_path.join("mapping.map.zst");
+        create_test_mapping(
+            &mapping_path,
+            vec![100u64, 101u64],
+            vec![200u64],
+        )?;
+
+        // Create a triple referencing local SO ID 5 (out of bounds)
+        let triples_path = temp_path.join("triples.bin.zst");
+        create_test_triples(
+            &triples_path,
+            vec![LocalIdTriple { subject: 5, predicate: 0, object: 1 }],
+        )?;
+
+        let (tx, _rx) = crossbeam_channel::bounded(10);
+
+        let batch_info = BatchRemapInfo {
+            batch_id: 0,
+            triples_path,
+            mapping_path,
+        };
+
+        let result = remap_batch(&batch_info, &tx);
+        assert!(result.is_err(), "Should error on out-of-bounds ID");
+        assert!(result.unwrap_err().to_string().contains("SO mapping missing"));
+
+        Ok(())
+    }
+
+    /// Test error handling for out-of-bounds predicate ID.
+    #[test]
+    fn test_remap_out_of_bounds_p_id() -> Result<()> {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new()?;
+        let temp_path = temp_dir.path();
+
+        // Create a mapping with only 1 predicate ID
+        let mapping_path = temp_path.join("mapping.map.zst");
+        create_test_mapping(
+            &mapping_path,
+            vec![100u64, 101u64],
+            vec![200u64],
+        )?;
+
+        // Create a triple referencing predicate ID 5 (out of bounds)
+        let triples_path = temp_path.join("triples.bin.zst");
+        create_test_triples(
+            &triples_path,
+            vec![LocalIdTriple { subject: 0, predicate: 5, object: 1 }],
+        )?;
+
+        let (tx, _rx) = crossbeam_channel::bounded(10);
+
+        let batch_info = BatchRemapInfo {
+            batch_id: 0,
+            triples_path,
+            mapping_path,
+        };
+
+        let result = remap_batch(&batch_info, &tx);
+        assert!(result.is_err(), "Should error on out-of-bounds predicate ID");
+        assert!(result.unwrap_err().to_string().contains("P mapping missing"));
+
+        Ok(())
+    }
+}

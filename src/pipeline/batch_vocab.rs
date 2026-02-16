@@ -268,4 +268,143 @@ mod tests {
         assert_eq!(vocab.len(), 1);
         assert_eq!(vocab[0].roles, Roles::SUBJECT | Roles::OBJECT);
     }
+
+    /// Test a term appearing in all three roles: subject, predicate, and object.
+    #[test]
+    fn test_term_in_all_roles() {
+        let arena = Bump::new();
+        let mut builder = BatchVocabBuilder::new(&arena, 100);
+
+        // Same term used as subject, predicate, and object
+        let subject_id = builder.get_or_assign_id(b"universal", Roles::SUBJECT);
+        let _predicate_id = builder.get_or_assign_id(b"universal", Roles::PREDICATE);
+        let object_id = builder.get_or_assign_id(b"universal", Roles::OBJECT);
+
+        // Subject/object share ID space; predicate has separate ID
+        assert_eq!(subject_id, object_id);
+        // Both SO and P spaces start at 0, so first term in each gets 0. They're tracked separately.
+        // What matters is that both so_local_id and p_local_id are present.
+
+        let (vocab, _) = builder.finish();
+        assert_eq!(vocab.len(), 1);
+
+        let entry = &vocab[0];
+        assert_eq!(entry.term, b"universal");
+        assert!(entry.roles.contains(Roles::SUBJECT));
+        assert!(entry.roles.contains(Roles::PREDICATE));
+        assert!(entry.roles.contains(Roles::OBJECT));
+        assert!(entry.so_local_id.is_some());
+        assert!(entry.p_local_id.is_some());
+    }
+
+    /// Test term appearing as both subject and predicate.
+    #[test]
+    fn test_term_as_subject_and_predicate() {
+        let arena = Bump::new();
+        let mut builder = BatchVocabBuilder::new(&arena, 100);
+
+        // Add a predicate first to ensure its ID space is non-empty
+        builder.get_or_assign_id(b"other_pred", Roles::PREDICATE);
+
+        let subject_id = builder.get_or_assign_id(b"term_sp", Roles::SUBJECT);
+        let predicate_id = builder.get_or_assign_id(b"term_sp", Roles::PREDICATE);
+
+        // With other_pred at predicate ID 0, term_sp gets predicate ID 1
+        // So they can have different values in their respective ID spaces
+        assert_eq!(subject_id, 0); // First SO term
+        assert_eq!(predicate_id, 1); // Second P term
+
+        let (vocab, _) = builder.finish();
+        let has_term_sp = vocab.iter().any(|e| e.term == b"term_sp");
+        assert!(has_term_sp);
+
+        let entry = vocab.iter().find(|e| e.term == b"term_sp").unwrap();
+        assert_eq!(entry.roles, Roles::SUBJECT | Roles::PREDICATE);
+        assert!(entry.so_local_id.is_some());
+        assert!(entry.p_local_id.is_some());
+    }
+
+    /// Test term appearing as both predicate and object.
+    #[test]
+    fn test_term_as_predicate_and_object() {
+        let arena = Bump::new();
+        let mut builder = BatchVocabBuilder::new(&arena, 100);
+
+        // Add another SO term first
+        builder.get_or_assign_id(b"other_so", Roles::SUBJECT);
+
+        let predicate_id = builder.get_or_assign_id(b"term_po", Roles::PREDICATE);
+        let object_id = builder.get_or_assign_id(b"term_po", Roles::OBJECT);
+
+        // With other_so at SO ID 0, term_po gets SO ID 1
+        assert_eq!(object_id, 1); // Second SO term
+        assert_eq!(predicate_id, 0); // First P term
+
+        let (vocab, _) = builder.finish();
+        let entry = vocab.iter().find(|e| e.term == b"term_po").unwrap();
+        assert_eq!(entry.roles, Roles::PREDICATE | Roles::OBJECT);
+        assert!(entry.so_local_id.is_some());
+        assert!(entry.p_local_id.is_some());
+    }
+
+    /// Test unique term counting with multi-role terms.
+    #[test]
+    fn test_unique_term_count_with_multi_role() {
+        let arena = Bump::new();
+        let mut builder = BatchVocabBuilder::new(&arena, 100);
+
+        // Add terms in various combinations
+        builder.add_triple(b"shared", b"p", b"shared");  // "shared" as subject+object, "p" as predicate
+        builder.add_triple(b"multi", b"multi", b"other"); // "multi" as subject+predicate
+
+        let stats = builder.stats();
+        // unique terms: "shared" (counted once), "p", "multi" (counted once), "other"
+        assert_eq!(stats.num_terms, 4);
+
+        let (vocab, _) = builder.finish();
+        assert_eq!(vocab.len(), 4);
+    }
+
+    /// Test ID assignment order for subject/object vs predicate spaces.
+    #[test]
+    fn test_id_space_separation() {
+        let arena = Bump::new();
+        let mut builder = BatchVocabBuilder::new(&arena, 100);
+
+        // Add subjects and objects in order
+        let s1_id = builder.get_or_assign_id(b"s1", Roles::SUBJECT);
+        let s2_id = builder.get_or_assign_id(b"s2", Roles::SUBJECT);
+        let o1_id = builder.get_or_assign_id(b"o1", Roles::OBJECT);
+
+        // Predicates should get separate ID space
+        let p1_id = builder.get_or_assign_id(b"p1", Roles::PREDICATE);
+        let p2_id = builder.get_or_assign_id(b"p2", Roles::PREDICATE);
+
+        // SO IDs should be sequential starting from 0
+        assert_eq!(s1_id, 0);
+        assert_eq!(s2_id, 1);
+        assert_eq!(o1_id, 2);
+
+        // P IDs should be sequential starting from 0 in separate space
+        assert_eq!(p1_id, 0);
+        assert_eq!(p2_id, 1);
+    }
+
+    /// Test that ID remapping with role info is preserved through finish().
+    #[test]
+    fn test_finish_preserves_role_info() {
+        let arena = Bump::new();
+        let mut builder = BatchVocabBuilder::new(&arena, 100);
+
+        builder.add_triple(b"s", b"p", b"s");  // subject/object reuse
+        builder.add_triple(b"p", b"q", b"o"); // "p" also appears as subject
+
+        let (vocab, _) = builder.finish();
+
+        // Find "p" entry
+        let p_entry = vocab.iter().find(|e| e.term == b"p").unwrap();
+        // "p" should have PREDICATE role from first triple, SUBJECT role from second
+        assert!(p_entry.roles.contains(Roles::PREDICATE));
+        assert!(p_entry.roles.contains(Roles::SUBJECT));
+    }
 }
