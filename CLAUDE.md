@@ -4,7 +4,7 @@ A Rust CLI tool for converting RDF files to HDT (Header, Dictionary, Triples) fo
 
 ## Project Overview
 
-Converts input RDF files (any standard format) to HDT binary format, optimized for very large datasets (up to 100 billion triples) with constrained memory (~20GB).
+Converts input RDF files (any standard format) to HDT binary format, optimized for very large datasets (up to 100 billion triples) with bounded memory (default 4GB, configurable).
 
 ## Key Technical Decisions
 
@@ -15,30 +15,38 @@ Converts input RDF files (any standard format) to HDT binary format, optimized f
 - **Triples**: BitmapTriples encoding in SPO order
 - **Index**: Standard `.hdt.index.v1-1` (OPS order), implemented after core HDT generation is solid
 - **Quads**: HDTQ approach (ESWC 2018) - standard BitmapTriples + graph dictionary + compressed graph membership bitmaps
-- **Term-to-ID Lookup**: Custom sorted string table (SST) with sparse in-memory block index, memory-mapped via `memmap2`. Write-once during dictionary construction (entries arrive sorted), read-many during Pass 2. Adaptive block size balances speed vs memory: 64-128 for <1B terms (~100MB index), 256-512 for 1-50B terms (~1.5GB index), 1024 for 50B+ terms (~12GB index for 100B terms). Override with `--sst-block-size`. 1 disk read per lookup vs 2-5 for LSM-based stores. No C++ dependency.
+- **Single-Pass Pipeline**: QLever-inspired architecture — per-batch hash maps assign local IDs during a single parse, partial vocabularies are k-way merged to build the global dictionary, local IDs are remapped to global IDs in parallel. No second parse needed.
 - **Compressed Input**: Transparently handle .gz, .bz2, .xz based on file extension
 - **Error Handling**: Skip malformed RDF with warning, report total skipped count at end
 - **All RDF formats**: N-Triples, N-Quads, Turtle, TriG, RDF/XML, JSON-LD, N3
 
 ## Architecture
 
-Multi-pass, disk-backed approach for scalability:
-1. Pass 1: Stream input, extract terms, write to zstd-compressed temp files, external merge sort to build dictionary
-2. Write dictionary sections with PFC encoding, build sorted string table (SST) for term-to-ID lookup
-3. Pass 2: Stream input again, encode triples as integer IDs using SST lookups
-4. External sort ID-triples in SPO order (zstd-compressed chunks), build BitmapTriples
-5. Assemble HDT file (header + dictionary + triples)
-6. Optionally build OPS index (.hdt.index.v1-1)
+Single-pass, 6-stage streaming pipeline with bounded channels and backpressure:
+
+1. **Parse** — Stream RDF input, batch quads (per-file blank node disambiguation)
+2. **Batch Vocab** — Per-batch hash map assigns local IDs, arena-allocated terms (`bumpalo`)
+3. **Vocab Writer** — Write zstd-compressed partial vocabularies and local-ID triples to disk
+4. **Vocab Merger** — K-way merge partial vocabularies → assign global IDs, write PFC dictionary
+5. **ID Remapper** — Convert local IDs to global IDs (parallel across batches)
+6. **BitmapTriples** — External sort in SPO order, streaming BitmapTriples construction
+
+Then assemble HDT file (header + dictionary + triples). Optionally build OPS index (.hdt.index.v1-1).
+
+Key design points:
+- Input is parsed **once** (no second pass). Local-ID triples are written during parsing; only a lightweight ID remap is needed after the vocabulary merge.
+- Per-batch hash maps deduplicate terms early, reducing the data volume for sorting by ~60x compared to sorting all term occurrences.
+- Adaptive batch sizing based on `--memory-limit` (1M–20M triples per batch).
+- All intermediate files are zstd-compressed and automatically cleaned up.
 
 ### Resource Requirements
 
 **Memory:** Default 4GB, configurable via `--memory-limit`. For 100B triples, recommend 16-32GB for optimal performance.
 
-**Temporary Disk Space:** Peak usage during Phase 1 (term extraction and sorting):
-- **Rule of thumb:** `Triples × 40 bytes` for typical RDF datasets (with zstd compression)
-- Examples: 500M triples ≈ 20GB, 10B triples ≈ 400GB, 100B triples ≈ 4TB
-- Varies by term uniqueness and compressibility: 25-60 bytes/triple (lower = more repeated terms)
-- External sort chunks are compressed with zstd level 1 (~67% space reduction vs uncompressed)
+**Temporary Disk Space:** Temp files consist of partial vocabularies (deduplicated unique terms), local-ID triples, ID mappings, and SPO sort chunks — all zstd-compressed.
+- **Rule of thumb:** ~6–10 bytes/triple after compression
+- Examples: 500M triples ≈ 4GB, 10B triples ≈ 80GB, 100B triples ≈ 800GB
+- Varies by term uniqueness and compressibility
 - Specify temp directory with `--temp-dir` (uses system temp by default)
 - Temp files automatically cleaned up after completion
 
@@ -66,17 +74,21 @@ Multi-pass, disk-backed approach for scalability:
 
 ```
 src/
-  main.rs          - CLI entry point
+  main.rs          - CLI entry point, pipeline orchestration
   cli.rs           - CLI argument definitions (clap)
   rdf/             - RDF parsing, input discovery, streaming, compressed input
-  dictionary/      - Dictionary construction, PFC encoding, SST term-to-ID lookup
-  triples/         - BitmapTriples encoding, external sort
+  dictionary/      - Dictionary construction, PFC encoding
+  triples/         - BitmapTriples encoding (streaming)
   hdt/             - HDT file serialization (header, dictionary, triples sections)
   index/           - HDT index file generation (.hdt.index.v1-1)
   io/              - VByte, LogArray, Bitmap, CRC utilities, Control Information
+  pipeline/        - 6-stage pipeline (batch vocab, partial vocab, merger, ID remapper)
   quads/           - HDTQ quad support (graph dictionary, membership bitmaps)
+  sort/            - External merge sort
 tests/
-  integration/     - Integration tests with sample RDF files
+  integration_test.rs - End-to-end pipeline tests
+  compat_test.rs      - Compatibility tests against the hdt crate
+  data/               - Sample RDF fixtures
 ```
 
 ## Key Dependencies
@@ -91,9 +103,12 @@ tests/
 | `crc` | CRC checksum computation (CRC8, CRC16, CRC32C) |
 | `rayon` | Data parallelism for sorting and processing |
 | `tempfile` | Temporary file management |
-| `memmap2` | Memory-mapped file I/O (SST lookup, large file access) |
+| `crossbeam-channel` | Bounded MPMC channels (pipeline backpressure) |
+| `hashbrown` | High-performance hash maps (batch vocabulary) |
+| `bumpalo` | Arena allocator (per-batch term storage) |
+| `bitflags` | Type-safe role flags |
 | `indicatif` | Progress bars and status reporting |
 | `flate2` | Gzip decompression |
 | `bzip2` | Bzip2 decompression |
 | `xz2` / `liblzma` | XZ/LZMA decompression |
-| `zstd` | Zstandard compression for temp chunk files |
+| `zstd` | Zstandard compression for temp files |
