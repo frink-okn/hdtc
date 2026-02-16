@@ -260,6 +260,44 @@ fn vocab_writer_stage(
     Ok(())
 }
 
+/// Clean up temporary files created during pipeline execution.
+fn cleanup_temp_files(batches: &[BatchComplete], mapping_paths: &[PathBuf]) {
+    // Delete partial vocabulary files
+    for batch in batches {
+        if let Err(e) = std::fs::remove_file(&batch.vocab_path) {
+            tracing::warn!(
+                "Failed to delete partial vocab file {}: {}",
+                batch.vocab_path.display(),
+                e
+            );
+        }
+    }
+
+    // Delete local triples files
+    for batch in batches {
+        if let Err(e) = std::fs::remove_file(&batch.triples_path) {
+            tracing::warn!(
+                "Failed to delete local triples file {}: {}",
+                batch.triples_path.display(),
+                e
+            );
+        }
+    }
+
+    // Delete ID mapping files
+    for path in mapping_paths {
+        if let Err(e) = std::fs::remove_file(path) {
+            tracing::warn!(
+                "Failed to delete ID mapping file {}: {}",
+                path.display(),
+                e
+            );
+        }
+    }
+
+    tracing::debug!("Temporary files cleaned up");
+}
+
 /// Run the complete pipeline: RDF → HDT.
 pub fn run_pipeline(
     inputs: &[RdfInput],
@@ -325,15 +363,41 @@ pub fn run_pipeline(
     tracing::info!("All batches written, {} batches total", batches.len());
 
     // Wait for all stages to complete
-    parser_handle
-        .join()
-        .map_err(|_| anyhow::anyhow!("Parser thread panicked"))??;
-    builder_handle
-        .join()
-        .map_err(|_| anyhow::anyhow!("Builder thread panicked"))??;
-    writer_handle
-        .join()
-        .map_err(|_| anyhow::anyhow!("Writer thread panicked"))??;
+    match parser_handle.join() {
+        Ok(Err(e)) => {
+            cleanup_temp_files(&batches, &[]);
+            return Err(e);
+        }
+        Err(_) => {
+            cleanup_temp_files(&batches, &[]);
+            return Err(anyhow::anyhow!("Parser thread panicked"));
+        }
+        Ok(Ok(())) => {}
+    }
+
+    match builder_handle.join() {
+        Ok(Err(e)) => {
+            cleanup_temp_files(&batches, &[]);
+            return Err(e);
+        }
+        Err(_) => {
+            cleanup_temp_files(&batches, &[]);
+            return Err(anyhow::anyhow!("Builder thread panicked"));
+        }
+        Ok(Ok(())) => {}
+    }
+
+    match writer_handle.join() {
+        Ok(Err(e)) => {
+            cleanup_temp_files(&batches, &[]);
+            return Err(e);
+        }
+        Err(_) => {
+            cleanup_temp_files(&batches, &[]);
+            return Err(anyhow::anyhow!("Writer thread panicked"));
+        }
+        Ok(Ok(())) => {}
+    }
 
     // Stage 4: Merge vocabularies and build global dictionary
     tracing::info!("Stage 4: Merging vocabularies");
@@ -358,10 +422,12 @@ pub fn run_pipeline(
     // Set up channel for global-ID triples
     let (global_triple_tx, global_triple_rx) = bounded::<IdTriple>(100_000);
 
-    // Prepare batch remap info
+    // Prepare batch remap info and track mapping paths for cleanup
     let (remap_tx, remap_rx) = bounded(batches.len());
+    let mut mapping_paths: Vec<PathBuf> = Vec::new();
     for batch in &batches {
         let mapping_path = temp_dir.join(format!("id_mapping_{:06}.map.zst", batch.batch_id));
+        mapping_paths.push(mapping_path.clone());
         remap_tx
             .send(id_remapper::BatchRemapInfo {
                 batch_id: batch.batch_id,
@@ -427,6 +493,9 @@ pub fn run_pipeline(
         "Pipeline complete: {} triples encoded",
         bitmap_triples.num_triples
     );
+
+    // Clean up temporary files
+    cleanup_temp_files(&batches, &mapping_paths);
 
     Ok(PipelineResult {
         counts: merge_result.counts,
