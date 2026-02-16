@@ -3,6 +3,7 @@ mod dictionary;
 mod hdt;
 mod index;
 mod io;
+mod pipeline;
 mod quads;
 mod rdf;
 mod sort;
@@ -65,45 +66,28 @@ fn main() -> Result<()> {
     let include_graphs = matches!(cli.mode, cli::OutputMode::Quads);
     let base_uri = &cli.base_uri;
 
-    // Phase 3: Build dictionary
-    let dict_result = dictionary::build_dictionary(
+    // Run the new pipelined HDT construction
+    tracing::info!("Using new pipelined architecture");
+    let pipeline_result = pipeline::run_pipeline(
         &inputs,
         &temp_dir,
         memory_budget,
         include_graphs,
-        Some(base_uri),
-        cli.sst_block_size,
+        base_uri,
     )?;
 
-    // Phase 4: Generate and sort ID triples
-    let sorted_triples = triples::generate_id_triples(
-        &inputs,
-        &dict_result.sst,
-        &dict_result.predicate_ids,
-        &dict_result.counts,
-        &temp_dir,
-        memory_budget,
-        Some(base_uri),
-    )?;
-
-    // Phase 4b: Build BitmapTriples
-    let bitmap_triples = triples::build_bitmap_triples(sorted_triples)?;
-
-    // Phase 5: Assemble HDT file
+    // Write HDT file
     hdt::write_hdt(
         &cli.output,
         base_uri,
-        &dict_result.counts,
-        &dict_result.sections,
-        &bitmap_triples,
+        &pipeline_result.counts,
+        &pipeline_result.dict_sections,
+        &pipeline_result.bitmap_triples,
     )?;
-
-    // Clean up SST
-    dict_result.sst.cleanup();
 
     tracing::info!(
         "Done! {} triples written to {}",
-        bitmap_triples.num_triples,
+        pipeline_result.bitmap_triples.num_triples,
         cli.output.display()
     );
 

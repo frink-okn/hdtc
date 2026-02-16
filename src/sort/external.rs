@@ -11,7 +11,7 @@ use zstd::{Decoder, Encoder};
 
 /// Trait for items that can be externally sorted.
 /// Items must be serializable to/from bytes for disk storage.
-pub trait Sortable: Ord + Sized + Send {
+pub trait Sortable: Ord + Sized + Send + Clone {
     /// Write this item to a writer. Must be self-delimiting.
     fn write_to<W: Write>(&self, writer: &mut W) -> Result<()>;
 
@@ -149,10 +149,11 @@ impl Drop for ExternalSorter {
     }
 }
 
-/// K-way merge iterator over sorted chunk files.
+/// K-way merge iterator over sorted chunk files with deduplication.
 pub struct MergeIterator<T: Sortable> {
     heap: BinaryHeap<HeapEntry<T>>,
     readers: Vec<Option<Decoder<'static, BufReader<File>>>>,
+    last_item: Option<T>, // Track last emitted item for deduplication
 }
 
 /// Entry in the merge heap. Wraps an item with its source chunk index.
@@ -204,6 +205,7 @@ impl<T: Sortable> MergeIterator<T> {
         Ok(Self {
             heap,
             readers: opt_readers,
+            last_item: None,
         })
     }
 }
@@ -212,26 +214,37 @@ impl<T: Sortable> Iterator for MergeIterator<T> {
     type Item = Result<T>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let entry = self.heap.pop()?;
-        let source = entry.source;
+        loop {
+            let entry = self.heap.pop()?;
+            let source = entry.source;
 
-        // Try to read the next item from the same source
-        if let Some(reader) = self.readers[source].as_mut() {
-            match T::read_from(reader) {
-                Ok(Some(next_item)) => {
-                    self.heap.push(HeapEntry {
-                        item: next_item,
-                        source,
-                    });
+            // Try to read the next item from the same source
+            if let Some(reader) = self.readers[source].as_mut() {
+                match T::read_from(reader) {
+                    Ok(Some(next_item)) => {
+                        self.heap.push(HeapEntry {
+                            item: next_item,
+                            source,
+                        });
+                    }
+                    Ok(None) => {
+                        self.readers[source] = None; // exhausted
+                    }
+                    Err(e) => return Some(Err(e)),
                 }
-                Ok(None) => {
-                    self.readers[source] = None; // exhausted
-                }
-                Err(e) => return Some(Err(e)),
             }
-        }
 
-        Some(Ok(entry.item))
+            // Skip duplicates: if this item equals the last emitted item, continue
+            if let Some(ref last) = self.last_item {
+                if &entry.item == last {
+                    continue; // Skip duplicate
+                }
+            }
+
+            // Emit this item and remember it for next comparison
+            self.last_item = Some(entry.item.clone());
+            return Some(Ok(entry.item));
+        }
     }
 }
 
@@ -360,14 +373,12 @@ mod tests {
             .collect::<Result<Vec<_>>>()
             .unwrap();
 
+        // Duplicates are automatically deduplicated
         assert_eq!(
             merged,
             vec![
                 TestItem(1),
-                TestItem(1),
                 TestItem(2),
-                TestItem(2),
-                TestItem(3),
                 TestItem(3)
             ]
         );

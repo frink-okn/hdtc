@@ -1,6 +1,10 @@
 pub(crate) mod pfc;
+
+// Old architecture modules (unused in pipeline, kept for reference)
+#[allow(dead_code)]
 pub(crate) mod sst;
+#[allow(dead_code)]
 pub(crate) mod builder;
 
-pub use sst::SstReader;
-pub use builder::{build_dictionary, resolve_global_id, DictCounts};
+// Only export what the pipeline uses
+pub use builder::DictCounts;
