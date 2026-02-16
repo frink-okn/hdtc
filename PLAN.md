@@ -27,11 +27,11 @@ Currently `build_bitmap_triples` accumulates four large vectors in memory:
 Then it makes a second pass to feed them into LogArrayWriter/BitmapWriter.
 
 **Steps:**
-- [ ] Write directly to `BitmapWriter` as triples arrive (eliminate intermediate `Vec<bool>`)
-- [ ] Track `max_subject`, `max_predicate`, `max_object` during the external sort merge phase and pass them into the builder, so LogArrayWriter can be initialized with correct bit width upfront
-- [ ] Write directly to `LogArrayWriter` as triples arrive (eliminate intermediate `Vec<u64>`)
-- [ ] The BitmapTriples encoding is inherently streaming since triples arrive in SPO order: on subject change emit 1-bit to BitmapY; on predicate change within same subject emit 1-bit to BitmapY; for each triple push object to ArrayZ and 0/1 to BitmapZ
-- [ ] Update tests to verify identical output
+- [x] Write directly to `BitmapWriter` as triples arrive (eliminate intermediate `Vec<bool>`)
+- [x] Track `max_subject`, `max_predicate`, `max_object` during the triple collection phase and pass them into the builder, so LogArrayWriter can be initialized with correct bit width upfront
+- [x] Write directly to `LogArrayWriter` as triples arrive (eliminate intermediate `Vec<u64>`)
+- [x] The BitmapTriples encoding is inherently streaming since triples arrive in SPO order: on subject change emit 1-bit to BitmapY; on predicate change within same subject emit 1-bit to BitmapY; for each triple push object to ArrayZ and 0/1 to BitmapZ
+- [x] Update tests to verify identical output (all 101 tests pass)
 
 ### 1.2 Single-Pass Vocab Merge
 **Impact:** Eliminates ~50% of merge I/O (currently reads all partial vocab files twice)
@@ -262,7 +262,7 @@ Prioritized to maximize value with minimal risk at each step:
 | ~~5~~ | ~~Phase 2.2 — Eliminate redundant HashMap in `finish()`~~ | ~~Done~~ |
 | ~~6~~ | ~~Phase 2.3 — Scale arena allocation~~ | ~~Done~~ |
 | ~~7~~ | ~~Phase 2.4 — Bounds checking in remapper~~ | ~~Done~~ |
-| 8 | Phase 1.1 — Stream BitmapTriples | **Biggest single improvement** — eliminates ~5.8GB peak memory |
+| ~~8~~ | ~~Phase 1.1 — Stream BitmapTriples~~ | ~~Done~~ |
 | 9 | Phase 1.2 — Single-pass vocab merge | Second biggest improvement — halves merge I/O |
 | 10 | Phase 3.2 — Named structs | Can be done alongside other work |
 | 11 | Phase 3.3 — Bitflags for roles | Can be done alongside other work |

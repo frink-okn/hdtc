@@ -58,6 +58,19 @@ impl BitmapWriter {
         self.push(false);
     }
 
+    /// Set the most recently pushed bit to the given value.
+    /// Panics if the bitmap is empty.
+    pub fn set_last(&mut self, value: bool) {
+        assert!(self.num_bits > 0, "Cannot set_last on empty bitmap");
+        let word_idx = ((self.num_bits - 1) / 64) as usize;
+        let bit_idx = ((self.num_bits - 1) % 64) as u32;
+        if value {
+            self.bits[word_idx] |= 1u64 << bit_idx;
+        } else {
+            self.bits[word_idx] &= !(1u64 << bit_idx);
+        }
+    }
+
     /// Number of bits in the bitmap.
     pub fn len(&self) -> u64 {
         self.num_bits

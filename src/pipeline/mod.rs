@@ -383,13 +383,19 @@ pub fn run_pipeline(
     // Stage 6: External sort + BitmapTriples construction
     tracing::info!("Stage 6: Sorting global-ID triples in SPO order");
 
-    // Collect triples into external sorter
+    // Collect triples into external sorter, tracking max IDs for BitmapTriples bit widths
     let mut sorter = ExternalSorter::new(temp_dir, memory_budget);
     let mut buffer: Vec<IdTriple> = Vec::new();
     let mut mem_used: usize = 0;
     let mut triple_count = 0u64;
+    let mut max_subject: u64 = 0;
+    let mut max_predicate: u64 = 0;
+    let mut max_object: u64 = 0;
 
     for triple in global_triple_rx {
+        max_subject = max_subject.max(triple.subject);
+        max_predicate = max_predicate.max(triple.predicate);
+        max_object = max_object.max(triple.object);
         sorter.push(triple, &mut buffer, &mut mem_used)?;
         triple_count += 1;
 
@@ -408,9 +414,14 @@ pub fn run_pipeline(
     // Finish sorting
     let sorted_triples = sorter.finish(&mut buffer)?;
 
-    // Build BitmapTriples
+    // Build BitmapTriples (max IDs enable single-pass streaming construction)
     tracing::info!("Building BitmapTriples");
-    let bitmap_triples = crate::triples::build_bitmap_triples(sorted_triples)?;
+    let bitmap_triples = crate::triples::build_bitmap_triples(
+        sorted_triples,
+        max_subject,
+        max_predicate,
+        max_object,
+    )?;
 
     tracing::info!(
         "Pipeline complete: {} triples encoded",

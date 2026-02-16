@@ -34,20 +34,28 @@ pub struct BitmapTriplesData {
 }
 
 /// Build BitmapTriples from a sorted iterator of ID triples.
+///
+/// `max_subject`, `max_predicate`, `max_object` must be upper bounds on the
+/// corresponding ID values in the input. They are used to determine the bit
+/// width for LogArray encoding upfront, enabling single-pass streaming
+/// construction without intermediate vectors.
 pub fn build_bitmap_triples(
     sorted_triples: impl Iterator<Item = Result<IdTriple>>,
+    max_subject: u64,
+    max_predicate: u64,
+    max_object: u64,
 ) -> Result<BitmapTriplesData> {
-    let mut bitmap_y_bits: Vec<bool> = Vec::new();
-    let mut array_y_entries: Vec<u64> = Vec::new();
-    let mut bitmap_z_bits: Vec<bool> = Vec::new();
-    let mut array_z_entries: Vec<u64> = Vec::new();
+    // Initialize writers with correct bit widths upfront so we can stream
+    // directly into them, eliminating the intermediate Vec<u64> / Vec<bool>.
+    let mut bitmap_y = BitmapWriter::new();
+    let mut array_y = LogArrayWriter::for_max_value(max_predicate.max(1));
+    let mut bitmap_z = BitmapWriter::new();
+    let max_obj_or_shared = max_object.max(max_subject).max(1);
+    let mut array_z = LogArrayWriter::for_max_value(max_obj_or_shared);
 
     let mut prev_subject: u64 = 0;
     let mut prev_predicate: u64 = 0;
     let mut num_triples: u64 = 0;
-    let mut max_subject: u64 = 0;
-    let mut max_predicate: u64 = 0;
-    let mut max_object: u64 = 0;
 
     // HDT convention: bit=1 marks the LAST child of a parent node.
     // Since we process triples in order, we mark the end of each group
@@ -56,37 +64,33 @@ pub fn build_bitmap_triples(
     for result in sorted_triples {
         let triple = result?;
 
-        max_subject = max_subject.max(triple.subject);
-        max_predicate = max_predicate.max(triple.predicate);
-        max_object = max_object.max(triple.object);
-
         if triple.subject != prev_subject {
             // New subject
             if num_triples > 0 {
                 // Mark end of previous subject's last predicate
-                *bitmap_y_bits.last_mut().unwrap() = true;
+                bitmap_y.set_last(true);
                 // Mark end of previous (S,P) pair's last object
-                *bitmap_z_bits.last_mut().unwrap() = true;
+                bitmap_z.set_last(true);
             }
-            bitmap_y_bits.push(false);
-            array_y_entries.push(triple.predicate);
-            bitmap_z_bits.push(false);
-            array_z_entries.push(triple.object);
+            bitmap_y.push(false);
+            array_y.push(triple.predicate);
+            bitmap_z.push(false);
+            array_z.push(triple.object);
             prev_subject = triple.subject;
             prev_predicate = triple.predicate;
         } else if triple.predicate != prev_predicate {
             // Same subject, new predicate
             // Mark end of previous (S,P) pair's last object
-            *bitmap_z_bits.last_mut().unwrap() = true;
-            bitmap_y_bits.push(false);
-            array_y_entries.push(triple.predicate);
-            bitmap_z_bits.push(false);
-            array_z_entries.push(triple.object);
+            bitmap_z.set_last(true);
+            bitmap_y.push(false);
+            array_y.push(triple.predicate);
+            bitmap_z.push(false);
+            array_z.push(triple.object);
             prev_predicate = triple.predicate;
         } else {
             // Same subject and predicate, new object
-            bitmap_z_bits.push(false);
-            array_z_entries.push(triple.object);
+            bitmap_z.push(false);
+            array_z.push(triple.object);
         }
 
         num_triples += 1;
@@ -94,43 +98,24 @@ pub fn build_bitmap_triples(
 
     // Mark end of the final groups
     if num_triples > 0 {
-        *bitmap_y_bits.last_mut().unwrap() = true;
-        *bitmap_z_bits.last_mut().unwrap() = true;
+        bitmap_y.set_last(true);
+        bitmap_z.set_last(true);
     }
 
     tracing::info!("BitmapTriples: {num_triples} triples encoded");
 
-    // Encode ArrayY
-    let mut array_y_writer = LogArrayWriter::for_max_value(max_predicate.max(1));
-    for &p in &array_y_entries {
-        array_y_writer.push(p);
-    }
-    let mut array_y_buf = Vec::new();
-    array_y_writer.write_to(&mut array_y_buf)?;
-
-    // Encode ArrayZ
-    let max_obj_or_shared = max_object.max(max_subject).max(1);
-    let mut array_z_writer = LogArrayWriter::for_max_value(max_obj_or_shared);
-    for &o in &array_z_entries {
-        array_z_writer.push(o);
-    }
-    let mut array_z_buf = Vec::new();
-    array_z_writer.write_to(&mut array_z_buf)?;
-
-    // Encode bitmaps
-    let mut bitmap_y = BitmapWriter::new();
-    for &b in &bitmap_y_bits {
-        bitmap_y.push(b);
-    }
+    // Serialize to byte buffers
     let mut bitmap_y_buf = Vec::new();
     bitmap_y.write_to(&mut bitmap_y_buf)?;
 
-    let mut bitmap_z = BitmapWriter::new();
-    for &b in &bitmap_z_bits {
-        bitmap_z.push(b);
-    }
     let mut bitmap_z_buf = Vec::new();
     bitmap_z.write_to(&mut bitmap_z_buf)?;
+
+    let mut array_y_buf = Vec::new();
+    array_y.write_to(&mut array_y_buf)?;
+
+    let mut array_z_buf = Vec::new();
+    array_z.write_to(&mut array_z_buf)?;
 
     Ok(BitmapTriplesData {
         bitmap_y: bitmap_y_buf,
@@ -158,7 +143,7 @@ mod tests {
             object: 1,
         })];
 
-        let result = build_bitmap_triples(triples.into_iter()).unwrap();
+        let result = build_bitmap_triples(triples.into_iter(), 1, 1, 1).unwrap();
         assert_eq!(result.num_triples, 1);
 
         // BitmapY should be [1] (last predicate of subject 1)
@@ -195,7 +180,7 @@ mod tests {
             Ok(IdTriple { subject: 2, predicate: 1, object: 1 }),
         ];
 
-        let result = build_bitmap_triples(triples.into_iter()).unwrap();
+        let result = build_bitmap_triples(triples.into_iter(), 2, 2, 3).unwrap();
         assert_eq!(result.num_triples, 4);
 
         // BitmapY: [0, 1, 1] (bit=1 marks last predicate of each subject)
