@@ -10,7 +10,16 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-use super::batch_vocab::{ROLE_OBJECT, ROLE_PREDICATE, ROLE_SUBJECT};
+use super::batch_vocab::Roles;
+
+/// Tracks which batch contributed a term and with what roles/local IDs.
+#[derive(Clone, Debug)]
+pub struct TermBatchInfo {
+    pub batch_id: usize,
+    pub roles: Roles,
+    pub so_local_id: Option<u32>,
+    pub p_local_id: Option<u32>,
+}
 
 /// ID mapping for a single batch (local ID → global ID).
 #[derive(Debug, Clone)]
@@ -104,7 +113,7 @@ impl IdMapping {
 /// Heap entry for k-way merge.
 struct HeapEntry {
     term: Vec<u8>,
-    roles: u8,
+    roles: Roles,
     so_local_id: Option<u32>,
     p_local_id: Option<u32>,
     source_batch: usize,
@@ -211,7 +220,7 @@ pub fn merge_vocabularies(
     // === PASS 1: Count terms per section ===
     tracing::debug!("Pass 1: Counting terms per section");
     let mut current_term: Option<Vec<u8>> = None;
-    let mut merged_roles: u8 = 0;
+    let mut merged_roles = Roles::empty();
 
     while let Some(heap_entry) = merge_heap.pop() {
         let term = heap_entry.term;
@@ -225,22 +234,8 @@ pub fn merge_vocabularies(
 
         if !is_same_term && current_term.is_some() {
             // Count completed term
-            let is_subject = merged_roles & ROLE_SUBJECT != 0;
-            let is_predicate = merged_roles & ROLE_PREDICATE != 0;
-            let is_object = merged_roles & ROLE_OBJECT != 0;
-
-            if is_predicate {
-                counts.predicates += 1;
-            }
-            if is_subject && is_object {
-                counts.shared += 1;
-            } else if is_subject {
-                counts.subjects += 1;
-            } else if is_object {
-                counts.objects += 1;
-            }
-
-            merged_roles = 0;
+            count_term_section(&merged_roles, &mut counts);
+            merged_roles = Roles::empty();
         }
 
         // Accumulate roles for current term
@@ -263,20 +258,7 @@ pub fn merge_vocabularies(
 
     // Count final term
     if current_term.is_some() {
-        let is_subject = merged_roles & ROLE_SUBJECT != 0;
-        let is_predicate = merged_roles & ROLE_PREDICATE != 0;
-        let is_object = merged_roles & ROLE_OBJECT != 0;
-
-        if is_predicate {
-            counts.predicates += 1;
-        }
-        if is_subject && is_object {
-            counts.shared += 1;
-        } else if is_subject {
-            counts.subjects += 1;
-        } else if is_object {
-            counts.objects += 1;
-        }
+        count_term_section(&merged_roles, &mut counts);
     }
 
     tracing::debug!("Counts: {} shared, {} subjects, {} predicates, {} objects",
@@ -309,8 +291,8 @@ pub fn merge_vocabularies(
     // Second k-way merge: assign global IDs
     let mut section_counts = DictCounts::default();  // Track current position in each section
     current_term = None;
-    merged_roles = 0;
-    let mut batches_with_term: Vec<(usize, u8, Option<u32>, Option<u32>)> = Vec::new();
+    merged_roles = Roles::empty();
+    let mut batches_with_term: Vec<TermBatchInfo> = Vec::new();
 
     while let Some(heap_entry) = merge_heap.pop() {
         let term = heap_entry.term;
@@ -341,12 +323,17 @@ pub fn merge_vocabularies(
             )?;
 
             batches_with_term.clear();
-            merged_roles = 0;
+            merged_roles = Roles::empty();
         }
 
         // Accumulate roles for current term
         merged_roles |= roles_in_batch;
-        batches_with_term.push((source_batch, roles_in_batch, so_local_id, p_local_id));
+        batches_with_term.push(TermBatchInfo {
+            batch_id: source_batch,
+            roles: roles_in_batch,
+            so_local_id,
+            p_local_id,
+        });
         current_term = Some(term);
 
         // Fetch next entry from same source
@@ -428,11 +415,25 @@ pub fn merge_vocabularies(
     })
 }
 
+/// Count a completed term into the appropriate dictionary section.
+fn count_term_section(roles: &Roles, counts: &mut DictCounts) {
+    if roles.contains(Roles::PREDICATE) {
+        counts.predicates += 1;
+    }
+    if roles.contains(Roles::SUBJECT) && roles.contains(Roles::OBJECT) {
+        counts.shared += 1;
+    } else if roles.contains(Roles::SUBJECT) {
+        counts.subjects += 1;
+    } else if roles.contains(Roles::OBJECT) {
+        counts.objects += 1;
+    }
+}
+
 /// Assign global IDs and record mappings for a single term.
 fn assign_global_ids_and_record_mappings(
     term: &[u8],
-    roles: u8,
-    batches: &[(usize, u8, Option<u32>, Option<u32>)], // (batch_id, roles, so_local_id, p_local_id)
+    roles: Roles,
+    batches: &[TermBatchInfo],
     final_counts: &DictCounts,  // Final section counts for offset calculation
     section_counts: &mut DictCounts,  // Current position in each section
     shared_enc: &mut PfcEncoder,
@@ -445,35 +446,31 @@ fn assign_global_ids_and_record_mappings(
     let term_str = std::str::from_utf8(term)
         .with_context(|| format!("Invalid UTF-8 in term: {:?}", term))?;
 
-    let is_subject = roles & ROLE_SUBJECT != 0;
-    let is_predicate = roles & ROLE_PREDICATE != 0;
-    let is_object = roles & ROLE_OBJECT != 0;
-
     // Handle predicates (separate ID space)
-    if is_predicate {
+    if roles.contains(Roles::PREDICATE) {
         section_counts.predicates += 1;
         let global_pred_id = section_counts.predicates;
         predicates_enc.push(term_str);
         predicate_ids.insert(term_str.to_string(), global_pred_id);
 
         // Record mapping for each batch that had this predicate
-        for &(batch_id, batch_roles, _so_local_id, p_local_id) in batches {
-            if batch_roles & ROLE_PREDICATE != 0 {
-                if let Some(local_p_id) = p_local_id {
-                    id_mappings[batch_id].p_map[local_p_id as usize] = global_pred_id;
+        for info in batches {
+            if info.roles.contains(Roles::PREDICATE) {
+                if let Some(local_p_id) = info.p_local_id {
+                    id_mappings[info.batch_id].p_map[local_p_id as usize] = global_pred_id;
                 }
             }
         }
     }
 
     // Handle subjects/objects (shared ID space)
-    if is_subject || is_object {
-        let global_so_id = if is_subject && is_object {
+    if roles.intersects(Roles::SUBJECT | Roles::OBJECT) {
+        let global_so_id = if roles.contains(Roles::SUBJECT | Roles::OBJECT) {
             // Shared: appears as both subject and object
             section_counts.shared += 1;
             shared_enc.push(term_str);
             section_counts.shared
-        } else if is_subject {
+        } else if roles.contains(Roles::SUBJECT) {
             // Subject-only: offset by total shared count
             section_counts.subjects += 1;
             subjects_enc.push(term_str);
@@ -486,10 +483,10 @@ fn assign_global_ids_and_record_mappings(
         };
 
         // Record mapping for each batch that had this subject/object
-        for &(batch_id, batch_roles, so_local_id, _p_local_id) in batches {
-            if (batch_roles & ROLE_SUBJECT != 0) || (batch_roles & ROLE_OBJECT != 0) {
-                if let Some(local_so_id) = so_local_id {
-                    id_mappings[batch_id].so_map[local_so_id as usize] = global_so_id;
+        for info in batches {
+            if info.roles.intersects(Roles::SUBJECT | Roles::OBJECT) {
+                if let Some(local_so_id) = info.so_local_id {
+                    id_mappings[info.batch_id].so_map[local_so_id as usize] = global_so_id;
                 }
             }
         }

@@ -141,36 +141,18 @@ The `error_tx`/`error_rx` channels (line 285-286) are created but all senders ar
 `ProcessedBatch.vocab` is `Vec<(Vec<u8>, u8, Option<u32>, Option<u32>)>` — opaque tuple.
 
 **Steps:**
-- [ ] Create a `VocabEntry` struct:
-  ```rust
-  struct VocabEntry {
-      term: Vec<u8>,
-      roles: u8,
-      so_local_id: Option<LocalId>,
-      p_local_id: Option<LocalId>,
-  }
-  ```
-- [ ] Replace all tuple uses with the named struct in `ProcessedBatch`, `PartialVocabWriter`, and `vocab_merger`
-- [ ] Similarly replace `batches_with_term: Vec<(usize, u8, Option<u32>, Option<u32>)>` in the merger with a named struct
+- [x] Create a `VocabEntry` struct with `term`, `roles`, `so_local_id`, `p_local_id` fields in `batch_vocab.rs`
+- [x] Replace all tuple uses with `VocabEntry` in `ProcessedBatch`, `BatchVocabBuilder::finish()`, `PartialVocabWriter` (via `PartialVocabEntry::from_vocab_entry`)
+- [x] Replace `batches_with_term: Vec<(usize, u8, Option<u32>, Option<u32>)>` with `TermBatchInfo` struct in the merger
 
 ### 3.3 Use Bitflags for Role Constants
 **Impact:** Type safety — prevents invalid role values at the type level
 **Files:** `src/pipeline/batch_vocab.rs`, `src/pipeline/vocab_merger.rs`, `src/pipeline/partial_vocab.rs`
 
 **Steps:**
-- [ ] Add `bitflags` crate to dependencies (or use a simple newtype wrapper with const methods)
-- [ ] Replace `ROLE_SUBJECT: u8 = 0x01` etc. with a bitflags type:
-  ```rust
-  bitflags! {
-      struct Roles: u8 {
-          const SUBJECT   = 0x01;
-          const PREDICATE = 0x02;
-          const OBJECT    = 0x04;
-          const GRAPH     = 0x08;
-      }
-  }
-  ```
-- [ ] Update all role flag usage throughout the pipeline modules
+- [x] Add `bitflags` crate to dependencies
+- [x] Replace `ROLE_SUBJECT: u8 = 0x01` etc. with `Roles` bitflags type in `batch_vocab.rs`
+- [x] Update all role flag usage throughout pipeline modules (`batch_vocab.rs`, `mod.rs`, `vocab_merger.rs`, `partial_vocab.rs`), using `contains()` and `intersects()` for flag checks and `.bits()` / `from_bits_truncate()` for serialization
 
 ### 3.4 Use Newtypes for ID Spaces
 **Impact:** Prevents accidentally mixing subject/object IDs with predicate IDs
@@ -264,8 +246,8 @@ Prioritized to maximize value with minimal risk at each step:
 | ~~7~~ | ~~Phase 2.4 — Bounds checking in remapper~~ | ~~Done~~ |
 | ~~8~~ | ~~Phase 1.1 — Stream BitmapTriples~~ | ~~Done~~ |
 | 9 | Phase 1.2 — Single-pass vocab merge | Second biggest improvement — halves merge I/O |
-| 10 | Phase 3.2 — Named structs | Can be done alongside other work |
-| 11 | Phase 3.3 — Bitflags for roles | Can be done alongside other work |
+| ~~10~~ | ~~Phase 3.2 — Named structs~~ | ~~Done~~ |
+| ~~11~~ | ~~Phase 3.3 — Bitflags for roles~~ | ~~Done~~ |
 | 12 | Phase 5.1 — Pipeline unit tests | Should accompany phases 8-9 |
 | 13 | Phase 3.4 — Newtype IDs | Evaluate after other changes settle |
 | 14 | Phase 5.2-5.3 — Stress tests & benchmarks | After core improvements are in |

@@ -29,7 +29,7 @@ use std::fs::File;
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 
-use batch_vocab::{LocalIdTriple, ROLE_GRAPH, ROLE_OBJECT, ROLE_PREDICATE, ROLE_SUBJECT};
+use batch_vocab::{LocalIdTriple, Roles, VocabEntry};
 
 /// Result of pipeline execution.
 pub struct PipelineResult {
@@ -44,7 +44,7 @@ type BatchedQuads = Vec<ExtractedQuad>;
 /// Processed batch with sorted vocabulary and local-ID triples (Stage 2 → Stage 3).
 struct ProcessedBatch {
     batch_id: usize,
-    vocab: Vec<(Vec<u8>, u8, Option<u32>, Option<u32>)>, // (term, roles, so_local_id, p_local_id) sorted
+    vocab: Vec<VocabEntry>,
     triples: Vec<LocalIdTriple>,
 }
 
@@ -142,13 +142,13 @@ fn vocab_builder_stage(
 
         // Process quads in this batch
         for quad in &quads_batch {
-            let s_id = builder.get_or_assign_id(quad.subject.as_bytes(), ROLE_SUBJECT);
-            let p_id = builder.get_or_assign_id(quad.predicate.as_bytes(), ROLE_PREDICATE);
-            let o_id = builder.get_or_assign_id(quad.object.as_bytes(), ROLE_OBJECT);
+            let s_id = builder.get_or_assign_id(quad.subject.as_bytes(), Roles::SUBJECT);
+            let p_id = builder.get_or_assign_id(quad.predicate.as_bytes(), Roles::PREDICATE);
+            let o_id = builder.get_or_assign_id(quad.object.as_bytes(), Roles::OBJECT);
 
             if include_graphs {
                 if let Some(ref graph) = quad.graph {
-                    builder.get_or_assign_id(graph.as_bytes(), ROLE_GRAPH);
+                    builder.get_or_assign_id(graph.as_bytes(), Roles::GRAPH);
                 }
             }
 
@@ -204,20 +204,20 @@ fn vocab_writer_stage(
         let entry_count = batch.vocab.len() as u32;
         let mut max_so_id = 0u32;
         let mut max_p_id = 0u32;
-        for (_term, _roles, so_local_id, p_local_id) in &batch.vocab {
-            if let Some(so_id) = so_local_id {
-                max_so_id = max_so_id.max(*so_id);
+        for entry in &batch.vocab {
+            if let Some(so_id) = entry.so_local_id {
+                max_so_id = max_so_id.max(so_id);
             }
-            if let Some(p_id) = p_local_id {
-                max_p_id = max_p_id.max(*p_id);
+            if let Some(p_id) = entry.p_local_id {
+                max_p_id = max_p_id.max(p_id);
             }
         }
 
         let mut vocab_writer = PartialVocabWriter::create(&vocab_path)
             .with_context(|| format!("Failed to create vocab writer for batch {}", batch.batch_id))?;
         vocab_writer.write_header(entry_count, max_so_id, max_p_id)?;
-        for (term, roles, so_local_id, p_local_id) in &batch.vocab {
-            vocab_writer.write_entry(&PartialVocabEntry::new(term.clone(), *roles, *so_local_id, *p_local_id))?;
+        for entry in &batch.vocab {
+            vocab_writer.write_entry(&PartialVocabEntry::from_vocab_entry(entry))?;
         }
         let term_count = vocab_writer.count() as usize;
         vocab_writer.finish()?;

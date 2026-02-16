@@ -1,16 +1,31 @@
 //! Batch vocabulary builder with hash map and arena allocation.
 
+use bitflags::bitflags;
 use bumpalo::Bump;
 use hashbrown::HashMap;
 
-/// Role flags for terms (can be OR-ed together).
-pub const ROLE_SUBJECT: u8 = 0x01;
-pub const ROLE_PREDICATE: u8 = 0x02;
-pub const ROLE_OBJECT: u8 = 0x04;
-pub const ROLE_GRAPH: u8 = 0x08;
+bitflags! {
+    /// Role flags for terms (can be OR-ed together).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    pub struct Roles: u8 {
+        const SUBJECT   = 0x01;
+        const PREDICATE = 0x02;
+        const OBJECT    = 0x04;
+        const GRAPH     = 0x08;
+    }
+}
 
 /// Local ID assigned within a batch (32-bit sufficient for 10M triples/batch).
 pub type LocalId = u32;
+
+/// A vocabulary entry produced by batch processing: a term with its roles and local IDs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VocabEntry {
+    pub term: Vec<u8>,
+    pub roles: Roles,
+    pub so_local_id: Option<LocalId>,
+    pub p_local_id: Option<LocalId>,
+}
 
 /// Triple with local IDs (compact: 12 bytes).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,7 +74,7 @@ impl LocalIdTriple {
 /// ID triples. Terms are stored in an arena for efficient memory management.
 pub struct BatchVocabBuilder<'bump> {
     /// HashMap for subject/object terms: term bytes → (local_id, roles)
-    so_term_map: HashMap<&'bump [u8], (LocalId, u8)>,
+    so_term_map: HashMap<&'bump [u8], (LocalId, Roles)>,
     /// HashMap for predicate terms: term bytes → local_id
     p_term_map: HashMap<&'bump [u8], LocalId>,
     /// Arena allocator for term storage
@@ -95,10 +110,8 @@ impl<'bump> BatchVocabBuilder<'bump> {
     /// Get or assign a local ID for a term.
     ///
     /// Returns the local ID for this term in the appropriate ID space.
-    pub fn get_or_assign_id(&mut self, term: &[u8], role: u8) -> LocalId {
-        let is_predicate = role & ROLE_PREDICATE != 0;
-
-        if is_predicate {
+    pub fn get_or_assign_id(&mut self, term: &[u8], role: Roles) -> LocalId {
+        if role.contains(Roles::PREDICATE) {
             // Predicate ID space
             if let Some(&id) = self.p_term_map.get(term) {
                 return id;
@@ -139,9 +152,9 @@ impl<'bump> BatchVocabBuilder<'bump> {
     /// Add a triple to this batch (test helper).
     #[cfg(test)]
     pub fn add_triple(&mut self, subject: &[u8], predicate: &[u8], object: &[u8]) {
-        let s_id = self.get_or_assign_id(subject, ROLE_SUBJECT);
-        let p_id = self.get_or_assign_id(predicate, ROLE_PREDICATE);
-        let o_id = self.get_or_assign_id(object, ROLE_OBJECT);
+        let s_id = self.get_or_assign_id(subject, Roles::SUBJECT);
+        let p_id = self.get_or_assign_id(predicate, Roles::PREDICATE);
+        let o_id = self.get_or_assign_id(object, Roles::OBJECT);
 
         self.id_triples.push(LocalIdTriple {
             subject: s_id,
@@ -153,30 +166,40 @@ impl<'bump> BatchVocabBuilder<'bump> {
     /// Finish building and return sorted vocabulary and ID triples.
     ///
     /// Consumes the builder and returns:
-    /// - Sorted vocabulary entries (term, roles, so_local_id, p_local_id)
+    /// - Sorted vocabulary entries
     /// - Local-ID triples
-    pub fn finish(self) -> (Vec<(Vec<u8>, u8, Option<LocalId>, Option<LocalId>)>, Vec<LocalIdTriple>) {
+    pub fn finish(self) -> (Vec<VocabEntry>, Vec<LocalIdTriple>) {
         // Collect entries directly into a Vec — no intermediate HashMap needed.
-        let mut entries: Vec<(Vec<u8>, u8, Option<LocalId>, Option<LocalId>)> =
+        let mut entries: Vec<VocabEntry> =
             Vec::with_capacity(self.so_term_map.len() + self.p_term_map.len());
 
         for (term, (so_id, roles)) in self.so_term_map {
-            entries.push((term.to_vec(), roles, Some(so_id), None));
+            entries.push(VocabEntry {
+                term: term.to_vec(),
+                roles,
+                so_local_id: Some(so_id),
+                p_local_id: None,
+            });
         }
 
         for (term, p_id) in self.p_term_map {
-            entries.push((term.to_vec(), ROLE_PREDICATE, None, Some(p_id)));
+            entries.push(VocabEntry {
+                term: term.to_vec(),
+                roles: Roles::PREDICATE,
+                so_local_id: None,
+                p_local_id: Some(p_id),
+            });
         }
 
         // Sort by term bytes — duplicates (terms in both maps) become adjacent
-        entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        entries.sort_unstable_by(|a, b| a.term.cmp(&b.term));
 
         // Merge adjacent duplicates (terms appearing in both SO and P maps)
         entries.dedup_by(|b, a| {
-            if a.0 == b.0 {
-                a.1 |= b.1; // merge roles
-                if a.2.is_none() { a.2 = b.2; } // take so_local_id
-                if a.3.is_none() { a.3 = b.3; } // take p_local_id
+            if a.term == b.term {
+                a.roles |= b.roles;
+                if a.so_local_id.is_none() { a.so_local_id = b.so_local_id; }
+                if a.p_local_id.is_none() { a.p_local_id = b.p_local_id; }
                 true
             } else {
                 false
@@ -226,7 +249,7 @@ mod tests {
 
         // Vocabulary should be sorted
         for i in 1..vocab.len() {
-            assert!(vocab[i - 1].0 < vocab[i].0);
+            assert!(vocab[i - 1].term < vocab[i].term);
         }
     }
 
@@ -236,13 +259,13 @@ mod tests {
         let mut builder = BatchVocabBuilder::new(&arena, 100);
 
         // Same term appears as both subject and object
-        let id1 = builder.get_or_assign_id(b"term1", ROLE_SUBJECT);
-        let id2 = builder.get_or_assign_id(b"term1", ROLE_OBJECT);
+        let id1 = builder.get_or_assign_id(b"term1", Roles::SUBJECT);
+        let id2 = builder.get_or_assign_id(b"term1", Roles::OBJECT);
 
         assert_eq!(id1, id2); // Should get same ID
 
         let (vocab, _) = builder.finish();
         assert_eq!(vocab.len(), 1);
-        assert_eq!(vocab[0].1, ROLE_SUBJECT | ROLE_OBJECT);
+        assert_eq!(vocab[0].roles, Roles::SUBJECT | Roles::OBJECT);
     }
 }

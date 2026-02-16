@@ -5,6 +5,8 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
+use super::batch_vocab::{Roles, VocabEntry};
+
 /// Magic number for partial vocabulary files: "PVOC" (0x50564F43)
 const MAGIC: u32 = 0x50564F43;
 
@@ -12,14 +14,25 @@ const MAGIC: u32 = 0x50564F43;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PartialVocabEntry {
     pub term: Vec<u8>,
-    pub roles: u8,
+    pub roles: Roles,
     pub so_local_id: Option<u32>, // Local ID in subject/object space (if used as S or O)
     pub p_local_id: Option<u32>,  // Local ID in predicate space (if used as P)
 }
 
 impl PartialVocabEntry {
-    pub fn new(term: Vec<u8>, roles: u8, so_local_id: Option<u32>, p_local_id: Option<u32>) -> Self {
+    #[cfg(test)]
+    pub fn new(term: Vec<u8>, roles: Roles, so_local_id: Option<u32>, p_local_id: Option<u32>) -> Self {
         Self { term, roles, so_local_id, p_local_id }
+    }
+
+    /// Create from a `VocabEntry` (cloning the term).
+    pub fn from_vocab_entry(entry: &VocabEntry) -> Self {
+        Self {
+            term: entry.term.clone(),
+            roles: entry.roles,
+            so_local_id: entry.so_local_id,
+            p_local_id: entry.p_local_id,
+        }
     }
 }
 
@@ -54,26 +67,22 @@ impl PartialVocabWriter {
 
     /// Write a single entry.
     pub fn write_entry(&mut self, entry: &PartialVocabEntry) -> Result<()> {
-        use super::batch_vocab::{ROLE_SUBJECT, ROLE_OBJECT, ROLE_PREDICATE};
-
         // Write term length
         let term_len = entry.term.len() as u32;
         self.encoder.write_all(&term_len.to_le_bytes())?;
         // Write term bytes
         self.encoder.write_all(&entry.term)?;
-        // Write roles
-        self.encoder.write_all(&[entry.roles])?;
+        // Write roles as raw u8
+        self.encoder.write_all(&[entry.roles.bits()])?;
 
         // Write SO local ID if term is used as subject/object
-        let is_so = (entry.roles & (ROLE_SUBJECT | ROLE_OBJECT)) != 0;
-        if is_so {
+        if entry.roles.intersects(Roles::SUBJECT | Roles::OBJECT) {
             let so_id = entry.so_local_id.expect("SO local ID must be present when roles include S/O");
             self.encoder.write_all(&so_id.to_le_bytes())?;
         }
 
         // Write P local ID if term is used as predicate
-        let is_p = (entry.roles & ROLE_PREDICATE) != 0;
-        if is_p {
+        if entry.roles.contains(Roles::PREDICATE) {
             let p_id = entry.p_local_id.expect("P local ID must be present when roles include P");
             self.encoder.write_all(&p_id.to_le_bytes())?;
         }
@@ -152,8 +161,6 @@ impl PartialVocabReader {
 
     /// Read the next entry.
     pub fn read_entry(&mut self) -> Result<Option<PartialVocabEntry>> {
-        use super::batch_vocab::{ROLE_SUBJECT, ROLE_OBJECT, ROLE_PREDICATE};
-
         if self.entries_read >= self.count {
             return Ok(None);
         }
@@ -172,11 +179,10 @@ impl PartialVocabReader {
         // Read roles
         let mut roles_byte = [0u8; 1];
         self.decoder.read_exact(&mut roles_byte)?;
-        let roles = roles_byte[0];
+        let roles = Roles::from_bits_truncate(roles_byte[0]);
 
         // Read SO local ID if present
-        let is_so = (roles & (ROLE_SUBJECT | ROLE_OBJECT)) != 0;
-        let so_local_id = if is_so {
+        let so_local_id = if roles.intersects(Roles::SUBJECT | Roles::OBJECT) {
             let mut id_bytes = [0u8; 4];
             self.decoder.read_exact(&mut id_bytes)?;
             Some(u32::from_le_bytes(id_bytes))
@@ -185,8 +191,7 @@ impl PartialVocabReader {
         };
 
         // Read P local ID if present
-        let is_p = (roles & ROLE_PREDICATE) != 0;
-        let p_local_id = if is_p {
+        let p_local_id = if roles.contains(Roles::PREDICATE) {
             let mut id_bytes = [0u8; 4];
             self.decoder.read_exact(&mut id_bytes)?;
             Some(u32::from_le_bytes(id_bytes))
@@ -231,16 +236,16 @@ mod tests {
         // Write some entries
         let mut writer = PartialVocabWriter::create(&path)?;
         writer.write_header(3, 2, 1)?; // 3 entries, max_so_id=2, max_p_id=1
-        writer.write_entry(&PartialVocabEntry::new(b"term1".to_vec(), 0x01, Some(0), None))?; // subject only
-        writer.write_entry(&PartialVocabEntry::new(b"term2".to_vec(), 0x02, None, Some(0)))?; // predicate only
-        writer.write_entry(&PartialVocabEntry::new(b"term3".to_vec(), 0x04, Some(1), None))?; // object only
+        writer.write_entry(&PartialVocabEntry::new(b"term1".to_vec(), Roles::SUBJECT, Some(0), None))?; // subject only
+        writer.write_entry(&PartialVocabEntry::new(b"term2".to_vec(), Roles::PREDICATE, None, Some(0)))?; // predicate only
+        writer.write_entry(&PartialVocabEntry::new(b"term3".to_vec(), Roles::OBJECT, Some(1), None))?; // object only
         let count = writer.count();
         writer.finish()?;
 
         assert_eq!(count, 3);
 
         // Read them back
-        let mut reader = PartialVocabReader::open(&path)?;
+        let reader = PartialVocabReader::open(&path)?;
         assert_eq!(reader.total_entries(), 3);
         assert_eq!(reader.max_so_id(), 2);
         assert_eq!(reader.max_p_id(), 1);
@@ -248,11 +253,11 @@ mod tests {
         let entries: Vec<_> = reader.collect::<Result<Vec<_>>>()?;
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].term, b"term1");
-        assert_eq!(entries[0].roles, 0x01);
+        assert_eq!(entries[0].roles, Roles::SUBJECT);
         assert_eq!(entries[0].so_local_id, Some(0));
         assert_eq!(entries[0].p_local_id, None);
         assert_eq!(entries[1].term, b"term2");
-        assert_eq!(entries[1].roles, 0x02);
+        assert_eq!(entries[1].roles, Roles::PREDICATE);
         assert_eq!(entries[1].so_local_id, None);
         assert_eq!(entries[1].p_local_id, Some(0));
         assert_eq!(entries[2].term, b"term3");
