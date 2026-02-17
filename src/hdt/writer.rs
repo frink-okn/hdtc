@@ -21,19 +21,33 @@ pub fn write_hdt(
     counts: &DictCounts,
     dict_sections: &[Vec<u8>],
     triples: &BitmapTriplesData,
+    original_input_size: u64,
 ) -> Result<()> {
     let file = File::create(output_path)
         .with_context(|| format!("Failed to create output file {}", output_path.display()))?;
     let mut writer = BufWriter::with_capacity(256 * 1024, file);
 
-    // 1. Global Control Information
-    let mut global_ci = ControlInfo::new(ControlType::Global, "<http://purl.org/HDT/hdt#HDTv1>");
-    global_ci.set_property("BaseURI", base_uri);
-    global_ci.set_property("Software", "hdtc");
+    // 1. Global Control Information (no properties, per hdt-java spec)
+    let global_ci = ControlInfo::new(ControlType::Global, "<http://purl.org/HDT/hdt#HDTv1>");
     global_ci.write_to(&mut writer)?;
 
+    // Calculate actual dictionary size and HDT data size from encoded sections
+    let dict_size: u64 = dict_sections.iter().map(|s| s.len() as u64).sum();
+    let triples_size: u64 = (triples.bitmap_y.len()
+        + triples.bitmap_z.len()
+        + triples.array_y.len()
+        + triples.array_z.len()) as u64;
+    let hdt_data_size = dict_size + triples_size;
+
     // 2. Header
-    let header_content = build_header_ntriples(base_uri, counts, triples.num_triples);
+    let header_content = build_header_ntriples(
+        base_uri,
+        counts,
+        triples.num_triples,
+        dict_size,
+        hdt_data_size,
+        original_input_size,
+    );
     let mut header_ci = ControlInfo::new(ControlType::Header, "ntriples");
     header_ci.set_property("length", &header_content.len().to_string());
     header_ci.write_to(&mut writer)?;
@@ -80,8 +94,15 @@ pub fn write_hdt(
     Ok(())
 }
 
-/// Build the header section content as N-Triples.
-fn build_header_ntriples(base_uri: &str, counts: &DictCounts, num_triples: u64) -> String {
+/// Build the header section content as N-Triples (Java-compatible format).
+fn build_header_ntriples(
+    base_uri: &str,
+    counts: &DictCounts,
+    num_triples: u64,
+    dict_size: u64,
+    hdt_data_size: u64,
+    original_input_size: u64,
+) -> String {
     let mut lines = Vec::new();
     let dataset = format!("<{base_uri}>");
     let void = "http://rdfs.org/ns/void#";
@@ -89,50 +110,160 @@ fn build_header_ntriples(base_uri: &str, counts: &DictCounts, num_triples: u64) 
     let dcterms = "http://purl.org/dc/terms/";
     let hdt_ns = "http://purl.org/HDT/hdt#";
 
-    // Type
+    // Match Java's type declarations (both hdt#Dataset and void#Dataset)
+    lines.push(format!(
+        "{dataset} <{rdf}type> <{hdt_ns}Dataset> ."
+    ));
     lines.push(format!(
         "{dataset} <{rdf}type> <{void}Dataset> ."
     ));
 
-    // Counts
+    // Counts (untyped literals to match Java format)
     lines.push(format!(
-        "{dataset} <{void}triples> \"{num_triples}\"^^<http://www.w3.org/2001/XMLSchema#integer> ."
+        "{dataset} <{void}triples> \"{num_triples}\" ."
+    ));
+
+    lines.push(format!(
+        "{dataset} <{void}properties> \"{}\" .",
+        counts.predicates
     ));
 
     let distinct_subjects = counts.shared + counts.subjects;
     lines.push(format!(
-        "{dataset} <{void}distinctSubjects> \"{distinct_subjects}\"^^<http://www.w3.org/2001/XMLSchema#integer> ."
-    ));
-
-    lines.push(format!(
-        "{dataset} <{void}properties> \"{}\"^^<http://www.w3.org/2001/XMLSchema#integer> .",
-        counts.predicates
+        "{dataset} <{void}distinctSubjects> \"{distinct_subjects}\" ."
     ));
 
     let distinct_objects = counts.shared + counts.objects;
     lines.push(format!(
-        "{dataset} <{void}distinctObjects> \"{distinct_objects}\"^^<http://www.w3.org/2001/XMLSchema#integer> ."
+        "{dataset} <{void}distinctObjects> \"{distinct_objects}\" ."
     ));
 
+    // Blank node for format information (Java style)
     lines.push(format!(
-        "{dataset} <{void}entities> \"{}\"^^<http://www.w3.org/2001/XMLSchema#integer> .",
-        counts.shared
+        "{dataset} <{hdt_ns}formatInformation> _:format ."
+    ));
+    lines.push(format!(
+        "_:format <{hdt_ns}dictionary> _:dictionary ."
+    ));
+    lines.push(format!(
+        "_:format <{hdt_ns}triples> _:triples ."
     ));
 
-    // HDT properties
+    // Blank node for statistical information
     lines.push(format!(
-        "{dataset} <{hdt_ns}dictionaryFormat> <{hdt_ns}dictionaryFour> ."
-    ));
-    lines.push(format!(
-        "{dataset} <{hdt_ns}triplesFormat> <{hdt_ns}triplesBitmap> ."
+        "{dataset} <{hdt_ns}statisticalInformation> _:statistics ."
     ));
 
-    // Software
+    // Blank node for publication information
     lines.push(format!(
-        "{dataset} <{dcterms}source> <{base_uri}> ."
+        "{dataset} <{hdt_ns}publicationInformation> _:publicationInformation ."
+    ));
+
+    // Dictionary format information
+    lines.push(format!(
+        "_:dictionary <{dcterms}format> <{hdt_ns}dictionaryFour> ."
+    ));
+    lines.push(format!(
+        "_:dictionary <{hdt_ns}dictionarynumSharedSubjectObject> \"{shared}\" .",
+        shared = counts.shared
+    ));
+
+    // Dictionary size in bytes (actual encoded size)
+    lines.push(format!(
+        "_:dictionary <{hdt_ns}dictionarysizeStrings> \"{dict_size}\" ."
+    ));
+
+    // Triples format information
+    lines.push(format!(
+        "_:triples <{dcterms}format> <{hdt_ns}triplesBitmap> ."
+    ));
+    lines.push(format!(
+        "_:triples <{hdt_ns}triplesnumTriples> \"{num_triples}\" ."
+    ));
+    lines.push(format!(
+        "_:triples <{hdt_ns}triplesOrder> \"SPO\" ."
+    ));
+
+    // Statistical information (HDT data size in bytes)
+    lines.push(format!(
+        "_:statistics <{hdt_ns}hdtSize> \"{hdt_data_size}\" ."
+    ));
+
+    // Publication information with timestamp (ISO 8601 format)
+    let timestamp = generate_timestamp();
+    lines.push(format!(
+        "_:publicationInformation <{dcterms}issued> \"{timestamp}\" ."
+    ));
+
+    // Original input file size
+    lines.push(format!(
+        "_:statistics <{hdt_ns}originalSize> \"{original_input_size}\" ."
     ));
 
     lines.join("\n") + "\n"
+}
+
+/// Generate ISO 8601 timestamp for publication info.
+fn generate_timestamp() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    // Get current time since Unix epoch
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+
+    let total_secs = duration.as_secs();
+
+    // Simple date calculation for 1970-2100 range
+    // This is a simplified approximation; use chrono for production accuracy
+    let days_since_epoch = total_secs / 86400;
+    let secs_today = total_secs % 86400;
+
+    let hours = secs_today / 3600;
+    let minutes = (secs_today % 3600) / 60;
+
+    // Rough year calculation (doesn't account for leap years perfectly)
+    let mut year = 1970;
+    let mut remaining_days = days_since_epoch;
+
+    loop {
+        let days_in_year = if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) {
+            366
+        } else {
+            365
+        };
+
+        if remaining_days < days_in_year as u64 {
+            break;
+        }
+
+        remaining_days -= days_in_year as u64;
+        year += 1;
+
+        if year > 2100 {
+            // Fallback for out-of-range dates
+            return "2026-02-16T00:00Z".to_string();
+        }
+    }
+
+    let month_days = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut month = 1;
+    let mut day_of_month = remaining_days + 1;
+
+    let is_leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    for (i, &days) in month_days.iter().enumerate() {
+        let days_in_month = if i == 1 && is_leap { 29 } else { days };
+        if day_of_month <= days_in_month as u64 {
+            month = i + 1;
+            break;
+        }
+        day_of_month -= days_in_month as u64;
+    }
+
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}Z",
+        year, month, day_of_month, hours, minutes
+    )
 }
 
 #[cfg(test)]
@@ -149,13 +280,33 @@ mod tests {
             graphs: 0,
         };
 
-        let header = build_header_ntriples("http://example.org/dataset", &counts, 100);
+        let header = build_header_ntriples("http://example.org/dataset", &counts, 100, 150, 200, 1000);
 
+        // Check both dataset types (hdt and void)
+        assert!(header.contains("hdt#Dataset"));
         assert!(header.contains("void#Dataset"));
+
+        // Check counts (now untyped literals)
         assert!(header.contains("\"100\""));
         assert!(header.contains("\"15\"")); // distinct subjects = 10 + 5
         assert!(header.contains("\"3\""));  // predicates
         assert!(header.contains("\"17\"")); // distinct objects = 10 + 7
-        assert!(header.contains("\"10\"")); // shared entities
+
+        // Check blank node structures
+        assert!(header.contains("_:format"));
+        assert!(header.contains("_:dictionary"));
+        assert!(header.contains("_:triples"));
+        assert!(header.contains("_:statistics"));
+        assert!(header.contains("_:publicationInformation"));
+
+        // Check format information
+        assert!(header.contains("dictionaryFour"));
+        assert!(header.contains("triplesBitmap"));
+        assert!(header.contains("SPO"));
+
+        // Check that statistics are present
+        assert!(header.contains("\"150\"")); // dict_size
+        assert!(header.contains("\"200\"")); // hdt_data_size
+        assert!(header.contains("\"1000\"")); // original_input_size
     }
 }

@@ -10,10 +10,13 @@ fn run_hdtc(temp_dir: &Path, inputs: &[&Path], hdt_name: &str) -> (bool, String,
     let hdt_path = temp_dir.join(hdt_name);
     let work_dir = temp_dir.join("work");
 
-    let mut args: Vec<String> = inputs
-        .iter()
-        .map(|p| p.to_str().unwrap().to_string())
-        .collect();
+    // Build args with "create" subcommand as first argument
+    let mut args: Vec<String> = vec!["create".to_string()];
+    args.extend(
+        inputs
+            .iter()
+            .map(|p| p.to_str().unwrap().to_string())
+    );
     args.extend([
         "-o".to_string(),
         hdt_path.to_str().unwrap().to_string(),
@@ -111,6 +114,7 @@ fn test_end_to_end_ntriples_to_hdt() {
     // Run hdtc
     let output = Command::new(env!("CARGO_BIN_EXE_hdtc"))
         .args([
+            "create",
             nt_path.to_str().unwrap(),
             "-o",
             hdt_path.to_str().unwrap(),
@@ -162,6 +166,7 @@ fn test_multiple_files_blank_node_disambiguation() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_hdtc"))
         .args([
+            "create",
             nt1_path.to_str().unwrap(),
             nt2_path.to_str().unwrap(),
             "-o",
@@ -219,6 +224,7 @@ fn test_predicate_also_used_as_subject() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_hdtc"))
         .args([
+            "create",
             nt_path.to_str().unwrap(),
             "-o",
             hdt_path.to_str().unwrap(),
@@ -689,8 +695,8 @@ fn test_hdt_section_structure() {
     assert_eq!(ct, 1, "Global CI type should be 1");
     assert_eq!(format, "<http://purl.org/HDT/hdt#HDTv1>");
     assert!(
-        props.contains("BaseURI="),
-        "Global CI should have BaseURI property"
+        props.is_empty(),
+        "Global CI should have no properties (Java-compatible format)"
     );
 
     // Parse Header CI
@@ -965,6 +971,7 @@ fn test_single_triple_pipeline() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_hdtc"))
         .args(&[
+            "create",
             nt_path.to_str().unwrap(),
             "-o", hdt_path.to_str().unwrap(),
             "--base-uri", "http://example.org/dataset",
@@ -1003,6 +1010,7 @@ fn test_many_small_batches_backpressure() {
     // Use a very small memory limit to force multiple batches and test backpressure
     let output = Command::new(env!("CARGO_BIN_EXE_hdtc"))
         .args(&[
+            "create",
             nt_path.to_str().unwrap(),
             "-o", hdt_path.to_str().unwrap(),
             "--base-uri", "http://example.org/dataset",
@@ -1049,6 +1057,7 @@ fn test_multi_file_term_overlap() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_hdtc"))
         .args(&[
+            "create",
             file1.to_str().unwrap(),
             file2.to_str().unwrap(),
             "-o", hdt_path.to_str().unwrap(),

@@ -32,10 +32,13 @@ pub fn run_hdtc_to_path(temp_dir: &Path, inputs: &[&Path], hdt_name: &str) -> Pa
     let hdt_path = temp_dir.join(hdt_name);
     let work_dir = temp_dir.join("work");
 
-    let mut args: Vec<String> = inputs
-        .iter()
-        .map(|p| p.to_str().unwrap().to_string())
-        .collect();
+    // Build args with "create" subcommand as first argument
+    let mut args: Vec<String> = vec!["create".to_string()];
+    args.extend(
+        inputs
+            .iter()
+            .map(|p| p.to_str().unwrap().to_string())
+    );
     args.extend([
         "-o".to_string(),
         hdt_path.to_str().unwrap().to_string(),

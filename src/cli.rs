@@ -1,4 +1,4 @@
-use clap::{Parser, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -12,9 +12,33 @@ pub enum OutputMode {
     name = "hdtc",
     about = "HDT Creator - converts RDF files to HDT format",
     long_about = "Converts RDF files in any standard format to HDT (Header, Dictionary, Triples) \
-                  binary format. Optimized for very large inputs with bounded memory usage."
+                  binary format. Optimized for very large inputs with bounded memory usage. \
+                  Can also create index files (.hdt.index.v1-1) for existing HDT files."
 )]
 pub struct Cli {
+    #[command(subcommand)]
+    pub command: Commands,
+
+    /// Increase logging verbosity (-v for debug, -vv for trace)
+    #[arg(short, long, action = clap::ArgAction::Count, global = true)]
+    pub verbose: u8,
+
+    /// Suppress all output except errors
+    #[arg(short, long, global = true)]
+    pub quiet: bool,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum Commands {
+    /// Create HDT file from RDF input(s)
+    Create(CreateArgs),
+
+    /// Create index file for an existing HDT file
+    Index(IndexArgs),
+}
+
+#[derive(Debug, Parser)]
+pub struct CreateArgs {
     /// Input RDF files or directories containing RDF files
     #[arg(required = true)]
     pub inputs: Vec<PathBuf>,
@@ -35,9 +59,9 @@ pub struct Cli {
     #[arg(long)]
     pub index: bool,
 
-    /// Base URI for the dataset
-    #[arg(long, default_value = "http://example.org/dataset")]
-    pub base_uri: String,
+    /// Base URI for the dataset (defaults to first input file's file:// URI if not specified)
+    #[arg(long)]
+    pub base_uri: Option<String>,
 
     /// Map input files/directories to named graphs (format: path=uri)
     #[arg(long = "graph-map", value_name = "PATH=URI")]
@@ -50,12 +74,18 @@ pub struct Cli {
     /// Soft memory limit in megabytes for internal buffers
     #[arg(long, value_name = "MB")]
     pub memory_limit: Option<usize>,
+}
 
-    /// Increase logging verbosity (-v for debug, -vv for trace)
-    #[arg(short, long, action = clap::ArgAction::Count)]
-    pub verbose: u8,
+#[derive(Debug, Parser)]
+pub struct IndexArgs {
+    /// Path to existing HDT file
+    pub hdt_file: PathBuf,
 
-    /// Suppress all output except errors
-    #[arg(short, long)]
-    pub quiet: bool,
+    /// Directory for temporary working files
+    #[arg(long)]
+    pub temp_dir: Option<PathBuf>,
+
+    /// Soft memory limit in megabytes for sorting operations
+    #[arg(long, value_name = "MB")]
+    pub memory_limit: Option<usize>,
 }

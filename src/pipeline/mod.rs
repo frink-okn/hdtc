@@ -36,6 +36,7 @@ pub struct PipelineResult {
     pub counts: DictCounts,
     pub dict_sections: Vec<Vec<u8>>, // PFC-encoded sections
     pub bitmap_triples: BitmapTriplesData,
+    pub original_input_size: u64, // Size of original input files in bytes
 }
 
 /// Batch of parsed quads (Stage 1 → Stage 2).
@@ -497,9 +498,17 @@ pub fn run_pipeline(
     // Clean up temporary files
     cleanup_temp_files(&batches, &mapping_paths);
 
+    // Calculate original input file size
+    let original_input_size: u64 = inputs
+        .iter()
+        .filter_map(|input| std::fs::metadata(&input.path).ok())
+        .map(|m| m.len())
+        .sum();
+
     Ok(PipelineResult {
         counts: merge_result.counts,
         dict_sections: merge_result.dict_sections,
         bitmap_triples,
+        original_input_size,
     })
 }

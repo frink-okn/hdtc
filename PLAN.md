@@ -249,6 +249,145 @@ Prioritized to maximize value with minimal risk at each step:
 | ~~10~~ | ~~Phase 3.2 — Named structs~~ | ~~Done~~ |
 | ~~11~~ | ~~Phase 3.3 — Bitflags for roles~~ | ~~Done~~ |
 | ~~12~~ | ~~Phase 5.1 — Pipeline unit tests~~ | ~~Done~~ |
-| 13 | Phase 3.4 — Newtype IDs | Evaluate after other changes settle |
-| 14 | Phase 5.2-5.3 — Stress tests & benchmarks | After core improvements are in |
-| 15 | Phase 4.1-4.3 — Parallel parsing etc. | Only if benchmarks show it's needed |
+| ~~13~~ | ~~Phase 6.1 — Index creation (post-HDT)~~ | ~~Done~~ |
+| 14 | Phase 3.4 — Newtype IDs | Evaluate after other changes settle |
+| 15 | Phase 5.2-5.3 — Stress tests & benchmarks | After core improvements are in |
+| ~~16~~ | ~~Phase 6.3 — Standalone index CLI command~~ | ~~Done~~ |
+| 17 | Phase 6.2 — In-pipeline index creation | Future optimization if post-HDT is slow |
+| 18 | Phase 4.1-4.3 — Parallel parsing etc. | Only if benchmarks show it's needed |
+
+---
+
+## Phase 6: HDT Index Creation
+
+### Background
+
+The `.hdt.index.v1-1` file is a **complex sidecar index**, not just reordered triples. Based on hdt-java source analysis, it contains five sections:
+
+1. **Control Info** (type=INDEX, format=indexFoQ)
+2. **BitmapIndexZ** (bitmap for object tracking in permutation)
+3. **IndexZ** (sequence of object IDs in permuted order)
+4. **PredicateIndex** = Bitmap (predicate boundaries) + Sequence (position mappings)
+5. **PredicateCount** (predicate occurrence statistics)
+
+The index enables efficient **predicate-based queries** through an **inverted index** that maps predicate values to their positions. The index covers **a single permutation** (typically OPS for Object-Predicate-Subject queries).
+
+**Complexity:** Creating the index is nearly as expensive as creating the main HDT:
+- Must decode SPO triples, column-swap, and re-sort to chosen permutation
+- Must build full BitmapTriples encoding in new order
+- Must build PredicateIndex inverted structures from seqY values
+
+The index can be created:
+1. **Post-HDT** (primary): Read SPO HDT → decode → permute → re-sort → build full BitmapTriples + indices
+2. **In-pipeline** (future): Create during pipeline alongside SPO (overlaps I/O, can save 20-40% time)
+3. **Standalone** (future): Separate CLI command to create index for existing HDT files
+
+### 6.1 Post-HDT Index Creation (Primary Implementation)
+**Impact:** Enables index generation with `--index` flag; moderately slower than in-pipeline but simpler
+**Files:** `src/index/mod.rs`, `src/index/builder.rs`, `src/hdt/mod.rs` (for index write support)
+**Dependencies:** Read HDT file's triples section, apply column permutation, re-sort in OPS order
+
+**Approach:**
+1. After main HDT file is written, if `--index` flag is set:
+   - Open the HDT file and read the SPO BitmapTriples section
+   - Decode SPO triples back to (subject, predicate, object) ID tuples
+   - Permute columns and sort in OPS order: `(object, predicate, subject)`
+   - Build OPS BitmapTriples structure (seqY, seqZ, bitmapY, bitmapZ)
+   - Build PredicateIndex inverted structures from seqY values
+   - Write index file with five sections
+
+**Steps:**
+- [x] Create `src/index/decoder.rs` to decode existing HDT BitmapTriples:
+  - [x] Read and decompress seqY, seqZ, bitmapY, bitmapZ from main HDT file
+  - [x] Implement `BitmapTriplesDecoder` iterator to yield (S, P, O) tuples
+  - [x] Handle AdjacencyList traversal pattern for multi-level bitmap decoding
+- [x] Create `src/index/ops_triple.rs` with OPS triple wrapper:
+  - [x] Implement `OpsTriple` struct with (Object, Predicate, Subject) ordering
+  - [x] Implement `Sortable` trait for external sorter compatibility
+- [x] Create `src/index/predicate_index.rs` with PredicateIndex building logic:
+  - [x] `build_predicate_index()` builds inverted index structures
+  - [x] `build_predicate_count()` builds per-predicate occurrence counts
+  - [x] Implements hdt-java PredicateIndexArray algorithm
+- [x] Create `src/index/writer.rs` to write index file:
+  - [x] `write_index()` writes magic bytes and control info
+  - [x] Write five sections: bitmapIndexZ, indexZ, predicateIndex (bitmap + sequence), predicateCount
+  - [x] Proper control info with format=indexFoQ, order=6 (OPS)
+- [x] Integrate into main pipeline:
+  - [x] In `main.rs`, after `hdt::write_hdt()`, check `cli.index` flag
+  - [x] If set, call `index::create_index(&hdt_path, memory_budget, &temp_dir)`
+  - [x] ExternalSorter auto-cleans temp files
+- [x] Test index creation with sample RDF data and verify file format
+
+**Index File Format (confirmed by hdt-java source):**
+- Magic bytes: `$HDT` (0x24 0x48 0x44 0x54)
+- ControlInfo (type=INDEX, format=indexFoQ, numTriples, order=OPS enum ordinal=6)
+- Five binary sections in sequence (no intermediate HDT headers):
+  1. bitmapIndexZ (bitmap from OPS BitmapTriples Z component)
+  2. indexZ (sequence from OPS BitmapTriples Z component)
+  3. predicateIndex.bitmap (inverted index boundaries for predicates)
+  4. predicateIndex.sequence (position mappings for predicate occurrences)
+  5. predicateCount (occurrence counts per predicate)
+- CRC32 after all data (standard HDT format)
+
+### 6.2 In-Pipeline Index Creation (Future Optimization)
+**Impact:** 20-40% faster index creation vs post-HDT; overlaps I/O with computation
+**QLever ref:** Recommendation 2.5 (Cascading twin-permutation creation)
+**Complexity:** High — requires architectural changes to pipeline and triple sorting
+
+**Approach:**
+Modify the external sort stage (Stage 6) to produce two sorted outputs simultaneously:
+1. **Main path:** Sort global-ID triples in SPO order → build SPO BitmapTriples for main HDT
+2. **Index path:** In parallel, sort *copies* in OPS order → build OPS BitmapTriples + PredicateIndex for index file
+
+This overlaps the sorts and I/O, avoiding a second full re-sort of triples.
+
+**Trade-offs:**
+- **Pros:** Avoids re-reading HDT file (expensive I/O), overlaps sorting, saves 20-40% time
+- **Cons:** Requires dual-sort tracking, more memory during pipeline, more complex architecture
+- **Only pursue if:** Post-HDT profiling shows index creation is a significant bottleneck (>10% of total time)
+
+**Steps (if pursued):**
+- [ ] Profile Phase 6.1 implementation to measure actual overhead
+- [ ] Measure I/O time for re-reading HDT file vs dual-sort memory cost
+- [ ] If index creation overhead > 10% of total: refactor external sorter to support dual-output
+- [ ] Modify BitmapTriples builder to accept permutation order parameter
+- [ ] Run two BitmapTriples builders in parallel (one SPO, one OPS) from sorted triple sources
+- [ ] Write both HDT and index files from builder outputs
+
+### 6.3 Standalone Index CLI Command
+**Impact:** User convenience — can create index for existing HDT files without reprocessing
+**Files:** `src/main.rs`, `src/cli.rs`, `src/index/mod.rs`
+
+**Approach:**
+Add a new CLI subcommand: `hdtc index <HDT_FILE>` that:
+1. Reads an existing HDT file
+2. Builds OPS index using logic from Phase 6.1
+3. Writes `.hdt.index.v1-1` file
+
+**Steps:**
+- [x] Refactor CLI from flat structure to subcommand-based (both `create` and `index`)
+- [x] Update `src/cli.rs` to use clap's subcommand structure with `Commands` enum
+- [x] Create `CreateArgs` struct for RDF-to-HDT conversion
+- [x] Create `IndexArgs` struct for index creation from existing HDT
+- [x] Split `main()` into `create_hdt()` and `create_index_from_hdt()` handlers
+- [x] Update test harnesses (`tests/common/mod.rs`, `tests/integration_test.rs`) to use new CLI
+- [x] Verify all 129 tests pass with new subcommand structure
+- [x] Update README.md with new CLI usage documentation
+
+**CLI Usage:**
+```sh
+# Create HDT with index in one step
+hdtc create data.nt -o data.hdt --index
+
+# Create HDT, then add index separately
+hdtc create data.nt -o data.hdt
+hdtc index data.hdt  # Creates data.hdt.index.v1-1
+```
+
+**Verified:**
+- Both subcommands work correctly with all relevant options (--memory-limit, --temp-dir)
+- Help text displays correctly for both `hdtc create --help` and `hdtc index --help`
+- All integration and compatibility tests pass
+- [ ] Test with various HDT files (including sample vdjserver.hdt)
+
+---

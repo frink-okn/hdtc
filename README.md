@@ -31,67 +31,92 @@ cargo build --release
 
 ## Usage
 
+hdtc supports two main commands:
+
+### `hdtc create` — Convert RDF to HDT
+
 ```
-hdtc [OPTIONS] <INPUTS>... -o <OUTPUT>
+hdtc create [OPTIONS] --output <OUTPUT> <INPUTS>...
 ```
 
-### Basic examples
+### `hdtc index` — Create index for existing HDT
+
+```
+hdtc index [OPTIONS] <HDT_FILE>
+```
+
+### Create: Basic examples
 
 Convert a single N-Triples file:
 
 ```sh
-hdtc data.nt -o data.hdt
+hdtc create data.nt -o data.hdt
 ```
 
 Convert multiple files at once:
 
 ```sh
-hdtc file1.ttl file2.nt.gz -o combined.hdt
+hdtc create file1.ttl file2.nt.gz -o combined.hdt
 ```
 
 Convert an entire directory of RDF files:
 
 ```sh
-hdtc ./rdf-data/ -o output.hdt
+hdtc create ./rdf-data/ -o output.hdt
 ```
 
 Generate an HDT index alongside the output:
 
 ```sh
-hdtc data.nt -o data.hdt --index
+hdtc create data.nt -o data.hdt --index
 ```
 
-### Quads mode
+### Create: Quads mode
 
 Produce an HDTQ file from N-Quads input:
 
 ```sh
-hdtc data.nq -o data.hdt -m quads
+hdtc create data.nq -o data.hdt -m quads
 ```
 
 Map input files to named graphs:
 
 ```sh
-hdtc people.nt places.nt -o data.hdt -m quads \
+hdtc create people.nt places.nt -o data.hdt -m quads \
   --graph-map people.nt=http://example.org/people \
   --graph-map places.nt=http://example.org/places
 ```
 
-### Tuning for large datasets
+### Create: Tuning for large datasets
 
 Set a higher memory limit (in MB) for better throughput:
 
 ```sh
-hdtc huge.nt.gz -o huge.hdt --memory-limit 16384
+hdtc create huge.nt.gz -o huge.hdt --memory-limit 16384
 ```
 
 Direct temporary files to a fast disk with sufficient space:
 
 ```sh
-hdtc huge.nt -o huge.hdt --temp-dir /mnt/fast-ssd/tmp
+hdtc create huge.nt -o huge.hdt --temp-dir /mnt/fast-ssd/tmp
 ```
 
-### All options
+### Index: Creating indexes
+
+Create an index file for an existing HDT file:
+
+```sh
+hdtc index existing.hdt
+# Creates: existing.hdt.index.v1-1
+```
+
+With custom memory and temp settings:
+
+```sh
+hdtc index existing.hdt --memory-limit 8192 --temp-dir /mnt/fast-ssd/tmp
+```
+
+### Create: All options
 
 | Option                 | Default                      | Description                                         |
 | ---------------------- | ---------------------------- | --------------------------------------------------- |
@@ -106,6 +131,16 @@ hdtc huge.nt -o huge.hdt --temp-dir /mnt/fast-ssd/tmp
 | `--memory-limit MB`    | 4096                         | Soft memory limit for internal buffers              |
 | `-v, --verbose`        | —                            | Increase log verbosity (`-v` debug, `-vv` trace)    |
 | `-q, --quiet`          | —                            | Suppress all output except errors                   |
+
+### Index: All options
+
+| Option              | Default      | Description                                    |
+| ------------------- | ------------ | ---------------------------------------------- |
+| `<HDT_FILE>`        | _(required)_ | Path to existing HDT file                      |
+| `--temp-dir`        | system temp  | Directory for temporary working files          |
+| `--memory-limit MB` | 4096         | Soft memory limit for sorting operations       |
+| `-v, --verbose`     | —            | Increase log verbosity (`-v` debug, `-vv` trace) |
+| `-q, --quiet`       | —            | Suppress all output except errors              |
 
 ## Resource requirements
 
