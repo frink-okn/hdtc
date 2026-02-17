@@ -57,8 +57,7 @@ pub fn build_predicate_index(predicates: &[u64], max_predicate: u64) -> Result<P
     let mut bitmap = BitmapWriter::new();
     let mut accumulated = 0u64;
 
-    for (_pred_id, count) in pred_count[1..].iter().enumerate() {
-        // Skip ID 0 (unused), so pred_id is actually pred_id + 1
+    for count in pred_count[1..].iter() {
         accumulated += count;
         if accumulated > num_predicates {
             break;
@@ -81,7 +80,7 @@ pub fn build_predicate_index(predicates: &[u64], max_predicate: u64) -> Result<P
     }
 
     // Make sure last bit is set (marks end of last group)
-    if bitmap.len() > 0 {
+    if !bitmap.is_empty() {
         bitmap.set_last(true);
     }
 

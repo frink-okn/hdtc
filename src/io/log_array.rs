@@ -31,13 +31,13 @@ pub fn bits_for(max_value: u64) -> u8 {
 /// Number of u64 words needed to store `count` entries at `bits` bits each.
 fn words_needed(count: u64, bits: u8) -> u64 {
     let total_bits = count * bits as u64;
-    (total_bits + 63) / 64
+    total_bits.div_ceil(64)
 }
 
 /// Number of bytes needed to store `count` entries at `bits` bits each (byte-packed).
 fn bytes_needed(count: u64, bits: u8) -> u64 {
     let total_bits = count * bits as u64;
-    (total_bits + 7) / 8
+    total_bits.div_ceil(8)
 }
 
 /// Writer for building a LogArray incrementally.

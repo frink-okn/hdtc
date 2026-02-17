@@ -99,7 +99,7 @@ impl BitmapWriter {
         } else {
             ((self.num_bits - 1) / 64 + 1) as usize
         };
-        let data_byte_count = ((self.num_bits + 7) / 8) as usize;
+        let data_byte_count = (self.num_bits.div_ceil(8)) as usize;
 
         let mut data = Vec::with_capacity(data_byte_count);
         for i in 0..num_words {
@@ -168,7 +168,7 @@ impl BitmapReader {
         } else {
             ((num_bits - 1) / 64 + 1) as usize
         };
-        let data_byte_count = ((num_bits + 7) / 8) as usize;
+        let data_byte_count = (num_bits.div_ceil(8)) as usize;
         let mut data = vec![0u8; data_byte_count];
         reader.read_exact(&mut data)?;
 

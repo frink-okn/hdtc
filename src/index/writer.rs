@@ -42,7 +42,7 @@ pub fn write_index(
         crate::io::ControlType::Triples,
         "<http://purl.org/HDT/hdt#indexFoQ>",
     );
-    ci.set_property("numTriples", &num_triples.to_string());
+    ci.set_property("numTriples", num_triples.to_string());
     ci.set_property("order", "1"); // OPS order
     ci.write_to(&mut writer)
         .context("Failed to write control info to index file")?;

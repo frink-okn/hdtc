@@ -101,12 +101,12 @@ pub fn discover_inputs(paths: &[PathBuf]) -> Result<Vec<RdfInput>> {
                 .into_iter()
                 .filter_map(|e| e.ok())
             {
-                if entry.file_type().is_file() {
-                    if let Some(input) = classify_file(entry.path()) {
-                        inputs.push(input);
-                    }
-                    // Silently skip unrecognized files in directories
+                if entry.file_type().is_file()
+                    && let Some(input) = classify_file(entry.path())
+                {
+                    inputs.push(input);
                 }
+                // Silently skip unrecognized files in directories
             }
         } else {
             bail!(

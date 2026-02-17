@@ -63,10 +63,10 @@ where
     let format = to_oxrdf_format(input.format);
 
     let mut parser = oxrdfio::RdfParser::from_format(format).lenient();
-    if let Some(base) = base_uri {
-        if let Ok(p) = parser.clone().with_base_iri(base) {
-            parser = p;
-        }
+    if let Some(base) = base_uri
+        && let Ok(p) = parser.clone().with_base_iri(base)
+    {
+        parser = p;
     }
 
     let blank_prefix = format!("f{file_index}_");
@@ -188,20 +188,20 @@ fn literal_ntriples_size(l: &Literal) -> u64 {
 /// This calculates the size as if the original RDF file were serialized to N-Triples/N-Quads,
 /// WITHOUT the internal blank node disambiguation prefix that we add during parsing.
 fn calculate_original_ntriples_size(
-    subject: &oxrdf::Subject,
+    subject: &oxrdf::NamedOrBlankNode,
     predicate: &oxrdf::NamedNode,
     object: &Term,
     graph: &GraphName,
 ) -> u64 {
     let mut size = 0u64;
 
-    // Subject: URI or blank node (from oxrdf::Subject)
+    // Subject: URI or blank node (from oxrdf::NamedOrBlankNode)
     match subject {
-        oxrdf::Subject::BlankNode(b) => {
+        oxrdf::NamedOrBlankNode::BlankNode(b) => {
             // Blank nodes are serialized as "_:name" with no extra brackets
             size += 2 + b.as_str().len() as u64; // _: + name
         }
-        oxrdf::Subject::NamedNode(n) => {
+        oxrdf::NamedOrBlankNode::NamedNode(n) => {
             // URIs are serialized as <uri>
             size += 2 + n.as_str().len() as u64; // < + uri + >
         }

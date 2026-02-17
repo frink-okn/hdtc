@@ -91,9 +91,8 @@ pub fn create_index(
     // Scan forward to find the triples section marker ($HDT magic bytes).
     let mut buf = [0u8; 4];
     let mut byte = [0u8; 1];
-    let mut num_triples = 0u64;
 
-    loop {
+    let num_triples = loop {
         reader
             .read_exact(&mut byte)
             .context("Failed to read while scanning for triples section")?;
@@ -131,17 +130,17 @@ pub fn create_index(
                         .read_exact(&mut [0u8; 2])
                         .context("Failed to skip CRC16")?;
 
-                    num_triples = properties
+                    let nt = properties
                         .get("numTriples")
                         .and_then(|s| s.parse().ok())
                         .context("Missing or invalid numTriples")?;
 
-                    tracing::info!("Decoded main HDT: {} triples", num_triples);
-                    break;
+                    tracing::info!("Decoded main HDT: {} triples", nt);
+                    break nt;
                 }
             }
         }
-    }
+    };
 
     // Read BitmapTriples structures (order: Y, Z, Y, Z)
     let bitmap_y = BitmapReader::read_from(&mut reader)

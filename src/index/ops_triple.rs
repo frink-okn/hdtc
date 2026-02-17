@@ -20,16 +20,6 @@ pub struct OpsTriple {
     pub subject: u64,
 }
 
-impl OpsTriple {
-    /// Create an OpsTriple from column values.
-    pub fn new(object: u64, predicate: u64, subject: u64) -> Self {
-        Self {
-            object,
-            predicate,
-            subject,
-        }
-    }
-}
 
 impl From<IdTriple> for OpsTriple {
     fn from(t: IdTriple) -> Self {
@@ -102,9 +92,21 @@ mod tests {
 
     #[test]
     fn test_ops_ordering() {
-        let t1 = OpsTriple::new(1, 2, 3);
-        let t2 = OpsTriple::new(1, 3, 2);
-        let t3 = OpsTriple::new(2, 1, 1);
+        let t1 = OpsTriple {
+            object: 1,
+            predicate: 2,
+            subject: 3,
+        };
+        let t2 = OpsTriple {
+            object: 1,
+            predicate: 3,
+            subject: 2,
+        };
+        let t3 = OpsTriple {
+            object: 2,
+            predicate: 1,
+            subject: 1,
+        };
 
         // Same object, different predicate
         assert!(t1 < t2);
@@ -113,8 +115,16 @@ mod tests {
         assert!(t1 < t3);
 
         // Same object and predicate, different subject
-        let t1a = OpsTriple::new(1, 2, 3);
-        let t1b = OpsTriple::new(1, 2, 4);
+        let t1a = OpsTriple {
+            object: 1,
+            predicate: 2,
+            subject: 3,
+        };
+        let t1b = OpsTriple {
+            object: 1,
+            predicate: 2,
+            subject: 4,
+        };
         assert!(t1a < t1b);
     }
 
@@ -139,7 +149,11 @@ mod tests {
 
     #[test]
     fn test_sortable_roundtrip() -> Result<()> {
-        let original = OpsTriple::new(100, 200, 300);
+        let original = OpsTriple {
+            object: 100,
+            predicate: 200,
+            subject: 300,
+        };
 
         let mut buf = Vec::new();
         original.write_to(&mut buf)?;

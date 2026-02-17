@@ -47,7 +47,7 @@ impl PfcEncoder {
     pub fn push(&mut self, s: impl Into<String>) {
         let s = s.into();
         debug_assert!(
-            self.strings.last().map_or(true, |prev| prev.as_str() < s.as_str()),
+            self.strings.last().is_none_or(|prev| prev.as_str() < s.as_str()),
             "Strings must be added in sorted order"
         );
         self.strings.push(s);

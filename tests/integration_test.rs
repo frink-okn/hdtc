@@ -970,7 +970,7 @@ fn test_single_triple_pipeline() {
     let work_dir = temp_dir.path().join("work");
 
     let output = Command::new(env!("CARGO_BIN_EXE_hdtc"))
-        .args(&[
+        .args([
             "create",
             nt_path.to_str().unwrap(),
             "-o", hdt_path.to_str().unwrap(),
@@ -1009,7 +1009,7 @@ fn test_many_small_batches_backpressure() {
 
     // Use a very small memory limit to force multiple batches and test backpressure
     let output = Command::new(env!("CARGO_BIN_EXE_hdtc"))
-        .args(&[
+        .args([
             "create",
             nt_path.to_str().unwrap(),
             "-o", hdt_path.to_str().unwrap(),
@@ -1056,7 +1056,7 @@ fn test_multi_file_term_overlap() {
     let work_dir = temp_dir.path().join("work");
 
     let output = Command::new(env!("CARGO_BIN_EXE_hdtc"))
-        .args(&[
+        .args([
             "create",
             file1.to_str().unwrap(),
             file2.to_str().unwrap(),

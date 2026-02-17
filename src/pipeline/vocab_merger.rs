@@ -228,9 +228,7 @@ pub fn merge_vocabularies(
         let roles_in_batch = heap_entry.roles;
 
         // Check if this is the same term as previous or a new term
-        let is_same_term = current_term
-            .as_ref()
-            .map_or(false, |prev| prev == &term);
+        let is_same_term = current_term.as_ref() == Some(&term);
 
         if !is_same_term && current_term.is_some() {
             // Count completed term
@@ -243,8 +241,8 @@ pub fn merge_vocabularies(
         current_term = Some(term);
 
         // Fetch next entry from same source
-        if let Some(Some(reader)) = readers.get_mut(source_batch) {
-            if let Some(next_entry) = reader.read_entry()? {
+        if let Some(Some(reader)) = readers.get_mut(source_batch)
+            && let Some(next_entry) = reader.read_entry()? {
                 merge_heap.push(HeapEntry {
                     term: next_entry.term.clone(),
                     roles: next_entry.roles,
@@ -254,9 +252,6 @@ pub fn merge_vocabularies(
                 });
             }
         }
-    }
-
-    // Count final term
     if current_term.is_some() {
         count_term_section(&merged_roles, &mut counts);
     }
@@ -302,28 +297,28 @@ pub fn merge_vocabularies(
         let p_local_id = heap_entry.p_local_id;
 
         // Check if this is the same term as previous or a new term
-        let is_same_term = current_term
-            .as_ref()
-            .map_or(false, |prev| prev == &term);
+        let is_same_term = current_term.as_ref() == Some(&term);
 
-        if !is_same_term && current_term.is_some() {
-            // Process completed term
-            assign_global_ids_and_record_mappings(
-                current_term.as_ref().unwrap(),
-                merged_roles,
-                &batches_with_term,
-                &counts,  // Use final counts for offset calculation
-                &mut section_counts,  // Track current position
-                &mut shared_enc,
-                &mut subjects_enc,
-                &mut predicates_enc,
-                &mut objects_enc,
-                &mut predicate_ids,
-                &mut id_mappings,
-            )?;
+        if !is_same_term {
+            // Process completed term if we have a current term
+            if let Some(prev_term) = &current_term {
+                assign_global_ids_and_record_mappings(
+                    prev_term,
+                    merged_roles,
+                    &batches_with_term,
+                    &counts,  // Use final counts for offset calculation
+                    &mut section_counts,  // Track current position
+                    &mut shared_enc,
+                    &mut subjects_enc,
+                    &mut predicates_enc,
+                    &mut objects_enc,
+                    &mut predicate_ids,
+                    &mut id_mappings,
+                )?;
 
-            batches_with_term.clear();
-            merged_roles = Roles::empty();
+                batches_with_term.clear();
+                merged_roles = Roles::empty();
+            }
         }
 
         // Accumulate roles for current term
@@ -337,16 +332,15 @@ pub fn merge_vocabularies(
         current_term = Some(term);
 
         // Fetch next entry from same source
-        if let Some(Some(reader)) = readers.get_mut(source_batch) {
-            if let Some(next_entry) = reader.read_entry()? {
-                merge_heap.push(HeapEntry {
-                    term: next_entry.term.clone(),
-                    roles: next_entry.roles,
-                    so_local_id: next_entry.so_local_id,
-                    p_local_id: next_entry.p_local_id,
-                    source_batch,
-                });
-            }
+        if let Some(Some(reader)) = readers.get_mut(source_batch)
+            && let Some(next_entry) = reader.read_entry()? {
+            merge_heap.push(HeapEntry {
+                term: next_entry.term.clone(),
+                roles: next_entry.roles,
+                so_local_id: next_entry.so_local_id,
+                p_local_id: next_entry.p_local_id,
+                source_batch,
+            });
         }
     }
 
@@ -430,6 +424,7 @@ fn count_term_section(roles: &Roles, counts: &mut DictCounts) {
 }
 
 /// Assign global IDs and record mappings for a single term.
+#[allow(clippy::too_many_arguments)]
 fn assign_global_ids_and_record_mappings(
     term: &[u8],
     roles: Roles,
@@ -455,10 +450,10 @@ fn assign_global_ids_and_record_mappings(
 
         // Record mapping for each batch that had this predicate
         for info in batches {
-            if info.roles.contains(Roles::PREDICATE) {
-                if let Some(local_p_id) = info.p_local_id {
-                    id_mappings[info.batch_id].p_map[local_p_id as usize] = global_pred_id;
-                }
+            if info.roles.contains(Roles::PREDICATE)
+                && let Some(local_p_id) = info.p_local_id
+            {
+                id_mappings[info.batch_id].p_map[local_p_id as usize] = global_pred_id;
             }
         }
     }
@@ -484,10 +479,10 @@ fn assign_global_ids_and_record_mappings(
 
         // Record mapping for each batch that had this subject/object
         for info in batches {
-            if info.roles.intersects(Roles::SUBJECT | Roles::OBJECT) {
-                if let Some(local_so_id) = info.so_local_id {
-                    id_mappings[info.batch_id].so_map[local_so_id as usize] = global_so_id;
-                }
+            if info.roles.intersects(Roles::SUBJECT | Roles::OBJECT)
+                && let Some(local_so_id) = info.so_local_id
+            {
+                id_mappings[info.batch_id].so_map[local_so_id as usize] = global_so_id;
             }
         }
     }

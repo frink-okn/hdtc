@@ -157,7 +157,7 @@ fn test_hdt_crate_all_triples_content() {
         .collect();
     triples.sort();
 
-    let mut expected = vec![
+    let mut expected = [
         ["http://example.org/alice", "http://example.org/name", "\"Alice\""],
         ["http://example.org/alice", "http://example.org/knows", "http://example.org/bob"],
         ["http://example.org/bob", "http://example.org/name", "\"Bob\""],
@@ -218,18 +218,22 @@ fn ensure_hdt_java() -> PathBuf {
 
         eprintln!("Downloading hdt-java from {url}...");
 
-        let curl = Command::new("curl")
+        let mut curl = Command::new("curl")
             .args(["-fsSL", &url])
             .stdout(std::process::Stdio::piped())
             .spawn()
             .expect("Failed to start curl");
 
+        let curl_stdout = curl.stdout.take().unwrap();
+
         let tar_output = Command::new("tar")
             .args(["xzf", "-", "--strip-components=1"])
             .current_dir(&base_dir)
-            .stdin(curl.stdout.unwrap())
+            .stdin(curl_stdout)
             .output()
             .expect("Failed to extract hdt-java tarball");
+
+        curl.wait().expect("Failed to wait for curl");
 
         assert!(
             tar_output.status.success(),

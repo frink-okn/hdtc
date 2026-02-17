@@ -235,10 +235,10 @@ impl<T: Sortable> Iterator for MergeIterator<T> {
             }
 
             // Skip duplicates: if this item equals the last emitted item, continue
-            if let Some(ref last) = self.last_item {
-                if &entry.item == last {
-                    continue; // Skip duplicate
-                }
+            if let Some(ref last) = self.last_item
+                && &entry.item == last
+            {
+                continue; // Skip duplicate
             }
 
             // Emit this item and remember it for next comparison

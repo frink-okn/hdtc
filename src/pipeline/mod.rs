@@ -82,7 +82,7 @@ fn calculate_batch_size(memory_budget: usize) -> usize {
     let batch_size = available / (bytes_per_triple * num_batches_buffered);
 
     // Clamp to reasonable range: 1M - 20M triples per batch
-    batch_size.max(1_000_000).min(20_000_000)
+    batch_size.clamp(1_000_000, 20_000_000)
 }
 
 /// Stage 1: Parse RDF and batch quads.
@@ -100,7 +100,7 @@ fn parser_stage(
     for (file_index, input) in inputs.iter().enumerate() {
         tracing::info!("Parsing: {}", input.path.display());
 
-        let parse_stats = stream_quads(&input, file_index, Some(&base_uri), |quad| {
+        let parse_stats = stream_quads(input, file_index, Some(&base_uri), |quad| {
             // In triples mode, we include all quads but ignore the graph component
             // (it will be None when building triples)
             current_batch.push(quad);
@@ -151,10 +151,10 @@ fn vocab_builder_stage(
             let p_id = builder.get_or_assign_id(quad.predicate.as_bytes(), Roles::PREDICATE);
             let o_id = builder.get_or_assign_id(quad.object.as_bytes(), Roles::OBJECT);
 
-            if include_graphs {
-                if let Some(ref graph) = quad.graph {
-                    builder.get_or_assign_id(graph.as_bytes(), Roles::GRAPH);
-                }
+            if include_graphs
+                && let Some(ref graph) = quad.graph
+            {
+                builder.get_or_assign_id(graph.as_bytes(), Roles::GRAPH);
             }
 
             builder.id_triples.push(LocalIdTriple {
@@ -466,7 +466,7 @@ pub fn run_pipeline(
         sorter.push(triple, &mut buffer, &mut mem_used)?;
         triple_count += 1;
 
-        if triple_count % 10_000_000 == 0 {
+        if triple_count.is_multiple_of(10_000_000) {
             tracing::info!("Collected {} triples for sorting", triple_count);
         }
     }
