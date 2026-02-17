@@ -185,7 +185,7 @@ pub fn merge_vocabularies(
                     entry.roles
                 );
                 merge_heap.push(HeapEntry {
-                    term: entry.term.clone(),
+                    term: entry.term,
                     roles: entry.roles,
                     so_local_id: entry.so_local_id,
                     p_local_id: entry.p_local_id,
@@ -244,7 +244,7 @@ pub fn merge_vocabularies(
         if let Some(Some(reader)) = readers.get_mut(source_batch)
             && let Some(next_entry) = reader.read_entry()? {
                 merge_heap.push(HeapEntry {
-                    term: next_entry.term.clone(),
+                    term: next_entry.term,
                     roles: next_entry.roles,
                     so_local_id: next_entry.so_local_id,
                     p_local_id: next_entry.p_local_id,
@@ -273,7 +273,7 @@ pub fn merge_vocabularies(
         // Read first entry and push to heap
         if let Some(entry) = reader.read_entry()? {
             merge_heap.push(HeapEntry {
-                term: entry.term.clone(),
+                term: entry.term,
                 roles: entry.roles,
                 so_local_id: entry.so_local_id,
                 p_local_id: entry.p_local_id,
@@ -335,7 +335,7 @@ pub fn merge_vocabularies(
         if let Some(Some(reader)) = readers.get_mut(source_batch)
             && let Some(next_entry) = reader.read_entry()? {
             merge_heap.push(HeapEntry {
-                term: next_entry.term.clone(),
+                    term: next_entry.term,
                 roles: next_entry.roles,
                 so_local_id: next_entry.so_local_id,
                 p_local_id: next_entry.p_local_id,
