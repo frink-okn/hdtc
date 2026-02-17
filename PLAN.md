@@ -307,14 +307,21 @@ same deterministic ordering and ID assignment as current single-threaded merge.
 - [x] Fail plan if end-to-end gain < 3% after Phase B + C (then keep simpler implementation)
 - [x] Keep each phase as a separate commit to allow clean rollback
 
+**Latest measured result (single-pass + parallel mapping writes):**
+
+- 2026-02-17: Enabled parallel `IdMapping::write_to_file` in Stage 4; validated with full `cargo test` and 2-run secure-chain benchmark sample.
+- 2-run sample on secure-chain benchmark: mapping writes reduced from ~4.10-4.28s to ~0.65-0.70s (~84-85% reduction)
+- Stage 4 subtotal reduced to ~9.53-9.69s from prior ~12.5-13.0s (~22-26% faster)
+- RSS remained within prior guardrails
+
 #### Function-level implementation checklist (do-this-next)
 
 **Phase A touchpoints (instrumentation):**
 
 - [x] In `merge_vocabularies` (`src/pipeline/vocab_merger.rs`), add stage-local timers around:
   - [x] reader initialization (`PartialVocabReader::open` + first `read_entry`)
-  - [x] pass 1 merge/count loop
-  - [x] pass 2 merge/ID-assignment loop
+  - [x] stream merge/read loop
+  - [x] ID-assignment loop
   - [x] dictionary section serialization (`shared_enc.write_to`, `subjects_enc.write_to`, `predicates_enc.write_to`, `objects_enc.write_to`)
   - [x] mapping writes (`IdMapping::write_to_file` loop)
 - [x] In `merge_vocabularies`, add compressed-byte counters consumed in pass 1 and pass 2
