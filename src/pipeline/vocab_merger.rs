@@ -121,6 +121,43 @@ struct StreamEntry {
     source_batch: usize,
 }
 
+const PROVISIONAL_SO_ID_TAG: u64 = 1 << 63;
+const PROVISIONAL_SO_ID_MASK: u64 = !PROVISIONAL_SO_ID_TAG;
+
+fn encode_provisional_so_id(local_section_id: u64) -> u64 {
+    debug_assert!(local_section_id > 0);
+    debug_assert!(local_section_id <= PROVISIONAL_SO_ID_MASK);
+    local_section_id | PROVISIONAL_SO_ID_TAG
+}
+
+fn is_provisional_so_id(id: u64) -> bool {
+    (id & PROVISIONAL_SO_ID_TAG) != 0
+}
+
+fn decode_provisional_so_id(id: u64) -> u64 {
+    id & PROVISIONAL_SO_ID_MASK
+}
+
+fn finalize_provisional_so_ids(id_mappings: &mut [IdMapping], shared_count: u64) -> Result<()> {
+    if shared_count > PROVISIONAL_SO_ID_MASK {
+        anyhow::bail!(
+            "Shared term count {} exceeds provisional ID range",
+            shared_count
+        );
+    }
+
+    for mapping in id_mappings {
+        for mapped_id in &mut mapping.so_map {
+            if is_provisional_so_id(*mapped_id) {
+                let local_section_id = decode_provisional_so_id(*mapped_id);
+                *mapped_id = shared_count + local_section_id;
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Result of vocabulary merge.
 pub struct VocabMergeResult {
     pub dict_sections: Vec<Vec<u8>>, // PFC-encoded: [shared, subjects, predicates, objects]
@@ -138,22 +175,20 @@ pub fn merge_vocabularies(
 ) -> Result<VocabMergeResult> {
     tracing::info!("Merging {} partial vocabularies", batch_infos.len());
 
-    let mut pass1_reader_init_time = Duration::ZERO;
-    let mut pass1_read_time = Duration::ZERO;
-    let mut pass2_reader_init_time = Duration::ZERO;
-    let mut pass2_read_time = Duration::ZERO;
+    let mut stream_reader_init_time = Duration::ZERO;
+    let mut stream_read_time = Duration::ZERO;
     let mut id_assignment_time = Duration::ZERO;
+    let mut so_map_finalize_time = Duration::ZERO;
     let mut pfc_serialize_time = Duration::ZERO;
     let mut mapping_write_time = Duration::ZERO;
-    let mut pass1_bytes_read = 0u64;
-    let mut pass2_bytes_read = 0u64;
+    let mut stream_bytes_read = 0u64;
 
     let mut id_mappings: Vec<IdMapping> = Vec::new();
 
     for (batch_id, vocab_path) in &batch_infos {
         let init_start = Instant::now();
         tracing::debug!("Opening partial vocab header for batch {}: {:?}", batch_id, vocab_path);
-        pass1_bytes_read += std::fs::metadata(vocab_path)
+        stream_bytes_read += std::fs::metadata(vocab_path)
             .with_context(|| format!("Failed to stat partial vocab for batch {}", batch_id))?
             .len();
         let reader = PartialVocabReader::open(vocab_path)
@@ -166,7 +201,7 @@ pub fn merge_vocabularies(
         mapping.so_map = vec![0u64; (max_so_id + 1) as usize];
         mapping.p_map = vec![0u64; (max_p_id + 1) as usize];
         id_mappings.push(mapping);
-        pass1_reader_init_time += init_start.elapsed();
+        stream_reader_init_time += init_start.elapsed();
     }
 
     // Initialize PFC encoders for each section
@@ -178,74 +213,17 @@ pub fn merge_vocabularies(
     let mut counts = DictCounts::default();
     let mut predicate_ids = HashMap::new();
 
-    // Two-pass streaming merge for constant memory usage:
-    // Pass 1: Count terms in each section to determine offsets
-    // Pass 2: Re-stream and assign global IDs with correct offsets
+    // Single-pass streaming merge:
+    // - Aggregate term roles across batches
+    // - Assign IDs and write dictionary sections immediately
+    // - Use provisional SO IDs for subject-only/object-only terms, then finalize once shared count is known
+    tracing::debug!("Single-pass merge: assigning global IDs with provisional SO offsets");
 
-    // === PASS 1: Count terms per section ===
-    tracing::debug!("Pass 1: Counting terms per section");
-    let pass1_init_start = Instant::now();
-    let (pass1_rx, pass1_worker_handles) = build_parallel_vocab_stream(&batch_infos, 2048)?;
-    pass1_reader_init_time += pass1_init_start.elapsed();
-
-    let pass1_result = (|| -> Result<()> {
-        let mut pass1_current_term: Option<Vec<u8>> = None;
-        let mut pass1_merged_roles = Roles::empty();
-
-        loop {
-            let read_start = Instant::now();
-            let recv_item = pass1_rx.recv();
-            pass1_read_time += read_start.elapsed();
-
-            let stream_entry = match recv_item {
-                Ok(Ok(entry)) => entry,
-                Ok(Err(e)) => return Err(e),
-                Err(_) => break,
-            };
-
-            let term = stream_entry.term;
-            let roles_in_batch = stream_entry.roles;
-
-            let is_same_term = pass1_current_term.as_ref() == Some(&term);
-
-            if !is_same_term && pass1_current_term.is_some() {
-                count_term_section(&pass1_merged_roles, &mut counts);
-                pass1_merged_roles = Roles::empty();
-            }
-
-            pass1_merged_roles |= roles_in_batch;
-            pass1_current_term = Some(term);
-        }
-
-        if pass1_current_term.is_some() {
-            count_term_section(&pass1_merged_roles, &mut counts);
-        }
-
-        Ok(())
-    })();
-
-    join_worker_handles(pass1_worker_handles)?;
-    pass1_result?;
-
-    tracing::debug!("Counts: {} shared, {} subjects, {} predicates, {} objects",
-                    counts.shared, counts.subjects, counts.predicates, counts.objects);
-
-    // === PASS 2: Re-open readers and assign global IDs ===
-    tracing::debug!("Pass 2: Assigning global IDs with correct offsets");
-
-    for (batch_id, vocab_path) in &batch_infos {
-        pass2_bytes_read += std::fs::metadata(vocab_path)
-            .with_context(|| format!("Failed to stat partial vocab for batch {}", batch_id))?
-            .len();
-    }
-
-    let pass2_init_start = Instant::now();
+    let stream_init_start = Instant::now();
     let (stream_rx, worker_handles) = build_parallel_vocab_stream(&batch_infos, 2048)?;
-    pass2_reader_init_time += pass2_init_start.elapsed();
+    stream_reader_init_time += stream_init_start.elapsed();
 
-    // Second merge consumption: assign global IDs from merged stream
-    let pass2_result = (|| -> Result<()> {
-        let mut section_counts = DictCounts::default();  // Track current position in each section
+    let stream_result = (|| -> Result<()> {
         let mut current_term: Option<Vec<u8>> = None;
         let mut merged_roles = Roles::empty();
         let mut batches_with_term: Vec<TermBatchInfo> = Vec::new();
@@ -253,7 +231,7 @@ pub fn merge_vocabularies(
         loop {
             let read_start = Instant::now();
             let recv_item = stream_rx.recv();
-            pass2_read_time += read_start.elapsed();
+            stream_read_time += read_start.elapsed();
 
             let stream_entry = match recv_item {
                 Ok(Ok(entry)) => entry,
@@ -276,8 +254,7 @@ pub fn merge_vocabularies(
                         prev_term,
                         merged_roles,
                         &batches_with_term,
-                        &counts,
-                        &mut section_counts,
+                        &mut counts,
                         &mut shared_enc,
                         &mut subjects_enc,
                         &mut predicates_enc,
@@ -308,8 +285,7 @@ pub fn merge_vocabularies(
                 &term,
                 merged_roles,
                 &batches_with_term,
-                &counts,
-                &mut section_counts,
+                &mut counts,
                 &mut shared_enc,
                 &mut subjects_enc,
                 &mut predicates_enc,
@@ -324,7 +300,11 @@ pub fn merge_vocabularies(
     })();
 
     join_worker_handles(worker_handles)?;
-    pass2_result?;
+    stream_result?;
+
+    let so_finalize_start = Instant::now();
+    finalize_provisional_so_ids(&mut id_mappings, counts.shared)?;
+    so_map_finalize_time += so_finalize_start.elapsed();
 
     tracing::info!(
         "Merged vocabulary: {} shared, {} subjects, {} predicates, {} objects",
@@ -371,14 +351,12 @@ pub fn merge_vocabularies(
     mapping_write_time += mapping_write_start.elapsed();
 
     tracing::debug!(
-        "Stage 4 timing: pass1 init {:.3}s/read {:.3}s ({} MB), pass2 init {:.3}s/dequeue {:.3}s ({} MB), assign {:.3}s, dict serialize {:.3}s, mapping writes {:.3}s",
-        pass1_reader_init_time.as_secs_f64(),
-        pass1_read_time.as_secs_f64(),
-        pass1_bytes_read / (1024 * 1024),
-        pass2_reader_init_time.as_secs_f64(),
-        pass2_read_time.as_secs_f64(),
-        pass2_bytes_read / (1024 * 1024),
+        "Stage 4 timing: stream init {:.3}s/read {:.3}s ({} MB), assign {:.3}s, finalize SO-map {:.3}s, dict serialize {:.3}s, mapping writes {:.3}s",
+        stream_reader_init_time.as_secs_f64(),
+        stream_read_time.as_secs_f64(),
+        stream_bytes_read / (1024 * 1024),
         id_assignment_time.as_secs_f64(),
+        so_map_finalize_time.as_secs_f64(),
         pfc_serialize_time.as_secs_f64(),
         mapping_write_time.as_secs_f64(),
     );
@@ -544,28 +522,13 @@ fn join_worker_handles(handles: Vec<JoinHandle<()>>) -> Result<()> {
     Ok(())
 }
 
-/// Count a completed term into the appropriate dictionary section.
-fn count_term_section(roles: &Roles, counts: &mut DictCounts) {
-    if roles.contains(Roles::PREDICATE) {
-        counts.predicates += 1;
-    }
-    if roles.contains(Roles::SUBJECT) && roles.contains(Roles::OBJECT) {
-        counts.shared += 1;
-    } else if roles.contains(Roles::SUBJECT) {
-        counts.subjects += 1;
-    } else if roles.contains(Roles::OBJECT) {
-        counts.objects += 1;
-    }
-}
-
 /// Assign global IDs and record mappings for a single term.
 #[allow(clippy::too_many_arguments)]
 fn assign_global_ids_and_record_mappings(
     term: &[u8],
     roles: Roles,
     batches: &[TermBatchInfo],
-    final_counts: &DictCounts,  // Final section counts for offset calculation
-    section_counts: &mut DictCounts,  // Current position in each section
+    counts: &mut DictCounts,
     shared_enc: &mut PfcEncoder,
     subjects_enc: &mut PfcEncoder,
     predicates_enc: &mut PfcEncoder,
@@ -578,8 +541,8 @@ fn assign_global_ids_and_record_mappings(
 
     // Handle predicates (separate ID space)
     if roles.contains(Roles::PREDICATE) {
-        section_counts.predicates += 1;
-        let global_pred_id = section_counts.predicates;
+        counts.predicates += 1;
+        let global_pred_id = counts.predicates;
         predicates_enc.push(term_str);
         predicate_ids.insert(term_str.to_string(), global_pred_id);
 
@@ -597,19 +560,19 @@ fn assign_global_ids_and_record_mappings(
     if roles.intersects(Roles::SUBJECT | Roles::OBJECT) {
         let global_so_id = if roles.contains(Roles::SUBJECT | Roles::OBJECT) {
             // Shared: appears as both subject and object
-            section_counts.shared += 1;
+            counts.shared += 1;
             shared_enc.push(term_str);
-            section_counts.shared
+            counts.shared
         } else if roles.contains(Roles::SUBJECT) {
-            // Subject-only: offset by total shared count
-            section_counts.subjects += 1;
+            // Subject-only: use provisional section-local ID, fix offset after stream completes
+            counts.subjects += 1;
             subjects_enc.push(term_str);
-            final_counts.shared + section_counts.subjects
+            encode_provisional_so_id(counts.subjects)
         } else {
-            // Object-only: offset by total shared count
-            section_counts.objects += 1;
+            // Object-only: use provisional section-local ID, fix offset after stream completes
+            counts.objects += 1;
             objects_enc.push(term_str);
-            final_counts.shared + section_counts.objects
+            encode_provisional_so_id(counts.objects)
         };
 
         // Record mapping for each batch that had this subject/object

@@ -52,12 +52,12 @@ all terms are counted.
 
 **Steps:**
 
-- [ ] Choose approach (recommended: Option A — buffer merged entries in memory during single merge pass, since deduplicated unique terms are modest in size, ~26M entries for 550M triples)
+- [x] Choose approach (implemented Option C: provisional subject/object-only IDs with final SO-map fix-up after shared count is known)
 - [ ] Option A: During the single merge, buffer merged `(term, roles, batch_sources)` entries. After merge completes, iterate buffer to assign global IDs.
 - [ ] Option B (alternative): Pre-count with a lightweight first pass reading only roles bytes (skip term data) then do a full second pass. Cheaper than current but still two passes.
-- [ ] Option C (alternative): Assign provisional IDs during single merge, then fix up subject-only and object-only offsets in the mapping arrays (no re-read of vocab files).
-- [ ] Remove the file re-open and second merge loop
-- [ ] Update tests to verify identical dictionary output
+- [x] Option C (alternative): Assign provisional IDs during single merge, then fix up subject-only and object-only offsets in the mapping arrays (no re-read of vocab files).
+- [x] Remove the file re-open and second merge loop
+- [x] Update tests to verify identical dictionary output
 
 ---
 
