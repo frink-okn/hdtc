@@ -48,11 +48,13 @@ fn open_input(input: &RdfInput) -> Result<Box<dyn Read>> {
 
 /// Stream quads from an RDF input file, calling the callback for each quad.
 ///
-/// Blank nodes are disambiguated by prefixing with `f{file_index}_`.
+/// When `disambiguate_blank_nodes` is true, blank nodes are disambiguated by
+/// prefixing with `f{file_index}_`.
 /// Malformed input is skipped with a warning; the total skip count is returned.
 pub fn stream_quads<F>(
     input: &RdfInput,
     file_index: usize,
+    disambiguate_blank_nodes: bool,
     base_uri: Option<&str>,
     mut callback: F,
 ) -> Result<ParseStats>
@@ -69,7 +71,11 @@ where
         parser = p;
     }
 
-    let blank_prefix = format!("f{file_index}_");
+    let blank_prefix = if disambiguate_blank_nodes {
+        format!("f{file_index}_")
+    } else {
+        String::new()
+    };
     let mut stats = ParseStats::default();
 
     for result in parser.for_reader(reader) {
@@ -285,7 +291,7 @@ mod tests {
 "#;
         let (_f, input) = make_temp_nt(content);
         let mut quads = Vec::new();
-        let stats = stream_quads(&input, 0, None, |q| {
+        let stats = stream_quads(&input, 0, true, None, |q| {
             quads.push(q);
             Ok(())
         })
@@ -305,7 +311,7 @@ mod tests {
         let content = "_:b1 <http://example.org/p> _:b2 .\n";
         let (_f, input) = make_temp_nt(content);
         let mut quads = Vec::new();
-        stream_quads(&input, 5, None, |q| {
+        stream_quads(&input, 5, true, None, |q| {
             quads.push(q);
             Ok(())
         })
@@ -321,7 +327,7 @@ mod tests {
         let content = "<http://example.org/s> <http://example.org/p> <http://example.org/o> .\nthis is not valid RDF\n<http://example.org/s2> <http://example.org/p2> <http://example.org/o2> .\n";
         let (_f, input) = make_temp_nt(content);
         let mut quads = Vec::new();
-        let stats = stream_quads(&input, 0, None, |q| {
+        let stats = stream_quads(&input, 0, true, None, |q| {
             quads.push(q);
             Ok(())
         })
@@ -344,7 +350,7 @@ mod tests {
 _:b1 <http://example.org/type> <http://example.org/Thing> .
 "#;
         let (_f, input) = make_temp_nt(content);
-        let stats = stream_quads(&input, 0, None, |_q| Ok(()))
+        let stats = stream_quads(&input, 0, true, None, |_q| Ok(()))
             .unwrap();
 
         assert_eq!(stats.quads, 8);
@@ -363,7 +369,7 @@ _:b1 <http://example.org/type> <http://example.org/Thing> .
 <http://example.org/subject3> <http://example.org/predicate1> <http://example.org/object3> .
 "#;
         let (_f, input) = make_temp_nt(content);
-        let stats = stream_quads(&input, 0, None, |_q| Ok(()))
+        let stats = stream_quads(&input, 0, true, None, |_q| Ok(()))
             .unwrap();
 
         assert_eq!(stats.quads, 5);
@@ -377,7 +383,7 @@ _:b1 <http://example.org/type> <http://example.org/Thing> .
         // Test that blank node size is calculated WITHOUT the file prefix
         let content = "_:b1 <http://example.org/p> <http://example.org/o> .\n";
         let (_f, input) = make_temp_nt(content);
-        let stats = stream_quads(&input, 0, None, |_q| Ok(()))
+        let stats = stream_quads(&input, 0, true, None, |_q| Ok(()))
             .unwrap();
 
         assert_eq!(stats.quads, 1);

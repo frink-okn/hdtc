@@ -96,11 +96,17 @@ fn parser_stage(
     let mut current_batch = Vec::with_capacity(batch_size);
     let mut total_quads = 0u64;
     let mut ntriples_size = 0u64;
+    let disambiguate_blank_nodes = inputs.len() > 1;
 
     for (file_index, input) in inputs.iter().enumerate() {
         tracing::info!("Parsing: {}", input.path.display());
 
-        let parse_stats = stream_quads(input, file_index, Some(&base_uri), |quad| {
+        let parse_stats = stream_quads(
+            input,
+            file_index,
+            disambiguate_blank_nodes,
+            Some(&base_uri),
+            |quad| {
             // In triples mode, we include all quads but ignore the graph component
             // (it will be None when building triples)
             current_batch.push(quad);

@@ -274,7 +274,14 @@ needed for section counts (roles) and skipping term materialization/clone work.
 
 - [ ] Add a lightweight partial-vocab scan path for count-only pass (roles + presence of IDs, no term clone)
 - [ ] Keep existing pass-2 correctness semantics and output format unchanged
-- [ ] Verify dictionary byte-for-byte compatibility on representative fixtures
+- [x] Verify dictionary/triples compatibility on representative fixtures via parsed-structure equivalence tests against hdt-java output
+
+**Compatibility decision (2026-02-17):**
+
+- We intentionally avoid forcing raw byte-for-byte equality for all payload bytes in dictionary/triples sections.
+- Reason: non-semantic tail/padding bits in packed sequence encodings can differ while decoding to identical values.
+- Policy: keep canonical, simpler serializer behavior and assert decoded equivalence (PFC strings, bitmap bits, LogArray values) in compat tests.
+- Outcome: avoids brittle serializer tweaks that increased maintenance risk and caused large-run instability.
 
 **Memory guardrail:** Do not retain merged term buffers across the full vocabulary.
 
