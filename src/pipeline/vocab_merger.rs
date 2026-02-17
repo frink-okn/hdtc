@@ -5,8 +5,7 @@ use crate::dictionary::DictCounts;
 use crate::pipeline::PartialVocabReader;
 use anyhow::{Context, Result};
 use crossbeam_channel::{bounded, Receiver};
-use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -113,13 +112,6 @@ impl IdMapping {
     }
 }
 
-/// Heap entry for k-way merge.
-struct HeapEntry {
-    term: Vec<u8>,
-    roles: Roles,
-    source_batch: usize,
-}
-
 #[derive(Debug)]
 struct StreamEntry {
     term: Vec<u8>,
@@ -127,27 +119,6 @@ struct StreamEntry {
     so_local_id: Option<u32>,
     p_local_id: Option<u32>,
     source_batch: usize,
-}
-
-impl Eq for HeapEntry {}
-
-impl PartialEq for HeapEntry {
-    fn eq(&self, other: &Self) -> bool {
-        self.term == other.term
-    }
-}
-
-impl Ord for HeapEntry {
-    fn cmp(&self, other: &Self) -> Ordering {
-        // Reverse order for min-heap
-        other.term.cmp(&self.term)
-    }
-}
-
-impl PartialOrd for HeapEntry {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
 }
 
 /// Result of vocabulary merge.
@@ -177,18 +148,15 @@ pub fn merge_vocabularies(
     let mut pass1_bytes_read = 0u64;
     let mut pass2_bytes_read = 0u64;
 
-    // Open readers for all batches
-    let mut readers: Vec<Option<PartialVocabReader>> = Vec::new();
-    let mut merge_heap = BinaryHeap::new();
     let mut id_mappings: Vec<IdMapping> = Vec::new();
 
     for (batch_id, vocab_path) in &batch_infos {
         let init_start = Instant::now();
-        tracing::debug!("Opening partial vocab for batch {}: {:?}", batch_id, vocab_path);
+        tracing::debug!("Opening partial vocab header for batch {}: {:?}", batch_id, vocab_path);
         pass1_bytes_read += std::fs::metadata(vocab_path)
             .with_context(|| format!("Failed to stat partial vocab for batch {}", batch_id))?
             .len();
-        let mut reader = PartialVocabReader::open(vocab_path)
+        let reader = PartialVocabReader::open(vocab_path)
             .with_context(|| format!("Failed to open partial vocab for batch {}", batch_id))?;
 
         // Pre-allocate ID mappings based on max IDs from this batch
@@ -198,35 +166,6 @@ pub fn merge_vocabularies(
         mapping.so_map = vec![0u64; (max_so_id + 1) as usize];
         mapping.p_map = vec![0u64; (max_p_id + 1) as usize];
         id_mappings.push(mapping);
-
-        // Read first entry and push to heap
-        let read_start = Instant::now();
-        let first_entry = reader.read_entry();
-        pass1_read_time += read_start.elapsed();
-        match first_entry {
-            Ok(Some(entry)) => {
-                tracing::debug!(
-                    "Batch {}: first entry: {:?}, roles: {:02x}",
-                    batch_id,
-                    String::from_utf8_lossy(&entry.term),
-                    entry.roles
-                );
-                merge_heap.push(HeapEntry {
-                    term: entry.term,
-                    roles: entry.roles,
-                    source_batch: *batch_id,
-                });
-            }
-            Ok(None) => {
-                tracing::warn!("Batch {}: no entries in partial vocab", batch_id);
-            }
-            Err(e) => {
-                tracing::error!("Batch {}: error reading first entry: {}", batch_id, e);
-                return Err(e);
-            }
-        }
-
-        readers.push(Some(reader));
         pass1_reader_init_time += init_start.elapsed();
     }
 
@@ -245,44 +184,48 @@ pub fn merge_vocabularies(
 
     // === PASS 1: Count terms per section ===
     tracing::debug!("Pass 1: Counting terms per section");
-    let mut pass1_current_term: Option<Vec<u8>> = None;
-    let mut pass1_merged_roles = Roles::empty();
+    let pass1_init_start = Instant::now();
+    let (pass1_rx, pass1_worker_handles) = build_parallel_vocab_stream(&batch_infos, 2048)?;
+    pass1_reader_init_time += pass1_init_start.elapsed();
 
-    while let Some(heap_entry) = merge_heap.pop() {
-        let term = heap_entry.term;
-        let source_batch = heap_entry.source_batch;
-        let roles_in_batch = heap_entry.roles;
+    let pass1_result = (|| -> Result<()> {
+        let mut pass1_current_term: Option<Vec<u8>> = None;
+        let mut pass1_merged_roles = Roles::empty();
 
-        // Check if this is the same term as previous or a new term
-        let is_same_term = pass1_current_term.as_ref() == Some(&term);
-
-        if !is_same_term && pass1_current_term.is_some() {
-            // Count completed term
-            count_term_section(&pass1_merged_roles, &mut counts);
-            pass1_merged_roles = Roles::empty();
-        }
-
-        // Accumulate roles for current term
-        pass1_merged_roles |= roles_in_batch;
-        pass1_current_term = Some(term);
-
-        // Fetch next entry from same source
-        if let Some(Some(reader)) = readers.get_mut(source_batch) {
+        loop {
             let read_start = Instant::now();
-            let next_entry = reader.read_entry()?;
+            let recv_item = pass1_rx.recv();
             pass1_read_time += read_start.elapsed();
-            if let Some(next_entry) = next_entry {
-                merge_heap.push(HeapEntry {
-                    term: next_entry.term,
-                    roles: next_entry.roles,
-                    source_batch,
-                });
+
+            let stream_entry = match recv_item {
+                Ok(Ok(entry)) => entry,
+                Ok(Err(e)) => return Err(e),
+                Err(_) => break,
+            };
+
+            let term = stream_entry.term;
+            let roles_in_batch = stream_entry.roles;
+
+            let is_same_term = pass1_current_term.as_ref() == Some(&term);
+
+            if !is_same_term && pass1_current_term.is_some() {
+                count_term_section(&pass1_merged_roles, &mut counts);
+                pass1_merged_roles = Roles::empty();
             }
+
+            pass1_merged_roles |= roles_in_batch;
+            pass1_current_term = Some(term);
         }
-    }
-    if pass1_current_term.is_some() {
-        count_term_section(&pass1_merged_roles, &mut counts);
-    }
+
+        if pass1_current_term.is_some() {
+            count_term_section(&pass1_merged_roles, &mut counts);
+        }
+
+        Ok(())
+    })();
+
+    join_worker_handles(pass1_worker_handles)?;
+    pass1_result?;
 
     tracing::debug!("Counts: {} shared, {} subjects, {} predicates, {} objects",
                     counts.shared, counts.subjects, counts.predicates, counts.objects);
@@ -297,7 +240,7 @@ pub fn merge_vocabularies(
     }
 
     let pass2_init_start = Instant::now();
-    let (stream_rx, worker_handles) = build_parallel_pass2_stream(&batch_infos, 2048)?;
+    let (stream_rx, worker_handles) = build_parallel_vocab_stream(&batch_infos, 2048)?;
     pass2_reader_init_time += pass2_init_start.elapsed();
 
     // Second merge consumption: assign global IDs from merged stream
@@ -456,7 +399,7 @@ fn read_stream_entry(rx: &Receiver<Result<StreamEntry>>) -> Result<Option<Stream
     }
 }
 
-fn build_parallel_pass2_stream(
+fn build_parallel_vocab_stream(
     batch_infos: &[(usize, PathBuf)],
     channel_capacity: usize,
 ) -> Result<(Receiver<Result<StreamEntry>>, Vec<JoinHandle<()>>)> {
@@ -963,5 +906,78 @@ mod tests {
         assert_eq!(result.id_mappings.len(), 2);
 
         Ok(())
+    }
+
+    #[test]
+    fn test_parallel_pass2_stream_tiny_capacity_ordering() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let temp_path = temp_dir.path();
+
+        let batch0_path = temp_path.join("batch0.vocab.zst");
+        create_test_partial_vocab(
+            &batch0_path,
+            vec![
+                ("a", Roles::SUBJECT, Some(0), None),
+                ("c", Roles::SUBJECT, Some(1), None),
+            ],
+        )?;
+
+        let batch1_path = temp_path.join("batch1.vocab.zst");
+        create_test_partial_vocab(
+            &batch1_path,
+            vec![
+                ("b", Roles::SUBJECT, Some(0), None),
+                ("d", Roles::SUBJECT, Some(1), None),
+            ],
+        )?;
+
+        let batch_infos = vec![(0usize, batch0_path), (1usize, batch1_path)];
+        let (rx, handles) = build_parallel_vocab_stream(&batch_infos, 1)?;
+
+        let mut observed_terms: Vec<String> = Vec::new();
+        let mut observed_batches: Vec<usize> = Vec::new();
+        while let Ok(item) = rx.recv() {
+            let entry = item?;
+            observed_terms.push(String::from_utf8(entry.term).expect("test terms should be valid UTF-8"));
+            observed_batches.push(entry.source_batch);
+        }
+
+        join_worker_handles(handles)?;
+
+        assert_eq!(observed_terms, vec!["a", "b", "c", "d"]);
+        assert_eq!(observed_batches, vec![0, 1, 0, 1]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_parallel_pass2_stream_missing_file_propagates_error() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let missing_path = temp_dir.path().join("does_not_exist.vocab.zst");
+        let batch_infos = vec![(42usize, missing_path)];
+
+        let (rx, handles) = build_parallel_vocab_stream(&batch_infos, 2)?;
+
+        let first = rx.recv().expect("expected an error item from missing-file source");
+        let err = first.expect_err("expected error result for missing partial vocab file");
+        assert!(
+            err.to_string().contains("Failed to re-open partial vocab for batch 42"),
+            "unexpected error: {err}"
+        );
+
+        join_worker_handles(handles)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_join_worker_handles_reports_panic() {
+        let panicking_handle = std::thread::spawn(|| {
+            panic!("intentional panic for test");
+        });
+
+        let result = join_worker_handles(vec![panicking_handle]);
+        assert!(result.is_err());
+        let message = result.err().expect("expected panic error").to_string();
+        assert!(message.contains("panicked"), "unexpected panic message: {message}");
     }
 }

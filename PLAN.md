@@ -336,7 +336,7 @@ same deterministic ordering and ID assignment as current single-threaded merge.
 - [x] Build recursive merge tree with bounded channels between internal merge nodes
 - [x] Keep final global ID assignment in a single deterministic consumer stage
 - [x] Add cancellation path: any worker error closes channels and propagates one root error
-- [ ] Add deadlock-safety tests (small channel capacities + injected early errors)
+- [x] Add deadlock-safety tests (small channel capacities + injected early errors)
 
 **Definition of done for 4.4:**
 
