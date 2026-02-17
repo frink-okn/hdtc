@@ -4,11 +4,14 @@ use crate::dictionary::pfc::PfcEncoder;
 use crate::dictionary::DictCounts;
 use crate::pipeline::PartialVocabReader;
 use anyhow::{Context, Result};
+use crossbeam_channel::{bounded, Receiver};
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use super::batch_vocab::Roles;
 
@@ -114,6 +117,13 @@ impl IdMapping {
 struct HeapEntry {
     term: Vec<u8>,
     roles: Roles,
+    source_batch: usize,
+}
+
+#[derive(Debug)]
+struct StreamEntry {
+    term: Vec<u8>,
+    roles: Roles,
     so_local_id: Option<u32>,
     p_local_id: Option<u32>,
     source_batch: usize,
@@ -157,13 +167,27 @@ pub fn merge_vocabularies(
 ) -> Result<VocabMergeResult> {
     tracing::info!("Merging {} partial vocabularies", batch_infos.len());
 
+    let mut pass1_reader_init_time = Duration::ZERO;
+    let mut pass1_read_time = Duration::ZERO;
+    let mut pass2_reader_init_time = Duration::ZERO;
+    let mut pass2_read_time = Duration::ZERO;
+    let mut id_assignment_time = Duration::ZERO;
+    let mut pfc_serialize_time = Duration::ZERO;
+    let mut mapping_write_time = Duration::ZERO;
+    let mut pass1_bytes_read = 0u64;
+    let mut pass2_bytes_read = 0u64;
+
     // Open readers for all batches
     let mut readers: Vec<Option<PartialVocabReader>> = Vec::new();
     let mut merge_heap = BinaryHeap::new();
     let mut id_mappings: Vec<IdMapping> = Vec::new();
 
     for (batch_id, vocab_path) in &batch_infos {
+        let init_start = Instant::now();
         tracing::debug!("Opening partial vocab for batch {}: {:?}", batch_id, vocab_path);
+        pass1_bytes_read += std::fs::metadata(vocab_path)
+            .with_context(|| format!("Failed to stat partial vocab for batch {}", batch_id))?
+            .len();
         let mut reader = PartialVocabReader::open(vocab_path)
             .with_context(|| format!("Failed to open partial vocab for batch {}", batch_id))?;
 
@@ -176,7 +200,10 @@ pub fn merge_vocabularies(
         id_mappings.push(mapping);
 
         // Read first entry and push to heap
-        match reader.read_entry() {
+        let read_start = Instant::now();
+        let first_entry = reader.read_entry();
+        pass1_read_time += read_start.elapsed();
+        match first_entry {
             Ok(Some(entry)) => {
                 tracing::debug!(
                     "Batch {}: first entry: {:?}, roles: {:02x}",
@@ -187,8 +214,6 @@ pub fn merge_vocabularies(
                 merge_heap.push(HeapEntry {
                     term: entry.term,
                     roles: entry.roles,
-                    so_local_id: entry.so_local_id,
-                    p_local_id: entry.p_local_id,
                     source_batch: *batch_id,
                 });
             }
@@ -202,6 +227,7 @@ pub fn merge_vocabularies(
         }
 
         readers.push(Some(reader));
+        pass1_reader_init_time += init_start.elapsed();
     }
 
     // Initialize PFC encoders for each section
@@ -219,8 +245,8 @@ pub fn merge_vocabularies(
 
     // === PASS 1: Count terms per section ===
     tracing::debug!("Pass 1: Counting terms per section");
-    let mut current_term: Option<Vec<u8>> = None;
-    let mut merged_roles = Roles::empty();
+    let mut pass1_current_term: Option<Vec<u8>> = None;
+    let mut pass1_merged_roles = Roles::empty();
 
     while let Some(heap_entry) = merge_heap.pop() {
         let term = heap_entry.term;
@@ -228,32 +254,34 @@ pub fn merge_vocabularies(
         let roles_in_batch = heap_entry.roles;
 
         // Check if this is the same term as previous or a new term
-        let is_same_term = current_term.as_ref() == Some(&term);
+        let is_same_term = pass1_current_term.as_ref() == Some(&term);
 
-        if !is_same_term && current_term.is_some() {
+        if !is_same_term && pass1_current_term.is_some() {
             // Count completed term
-            count_term_section(&merged_roles, &mut counts);
-            merged_roles = Roles::empty();
+            count_term_section(&pass1_merged_roles, &mut counts);
+            pass1_merged_roles = Roles::empty();
         }
 
         // Accumulate roles for current term
-        merged_roles |= roles_in_batch;
-        current_term = Some(term);
+        pass1_merged_roles |= roles_in_batch;
+        pass1_current_term = Some(term);
 
         // Fetch next entry from same source
-        if let Some(Some(reader)) = readers.get_mut(source_batch)
-            && let Some(next_entry) = reader.read_entry()? {
+        if let Some(Some(reader)) = readers.get_mut(source_batch) {
+            let read_start = Instant::now();
+            let next_entry = reader.read_entry()?;
+            pass1_read_time += read_start.elapsed();
+            if let Some(next_entry) = next_entry {
                 merge_heap.push(HeapEntry {
                     term: next_entry.term,
                     roles: next_entry.roles,
-                    so_local_id: next_entry.so_local_id,
-                    p_local_id: next_entry.p_local_id,
                     source_batch,
                 });
             }
         }
-    if current_term.is_some() {
-        count_term_section(&merged_roles, &mut counts);
+    }
+    if pass1_current_term.is_some() {
+        count_term_section(&pass1_merged_roles, &mut counts);
     }
 
     tracing::debug!("Counts: {} shared, {} subjects, {} predicates, {} objects",
@@ -262,104 +290,98 @@ pub fn merge_vocabularies(
     // === PASS 2: Re-open readers and assign global IDs ===
     tracing::debug!("Pass 2: Assigning global IDs with correct offsets");
 
-    // Re-open all partial vocab files
-    readers.clear();
-    merge_heap.clear();
-
     for (batch_id, vocab_path) in &batch_infos {
-        let mut reader = PartialVocabReader::open(vocab_path)
-            .with_context(|| format!("Failed to re-open partial vocab for batch {}", batch_id))?;
-
-        // Read first entry and push to heap
-        if let Some(entry) = reader.read_entry()? {
-            merge_heap.push(HeapEntry {
-                term: entry.term,
-                roles: entry.roles,
-                so_local_id: entry.so_local_id,
-                p_local_id: entry.p_local_id,
-                source_batch: *batch_id,
-            });
-        }
-        readers.push(Some(reader));
+        pass2_bytes_read += std::fs::metadata(vocab_path)
+            .with_context(|| format!("Failed to stat partial vocab for batch {}", batch_id))?
+            .len();
     }
 
-    // Second k-way merge: assign global IDs
-    let mut section_counts = DictCounts::default();  // Track current position in each section
-    current_term = None;
-    merged_roles = Roles::empty();
-    let mut batches_with_term: Vec<TermBatchInfo> = Vec::new();
+    let pass2_init_start = Instant::now();
+    let (stream_rx, worker_handles) = build_parallel_pass2_stream(&batch_infos, 2048)?;
+    pass2_reader_init_time += pass2_init_start.elapsed();
 
-    while let Some(heap_entry) = merge_heap.pop() {
-        let term = heap_entry.term;
-        let source_batch = heap_entry.source_batch;
-        let roles_in_batch = heap_entry.roles;
-        let so_local_id = heap_entry.so_local_id;
-        let p_local_id = heap_entry.p_local_id;
+    // Second merge consumption: assign global IDs from merged stream
+    let pass2_result = (|| -> Result<()> {
+        let mut section_counts = DictCounts::default();  // Track current position in each section
+        let mut current_term: Option<Vec<u8>> = None;
+        let mut merged_roles = Roles::empty();
+        let mut batches_with_term: Vec<TermBatchInfo> = Vec::new();
 
-        // Check if this is the same term as previous or a new term
-        let is_same_term = current_term.as_ref() == Some(&term);
+        loop {
+            let read_start = Instant::now();
+            let recv_item = stream_rx.recv();
+            pass2_read_time += read_start.elapsed();
 
-        if !is_same_term {
-            // Process completed term if we have a current term
-            if let Some(prev_term) = &current_term {
-                assign_global_ids_and_record_mappings(
-                    prev_term,
-                    merged_roles,
-                    &batches_with_term,
-                    &counts,  // Use final counts for offset calculation
-                    &mut section_counts,  // Track current position
-                    &mut shared_enc,
-                    &mut subjects_enc,
-                    &mut predicates_enc,
-                    &mut objects_enc,
-                    &mut predicate_ids,
-                    &mut id_mappings,
-                )?;
+            let stream_entry = match recv_item {
+                Ok(Ok(entry)) => entry,
+                Ok(Err(e)) => return Err(e),
+                Err(_) => break,
+            };
 
-                batches_with_term.clear();
-                merged_roles = Roles::empty();
+            let term = stream_entry.term;
+            let source_batch = stream_entry.source_batch;
+            let roles_in_batch = stream_entry.roles;
+            let so_local_id = stream_entry.so_local_id;
+            let p_local_id = stream_entry.p_local_id;
+
+            let is_same_term = current_term.as_ref() == Some(&term);
+
+            if !is_same_term {
+                if let Some(prev_term) = &current_term {
+                    let assign_start = Instant::now();
+                    assign_global_ids_and_record_mappings(
+                        prev_term,
+                        merged_roles,
+                        &batches_with_term,
+                        &counts,
+                        &mut section_counts,
+                        &mut shared_enc,
+                        &mut subjects_enc,
+                        &mut predicates_enc,
+                        &mut objects_enc,
+                        &mut predicate_ids,
+                        &mut id_mappings,
+                    )?;
+                    id_assignment_time += assign_start.elapsed();
+
+                    batches_with_term.clear();
+                    merged_roles = Roles::empty();
+                }
             }
-        }
 
-        // Accumulate roles for current term
-        merged_roles |= roles_in_batch;
-        batches_with_term.push(TermBatchInfo {
-            batch_id: source_batch,
-            roles: roles_in_batch,
-            so_local_id,
-            p_local_id,
-        });
-        current_term = Some(term);
-
-        // Fetch next entry from same source
-        if let Some(Some(reader)) = readers.get_mut(source_batch)
-            && let Some(next_entry) = reader.read_entry()? {
-            merge_heap.push(HeapEntry {
-                    term: next_entry.term,
-                roles: next_entry.roles,
-                so_local_id: next_entry.so_local_id,
-                p_local_id: next_entry.p_local_id,
-                source_batch,
+            merged_roles |= roles_in_batch;
+            batches_with_term.push(TermBatchInfo {
+                batch_id: source_batch,
+                roles: roles_in_batch,
+                so_local_id,
+                p_local_id,
             });
+            current_term = Some(term);
         }
-    }
 
-    // Process final term
-    if let Some(term) = current_term {
-        assign_global_ids_and_record_mappings(
-            &term,
-            merged_roles,
-            &batches_with_term,
-            &counts,
-            &mut section_counts,
-            &mut shared_enc,
-            &mut subjects_enc,
-            &mut predicates_enc,
-            &mut objects_enc,
-            &mut predicate_ids,
-            &mut id_mappings,
-        )?;
-    }
+        if let Some(term) = current_term {
+            let assign_start = Instant::now();
+            assign_global_ids_and_record_mappings(
+                &term,
+                merged_roles,
+                &batches_with_term,
+                &counts,
+                &mut section_counts,
+                &mut shared_enc,
+                &mut subjects_enc,
+                &mut predicates_enc,
+                &mut objects_enc,
+                &mut predicate_ids,
+                &mut id_mappings,
+            )?;
+            id_assignment_time += assign_start.elapsed();
+        }
+
+        Ok(())
+    })();
+
+    join_worker_handles(worker_handles)?;
+    pass2_result?;
 
     tracing::info!(
         "Merged vocabulary: {} shared, {} subjects, {} predicates, {} objects",
@@ -371,6 +393,7 @@ pub fn merge_vocabularies(
 
     // Encode dictionary sections
     let mut dict_sections = Vec::new();
+    let serialize_start = Instant::now();
 
     let mut shared_buf = Vec::new();
     shared_enc.write_to(&mut shared_buf)?;
@@ -387,8 +410,10 @@ pub fn merge_vocabularies(
     let mut objects_buf = Vec::new();
     objects_enc.write_to(&mut objects_buf)?;
     dict_sections.push(objects_buf);
+    pfc_serialize_time += serialize_start.elapsed();
 
     // Write ID mappings to files
+    let mapping_write_start = Instant::now();
     for mapping in &id_mappings {
         let mapping_path = temp_dir.join(format!("id_mapping_{:06}.map.zst", mapping.batch_id));
         mapping.write_to_file(&mapping_path)
@@ -400,6 +425,20 @@ pub fn merge_vocabularies(
             mapping.p_map.len()
         );
     }
+    mapping_write_time += mapping_write_start.elapsed();
+
+    tracing::debug!(
+        "Stage 4 timing: pass1 init {:.3}s/read {:.3}s ({} MB), pass2 init {:.3}s/dequeue {:.3}s ({} MB), assign {:.3}s, dict serialize {:.3}s, mapping writes {:.3}s",
+        pass1_reader_init_time.as_secs_f64(),
+        pass1_read_time.as_secs_f64(),
+        pass1_bytes_read / (1024 * 1024),
+        pass2_reader_init_time.as_secs_f64(),
+        pass2_read_time.as_secs_f64(),
+        pass2_bytes_read / (1024 * 1024),
+        id_assignment_time.as_secs_f64(),
+        pfc_serialize_time.as_secs_f64(),
+        mapping_write_time.as_secs_f64(),
+    );
 
     Ok(VocabMergeResult {
         dict_sections,
@@ -407,6 +446,159 @@ pub fn merge_vocabularies(
         predicate_ids,
         id_mappings,
     })
+}
+
+fn read_stream_entry(rx: &Receiver<Result<StreamEntry>>) -> Result<Option<StreamEntry>> {
+    match rx.recv() {
+        Ok(Ok(entry)) => Ok(Some(entry)),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Ok(None),
+    }
+}
+
+fn build_parallel_pass2_stream(
+    batch_infos: &[(usize, PathBuf)],
+    channel_capacity: usize,
+) -> Result<(Receiver<Result<StreamEntry>>, Vec<JoinHandle<()>>)> {
+    let mut handles: Vec<JoinHandle<()>> = Vec::new();
+    let mut layer: Vec<Receiver<Result<StreamEntry>>> = Vec::new();
+
+    for (batch_id, vocab_path) in batch_infos {
+        let (tx, rx) = bounded(channel_capacity);
+        let batch_id = *batch_id;
+        let vocab_path = vocab_path.clone();
+
+        let handle = std::thread::spawn(move || {
+            let mut reader = match PartialVocabReader::open(&vocab_path)
+                .with_context(|| format!("Failed to re-open partial vocab for batch {}", batch_id))
+            {
+                Ok(reader) => reader,
+                Err(e) => {
+                    let _ = tx.send(Err(e));
+                    return;
+                }
+            };
+
+            loop {
+                match reader.read_entry() {
+                    Ok(Some(entry)) => {
+                        let send_result = tx.send(Ok(StreamEntry {
+                            term: entry.term,
+                            roles: entry.roles,
+                            so_local_id: entry.so_local_id,
+                            p_local_id: entry.p_local_id,
+                            source_batch: batch_id,
+                        }));
+                        if send_result.is_err() {
+                            return;
+                        }
+                    }
+                    Ok(None) => return,
+                    Err(e) => {
+                        let _ = tx.send(Err(e));
+                        return;
+                    }
+                }
+            }
+        });
+
+        handles.push(handle);
+        layer.push(rx);
+    }
+
+    if layer.is_empty() {
+        let (_tx, rx) = bounded(1);
+        return Ok((rx, handles));
+    }
+
+    while layer.len() > 1 {
+        let mut next_layer: Vec<Receiver<Result<StreamEntry>>> = Vec::new();
+        let i = 0;
+
+        while i < layer.len() {
+            if i + 1 >= layer.len() {
+                next_layer.push(layer.remove(i));
+                continue;
+            }
+
+            let left = layer.remove(i);
+            let right = layer.remove(i);
+            let (tx, rx) = bounded(channel_capacity);
+
+            let handle = std::thread::spawn(move || {
+                let mut left_next = match read_stream_entry(&left) {
+                    Ok(entry) => entry,
+                    Err(e) => {
+                        let _ = tx.send(Err(e));
+                        return;
+                    }
+                };
+                let mut right_next = match read_stream_entry(&right) {
+                    Ok(entry) => entry,
+                    Err(e) => {
+                        let _ = tx.send(Err(e));
+                        return;
+                    }
+                };
+
+                while left_next.is_some() || right_next.is_some() {
+                    let send_item = match (&left_next, &right_next) {
+                        (Some(left_entry), Some(right_entry)) => {
+                            if left_entry.term <= right_entry.term {
+                                left_next.take()
+                            } else {
+                                right_next.take()
+                            }
+                        }
+                        (Some(_), None) => left_next.take(),
+                        (None, Some(_)) => right_next.take(),
+                        (None, None) => None,
+                    };
+
+                    if let Some(item) = send_item {
+                        if tx.send(Ok(item)).is_err() {
+                            return;
+                        }
+                    }
+
+                    if left_next.is_none() {
+                        left_next = match read_stream_entry(&left) {
+                            Ok(entry) => entry,
+                            Err(e) => {
+                                let _ = tx.send(Err(e));
+                                return;
+                            }
+                        };
+                    }
+                    if right_next.is_none() {
+                        right_next = match read_stream_entry(&right) {
+                            Ok(entry) => entry,
+                            Err(e) => {
+                                let _ = tx.send(Err(e));
+                                return;
+                            }
+                        };
+                    }
+                }
+            });
+
+            handles.push(handle);
+            next_layer.push(rx);
+        }
+
+        layer = next_layer;
+    }
+
+    Ok((layer.pop().expect("non-empty stream layer"), handles))
+}
+
+fn join_worker_handles(handles: Vec<JoinHandle<()>>) -> Result<()> {
+    for handle in handles {
+        if handle.join().is_err() {
+            anyhow::bail!("Stage 4 worker thread panicked during parallel merge");
+        }
+    }
+    Ok(())
 }
 
 /// Count a completed term into the appropriate dictionary section.
