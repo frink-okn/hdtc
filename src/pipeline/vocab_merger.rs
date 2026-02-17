@@ -122,6 +122,9 @@ struct StreamEntry {
     source_batch: usize,
 }
 
+type StreamRx = Receiver<Result<StreamEntry>>;
+type WorkerHandles = Vec<JoinHandle<()>>;
+
 const PROVISIONAL_SO_ID_TAG: u64 = 1 << 63;
 const PROVISIONAL_SO_ID_MASK: u64 = !PROVISIONAL_SO_ID_TAG;
 
@@ -248,26 +251,26 @@ pub fn merge_vocabularies(
 
             let is_same_term = current_term.as_ref() == Some(&term);
 
-            if !is_same_term {
-                if let Some(prev_term) = &current_term {
-                    let assign_start = Instant::now();
-                    assign_global_ids_and_record_mappings(
-                        prev_term,
-                        merged_roles,
-                        &batches_with_term,
-                        &mut counts,
-                        &mut shared_enc,
-                        &mut subjects_enc,
-                        &mut predicates_enc,
-                        &mut objects_enc,
-                        &mut predicate_ids,
-                        &mut id_mappings,
-                    )?;
-                    id_assignment_time += assign_start.elapsed();
+            if !is_same_term
+                && let Some(prev_term) = &current_term
+            {
+                let assign_start = Instant::now();
+                assign_global_ids_and_record_mappings(
+                    prev_term,
+                    merged_roles,
+                    &batches_with_term,
+                    &mut counts,
+                    &mut shared_enc,
+                    &mut subjects_enc,
+                    &mut predicates_enc,
+                    &mut objects_enc,
+                    &mut predicate_ids,
+                    &mut id_mappings,
+                )?;
+                id_assignment_time += assign_start.elapsed();
 
-                    batches_with_term.clear();
-                    merged_roles = Roles::empty();
-                }
+                batches_with_term.clear();
+                merged_roles = Roles::empty();
             }
 
             merged_roles |= roles_in_batch;
@@ -383,9 +386,9 @@ fn read_stream_entry(rx: &Receiver<Result<StreamEntry>>) -> Result<Option<Stream
 fn build_parallel_vocab_stream(
     batch_infos: &[(usize, PathBuf)],
     channel_capacity: usize,
-) -> Result<(Receiver<Result<StreamEntry>>, Vec<JoinHandle<()>>)> {
-    let mut handles: Vec<JoinHandle<()>> = Vec::new();
-    let mut layer: Vec<Receiver<Result<StreamEntry>>> = Vec::new();
+) -> Result<(StreamRx, WorkerHandles)> {
+    let mut handles: WorkerHandles = Vec::new();
+    let mut layer: Vec<StreamRx> = Vec::new();
 
     for (batch_id, vocab_path) in batch_infos {
         let (tx, rx) = bounded(channel_capacity);
@@ -436,7 +439,7 @@ fn build_parallel_vocab_stream(
     }
 
     while layer.len() > 1 {
-        let mut next_layer: Vec<Receiver<Result<StreamEntry>>> = Vec::new();
+        let mut next_layer: Vec<StreamRx> = Vec::new();
         let i = 0;
 
         while i < layer.len() {
@@ -479,10 +482,10 @@ fn build_parallel_vocab_stream(
                         (None, None) => None,
                     };
 
-                    if let Some(item) = send_item {
-                        if tx.send(Ok(item)).is_err() {
-                            return;
-                        }
+                    if let Some(item) = send_item
+                        && tx.send(Ok(item)).is_err()
+                    {
+                        return;
                     }
 
                     if left_next.is_none() {
@@ -943,7 +946,7 @@ mod tests {
 
         let result = join_worker_handles(vec![panicking_handle]);
         assert!(result.is_err());
-        let message = result.err().expect("expected panic error").to_string();
+        let message = result.expect_err("expected panic error").to_string();
         assert!(message.contains("panicked"), "unexpected panic message: {message}");
     }
 }
