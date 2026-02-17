@@ -5,6 +5,7 @@ use crate::dictionary::DictCounts;
 use crate::pipeline::PartialVocabReader;
 use anyhow::{Context, Result};
 use crossbeam_channel::{bounded, Receiver};
+use rayon::prelude::*;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -337,9 +338,10 @@ pub fn merge_vocabularies(
 
     // Write ID mappings to files
     let mapping_write_start = Instant::now();
-    for mapping in &id_mappings {
+    id_mappings.par_iter().try_for_each(|mapping| -> Result<()> {
         let mapping_path = temp_dir.join(format!("id_mapping_{:06}.map.zst", mapping.batch_id));
-        mapping.write_to_file(&mapping_path)
+        mapping
+            .write_to_file(&mapping_path)
             .with_context(|| format!("Failed to write ID mapping for batch {}", mapping.batch_id))?;
         tracing::debug!(
             "Wrote ID mapping for batch {}: {} SO entries, {} P entries",
@@ -347,7 +349,8 @@ pub fn merge_vocabularies(
             mapping.so_map.len(),
             mapping.p_map.len()
         );
-    }
+        Ok(())
+    })?;
     mapping_write_time += mapping_write_start.elapsed();
 
     tracing::debug!(
