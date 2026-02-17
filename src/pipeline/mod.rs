@@ -36,7 +36,7 @@ pub struct PipelineResult {
     pub counts: DictCounts,
     pub dict_sections: Vec<Vec<u8>>, // PFC-encoded sections
     pub bitmap_triples: BitmapTriplesData,
-    pub original_input_size: u64, // Size of original input files in bytes
+    pub ntriples_size: u64, // N-Triples serialization size of parsed data
 }
 
 /// Batch of parsed quads (Stage 1 → Stage 2).
@@ -92,14 +92,15 @@ fn parser_stage(
     _include_graphs: bool,
     base_uri: String,
     batch_tx: Sender<BatchedQuads>,
-) -> Result<()> {
+) -> Result<u64> {
     let mut current_batch = Vec::with_capacity(batch_size);
     let mut total_quads = 0u64;
+    let mut ntriples_size = 0u64;
 
     for (file_index, input) in inputs.iter().enumerate() {
         tracing::info!("Parsing: {}", input.path.display());
 
-        stream_quads(&input, file_index, Some(&base_uri), |quad| {
+        let parse_stats = stream_quads(&input, file_index, Some(&base_uri), |quad| {
             // In triples mode, we include all quads but ignore the graph component
             // (it will be None when building triples)
             current_batch.push(quad);
@@ -115,6 +116,9 @@ fn parser_stage(
 
             Ok(())
         })?;
+
+        // Accumulate original N-Triples size from parser stats
+        ntriples_size += parse_stats.original_ntriples_size;
     }
 
     // Send final partial batch
@@ -122,8 +126,8 @@ fn parser_stage(
         batch_tx.send(current_batch).ok();
     }
 
-    tracing::info!("Parsed {} quads total", total_quads);
-    Ok(())
+    tracing::info!("Parsed {} quads total, N-Triples size: {} bytes", total_quads, ntriples_size);
+    Ok(ntriples_size)
 }
 
 /// Stage 2: Build vocabulary with hash map + arena for each batch.
@@ -325,17 +329,13 @@ pub fn run_pipeline(
     let inputs_owned = inputs.to_vec();
     let base_uri_owned = base_uri.to_string();
     let parser_handle = std::thread::spawn(move || {
-        if let Err(e) = parser_stage(
+        parser_stage(
             inputs_owned,
             batch_size,
             include_graphs,
             base_uri_owned,
             batch_tx,
-        ) {
-            tracing::error!("Parser stage failed: {}", e);
-            return Err(e);
-        }
-        Ok(())
+        )
     });
 
     let builder_handle = std::thread::spawn(move || {
@@ -364,7 +364,8 @@ pub fn run_pipeline(
     tracing::info!("All batches written, {} batches total", batches.len());
 
     // Wait for all stages to complete
-    match parser_handle.join() {
+    let ntriples_size = match parser_handle.join() {
+        Ok(Ok(size)) => size,
         Ok(Err(e)) => {
             cleanup_temp_files(&batches, &[]);
             return Err(e);
@@ -373,8 +374,7 @@ pub fn run_pipeline(
             cleanup_temp_files(&batches, &[]);
             return Err(anyhow::anyhow!("Parser thread panicked"));
         }
-        Ok(Ok(())) => {}
-    }
+    };
 
     match builder_handle.join() {
         Ok(Err(e)) => {
@@ -498,17 +498,10 @@ pub fn run_pipeline(
     // Clean up temporary files
     cleanup_temp_files(&batches, &mapping_paths);
 
-    // Calculate original input file size
-    let original_input_size: u64 = inputs
-        .iter()
-        .filter_map(|input| std::fs::metadata(&input.path).ok())
-        .map(|m| m.len())
-        .sum();
-
     Ok(PipelineResult {
         counts: merge_result.counts,
         dict_sections: merge_result.dict_sections,
         bitmap_triples,
-        original_input_size,
+        ntriples_size,
     })
 }

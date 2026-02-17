@@ -75,6 +75,15 @@ where
     for result in parser.for_reader(reader) {
         match result {
             Ok(quad) => {
+                // Calculate original N-Triples size BEFORE adding blank node prefix
+                let original_size = calculate_original_ntriples_size(
+                    &quad.subject,
+                    &quad.predicate,
+                    &quad.object,
+                    &quad.graph_name,
+                );
+                stats.original_ntriples_size += original_size;
+
                 let subject = term_to_hdt_string(
                     &Term::from(quad.subject),
                     &blank_prefix,
@@ -156,11 +165,100 @@ fn literal_to_hdt_string(l: &Literal) -> String {
     }
 }
 
+/// Calculate the N-Triples serialization size of a literal without allocating.
+fn literal_ntriples_size(l: &Literal) -> u64 {
+    let value_len = l.value().len() as u64;
+    if let Some(lang) = l.language() {
+        // "value"@lang
+        2 + value_len + 1 + lang.len() as u64  // 2 quotes + value + @ + language
+    } else {
+        let dt = l.datatype().as_str();
+        if dt == "http://www.w3.org/2001/XMLSchema#string" {
+            // "value"
+            2 + value_len  // 2 quotes
+        } else {
+            // "value"^^<type>
+            2 + value_len + 4 + dt.len() as u64  // 2 quotes + ^^ + < + type + >
+        }
+    }
+}
+
+/// Calculate N-Triples serialization size for a quad's terms (before blank node prefixing).
+///
+/// This calculates the size as if the original RDF file were serialized to N-Triples/N-Quads,
+/// WITHOUT the internal blank node disambiguation prefix that we add during parsing.
+fn calculate_original_ntriples_size(
+    subject: &oxrdf::Subject,
+    predicate: &oxrdf::NamedNode,
+    object: &Term,
+    graph: &GraphName,
+) -> u64 {
+    let mut size = 0u64;
+
+    // Subject: URI or blank node (from oxrdf::Subject)
+    match subject {
+        oxrdf::Subject::BlankNode(b) => {
+            // Blank nodes are serialized as "_:name" with no extra brackets
+            size += 2 + b.as_str().len() as u64; // _: + name
+        }
+        oxrdf::Subject::NamedNode(n) => {
+            // URIs are serialized as <uri>
+            size += 2 + n.as_str().len() as u64; // < + uri + >
+        }
+    }
+
+    // Space
+    size += 1;
+
+    // Predicate: always a URI
+    size += 2 + predicate.as_str().len() as u64; // < + uri + >
+
+    // Space
+    size += 1;
+
+    // Object: URI, blank node, or literal
+    match object {
+        Term::BlankNode(b) => {
+            // Blank nodes: _:name
+            size += 2 + b.as_str().len() as u64;
+        }
+        Term::NamedNode(n) => {
+            // URIs: <uri>
+            size += 2 + n.as_str().len() as u64;
+        }
+        Term::Literal(l) => {
+            // Literals: "value" or "value"@lang or "value"^^<type>
+            size += literal_ntriples_size(l);
+        }
+    }
+
+    // Graph (if present, not default)
+    match graph {
+        GraphName::DefaultGraph => {
+            // Default graph: no graph suffix in serialization
+        }
+        GraphName::NamedNode(n) => {
+            // Named graph: space + <uri>
+            size += 1 + 2 + n.as_str().len() as u64;
+        }
+        GraphName::BlankNode(b) => {
+            // Graph blank node: space + _:name
+            size += 1 + 2 + b.as_str().len() as u64;
+        }
+    }
+
+    // Closing: space + dot + newline = 3 bytes
+    size += 3;
+
+    size
+}
+
 /// Statistics from parsing a single input file.
 #[derive(Debug, Default)]
 pub struct ParseStats {
     pub quads: u64,
     pub errors: u64,
+    pub original_ntriples_size: u64, // N-Triples serialization size (before blank node prefixing)
 }
 
 #[cfg(test)]
@@ -231,5 +329,63 @@ mod tests {
 
         assert_eq!(stats.quads, 2);
         assert!(stats.errors > 0);
+    }
+
+    #[test]
+    fn test_original_ntriples_size() {
+        // Test data matching representative.nt structure
+        let content = r#"<http://example.org/alice> <http://example.org/name> "Alice" .
+<http://example.org/alice> <http://example.org/knows> <http://example.org/bob> .
+<http://example.org/bob> <http://example.org/name> "Bob" .
+<http://example.org/bob> <http://example.org/knows> <http://example.org/alice> .
+<http://example.org/alice> <http://example.org/age> "30"^^<http://www.w3.org/2001/XMLSchema#integer> .
+<http://example.org/alice> <http://example.org/label> "Alice"@en .
+<http://example.org/alice> <http://example.org/label> "Alicia"@es .
+_:b1 <http://example.org/type> <http://example.org/Thing> .
+"#;
+        let (_f, input) = make_temp_nt(content);
+        let stats = stream_quads(&input, 0, None, |_q| Ok(()))
+            .unwrap();
+
+        assert_eq!(stats.quads, 8);
+        assert_eq!(stats.errors, 0);
+        // Verify the original N-Triples size matches the content
+        assert_eq!(stats.original_ntriples_size, content.len() as u64);
+    }
+
+    #[test]
+    fn test_original_ntriples_size_simple() {
+        // Test with simple.nt structure (URIs only, no literals with decorators)
+        let content = r#"<http://example.org/subject1> <http://example.org/predicate1> <http://example.org/object1> .
+<http://example.org/subject1> <http://example.org/predicate1> <http://example.org/object2> .
+<http://example.org/subject2> <http://example.org/predicate2> <http://example.org/object1> .
+<http://example.org/subject2> <http://example.org/predicate2> <http://example.org/object3> .
+<http://example.org/subject3> <http://example.org/predicate1> <http://example.org/object3> .
+"#;
+        let (_f, input) = make_temp_nt(content);
+        let stats = stream_quads(&input, 0, None, |_q| Ok(()))
+            .unwrap();
+
+        assert_eq!(stats.quads, 5);
+        assert_eq!(stats.errors, 0);
+        // Verify the original N-Triples size matches the content
+        assert_eq!(stats.original_ntriples_size, content.len() as u64);
+    }
+
+    #[test]
+    fn test_original_ntriples_size_with_blank_nodes() {
+        // Test that blank node size is calculated WITHOUT the file prefix
+        let content = "_:b1 <http://example.org/p> <http://example.org/o> .\n";
+        let (_f, input) = make_temp_nt(content);
+        let stats = stream_quads(&input, 0, None, |_q| Ok(()))
+            .unwrap();
+
+        assert_eq!(stats.quads, 1);
+        assert_eq!(stats.errors, 0);
+        // Size should be: _:b1 (4) + space (1) + <http://example.org/p> (22) + space (1) +
+        //                <http://example.org/o> (22) + space (1) + . (1) + \n (1) = 53 bytes
+        assert_eq!(stats.original_ntriples_size, 53);
+        // The content length should match since it's a single newline-terminated line
+        assert_eq!(stats.original_ntriples_size, content.len() as u64);
     }
 }

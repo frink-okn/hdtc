@@ -103,7 +103,7 @@ fn create_hdt(args: cli::CreateArgs) -> Result<()> {
         &pipeline_result.counts,
         &pipeline_result.dict_sections,
         &pipeline_result.bitmap_triples,
-        pipeline_result.original_input_size,
+        pipeline_result.ntriples_size,
     )?;
 
     // Optionally create index file

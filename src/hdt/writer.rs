@@ -21,7 +21,7 @@ pub fn write_hdt(
     counts: &DictCounts,
     dict_sections: &[Vec<u8>],
     triples: &BitmapTriplesData,
-    original_input_size: u64,
+    ntriples_size: u64,
 ) -> Result<()> {
     let file = File::create(output_path)
         .with_context(|| format!("Failed to create output file {}", output_path.display()))?;
@@ -46,7 +46,7 @@ pub fn write_hdt(
         triples.num_triples,
         dict_size,
         hdt_data_size,
-        original_input_size,
+        ntriples_size,
     );
     let mut header_ci = ControlInfo::new(ControlType::Header, "ntriples");
     header_ci.set_property("length", &header_content.len().to_string());
@@ -101,7 +101,7 @@ fn build_header_ntriples(
     num_triples: u64,
     dict_size: u64,
     hdt_data_size: u64,
-    original_input_size: u64,
+    ntriples_size: u64,
 ) -> String {
     let mut lines = Vec::new();
     let dataset = format!("<{base_uri}>");
@@ -195,9 +195,9 @@ fn build_header_ntriples(
         "_:publicationInformation <{dcterms}issued> \"{timestamp}\" ."
     ));
 
-    // Original input file size
+    // Original N-Triples serialization size
     lines.push(format!(
-        "_:statistics <{hdt_ns}originalSize> \"{original_input_size}\" ."
+        "_:statistics <{hdt_ns}originalSize> \"{ntriples_size}\" ."
     ));
 
     lines.join("\n") + "\n"
