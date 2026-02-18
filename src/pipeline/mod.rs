@@ -57,10 +57,6 @@ struct BatchComplete {
     batch_id: usize,
     vocab_path: PathBuf,
     triples_path: PathBuf,
-    #[allow(dead_code)]
-    term_count: usize,
-    #[allow(dead_code)]
-    triple_count: usize,
 }
 
 #[derive(Debug)]
@@ -356,8 +352,6 @@ fn vocab_writer_stage(
                 batch_id: batch.batch_id,
                 vocab_path,
                 triples_path,
-                term_count,
-                triple_count,
             })
             .is_err()
         {

@@ -8,8 +8,6 @@
 //!
 //! Data size is ceil(num_bits / 8) bytes (byte-packed, NOT padded to 64-bit words).
 
-#![allow(dead_code)]
-
 use crate::io::crc_utils::{crc8, crc32c};
 use crate::io::vbyte::encode_vbyte;
 use std::io::{self, Read, Write};
@@ -49,11 +47,13 @@ impl BitmapWriter {
     }
 
     /// Append a 1 bit.
+    #[cfg(test)]
     pub fn push_one(&mut self) {
         self.push(true);
     }
 
     /// Append a 0 bit.
+    #[cfg(test)]
     pub fn push_zero(&mut self) {
         self.push(false);
     }
@@ -198,6 +198,7 @@ impl BitmapReader {
     }
 
     /// Get the bit at the given index.
+    #[cfg(test)]
     pub fn get(&self, index: u64) -> bool {
         assert!(index < self.num_bits, "Bitmap index out of bounds");
         let word_idx = (index / 64) as usize;
@@ -206,11 +207,13 @@ impl BitmapReader {
     }
 
     /// Number of bits in the bitmap.
+    #[cfg(test)]
     pub fn len(&self) -> u64 {
         self.num_bits
     }
 
     /// Whether the bitmap is empty.
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.num_bits == 0
     }
@@ -237,6 +240,7 @@ impl BitmapReader {
 
     /// Find the position of the nth 1-bit (1-indexed).
     /// select1(1) returns the position of the first 1-bit.
+    #[cfg(test)]
     pub fn select1(&self, n: u64) -> Option<u64> {
         if n == 0 {
             return None;

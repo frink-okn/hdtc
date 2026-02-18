@@ -9,8 +9,6 @@
 //!
 //! Data size is ceil(total_bits / 8) bytes (byte-packed, NOT padded to 64-bit words).
 
-#![allow(dead_code)]
-
 use crate::io::crc_utils::{crc8, crc32c};
 use crate::io::vbyte::encode_vbyte;
 use std::io::{self, Read, Write};
@@ -70,21 +68,6 @@ impl LogArrayWriter {
             self.bits_per_entry
         );
         self.entries.push(value);
-    }
-
-    /// Number of entries added so far.
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    /// Whether the array is empty.
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
-    /// Bits per entry.
-    pub fn bits_per_entry(&self) -> u8 {
-        self.bits_per_entry
     }
 
     /// Serialize the LogArray to a writer.
@@ -257,14 +240,11 @@ impl LogArrayReader {
     }
 
     /// Whether the array is empty.
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.num_entries == 0
     }
 
-    /// Bits per entry.
-    pub fn bits_per_entry(&self) -> u8 {
-        self.bits_per_entry
-    }
 }
 
 /// Read a VByte value from a reader, appending raw bytes to a tracking buffer.

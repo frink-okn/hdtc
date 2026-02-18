@@ -53,18 +53,6 @@ impl PfcEncoder {
         self.strings.push(s);
     }
 
-    /// Number of strings added.
-    #[allow(dead_code)]
-    pub fn len(&self) -> usize {
-        self.strings.len()
-    }
-
-    /// Whether no strings have been added.
-    #[allow(dead_code)]
-    pub fn is_empty(&self) -> bool {
-        self.strings.is_empty()
-    }
-
     /// Serialize the PFC section to a writer.
     pub fn write_to<W: Write>(&self, writer: &mut W) -> io::Result<()> {
         // First, encode all strings into a buffer and collect block offsets

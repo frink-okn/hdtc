@@ -205,7 +205,7 @@ impl PartialVocabReader {
     }
 
     /// Get total number of entries in the file.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn total_entries(&self) -> u32 {
         self.count
     }

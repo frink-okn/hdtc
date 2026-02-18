@@ -5,9 +5,8 @@
 //! - CRC16-ANSI (poly 0x8005): after Control Information blocks
 //! - CRC32C (poly 0x1EDC6F41): after data payloads
 
-#![allow(dead_code)]
-
 use crc::{Crc, CRC_32_ISCSI};
+#[cfg(test)]
 use std::io::{self, Write};
 
 // CRC8-CCITT: polynomial 0x07
@@ -53,30 +52,14 @@ pub fn crc32c(data: &[u8]) -> u32 {
     CRC32C_ALGO.checksum(data)
 }
 
-/// Write CRC8 checksum of the given data.
-pub fn write_crc8<W: Write>(writer: &mut W, data: &[u8]) -> io::Result<()> {
-    let checksum = crc8(data);
-    writer.write_all(&[checksum])
-}
-
-/// Write CRC16 checksum of the given data (little-endian).
-pub fn write_crc16<W: Write>(writer: &mut W, data: &[u8]) -> io::Result<()> {
-    let checksum = crc16(data);
-    writer.write_all(&checksum.to_le_bytes())
-}
-
-/// Write CRC32C checksum of the given data (little-endian).
-pub fn write_crc32c<W: Write>(writer: &mut W, data: &[u8]) -> io::Result<()> {
-    let checksum = crc32c(data);
-    writer.write_all(&checksum.to_le_bytes())
-}
-
 /// A writer wrapper that incrementally computes a CRC8 over all bytes written.
+#[cfg(test)]
 pub struct Crc8Writer<W: Write> {
     inner: W,
     digest: crc::Digest<'static, u8>,
 }
 
+#[cfg(test)]
 impl<W: Write> Crc8Writer<W> {
     pub fn new(inner: W) -> Self {
         Self {
@@ -93,6 +76,7 @@ impl<W: Write> Crc8Writer<W> {
     }
 }
 
+#[cfg(test)]
 impl<W: Write> Write for Crc8Writer<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let n = self.inner.write(buf)?;
@@ -106,11 +90,13 @@ impl<W: Write> Write for Crc8Writer<W> {
 }
 
 /// A writer wrapper that incrementally computes a CRC32C over all bytes written.
+#[cfg(test)]
 pub struct Crc32cWriter<W: Write> {
     inner: W,
     digest: crc::Digest<'static, u32>,
 }
 
+#[cfg(test)]
 impl<W: Write> Crc32cWriter<W> {
     pub fn new(inner: W) -> Self {
         Self {
@@ -127,6 +113,7 @@ impl<W: Write> Crc32cWriter<W> {
     }
 }
 
+#[cfg(test)]
 impl<W: Write> Write for Crc32cWriter<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let n = self.inner.write(buf)?;

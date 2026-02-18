@@ -180,7 +180,6 @@ Stage 3  Write partial vocabularies to disk (zstd-compressed)
 Stage 4  K-way merge partial vocabularies → assign global IDs, write dictionary
    ↓
 Stage 5  Remap local IDs to global IDs (parallel)
-         (chunked transfer to Stage 6 to reduce channel overhead)
    ↓
 Stage 6  Build BitmapTriples (streaming, SPO order)
    ↓

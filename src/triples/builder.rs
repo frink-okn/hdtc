@@ -22,15 +22,6 @@ pub struct BitmapTriplesData {
     pub array_z: Vec<u8>,
     /// Total number of triples
     pub num_triples: u64,
-    /// Maximum subject ID seen
-    #[allow(dead_code)]
-    pub max_subject: u64,
-    /// Maximum predicate ID seen
-    #[allow(dead_code)]
-    pub max_predicate: u64,
-    /// Maximum object ID seen
-    #[allow(dead_code)]
-    pub max_object: u64,
 }
 
 /// Build BitmapTriples from a sorted iterator of ID triples.
@@ -123,9 +114,6 @@ pub fn build_bitmap_triples(
         bitmap_z: bitmap_z_buf,
         array_z: array_z_buf,
         num_triples,
-        max_subject,
-        max_predicate,
-        max_object,
     })
 }
 

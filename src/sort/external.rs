@@ -46,7 +46,7 @@ impl ExternalSorter {
 
     /// Sort items from an iterator, writing sorted chunks to disk as needed.
     /// Returns a merge iterator over all chunks in sorted order.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn sort<T: Sortable>(
         &mut self,
         items: impl Iterator<Item = T>,
