@@ -19,7 +19,7 @@ pub use batch_vocab::BatchVocabBuilder;
 pub use partial_vocab::{PartialVocabEntry, PartialVocabReader, PartialVocabWriter};
 
 use crate::dictionary::DictCounts;
-use crate::rdf::{stream_quads, ExtractedQuad, RdfInput};
+use crate::rdf::{stream_quads_with_options, ExtractedQuad, ParseOptions, RdfInput};
 use crate::sort::ExternalSorter;
 use crate::triples::builder::BitmapTriplesData;
 use crate::triples::id_triple::IdTriple;
@@ -28,11 +28,20 @@ use crossbeam_channel::{bounded, Receiver, Sender};
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use batch_vocab::{LocalIdTriple, Roles, VocabEntry};
 
 const STAGE5_TO_STAGE6_CHUNK_SIZE: usize = 16_384;
+
+#[derive(Debug, Clone, Default)]
+pub struct ParserParallelismConfig {
+    pub file_workers: Option<usize>,
+    pub chunk_workers: Option<usize>,
+    pub chunk_size_bytes: Option<usize>,
+    pub max_inflight_bytes: Option<usize>,
+}
 
 /// Result of pipeline execution.
 pub struct PipelineResult {
@@ -44,6 +53,95 @@ pub struct PipelineResult {
 
 /// Batch of parsed quads (Stage 1 → Stage 2).
 type BatchedQuads = Vec<ExtractedQuad>;
+
+#[derive(Default)]
+struct BatchAssemblerState {
+    current_batch: BatchedQuads,
+    total_quads: u64,
+}
+
+struct SharedBatchAssembler {
+    batch_size: usize,
+    batch_tx: Sender<BatchedQuads>,
+    state: Mutex<BatchAssemblerState>,
+}
+
+impl SharedBatchAssembler {
+    fn new(batch_size: usize, batch_tx: Sender<BatchedQuads>) -> Self {
+        Self {
+            batch_size,
+            batch_tx,
+            state: Mutex::new(BatchAssemblerState {
+                current_batch: Vec::with_capacity(batch_size),
+                total_quads: 0,
+            }),
+        }
+    }
+
+    fn push_many(&self, quads: Vec<ExtractedQuad>) -> Result<()> {
+        let mut full_batches: Vec<BatchedQuads> = Vec::new();
+
+        {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Batch assembler mutex poisoned"))?;
+
+            for quad in quads {
+                state.current_batch.push(quad);
+                state.total_quads += 1;
+
+                if state.current_batch.len() >= self.batch_size {
+                    let batch = std::mem::replace(
+                        &mut state.current_batch,
+                        Vec::with_capacity(self.batch_size),
+                    );
+                    full_batches.push(batch);
+                }
+            }
+        }
+
+        for batch in full_batches {
+            self.batch_tx
+                .send(batch)
+                .map_err(|_| anyhow::anyhow!("Batch receiver disconnected"))?;
+        }
+
+        Ok(())
+    }
+
+    fn flush_final(&self) -> Result<()> {
+        let final_batch = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Batch assembler mutex poisoned"))?;
+            if state.current_batch.is_empty() {
+                None
+            } else {
+                Some(std::mem::replace(
+                    &mut state.current_batch,
+                    Vec::with_capacity(self.batch_size),
+                ))
+            }
+        };
+
+        if let Some(batch) = final_batch {
+            self.batch_tx
+                .send(batch)
+                .map_err(|_| anyhow::anyhow!("Batch receiver disconnected"))?;
+        }
+        Ok(())
+    }
+
+    fn total_quads(&self) -> Result<u64> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Batch assembler mutex poisoned"))?;
+        Ok(state.total_quads)
+    }
+}
 
 /// Processed batch with sorted vocabulary and local-ID triples (Stage 2 → Stage 3).
 struct ProcessedBatch {
@@ -182,50 +280,163 @@ fn calculate_batch_size(memory_budget: usize) -> usize {
 fn parser_stage(
     inputs: Vec<RdfInput>,
     batch_size: usize,
+    memory_budget: usize,
     _include_graphs: bool,
     base_uri: String,
+    parser_parallelism: ParserParallelismConfig,
     batch_tx: Sender<BatchedQuads>,
 ) -> Result<u64> {
-    let mut current_batch = Vec::with_capacity(batch_size);
-    let mut total_quads = 0u64;
-    let mut ntriples_size = 0u64;
+    let expected_files = inputs.len();
     let disambiguate_blank_nodes = inputs.len() > 1;
+    let available_cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .max(1);
+    let default_file_workers = inputs.len().min(available_cpus).max(1);
+    let file_workers = parser_parallelism
+        .file_workers
+        .unwrap_or(default_file_workers)
+        .max(1)
+        .min(inputs.len().max(1));
+    let default_chunk_workers = (available_cpus / file_workers).max(1);
+    let capped_default_chunk_workers = default_chunk_workers.min(4);
+    let chunk_workers = parser_parallelism
+        .chunk_workers
+        .unwrap_or(capped_default_chunk_workers)
+        .max(1);
 
-    for (file_index, input) in inputs.iter().enumerate() {
-        tracing::info!("Parsing: {}", input.path.display());
+    // Keep parser memory bounded relative to global memory budget.
+    // Reserve most memory for downstream stages and sorting.
+    let parser_budget_total = (memory_budget / 8).clamp(64 * 1024 * 1024, 2 * 1024 * 1024 * 1024);
+    let parser_budget_per_file = (parser_budget_total / file_workers.max(1)).max(16 * 1024 * 1024);
 
-        let parse_stats = stream_quads(
-            input,
-            file_index,
-            disambiguate_blank_nodes,
-            Some(&base_uri),
-            |quad| {
-            // In triples mode, we include all quads but ignore the graph component
-            // (it will be None when building triples)
-            current_batch.push(quad);
-            total_quads += 1;
+    let chunk_size_bytes = parser_parallelism
+        .chunk_size_bytes
+        .unwrap_or((parser_budget_per_file / 8).clamp(1 * 1024 * 1024, 8 * 1024 * 1024))
+        .max(1);
+    let max_inflight_bytes = parser_parallelism
+        .max_inflight_bytes
+        .unwrap_or((parser_budget_per_file / 2).max(chunk_size_bytes))
+        .max(chunk_size_bytes);
 
-            if current_batch.len() >= batch_size {
-                // Send batch (blocks if channel is full - backpressure!)
-                let batch = std::mem::replace(&mut current_batch, Vec::with_capacity(batch_size));
-                if batch_tx.send(batch).is_err() {
-                    anyhow::bail!("Batch receiver disconnected");
+    tracing::info!(
+        "Parser parallelism: {} file worker(s), {} chunk worker(s)/file, {} chunk bytes, {} in-flight bytes/file (parser budget total: {})",
+        file_workers,
+        chunk_workers,
+        chunk_size_bytes,
+        max_inflight_bytes,
+        parser_budget_total
+    );
+
+    let parse_options = ParseOptions {
+        enable_ntnq_parallel: true,
+        chunk_size_bytes,
+        chunk_workers,
+        max_inflight_bytes,
+    };
+
+    let assembler = Arc::new(SharedBatchAssembler::new(batch_size, batch_tx));
+
+    let (file_tx, file_rx) = bounded::<(usize, RdfInput)>(inputs.len().max(1));
+    for (file_index, input) in inputs.into_iter().enumerate() {
+        file_tx
+            .send((file_index, input))
+            .map_err(|_| anyhow::anyhow!("File parser queue disconnected"))?;
+    }
+    drop(file_tx);
+
+    let (stats_tx, stats_rx) = crossbeam_channel::unbounded::<(usize, Result<u64>)>();
+    let mut worker_handles = Vec::with_capacity(file_workers);
+
+    for _ in 0..file_workers {
+        let file_rx = file_rx.clone();
+        let stats_tx = stats_tx.clone();
+        let assembler = Arc::clone(&assembler);
+        let base_uri = base_uri.clone();
+        let parse_options = parse_options.clone();
+
+        worker_handles.push(std::thread::spawn(move || {
+            for (file_index, input) in file_rx {
+                tracing::info!("Parsing: {}", input.path.display());
+
+                let mut staged_quads = Vec::with_capacity(4096);
+                let parse_result = stream_quads_with_options(
+                    &input,
+                    file_index,
+                    disambiguate_blank_nodes,
+                    Some(&base_uri),
+                    &parse_options,
+                    |quad| {
+                        staged_quads.push(quad);
+                        if staged_quads.len() >= 4096 {
+                            let chunk = std::mem::take(&mut staged_quads);
+                            assembler.push_many(chunk)?;
+                            staged_quads = Vec::with_capacity(4096);
+                        }
+                        Ok(())
+                    },
+                )
+                .and_then(|stats| {
+                    if !staged_quads.is_empty() {
+                        let chunk = std::mem::take(&mut staged_quads);
+                        assembler.push_many(chunk)?;
+                    }
+                    Ok(stats.original_ntriples_size)
+                });
+
+                if stats_tx.send((file_index, parse_result)).is_err() {
+                    return;
                 }
             }
+        }));
+    }
+    drop(stats_tx);
 
-            Ok(())
-        })?;
-
-        // Accumulate original N-Triples size from parser stats
-        ntriples_size += parse_stats.original_ntriples_size;
+    for handle in worker_handles {
+        if handle.join().is_err() {
+            return Err(anyhow::anyhow!("Parser worker thread panicked"));
+        }
     }
 
-    // Send final partial batch
-    if !current_batch.is_empty() {
-        batch_tx.send(current_batch).ok();
+    let mut ntriples_size = 0u64;
+    let mut outcomes = 0usize;
+    let mut first_error = None;
+    for (file_index, parse_result) in stats_rx {
+        outcomes += 1;
+        match parse_result {
+            Ok(size) => ntriples_size += size,
+            Err(e) => {
+                if first_error.is_none() {
+                    first_error = Some(anyhow::anyhow!(
+                        "Parser failed for file index {}: {}",
+                        file_index,
+                        e
+                    ));
+                }
+            }
+        }
     }
 
-    tracing::info!("Parsed {} quads total, N-Triples size: {} bytes", total_quads, ntriples_size);
+    if outcomes != expected_files {
+        return Err(anyhow::anyhow!(
+            "Parser outcomes mismatch: expected {}, got {}",
+            expected_files,
+            outcomes
+        ));
+    }
+
+    if let Some(e) = first_error {
+        return Err(e);
+    }
+
+    assembler.flush_final()?;
+    let total_quads = assembler.total_quads()?;
+
+    tracing::info!(
+        "Parsed {} quads total, N-Triples size: {} bytes",
+        total_quads,
+        ntriples_size
+    );
     Ok(ntriples_size)
 }
 
@@ -407,6 +618,7 @@ pub fn run_pipeline(
     memory_budget: usize,
     include_graphs: bool,
     base_uri: &str,
+    parser_parallelism: &ParserParallelismConfig,
     benchmark: bool,
 ) -> Result<PipelineResult> {
     tracing::info!("Starting pipelined HDT construction");
@@ -430,12 +642,15 @@ pub fn run_pipeline(
     // Spawn stages in separate threads
     let inputs_owned = inputs.to_vec();
     let base_uri_owned = base_uri.to_string();
+    let parser_parallelism_owned = parser_parallelism.clone();
     let parser_handle = std::thread::spawn(move || {
         parser_stage(
             inputs_owned,
             batch_size,
+            memory_budget,
             include_graphs,
             base_uri_owned,
+            parser_parallelism_owned,
             batch_tx,
         )
     });

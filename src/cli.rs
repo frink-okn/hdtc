@@ -78,6 +78,22 @@ pub struct CreateArgs {
     /// Soft memory limit in megabytes for internal buffers
     #[arg(long, value_name = "MB")]
     pub memory_limit: Option<usize>,
+
+    /// Number of files to parse concurrently (default: auto)
+    #[arg(long, value_name = "N")]
+    pub parse_file_workers: Option<usize>,
+
+    /// Number of parser workers per active NT/NQ file (default: auto)
+    #[arg(long, value_name = "N")]
+    pub parse_chunk_workers: Option<usize>,
+
+    /// Target parser chunk size in bytes for NT/NQ parallel parsing (default: 8388608)
+    #[arg(long, value_name = "BYTES")]
+    pub parse_chunk_bytes: Option<usize>,
+
+    /// Maximum in-flight parser chunk bytes per file (default: 268435456)
+    #[arg(long, value_name = "BYTES")]
+    pub parse_max_inflight_bytes: Option<usize>,
 }
 
 #[derive(Debug, Parser)]

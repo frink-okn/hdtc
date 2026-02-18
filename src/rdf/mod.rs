@@ -2,4 +2,4 @@ mod input;
 pub(crate) mod parser;
 
 pub use input::{discover_inputs, RdfInput};
-pub use parser::{stream_quads, ExtractedQuad};
+pub use parser::{stream_quads_with_options, ExtractedQuad, ParseOptions};

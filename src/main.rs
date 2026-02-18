@@ -74,6 +74,12 @@ fn create_hdt(args: cli::CreateArgs, benchmark: bool) -> Result<()> {
     let memory_budget = args.memory_limit.unwrap_or(4096) * 1024 * 1024;
 
     let include_graphs = matches!(args.mode, cli::OutputMode::Quads);
+    let parser_parallelism = pipeline::ParserParallelismConfig {
+        file_workers: args.parse_file_workers,
+        chunk_workers: args.parse_chunk_workers,
+        chunk_size_bytes: args.parse_chunk_bytes,
+        max_inflight_bytes: args.parse_max_inflight_bytes,
+    };
 
     // Compute base URI: use provided value, or derive from first input file
     let base_uri = match &args.base_uri {
@@ -95,6 +101,7 @@ fn create_hdt(args: cli::CreateArgs, benchmark: bool) -> Result<()> {
         memory_budget,
         include_graphs,
         &base_uri,
+        &parser_parallelism,
         benchmark,
     )?;
 
