@@ -15,6 +15,7 @@ use tracing_subscriber::EnvFilter;
 
 fn main() -> Result<()> {
     let cli = cli::Cli::parse();
+    let benchmark = cli.benchmark;
 
     // Set up logging
     let filter = match (cli.quiet, cli.verbose) {
@@ -33,13 +34,13 @@ fn main() -> Result<()> {
 
     // Route to appropriate subcommand
     match cli.command {
-        cli::Commands::Create(args) => create_hdt(args),
-        cli::Commands::Index(args) => create_index_from_hdt(args),
+        cli::Commands::Create(args) => create_hdt(args, benchmark),
+        cli::Commands::Index(args) => create_index_from_hdt(args, benchmark),
     }
 }
 
 /// Create HDT file from RDF input(s)
-fn create_hdt(args: cli::CreateArgs) -> Result<()> {
+fn create_hdt(args: cli::CreateArgs, benchmark: bool) -> Result<()> {
     // Discover input files
     let inputs = rdf::discover_inputs(&args.inputs)?;
     for input in &inputs {
@@ -94,6 +95,7 @@ fn create_hdt(args: cli::CreateArgs) -> Result<()> {
         memory_budget,
         include_graphs,
         &base_uri,
+        benchmark,
     )?;
 
     // Write HDT file
@@ -130,7 +132,7 @@ fn create_hdt(args: cli::CreateArgs) -> Result<()> {
 }
 
 /// Create index file for an existing HDT file
-fn create_index_from_hdt(args: cli::IndexArgs) -> Result<()> {
+fn create_index_from_hdt(args: cli::IndexArgs, benchmark: bool) -> Result<()> {
     // Verify the HDT file exists
     if !args.hdt_file.exists() {
         anyhow::bail!("HDT file not found: {}", args.hdt_file.display());
@@ -157,9 +159,16 @@ fn create_index_from_hdt(args: cli::IndexArgs) -> Result<()> {
     let memory_budget = args.memory_limit.unwrap_or(4096) * 1024 * 1024;
 
     // Create the index
+    let index_start = std::time::Instant::now();
     match index::create_index(&args.hdt_file, memory_budget, &temp_dir) {
         Ok(index_path) => {
             tracing::info!("Index created: {}", index_path.display());
+            if benchmark {
+                tracing::info!(
+                    "Benchmark summary (index): total {:.3}s",
+                    index_start.elapsed().as_secs_f64()
+                );
+            }
             tracing::info!("Done!");
             Ok(())
         }

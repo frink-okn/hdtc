@@ -434,6 +434,7 @@ dependencies = [
  "hashbrown 0.15.5",
  "hdt",
  "indicatif",
+ "libc",
  "oxrdf",
  "oxrdfio",
  "rayon",

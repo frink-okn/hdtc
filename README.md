@@ -129,18 +129,20 @@ hdtc index existing.hdt --memory-limit 8192 --temp-dir /mnt/fast-ssd/tmp
 | `--graph-map PATH=URI` | —                            | Map input paths to named graph URIs (quads mode)    |
 | `--default-graph URI`  | —                            | Default graph for triples without an explicit graph |
 | `--memory-limit MB`    | 4096                         | Soft memory limit for internal buffers              |
+| `--benchmark`          | off                          | Emit stage timing and RSS high-water summary        |
 | `-v, --verbose`        | —                            | Increase log verbosity (`-v` debug, `-vv` trace)    |
 | `-q, --quiet`          | —                            | Suppress all output except errors                   |
 
 ### Index: All options
 
-| Option              | Default      | Description                                    |
-| ------------------- | ------------ | ---------------------------------------------- |
-| `<HDT_FILE>`        | _(required)_ | Path to existing HDT file                      |
-| `--temp-dir`        | system temp  | Directory for temporary working files          |
-| `--memory-limit MB` | 4096         | Soft memory limit for sorting operations       |
+| Option              | Default      | Description                                      |
+| ------------------- | ------------ | ------------------------------------------------ |
+| `<HDT_FILE>`        | _(required)_ | Path to existing HDT file                        |
+| `--temp-dir`        | system temp  | Directory for temporary working files            |
+| `--memory-limit MB` | 4096         | Soft memory limit for sorting operations         |
+| `--benchmark`       | off          | Emit stage timing and RSS high-water summary     |
 | `-v, --verbose`     | —            | Increase log verbosity (`-v` debug, `-vv` trace) |
-| `-q, --quiet`       | —            | Suppress all output except errors              |
+| `-q, --quiet`       | —            | Suppress all output except errors                |
 
 ## Resource requirements
 
@@ -178,6 +180,7 @@ Stage 3  Write partial vocabularies to disk (zstd-compressed)
 Stage 4  K-way merge partial vocabularies → assign global IDs, write dictionary
    ↓
 Stage 5  Remap local IDs to global IDs (parallel)
+         (chunked transfer to Stage 6 to reduce channel overhead)
    ↓
 Stage 6  Build BitmapTriples (streaming, SPO order)
    ↓

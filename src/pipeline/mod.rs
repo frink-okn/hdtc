@@ -28,8 +28,11 @@ use crossbeam_channel::{bounded, Receiver, Sender};
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use batch_vocab::{LocalIdTriple, Roles, VocabEntry};
+
+const STAGE5_TO_STAGE6_CHUNK_SIZE: usize = 16_384;
 
 /// Result of pipeline execution.
 pub struct PipelineResult {
@@ -58,6 +61,100 @@ struct BatchComplete {
     term_count: usize,
     #[allow(dead_code)]
     triple_count: usize,
+}
+
+#[derive(Debug)]
+struct StageMetric {
+    name: &'static str,
+    duration: Duration,
+    peak_rss_bytes: u64,
+    peak_rss_delta_bytes: u64,
+}
+
+#[cfg(target_os = "linux")]
+fn process_peak_rss_bytes() -> Option<u64> {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+    let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+    if rc != 0 {
+        return None;
+    }
+    let usage = unsafe { usage.assume_init() };
+    if usage.ru_maxrss < 0 {
+        return None;
+    }
+    Some((usage.ru_maxrss as u64) * 1024)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_peak_rss_bytes() -> Option<u64> {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+    let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+    if rc != 0 {
+        return None;
+    }
+    let usage = unsafe { usage.assume_init() };
+    if usage.ru_maxrss < 0 {
+        return None;
+    }
+    Some(usage.ru_maxrss as u64)
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+
+    let b = bytes as f64;
+    if b >= GB {
+        format!("{:.2} GiB", b / GB)
+    } else if b >= MB {
+        format!("{:.2} MiB", b / MB)
+    } else if b >= KB {
+        format!("{:.2} KiB", b / KB)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
+fn push_stage_metric(
+    metrics: &mut Vec<StageMetric>,
+    name: &'static str,
+    start: Instant,
+    rss_before: Option<u64>,
+    benchmark: bool,
+) {
+    if !benchmark {
+        return;
+    }
+
+    let peak_rss_bytes = process_peak_rss_bytes().unwrap_or(0);
+    let peak_rss_delta_bytes = match rss_before {
+        Some(before) => peak_rss_bytes.saturating_sub(before),
+        None => 0,
+    };
+    metrics.push(StageMetric {
+        name,
+        duration: start.elapsed(),
+        peak_rss_bytes,
+        peak_rss_delta_bytes,
+    });
+}
+
+fn log_benchmark_summary(metrics: &[StageMetric], benchmark: bool) {
+    if !benchmark || metrics.is_empty() {
+        return;
+    }
+
+    tracing::info!("Benchmark summary (pipeline):");
+    for metric in metrics {
+        tracing::info!(
+            "  {:<28} time {:>8.3}s | peak RSS {:>10} | +{}",
+            metric.name,
+            metric.duration.as_secs_f64(),
+            format_bytes(metric.peak_rss_bytes),
+            format_bytes(metric.peak_rss_delta_bytes)
+        );
+    }
 }
 
 /// Helper to generate file paths.
@@ -316,8 +413,13 @@ pub fn run_pipeline(
     memory_budget: usize,
     include_graphs: bool,
     base_uri: &str,
+    benchmark: bool,
 ) -> Result<PipelineResult> {
     tracing::info!("Starting pipelined HDT construction");
+
+    let mut stage_metrics: Vec<StageMetric> = Vec::new();
+    let rss_start = if benchmark { process_peak_rss_bytes() } else { None };
+    let stages123_start = Instant::now();
 
     let batch_size = calculate_batch_size(memory_budget);
     tracing::info!(
@@ -406,8 +508,18 @@ pub fn run_pipeline(
         Ok(Ok(())) => {}
     }
 
+    push_stage_metric(
+        &mut stage_metrics,
+        "Stages 1-3 parse/build/write",
+        stages123_start,
+        rss_start,
+        benchmark,
+    );
+
     // Stage 4: Merge vocabularies and build global dictionary
     tracing::info!("Stage 4: Merging vocabularies");
+    let stage4_start = Instant::now();
+    let stage4_rss_before = if benchmark { process_peak_rss_bytes() } else { None };
     let batch_infos: Vec<(usize, PathBuf)> = batches
         .iter()
         .map(|b| (b.batch_id, b.vocab_path.clone()))
@@ -423,11 +535,21 @@ pub fn run_pipeline(
         merge_result.counts.objects
     );
 
+    push_stage_metric(
+        &mut stage_metrics,
+        "Stage 4 vocab merge",
+        stage4_start,
+        stage4_rss_before,
+        benchmark,
+    );
+
     // Stage 5: ID remapping (parallel)
     tracing::info!("Stage 5: Remapping local IDs to global IDs");
+    let stage5_start = Instant::now();
+    let stage5_rss_before = if benchmark { process_peak_rss_bytes() } else { None };
 
-    // Set up channel for global-ID triples
-    let (global_triple_tx, global_triple_rx) = bounded::<IdTriple>(100_000);
+    // Set up channel for global-ID triples (chunked to reduce per-message overhead)
+    let (global_triple_tx, global_triple_rx) = bounded::<Vec<IdTriple>>(256);
 
     // Prepare batch remap info and track mapping paths for cleanup
     let (remap_tx, remap_rx) = bounded(batches.len());
@@ -450,7 +572,12 @@ pub fn run_pipeline(
         .map(|n| n.get())
         .unwrap_or(4);
     let remapper_handle = std::thread::spawn(move || {
-        id_remapper::id_remapper_stage(remap_rx, global_triple_tx, num_cpus)
+        id_remapper::id_remapper_stage(
+            remap_rx,
+            global_triple_tx,
+            num_cpus,
+            STAGE5_TO_STAGE6_CHUNK_SIZE,
+        )
     });
 
     // Stage 6: External sort + BitmapTriples construction
@@ -465,15 +592,17 @@ pub fn run_pipeline(
     let mut max_predicate: u64 = 0;
     let mut max_object: u64 = 0;
 
-    for triple in global_triple_rx {
-        max_subject = max_subject.max(triple.subject);
-        max_predicate = max_predicate.max(triple.predicate);
-        max_object = max_object.max(triple.object);
-        sorter.push(triple, &mut buffer, &mut mem_used)?;
-        triple_count += 1;
+    for triple_chunk in global_triple_rx {
+        for triple in triple_chunk {
+            max_subject = max_subject.max(triple.subject);
+            max_predicate = max_predicate.max(triple.predicate);
+            max_object = max_object.max(triple.object);
+            sorter.push(triple, &mut buffer, &mut mem_used)?;
+            triple_count += 1;
 
-        if triple_count.is_multiple_of(10_000_000) {
-            tracing::info!("Collected {} triples for sorting", triple_count);
+            if triple_count.is_multiple_of(10_000_000) {
+                tracing::info!("Collected {} triples for sorting", triple_count);
+            }
         }
     }
 
@@ -484,17 +613,45 @@ pub fn run_pipeline(
 
     tracing::info!("Remapped {} triples, sorting...", remapped_count);
 
+    push_stage_metric(
+        &mut stage_metrics,
+        "Stage 5 remap/collect",
+        stage5_start,
+        stage5_rss_before,
+        benchmark,
+    );
+
     // Finish sorting
+    let sort_start = Instant::now();
+    let sort_rss_before = if benchmark { process_peak_rss_bytes() } else { None };
     let sorted_triples = sorter.finish(&mut buffer)?;
+
+    push_stage_metric(
+        &mut stage_metrics,
+        "Stage 6 external sort",
+        sort_start,
+        sort_rss_before,
+        benchmark,
+    );
 
     // Build BitmapTriples (max IDs enable single-pass streaming construction)
     tracing::info!("Building BitmapTriples");
+    let bitmap_start = Instant::now();
+    let bitmap_rss_before = if benchmark { process_peak_rss_bytes() } else { None };
     let bitmap_triples = crate::triples::build_bitmap_triples(
         sorted_triples,
         max_subject,
         max_predicate,
         max_object,
     )?;
+
+    push_stage_metric(
+        &mut stage_metrics,
+        "Stage 6 bitmap build",
+        bitmap_start,
+        bitmap_rss_before,
+        benchmark,
+    );
 
     tracing::info!(
         "Pipeline complete: {} triples encoded",
@@ -503,6 +660,8 @@ pub fn run_pipeline(
 
     // Clean up temporary files
     cleanup_temp_files(&batches, &mapping_paths);
+
+    log_benchmark_summary(&stage_metrics, benchmark);
 
     Ok(PipelineResult {
         counts: merge_result.counts,

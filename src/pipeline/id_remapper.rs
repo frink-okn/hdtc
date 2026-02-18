@@ -19,7 +19,8 @@ pub struct BatchRemapInfo {
 /// Remap a single batch: local IDs → global IDs.
 fn remap_batch(
     batch_info: &BatchRemapInfo,
-    global_triple_tx: &Sender<IdTriple>,
+    global_triple_tx: &Sender<Vec<IdTriple>>,
+    chunk_size: usize,
 ) -> Result<usize> {
     // Load ID mapping
     let mapping = IdMapping::read_from_file(&batch_info.mapping_path)
@@ -32,6 +33,7 @@ fn remap_batch(
     let mut decoder = zstd::Decoder::with_buffer(buf_reader)?;
 
     let mut count = 0;
+    let mut chunk: Vec<IdTriple> = Vec::with_capacity(chunk_size);
 
     // Read and remap each triple
     loop {
@@ -60,9 +62,14 @@ fn remap_batch(
                     object: global_object,
                 };
 
-                // Send to next stage
-                if global_triple_tx.send(global_triple).is_err() {
-                    anyhow::bail!("Global triple receiver disconnected");
+                // Send to next stage in chunks to reduce channel overhead
+                chunk.push(global_triple);
+                if chunk.len() >= chunk_size {
+                    let chunk_to_send = std::mem::take(&mut chunk);
+                    if global_triple_tx.send(chunk_to_send).is_err() {
+                        anyhow::bail!("Global triple receiver disconnected");
+                    }
+                    chunk = Vec::with_capacity(chunk_size);
                 }
 
                 count += 1;
@@ -76,6 +83,12 @@ fn remap_batch(
         }
     }
 
+    if !chunk.is_empty() {
+        if global_triple_tx.send(chunk).is_err() {
+            anyhow::bail!("Global triple receiver disconnected");
+        }
+    }
+
     Ok(count)
 }
 
@@ -84,9 +97,12 @@ fn remap_batch(
 /// Processes batches in parallel, remapping local IDs to global IDs.
 pub fn id_remapper_stage(
     batch_remap_rx: Receiver<BatchRemapInfo>,
-    global_triple_tx: Sender<IdTriple>,
+    global_triple_tx: Sender<Vec<IdTriple>>,
     num_threads: usize,
+    chunk_size: usize,
 ) -> Result<u64> {
+    anyhow::ensure!(chunk_size > 0, "chunk_size must be greater than 0");
+
     // Use rayon to process batches in parallel
     let batches: Vec<_> = batch_remap_rx.iter().collect();
 
@@ -98,7 +114,7 @@ pub fn id_remapper_stage(
             batches
                 .par_iter()
                 .map(|batch_info| {
-                    match remap_batch(batch_info, &global_triple_tx) {
+                    match remap_batch(batch_info, &global_triple_tx, chunk_size) {
                         Ok(count) => {
                             tracing::info!(
                                 "Batch {}: remapped {} triples",
@@ -208,13 +224,15 @@ mod tests {
         };
 
         // Remap the batch
-        let count = remap_batch(&batch_info, &tx)?;
+        let count = remap_batch(&batch_info, &tx, 4)?;
         drop(tx);
 
         // Verify result
         assert_eq!(count, 1);
 
-        let remapped = rx.recv().expect("Should receive remapped triple");
+        let remapped_chunk = rx.recv().expect("Should receive remapped triple chunk");
+        assert_eq!(remapped_chunk.len(), 1);
+        let remapped = remapped_chunk[0];
         assert_eq!(remapped.subject, 10);
         assert_eq!(remapped.predicate, 20);
         assert_eq!(remapped.object, 11);
@@ -257,12 +275,15 @@ mod tests {
             mapping_path,
         };
 
-        let count = remap_batch(&batch_info, &tx)?;
+        let count = remap_batch(&batch_info, &tx, 4)?;
         drop(tx);
 
         assert_eq!(count, 3);
 
-        let remapped_triples: Vec<_> = rx.iter().collect();
+        let remapped_triples: Vec<_> = rx
+            .iter()
+            .flat_map(|chunk| chunk.into_iter())
+            .collect();
         assert_eq!(remapped_triples.len(), 3);
 
         // Verify each triple
@@ -304,7 +325,7 @@ mod tests {
             mapping_path,
         };
 
-        let result = remap_batch(&batch_info, &tx);
+        let result = remap_batch(&batch_info, &tx, 4);
         assert!(result.is_err(), "Should error on out-of-bounds ID");
         assert!(result.unwrap_err().to_string().contains("SO mapping missing"));
 
@@ -342,7 +363,7 @@ mod tests {
             mapping_path,
         };
 
-        let result = remap_batch(&batch_info, &tx);
+        let result = remap_batch(&batch_info, &tx, 4);
         assert!(result.is_err(), "Should error on out-of-bounds predicate ID");
         assert!(result.unwrap_err().to_string().contains("P mapping missing"));
 

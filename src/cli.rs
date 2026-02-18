@@ -26,6 +26,10 @@ pub struct Cli {
     /// Suppress all output except errors
     #[arg(short, long, global = true)]
     pub quiet: bool,
+
+    /// Emit stage-by-stage timing and RSS high-water summaries
+    #[arg(long, global = true)]
+    pub benchmark: bool,
 }
 
 #[derive(Debug, Subcommand)]

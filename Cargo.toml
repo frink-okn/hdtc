@@ -25,6 +25,7 @@ crossbeam-channel = "0.5"
 hashbrown = "0.15"
 bumpalo = "3"
 bitflags = "2"
+libc = "0.2"
 
 [dev-dependencies]
 hdt = "0.4"
