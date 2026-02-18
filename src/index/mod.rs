@@ -257,8 +257,11 @@ fn build_object_index(
     let mut index_z_writer = LogArrayWriter::for_max_value(max_pos_y);
     let mut bitmap_index_z_writer = BitmapWriter::new();
 
-    for object_id in 1..=max_object as usize {
-        let entries = &mut object_lists[object_id];
+    for entries in object_lists
+        .iter_mut()
+        .take(max_object as usize + 1)
+        .skip(1)
+    {
         if entries.is_empty() {
             continue;
         }

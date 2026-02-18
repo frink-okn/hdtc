@@ -83,10 +83,8 @@ fn remap_batch(
         }
     }
 
-    if !chunk.is_empty() {
-        if global_triple_tx.send(chunk).is_err() {
-            anyhow::bail!("Global triple receiver disconnected");
-        }
+    if !chunk.is_empty() && global_triple_tx.send(chunk).is_err() {
+        anyhow::bail!("Global triple receiver disconnected");
     }
 
     Ok(count)
