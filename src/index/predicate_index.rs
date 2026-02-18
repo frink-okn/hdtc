@@ -143,13 +143,19 @@ pub fn build_predicate_index(predicates: &[u64], max_predicate: u64) -> Result<P
 /// - `predicates`: seqY from BitmapTriples
 /// - `max_predicate`: Maximum predicate ID value
 pub fn build_predicate_count(predicates: &[u64], max_predicate: u64) -> Result<Vec<u8>> {
-    let mut counts = vec![0u64; (max_predicate + 1) as usize];
+    let mut counts = vec![0u64; max_predicate as usize];
     for &p in predicates {
-        counts[p as usize] += 1;
+        if p > 0 && (p as usize) <= counts.len() {
+            counts[(p - 1) as usize] += 1;
+        }
     }
 
-    let max_count = *counts.iter().max().unwrap_or(&0);
-    let mut writer = LogArrayWriter::for_max_value(max_count);
+    let bits = if predicates.is_empty() {
+        1
+    } else {
+        (64 - (predicates.len() as u64).leading_zeros()) as u8
+    };
+    let mut writer = LogArrayWriter::new(bits);
 
     for &count in &counts {
         writer.push(count);
@@ -176,10 +182,10 @@ mod tests {
 
         // Parse back to verify
         let reader = LogArrayReader::read_from(&mut Cursor::new(counts_buf))?;
-        assert_eq!(reader.get(0), 0); // pred 0 has 0 occurrences
-        assert_eq!(reader.get(1), 3); // pred 1 has 3 occurrences
-        assert_eq!(reader.get(2), 1); // pred 2 has 1 occurrence
-        assert_eq!(reader.get(3), 1); // pred 3 has 1 occurrence
+        assert_eq!(reader.len(), 3);
+        assert_eq!(reader.get(0), 3); // pred 1 has 3 occurrences
+        assert_eq!(reader.get(1), 1); // pred 2 has 1 occurrence
+        assert_eq!(reader.get(2), 1); // pred 3 has 1 occurrence
 
         Ok(())
     }
@@ -197,7 +203,8 @@ mod tests {
         // Verify count
         let counts_buf = build_predicate_count(&predicates, 1)?;
         let reader = LogArrayReader::read_from(&mut Cursor::new(counts_buf))?;
-        assert_eq!(reader.get(1), 3);
+        assert_eq!(reader.len(), 1);
+        assert_eq!(reader.get(0), 3);
 
         Ok(())
     }
@@ -215,9 +222,10 @@ mod tests {
         // Verify counts
         let counts_buf = build_predicate_count(&predicates, max_pred)?;
         let reader = LogArrayReader::read_from(&mut Cursor::new(counts_buf))?;
-        assert_eq!(reader.get(1), 3); // pred 1 appears 3 times
-        assert_eq!(reader.get(2), 2); // pred 2 appears 2 times
-        assert_eq!(reader.get(3), 1); // pred 3 appears 1 time
+        assert_eq!(reader.len(), 3);
+        assert_eq!(reader.get(0), 3); // pred 1 appears 3 times
+        assert_eq!(reader.get(1), 2); // pred 2 appears 2 times
+        assert_eq!(reader.get(2), 1); // pred 3 appears 1 time
 
         Ok(())
     }

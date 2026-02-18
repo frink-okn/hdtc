@@ -1,6 +1,7 @@
 mod common;
 
 use common::write_file;
+use oxrdf::Term;
 use std::io::Write;
 use std::path::Path;
 use std::process::Command;
@@ -71,6 +72,52 @@ fn parse_control_info(data: &[u8], offset: usize) -> (u8, String, String, usize)
     // Skip null + 2 bytes CRC16
     let after = props_end + 1 + 2;
     (control_type, format, props, after)
+}
+
+fn parse_header_num_triples(header_content: &str) -> u64 {
+    const VOID_TRIPLES: &str = "http://rdfs.org/ns/void#triples";
+    const HDT_TRIPLES_NUM: &str = "http://purl.org/HDT/hdt#triplesnumTriples";
+
+    let parser = oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::NTriples)
+        .for_reader(std::io::Cursor::new(header_content.as_bytes()));
+
+    let mut value_from_void: Option<u64> = None;
+    let mut value_from_hdt: Option<u64> = None;
+
+    for quad in parser {
+        let quad = quad.expect("Header must be valid N-Triples");
+        let predicate = quad.predicate.as_str();
+
+        if predicate != VOID_TRIPLES && predicate != HDT_TRIPLES_NUM {
+            continue;
+        }
+
+        let Term::Literal(literal) = quad.object else {
+            continue;
+        };
+
+        let value = literal
+            .value()
+            .parse::<u64>()
+            .expect("Triple-count literal must be numeric");
+
+        if predicate == VOID_TRIPLES {
+            value_from_void = Some(value);
+        }
+        if predicate == HDT_TRIPLES_NUM {
+            value_from_hdt = Some(value);
+        }
+    }
+
+    match (value_from_void, value_from_hdt) {
+        (Some(v), Some(h)) => {
+            assert_eq!(v, h, "void:triples and hdt:triplesnumTriples must match");
+            v
+        }
+        (Some(v), None) => v,
+        (None, Some(h)) => h,
+        (None, None) => panic!("Header is missing triple-count metadata"),
+    }
 }
 
 // =============================================================================
@@ -718,8 +765,8 @@ fn test_hdt_section_structure() {
     assert_eq!(ct, 3, "Dictionary CI type should be 3");
     assert_eq!(format, "<http://purl.org/HDT/hdt#dictionaryFour>");
     assert!(
-        props.contains("mapping=1"),
-        "Dictionary should use mapping=1"
+        props.contains("elements="),
+        "Dictionary should include elements property"
     );
 
     // Find Triples CI
@@ -737,10 +784,22 @@ fn test_hdt_section_structure() {
         props.contains("order=1"),
         "Triples should use SPO order (1)"
     );
-    assert!(
-        props.contains("numTriples=3"),
-        "Expected numTriples=3, got props: {props}"
-    );
+
+    // Triple count is encoded in header metadata (Java-compatible), not triples CI.
+    let (_, _, _, header_start) = parse_control_info(&hdt_bytes, 0);
+    let (_, _, header_props, header_content_start) = parse_control_info(&hdt_bytes, header_start);
+    let header_length: usize = header_props
+        .split(';')
+        .find_map(|p| p.strip_prefix("length="))
+        .expect("Header CI should have length property")
+        .parse()
+        .expect("Header length should be numeric");
+    let header_content = String::from_utf8(
+        hdt_bytes[header_content_start..header_content_start + header_length].to_vec(),
+    )
+    .expect("Header should be valid UTF-8");
+    let header_num_triples = parse_header_num_triples(&header_content);
+    assert_eq!(header_num_triples, 3, "Header triple count should be 3");
 }
 
 /// Verify the header section contains expected VoID metadata.

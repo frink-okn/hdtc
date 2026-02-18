@@ -29,6 +29,18 @@ pub fn write_file(path: &Path, content: &[u8]) {
 /// Run hdtc on given input files and return the path to the generated HDT file.
 /// Panics if hdtc fails.
 pub fn run_hdtc_to_path(temp_dir: &Path, inputs: &[&Path], hdt_name: &str) -> PathBuf {
+    run_hdtc_to_path_with_args(temp_dir, inputs, hdt_name, &[])
+}
+
+/// Run hdtc on given input files and return the path to the generated HDT file,
+/// appending additional CLI arguments.
+/// Panics if hdtc fails.
+pub fn run_hdtc_to_path_with_args(
+    temp_dir: &Path,
+    inputs: &[&Path],
+    hdt_name: &str,
+    extra_args: &[&str],
+) -> PathBuf {
     let hdt_path = temp_dir.join(hdt_name);
     let work_dir = temp_dir.join("work");
 
@@ -47,6 +59,7 @@ pub fn run_hdtc_to_path(temp_dir: &Path, inputs: &[&Path], hdt_name: &str) -> Pa
         "--temp-dir".to_string(),
         work_dir.to_str().unwrap().to_string(),
     ]);
+    args.extend(extra_args.iter().map(|arg| arg.to_string()));
 
     let output = Command::new(env!("CARGO_BIN_EXE_hdtc"))
         .args(&args)

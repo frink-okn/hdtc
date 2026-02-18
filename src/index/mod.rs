@@ -1,44 +1,72 @@
 //! HDT index file creation (.hdt.index.v1-1).
 //!
-//! Creates an OPS-ordered sidecar index file from an existing HDT file.
+//! Creates a Java-compatible sidecar index file from an existing HDT file.
 
-mod decoder;
-mod ops_triple;
 mod predicate_index;
 mod writer;
 
-pub use decoder::BitmapTriplesDecoder;
-pub use ops_triple::OpsTriple;
 pub use predicate_index::{build_predicate_index, build_predicate_count};
 pub use writer::write_index;
 
-use crate::io::{BitmapReader, LogArrayReader, ControlInfo, ControlType};
-use crate::sort::ExternalSorter;
-use crate::triples::builder::build_bitmap_triples;
-use crate::triples::id_triple::IdTriple;
+use crate::io::{BitmapReader, BitmapWriter, ControlInfo, ControlType, LogArrayReader, LogArrayWriter};
 use anyhow::{bail, Context, Result};
+use oxrdf::Term;
 use std::fs::File;
+use std::io::Cursor;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-/// Helper function to read null-terminated string from a reader
-fn read_null_terminated_string<R: Read>(reader: &mut R) -> Result<String> {
-    let mut result = Vec::new();
-    let mut buf = [0u8; 1];
-    loop {
-        reader.read_exact(&mut buf)?;
-        if buf[0] == 0 {
-            break;
+fn parse_num_triples_from_header(header: &str) -> Result<u64> {
+    const VOID_TRIPLES: &str = "http://rdfs.org/ns/void#triples";
+    const HDT_TRIPLES_NUM: &str = "http://purl.org/HDT/hdt#triplesnumTriples";
+
+    let mut value_from_void: Option<u64> = None;
+    let mut value_from_hdt: Option<u64> = None;
+
+    let parser = oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::NTriples)
+        .for_reader(Cursor::new(header.as_bytes()));
+
+    for quad_result in parser {
+        let quad = quad_result.context("Invalid N-Triples in HDT header metadata")?;
+        let predicate = quad.predicate.as_str();
+
+        if predicate != VOID_TRIPLES && predicate != HDT_TRIPLES_NUM {
+            continue;
         }
-        result.push(buf[0]);
+
+        let Term::Literal(literal) = quad.object else {
+            continue;
+        };
+        let parsed = literal
+            .value()
+            .parse::<u64>()
+            .with_context(|| format!("Invalid numeric triple-count literal: {}", literal.value()))?;
+
+        if predicate == VOID_TRIPLES {
+            value_from_void = Some(parsed);
+        }
+        if predicate == HDT_TRIPLES_NUM {
+            value_from_hdt = Some(parsed);
+        }
     }
-    Ok(String::from_utf8(result)?)
+
+    match (value_from_void, value_from_hdt) {
+        (Some(v), Some(h)) if v != h => {
+            bail!(
+                "Header triple-count mismatch between void:triples ({v}) and hdt:triplesnumTriples ({h})"
+            )
+        }
+        (Some(v), Some(_)) => Ok(v),
+        (Some(v), None) => Ok(v),
+        (None, Some(h)) => Ok(h),
+        (None, None) => bail!("Header metadata missing triple-count predicate"),
+    }
 }
 
 /// Create HDT index file (.hdt.index.v1-1) from an existing HDT file.
 ///
-/// The index file contains triples in OPS (Object-Predicate-Subject) order
-/// plus auxiliary inverted index structures for fast predicate-based queries.
+/// The index file contains object index and predicate index structures
+/// compatible with hdt-java's `indexFoQ` format.
 ///
 /// # Arguments
 /// - `hdt_path`: Path to the main HDT file
@@ -49,8 +77,8 @@ fn read_null_terminated_string<R: Read>(reader: &mut R) -> Result<String> {
 /// Path to the created index file (same as HDT with .hdt.index.v1-1 suffix)
 pub fn create_index(
     hdt_path: &Path,
-    memory_budget: usize,
-    temp_dir: &Path,
+    _memory_budget: usize,
+    _temp_dir: &Path,
 ) -> Result<PathBuf> {
     tracing::info!("Creating index for {}", hdt_path.display());
 
@@ -76,9 +104,15 @@ pub fn create_index(
         .get_property("length")
         .and_then(|s| s.parse().ok())
         .context("Missing or invalid header length in control info")?;
+
+    let mut header_buf = vec![0u8; header_len];
     reader
-        .seek(SeekFrom::Current(header_len as i64))
-        .context("Failed to skip header section")?;
+        .read_exact(&mut header_buf)
+        .context("Failed to read header section")?;
+    let header_text = String::from_utf8(header_buf)
+        .context("Header content is not valid UTF-8")?;
+    let num_triples_from_header = parse_num_triples_from_header(&header_text)
+        .context("Failed to parse triple count from header metadata")?;
 
     // Skip dictionary section (without knowing its exact length)
     let dict_ci = ControlInfo::read_from(&mut reader)
@@ -87,63 +121,49 @@ pub fn create_index(
         bail!("Expected dictionary control info");
     }
 
-    // The dictionary contains four PFC-encoded sub-sections without explicit length headers.
-    // Scan forward to find the triples section marker ($HDT magic bytes).
-    let mut buf = [0u8; 4];
-    let mut byte = [0u8; 1];
+    // The dictionary contains PFC-encoded sub-sections without an explicit total length.
+    // Scan forward for a *valid* triples ControlInfo block instead of trusting raw "$HDT" bytes,
+    // which may appear in dictionary payloads.
+    let triples_order = loop {
+        let candidate_start = reader
+            .stream_position()
+            .context("Failed to get stream position while scanning for triples section")?;
 
-    let num_triples = loop {
-        reader
-            .read_exact(&mut byte)
-            .context("Failed to read while scanning for triples section")?;
+        let mut marker = [0u8; 5];
+        if reader.read_exact(&mut marker).is_err() {
+            bail!("Failed to locate triples control info marker");
+        }
 
-        if byte[0] == b'$' {
-            buf[0] = byte[0];
+        if &marker == b"$HDT\x04" {
             reader
-                .read_exact(&mut buf[1..])
-                .context("Failed to read potential magic bytes")?;
+                .seek(SeekFrom::Start(candidate_start))
+                .context("Failed to rewind to triples control info candidate")?;
 
-            if &buf == b"$HDT" {
-                reader
-                    .read_exact(&mut byte)
-                    .context("Failed to read section type")?;
-
-                if byte[0] == 4 {
-                    // Found the triples section (type=4)
-                    let _format = read_null_terminated_string(&mut reader)
-                        .context("Failed to read triples format")?;
-                    let props_str = read_null_terminated_string(&mut reader)
-                        .context("Failed to read triples properties")?;
-
-                    // Parse properties
-                    let mut properties = std::collections::BTreeMap::new();
-                    if !props_str.is_empty() {
-                        for prop in props_str.split(';') {
-                            if let Some((key, value)) = prop.split_once('=') {
-                                properties.insert(key.to_string(), value.to_string());
-                            }
-                        }
-                    }
-
-                    // Skip CRC16
-                    reader
-                        .read_exact(&mut [0u8; 2])
-                        .context("Failed to skip CRC16")?;
-
-                    let nt = properties
-                        .get("numTriples")
+            match ControlInfo::read_from(&mut reader) {
+                Ok(ci) if ci.control_type == ControlType::Triples => {
+                    let order = ci
+                        .get_property("order")
                         .and_then(|s| s.parse().ok())
-                        .context("Missing or invalid numTriples")?;
+                        .context("Missing or invalid triples order")?;
 
-                    tracing::info!("Decoded main HDT: {} triples", nt);
-                    break nt;
+                    tracing::info!("Decoded main HDT: {} triples", num_triples_from_header);
+                    break order;
+                }
+                _ => {
+                    reader
+                        .seek(SeekFrom::Start(candidate_start + 1))
+                        .context("Failed to advance after invalid triples control info candidate")?;
                 }
             }
+        } else {
+            reader
+                .seek(SeekFrom::Start(candidate_start + 1))
+                .context("Failed to advance scan position")?;
         }
     };
 
     // Read BitmapTriples structures (order: Y, Z, Y, Z)
-    let bitmap_y = BitmapReader::read_from(&mut reader)
+    let _bitmap_y = BitmapReader::read_from(&mut reader)
         .context("Failed to read BitmapY")?;
     let bitmap_z = BitmapReader::read_from(&mut reader)
         .context("Failed to read BitmapZ")?;
@@ -152,68 +172,20 @@ pub fn create_index(
     let array_z = LogArrayReader::read_from(&mut reader)
         .context("Failed to read ArrayZ")?;
 
+    let num_triples = num_triples_from_header;
+
     // Extract seqY for later PredicateIndex building
     let mut seq_y = Vec::new();
     for i in 0..array_y.len() {
         seq_y.push(array_y.get(i));
     }
 
-    // Create decoder and convert to OPS order
-    let decoder = BitmapTriplesDecoder::new(bitmap_y, array_y, bitmap_z, array_z, num_triples);
-
-    tracing::info!("Sorting triples in OPS order...");
-
-    // Convert to OPS and sort
-    let mut sorter = ExternalSorter::new(temp_dir, memory_budget);
-
-    // Track max IDs while converting
-    let mut max_object = 0u64;
-    let mut max_predicate = 0u64;
-    let mut max_subject = 0u64;
-    let mut sort_buffer: Vec<OpsTriple> = Vec::new();
-    let mut mem_used: usize = 0;
-
-    for result in decoder {
-        let triple = result.context("Failed to decode triple")?;
-        max_object = max_object.max(triple.object);
-        max_predicate = max_predicate.max(triple.predicate);
-        max_subject = max_subject.max(triple.subject);
-
-        let ops = OpsTriple::from(triple);
-        sorter.push(ops, &mut sort_buffer, &mut mem_used)?;
-    }
-
-    // Finish sorting to get sorted iterator
-    let sorted_ops = sorter.finish(&mut sort_buffer)?;
-
-    // Collect sorted OPS triples for processing
-    let mut sorted_triples = Vec::new();
-    for result in sorted_ops {
-        let ops = result.context("Failed to read sorted OPS triple")?;
-        sorted_triples.push(ops);
-    }
-
-    tracing::info!(
-        "Building OPS BitmapTriples structures (max S={}, max P={}, max O={})",
-        max_subject,
-        max_predicate,
-        max_object
-    );
-
-    // Build OPS BitmapTriples
-    let ops_iter = sorted_triples.iter().map(|ops| Ok(IdTriple {
-        subject: ops.subject,
-        predicate: ops.predicate,
-        object: ops.object,
-    }));
-
-    let ops_bitmap = build_bitmap_triples(
-        ops_iter,
-        max_object,    // X in OPS
-        max_predicate, // Y in OPS
-        max_subject,   // Z in OPS
-    )
-    .context("Failed to build OPS BitmapTriples")?;
+    // Build bitmapIndexZ + indexZ exactly as hdt-java does for indexFoQ:
+    // for each triple position i in SPO stream, compute (object=seqZ[i], posY=rank1(bitmapZ, i-1)),
+    // group by object, sort each object-group by (predicate at posY, posY), then serialize posY values.
+    let (bitmap_index_z, index_z, max_predicate) =
+        build_object_index(&seq_y, &bitmap_z, &array_z, num_triples)
+            .context("Failed to build bitmapIndexZ/indexZ")?;
 
     // Build PredicateIndex
     tracing::info!("Building PredicateIndex structures...");
@@ -226,12 +198,97 @@ pub fn create_index(
     // Write index file
     let index_path = hdt_path.with_extension("hdt.index.v1-1");
 
-    write_index(&index_path, num_triples, &ops_bitmap, &pred_index, &pred_count)
+    write_index(
+        &index_path,
+        num_triples,
+        triples_order,
+        &bitmap_index_z,
+        &index_z,
+        &pred_index,
+        &pred_count,
+    )
         .context("Failed to write index file")?;
 
     tracing::info!("Index creation complete: {}", index_path.display());
 
     Ok(index_path)
+}
+
+fn build_object_index(
+    seq_y: &[u64],
+    bitmap_z: &BitmapReader,
+    array_z: &LogArrayReader,
+    num_triples: u64,
+) -> Result<(Vec<u8>, Vec<u8>, u64)> {
+    if num_triples == 0 {
+        let mut bitmap_buf = Vec::new();
+        BitmapWriter::new().write_to(&mut bitmap_buf)?;
+
+        let mut index_buf = Vec::new();
+        LogArrayWriter::for_max_value(0).write_to(&mut index_buf)?;
+
+        return Ok((bitmap_buf, index_buf, 0));
+    }
+
+    let mut max_object = 0u64;
+    let mut max_predicate = 0u64;
+    let mut object_lists: Vec<Vec<(u64, u64)>> = vec![Vec::new()];
+
+    for i in 0..num_triples {
+        let object = array_z.get(i);
+        max_object = max_object.max(object);
+
+        let object_idx = object as usize;
+        if object_idx >= object_lists.len() {
+            object_lists.resize_with(object_idx + 1, Vec::new);
+        }
+
+        let pos_y = if i == 0 { 0 } else { bitmap_z.rank1(i - 1) };
+        let predicate = seq_y
+            .get(pos_y as usize)
+            .copied()
+            .context("posY out of bounds while building object index")?;
+        max_predicate = max_predicate.max(predicate);
+
+        object_lists[object_idx].push((predicate, pos_y));
+    }
+
+    let max_pos_y = (seq_y.len() as u64).saturating_sub(1);
+    let mut index_z_writer = LogArrayWriter::for_max_value(max_pos_y);
+    let mut bitmap_index_z_writer = BitmapWriter::new();
+
+    for object_id in 1..=max_object as usize {
+        let entries = &mut object_lists[object_id];
+        if entries.is_empty() {
+            continue;
+        }
+
+        entries.sort_unstable_by(|(pred_a, pos_a), (pred_b, pos_b)| {
+            pred_a.cmp(pred_b).then(pos_a.cmp(pos_b))
+        });
+
+        for &(_, pos_y) in entries.iter() {
+            index_z_writer.push(pos_y);
+            bitmap_index_z_writer.push(false);
+        }
+        bitmap_index_z_writer.set_last(true);
+    }
+
+    if bitmap_index_z_writer.len() != num_triples {
+        bail!(
+            "bitmapIndexZ length mismatch: got {}, expected {}",
+            bitmap_index_z_writer.len(),
+            num_triples
+        );
+    }
+
+    let mut bitmap_buf = Vec::new();
+    bitmap_index_z_writer.write_to(&mut bitmap_buf)?;
+
+    let mut index_buf = Vec::new();
+    index_z_writer.write_to(&mut index_buf)?;
+
+    Ok((bitmap_buf, index_buf, max_predicate))
 }
 
 #[cfg(test)]

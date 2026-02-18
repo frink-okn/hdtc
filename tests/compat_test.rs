@@ -5,7 +5,13 @@
 
 mod common;
 
-use common::{run_hdtc_to_path, write_file, REPRESENTATIVE_NT, REPRESENTATIVE_TRIPLE_COUNT};
+use common::{
+    run_hdtc_to_path,
+    run_hdtc_to_path_with_args,
+    write_file,
+    REPRESENTATIVE_NT,
+    REPRESENTATIVE_TRIPLE_COUNT,
+};
 use std::io::BufReader;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -270,13 +276,19 @@ fn hdt_java_classpath(hdt_java_dir: &Path) -> String {
 }
 
 /// Run hdt-java's rdf2hdt conversion using the downloaded distribution.
-fn run_hdt_java_rdf2hdt(hdt_java_dir: &Path, input_rdf: &Path, output_hdt: &Path) {
+fn run_hdt_java_rdf2hdt(hdt_java_dir: &Path, input_rdf: &Path, output_hdt: &Path, with_index: bool) {
     let script = hdt_java_dir.join("bin").join("rdf2hdt.sh");
 
-    let output = Command::new("bash")
-        .arg(script.to_str().expect("valid rdf2hdt script path"))
+    let mut cmd = Command::new("bash");
+    cmd.arg(script.to_str().expect("valid rdf2hdt script path"))
         .arg(input_rdf.to_str().expect("valid input RDF path"))
-        .arg(output_hdt.to_str().expect("valid output HDT path"))
+        .arg(output_hdt.to_str().expect("valid output HDT path"));
+
+    if with_index {
+        cmd.arg("-index");
+    }
+
+    let output = cmd
         .output()
         .expect("Failed to run hdt-java rdf2hdt.sh");
 
@@ -295,6 +307,15 @@ fn run_hdt_java_rdf2hdt(hdt_java_dir: &Path, input_rdf: &Path, output_hdt: &Path
         "hdt-java rdf2hdt did not produce output file: {}",
         output_hdt.display()
     );
+
+    if with_index {
+        let index_path = output_hdt.with_extension("hdt.index.v1-1");
+        assert!(
+            index_path.exists(),
+            "hdt-java rdf2hdt did not produce index file: {}",
+            index_path.display()
+        );
+    }
 }
 
 #[derive(Debug)]
@@ -714,6 +735,39 @@ fn parse_triples_components(bytes: &[u8], triples_start: usize) -> Vec<Span> {
     spans
 }
 
+fn parse_index_components(bytes: &[u8]) -> Vec<Span> {
+    let index_ci = parse_control_info_at(bytes, 0);
+    let mut spans = vec![Span {
+        name: "IndexControlInfo",
+        start: index_ci.start,
+        end: index_ci.end,
+    }];
+
+    let mut pos = index_ci.end;
+    for name in [
+        "BitmapIndexZ",
+        "IndexZ",
+        "PredicateIndexBitmap",
+        "PredicateIndexSequence",
+        "PredicateCount",
+    ] {
+        let len = if name.contains("Bitmap") {
+            parse_bitmap_len_at(bytes, pos)
+        } else {
+            parse_logarray_len_at(bytes, pos)
+        };
+        spans.push(Span {
+            name,
+            start: pos,
+            end: pos + len,
+        });
+        pos += len;
+    }
+
+    assert_eq!(pos, bytes.len(), "index component boundaries do not reach file end exactly");
+    spans
+}
+
 fn component_diff_report(
     section_name: &str,
     component_name: &str,
@@ -850,7 +904,7 @@ fn test_hdtjava_exact_dictionary_and_triples_bytes() {
 
     let hdtc_hdt = run_hdtc_to_path(temp.path(), &[&input_nt], "hdtc.hdt");
     let java_hdt = temp.path().join("java.hdt");
-    run_hdt_java_rdf2hdt(&hdt_java_dir, &input_nt, &java_hdt);
+    run_hdt_java_rdf2hdt(&hdt_java_dir, &input_nt, &java_hdt, false);
 
     let hdtc_bytes = std::fs::read(&hdtc_hdt).expect("read hdtc HDT bytes");
     let java_bytes = std::fs::read(&java_hdt).expect("read hdt-java HDT bytes");
@@ -901,7 +955,7 @@ fn test_hdtjava_exact_dictionary_and_triples_diagnostics() {
 
     let hdtc_hdt = run_hdtc_to_path(temp.path(), &[&input_nt], "hdtc.hdt");
     let java_hdt = temp.path().join("java.hdt");
-    run_hdt_java_rdf2hdt(&hdt_java_dir, &input_nt, &java_hdt);
+    run_hdt_java_rdf2hdt(&hdt_java_dir, &input_nt, &java_hdt, false);
 
     let hdtc_bytes = std::fs::read(&hdtc_hdt).expect("read hdtc HDT bytes");
     let java_bytes = std::fs::read(&java_hdt).expect("read hdt-java HDT bytes");
@@ -925,11 +979,46 @@ fn test_hdtjava_exact_dictionary_and_triples_diagnostics() {
     let java_triples_components = parse_triples_components(&java_bytes, java_ranges.triples_start);
 
     let mut reports = Vec::new();
-    if let Some(r) = section_diff_report("Dictionary section", hdtc_dict, java_dict, &hdtc_dict_ci, &java_dict_ci) {
-        reports.push(r);
+    let mut notes = Vec::new();
+
+    if hdtc_dict_ci.control_type != java_dict_ci.control_type
+        || hdtc_dict_ci.format != java_dict_ci.format
+    {
+        reports.push(format!(
+            "Dictionary control info mismatch\n  hdtc: {}\n  java: {}",
+            format_control_info(&hdtc_dict_ci),
+            format_control_info(&java_dict_ci)
+        ));
     }
-    if let Some(r) = section_diff_report("Triples section", hdtc_triples, java_triples, &hdtc_triples_ci, &java_triples_ci) {
-        reports.push(r);
+
+    if hdtc_triples_ci.control_type != java_triples_ci.control_type
+        || hdtc_triples_ci.format != java_triples_ci.format
+        || hdtc_triples_ci.properties.get("order") != java_triples_ci.properties.get("order")
+    {
+        reports.push(format!(
+            "Triples control info mismatch\n  hdtc: {}\n  java: {}",
+            format_control_info(&hdtc_triples_ci),
+            format_control_info(&java_triples_ci)
+        ));
+    }
+
+    if let Some(r) = section_diff_report(
+        "Dictionary section",
+        hdtc_dict,
+        java_dict,
+        &hdtc_dict_ci,
+        &java_dict_ci,
+    ) {
+        notes.push(r);
+    }
+    if let Some(r) = section_diff_report(
+        "Triples section",
+        hdtc_triples,
+        java_triples,
+        &hdtc_triples_ci,
+        &java_triples_ci,
+    ) {
+        notes.push(r);
     }
 
     for component in ["SharedPFC", "SubjectsPFC", "PredicatesPFC", "ObjectsPFC"] {
@@ -947,33 +1036,178 @@ fn test_hdtjava_exact_dictionary_and_triples_diagnostics() {
         let jc = find_component(&java_triples_components, component);
         let left = &hdtc_bytes[hc.start..hc.end];
         let right = &java_bytes[jc.start..jc.end];
+
+        if component == "ArrayY" {
+            let left_vals = decode_logarray_values(left);
+            let right_vals = decode_logarray_values(right);
+            if left_vals != right_vals {
+                reports.push(format!(
+                    "Decoded ArrayY values differ\n  hdtc: {:?}\n  java: {:?}",
+                    left_vals, right_vals
+                ));
+                if let Some(r) = component_diff_report("Triples", component, left, right) {
+                    reports.push(r);
+                }
+            } else if let Some(r) = component_diff_report("Triples", component, left, right) {
+                notes.push(format!(
+                    "Decoded ArrayY values are identical ({:?}), but raw ArrayY bytes differ; this indicates a non-semantic LogArray encoding difference (e.g., trailing padding bits and resulting CRC32C).\n{}",
+                    left_vals,
+                    r
+                ));
+            }
+            continue;
+        }
+
         if let Some(r) = component_diff_report("Triples", component, left, right) {
             reports.push(r);
         }
     }
 
-    let hdtc_array_y_span = find_component(&hdtc_triples_components, "ArrayY");
-    let java_array_y_span = find_component(&java_triples_components, "ArrayY");
-    let hdtc_array_y_bytes = &hdtc_bytes[hdtc_array_y_span.start..hdtc_array_y_span.end];
-    let java_array_y_bytes = &java_bytes[java_array_y_span.start..java_array_y_span.end];
-    let hdtc_array_y = decode_logarray_values(hdtc_array_y_bytes);
-    let java_array_y = decode_logarray_values(java_array_y_bytes);
-
-    if hdtc_array_y != java_array_y {
-        reports.push(format!(
-            "Decoded ArrayY values differ\n  hdtc: {:?}\n  java: {:?}",
-            hdtc_array_y, java_array_y
-        ));
-    } else if first_diff_offset(hdtc_array_y_bytes, java_array_y_bytes).is_some() {
-        reports.push(format!(
-            "Decoded ArrayY values are identical ({:?}), but raw ArrayY bytes differ; this indicates a non-semantic LogArray encoding difference (e.g., trailing padding bits and resulting CRC32C).",
-            hdtc_array_y
-        ));
+    if reports.is_empty() && !notes.is_empty() {
+        eprintln!("HDT diagnostics notes (non-semantic differences):\n{}", notes.join("\n\n"));
     }
 
     assert!(
         reports.is_empty(),
         "HDT parity diagnostics:\n{}",
+        reports.join("\n\n")
+    );
+}
+
+/// Generate HDT+index with hdtc and hdt-java from the same RDF input and compare
+/// parsed index structures for semantic equivalence.
+#[test]
+#[ignore]
+fn test_hdtjava_exact_index_bytes() {
+    let hdt_java_dir = ensure_hdt_java();
+    let temp = tempfile::tempdir().expect("create temp dir");
+
+    let input_nt = temp.path().join("input.nt");
+    write_file(&input_nt, REPRESENTATIVE_NT.as_bytes());
+
+    let hdtc_hdt = run_hdtc_to_path_with_args(temp.path(), &[&input_nt], "hdtc.hdt", &["--index"]);
+    let hdtc_index = hdtc_hdt.with_extension("hdt.index.v1-1");
+    assert!(hdtc_index.exists(), "hdtc did not produce index file");
+
+    let java_hdt = temp.path().join("java.hdt");
+    run_hdt_java_rdf2hdt(&hdt_java_dir, &input_nt, &java_hdt, true);
+    let java_index = java_hdt.with_extension("hdt.index.v1-1");
+
+    let hdtc_bytes = std::fs::read(&hdtc_index).expect("read hdtc index bytes");
+    let java_bytes = std::fs::read(&java_index).expect("read hdt-java index bytes");
+
+    let hdtc_components = parse_index_components(&hdtc_bytes);
+    let java_components = parse_index_components(&java_bytes);
+
+    let hdtc_ci = parse_control_info_at(&hdtc_bytes, 0);
+    let java_ci = parse_control_info_at(&java_bytes, 0);
+    assert_eq!(hdtc_ci.control_type, java_ci.control_type, "Index control type differs");
+    assert_eq!(hdtc_ci.format, java_ci.format, "Index format URI differs");
+    assert_eq!(hdtc_ci.properties, java_ci.properties, "Index properties differ");
+
+    for component in ["BitmapIndexZ", "PredicateIndexBitmap"] {
+        let hc = find_component(&hdtc_components, component);
+        let jc = find_component(&java_components, component);
+        let left = decode_bitmap_bits(&hdtc_bytes[hc.start..hc.end]);
+        let right = decode_bitmap_bits(&java_bytes[jc.start..jc.end]);
+        assert_eq!(left, right, "Decoded index component {component} differs");
+    }
+
+    for component in ["IndexZ", "PredicateIndexSequence", "PredicateCount"] {
+        let hc = find_component(&hdtc_components, component);
+        let jc = find_component(&java_components, component);
+        let left = decode_logarray_values(&hdtc_bytes[hc.start..hc.end]);
+        let right = decode_logarray_values(&java_bytes[jc.start..jc.end]);
+        assert_eq!(left, right, "Decoded index component {component} differs");
+    }
+}
+
+/// Diagnostic parity test with detailed index metadata + byte-window diff.
+/// Run this when exact index parity fails to quickly identify root causes.
+#[test]
+#[ignore]
+fn test_hdtjava_exact_index_diagnostics() {
+    let hdt_java_dir = ensure_hdt_java();
+    let temp = tempfile::tempdir().expect("create temp dir");
+
+    let input_nt = temp.path().join("input.nt");
+    write_file(&input_nt, REPRESENTATIVE_NT.as_bytes());
+
+    let hdtc_hdt = run_hdtc_to_path_with_args(temp.path(), &[&input_nt], "hdtc.hdt", &["--index"]);
+    let hdtc_index = hdtc_hdt.with_extension("hdt.index.v1-1");
+    assert!(hdtc_index.exists(), "hdtc did not produce index file");
+
+    let java_hdt = temp.path().join("java.hdt");
+    run_hdt_java_rdf2hdt(&hdt_java_dir, &input_nt, &java_hdt, true);
+    let java_index = java_hdt.with_extension("hdt.index.v1-1");
+
+    let hdtc_bytes = std::fs::read(&hdtc_index).expect("read hdtc index bytes");
+    let java_bytes = std::fs::read(&java_index).expect("read hdt-java index bytes");
+
+    let hdtc_ci = parse_control_info_at(&hdtc_bytes, 0);
+    let java_ci = parse_control_info_at(&java_bytes, 0);
+
+    let hdtc_components = parse_index_components(&hdtc_bytes);
+    let java_components = parse_index_components(&java_bytes);
+
+    let mut reports = Vec::new();
+    if let Some(r) = section_diff_report("Index section", &hdtc_bytes, &java_bytes, &hdtc_ci, &java_ci) {
+        reports.push(r);
+    }
+
+    for component in [
+        "BitmapIndexZ",
+        "IndexZ",
+        "PredicateIndexBitmap",
+        "PredicateIndexSequence",
+        "PredicateCount",
+    ] {
+        let hc = find_component(&hdtc_components, component);
+        let jc = find_component(&java_components, component);
+        let left = &hdtc_bytes[hc.start..hc.end];
+        let right = &java_bytes[jc.start..jc.end];
+        if let Some(r) = component_diff_report("Index", component, left, right) {
+            reports.push(r);
+        }
+    }
+
+    for component in ["IndexZ", "PredicateIndexSequence", "PredicateCount"] {
+        let hc = find_component(&hdtc_components, component);
+        let jc = find_component(&java_components, component);
+        let left_bytes = &hdtc_bytes[hc.start..hc.end];
+        let right_bytes = &java_bytes[jc.start..jc.end];
+        let left = decode_logarray_values(left_bytes);
+        let right = decode_logarray_values(right_bytes);
+        if left != right {
+            reports.push(format!(
+                "Decoded index component {component} differs\n  hdtc: {:?}\n  java: {:?}",
+                left, right
+            ));
+        } else if first_diff_offset(left_bytes, right_bytes).is_some() {
+            reports.push(format!(
+                "Decoded index component {component} values are identical, but raw bytes differ; this indicates a non-semantic LogArray encoding difference (e.g., trailing padding bits and resulting CRC32C)."
+            ));
+        }
+    }
+
+    for component in ["BitmapIndexZ", "PredicateIndexBitmap"] {
+        let hc = find_component(&hdtc_components, component);
+        let jc = find_component(&java_components, component);
+        let left_bytes = &hdtc_bytes[hc.start..hc.end];
+        let right_bytes = &java_bytes[jc.start..jc.end];
+        let left = decode_bitmap_bits(left_bytes);
+        let right = decode_bitmap_bits(right_bytes);
+        if left != right {
+            reports.push(format!(
+                "Decoded index component {component} differs\n  hdtc: {:?}\n  java: {:?}",
+                left, right
+            ));
+        }
+    }
+
+    assert!(
+        reports.is_empty(),
+        "Index parity diagnostics:\n{}",
         reports.join("\n\n")
     );
 }

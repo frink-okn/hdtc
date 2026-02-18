@@ -2,7 +2,7 @@
 //!
 //! Every HDT section is preceded by a Control Information block:
 //! - Magic: "$HDT" (4 bytes)
-//! - Type: 1 byte (0=Global, 1=Header, 2=Dictionary, 3=Triples)
+//! - Type: 1 byte (1=Global, 2=Header, 3=Dictionary, 4=Triples, 5=Index)
 //! - Format: null-terminated URI string
 //! - Properties: semicolon-separated key=value pairs, null-terminated
 //! - CRC16-ANSI checksum over everything from magic through properties (inclusive)
@@ -24,6 +24,7 @@ pub enum ControlType {
     Header = 2,
     Dictionary = 3,
     Triples = 4,
+    Index = 5,
 }
 
 impl ControlType {
@@ -33,6 +34,7 @@ impl ControlType {
             2 => Ok(Self::Header),
             3 => Ok(Self::Dictionary),
             4 => Ok(Self::Triples),
+            5 => Ok(Self::Index),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("Unknown control type byte: {b}"),
@@ -257,6 +259,7 @@ mod tests {
             ControlType::Header,
             ControlType::Dictionary,
             ControlType::Triples,
+            ControlType::Index,
         ] {
             let ci = ControlInfo::new(ct, "format");
             let mut buf = Vec::new();
