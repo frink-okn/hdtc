@@ -133,6 +133,11 @@ impl ExternalSorter {
         MergeIterator::new(readers)
     }
 
+    /// Number of chunk files currently produced.
+    pub fn chunk_file_count(&self) -> usize {
+        self.chunk_files.len()
+    }
+
     /// Clean up temporary chunk files.
     pub fn cleanup(&self) {
         for path in &self.chunk_files {

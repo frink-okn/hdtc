@@ -129,6 +129,7 @@ impl Default for BitmapWriter {
 pub struct BitmapReader {
     words: Vec<u64>,
     num_bits: u64,
+    rank_prefix: Vec<u64>,
 }
 
 impl BitmapReader {
@@ -194,7 +195,20 @@ impl BitmapReader {
             words.push(u64::from_le_bytes(word_bytes));
         }
 
-        Ok(Self { words, num_bits })
+        // rank_prefix[i] = number of set bits in words[0..i)
+        let mut rank_prefix = Vec::with_capacity(num_words + 1);
+        rank_prefix.push(0);
+        let mut cumulative = 0u64;
+        for &word in &words {
+            cumulative += word.count_ones() as u64;
+            rank_prefix.push(cumulative);
+        }
+
+        Ok(Self {
+            words,
+            num_bits,
+            rank_prefix,
+        })
     }
 
     /// Get the bit at the given index.
@@ -224,10 +238,7 @@ impl BitmapReader {
         let word_idx = (pos / 64) as usize;
         let bit_idx = (pos % 64) as u32;
 
-        let mut count = 0u64;
-        for i in 0..word_idx {
-            count += self.words[i].count_ones() as u64;
-        }
+        let mut count = self.rank_prefix[word_idx];
         // Count bits in the last word up to and including bit_idx
         let mask = if bit_idx == 63 {
             u64::MAX
