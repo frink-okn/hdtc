@@ -21,7 +21,6 @@ jobs:
       with:
         java-version: '21'
         distribution: 'temurin'
-        cache: 'maven'
     - name: Build
       run: cargo build --verbose
     - name: Run tests
