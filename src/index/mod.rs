@@ -8,7 +8,6 @@ mod writer;
 pub use predicate_index::{build_predicate_index, build_predicate_count};
 pub use writer::write_index;
 
-use crate::io::crc_utils::Crc32cWriter;
 use crate::io::{
     BitmapReader, ControlInfo, ControlType, LogArrayReader,
     StreamingBitmapEncoder, StreamingLogArrayEncoder,
@@ -436,13 +435,13 @@ fn build_object_index(
 
     let bitmap_file = File::create(&bitmap_path)
         .context("Failed to create bitmap_index_z temp file")?;
-    let bitmap_crc_writer = Crc32cWriter::new(BufWriter::with_capacity(256 * 1024, bitmap_file));
-    let mut bitmap_encoder = StreamingBitmapEncoder::new(bitmap_crc_writer);
+    let mut bitmap_encoder =
+        StreamingBitmapEncoder::new(BufWriter::with_capacity(256 * 1024, bitmap_file));
 
     let index_file = File::create(&index_path)
         .context("Failed to create index_z temp file")?;
-    let index_crc_writer = Crc32cWriter::new(BufWriter::with_capacity(256 * 1024, index_file));
-    let mut index_encoder = StreamingLogArrayEncoder::new(bits_per_entry, index_crc_writer);
+    let mut index_encoder =
+        StreamingLogArrayEncoder::new(bits_per_entry, BufWriter::with_capacity(256 * 1024, index_file));
 
     let mut current_object: Option<u64> = None;
     let mut emitted = 0u64;
@@ -480,10 +479,8 @@ fn build_object_index(
     }
 
     // Finish streaming encoders
-    let (bitmap_num_bits, bitmap_crc_writer) = bitmap_encoder.finish()?;
-    let (bitmap_crc, mut bitmap_writer) = bitmap_crc_writer.finalize();
+    let (bitmap_num_bits, mut bitmap_writer) = bitmap_encoder.finish()?;
     bitmap_writer.flush()?;
-    tracing::debug!("bitmap_index_z CRC32C: {bitmap_crc:#010x}");
 
     if bitmap_num_bits != num_triples {
         bail!(
@@ -493,10 +490,8 @@ fn build_object_index(
         );
     }
 
-    let (index_num_entries, index_bpe, index_crc_writer) = index_encoder.finish()?;
-    let (index_crc, mut index_writer) = index_crc_writer.finalize();
+    let (index_num_entries, index_bpe, mut index_writer) = index_encoder.finish()?;
     index_writer.flush()?;
-    tracing::debug!("index_z CRC32C: {index_crc:#010x}");
 
     tracing::info!(
         "Object-index pass 3 complete in {:.3}s ({} entries streamed to temp files)",

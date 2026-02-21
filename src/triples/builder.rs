@@ -6,7 +6,6 @@
 //! - ArrayZ (So): object ID sequence
 //! - BitmapZ (Bo): marks last object for each (subject,predicate) pair (1 = last object of pair)
 
-use crate::io::crc_utils::Crc32cWriter;
 use crate::io::{StreamingBitmapEncoder, StreamingLogArrayEncoder};
 use crate::triples::id_triple::IdTriple;
 use anyhow::{Context, Result};
@@ -227,20 +226,16 @@ pub fn build_bitmap_triples_to_files(
         Ok(BufWriter::with_capacity(256 * 1024, file))
     };
 
-    // Each component writes: raw packed data bytes (no preamble).
-    // CRC32C is computed incrementally via Crc32cWriter wrapper.
-    // The preamble + CRC32C framing is written during HDT assembly.
-    let mut bitmap_y = StreamingBitmapEncoder::new(
-        Crc32cWriter::new(make_writer(&bitmap_y_path)?));
+    // Each component writes raw packed data bytes (no preamble, no CRC).
+    // The preamble + CRC32C framing is computed during HDT assembly when
+    // the temp files are copied into the final output.
+    let mut bitmap_y = StreamingBitmapEncoder::new(make_writer(&bitmap_y_path)?);
     let mut array_y = StreamingLogArrayEncoder::for_max_value(
-        max_predicate.max(1),
-        Crc32cWriter::new(make_writer(&array_y_path)?));
-    let mut bitmap_z = StreamingBitmapEncoder::new(
-        Crc32cWriter::new(make_writer(&bitmap_z_path)?));
+        max_predicate.max(1), make_writer(&array_y_path)?);
+    let mut bitmap_z = StreamingBitmapEncoder::new(make_writer(&bitmap_z_path)?);
     let max_obj_or_shared = max_object.max(max_subject).max(1);
     let mut array_z = StreamingLogArrayEncoder::for_max_value(
-        max_obj_or_shared,
-        Crc32cWriter::new(make_writer(&array_z_path)?));
+        max_obj_or_shared, make_writer(&array_z_path)?);
 
     let mut prev_subject: u64 = 0;
     let mut prev_predicate: u64 = 0;
@@ -282,21 +277,17 @@ pub fn build_bitmap_triples_to_files(
 
     tracing::info!("BitmapTriples: {num_triples} triples encoded (streamed to files)");
 
-    // Finish each encoder: flush final partial word, get CRC, flush file
-    let (by_bits, by_crc_writer) = bitmap_y.finish()?;
-    let (_by_crc, mut by_buf) = by_crc_writer.finalize();
+    // Finish each encoder: flush final partial word, then flush file
+    let (by_bits, mut by_buf) = bitmap_y.finish()?;
     by_buf.flush()?;
 
-    let (ay_entries, ay_bits_per_entry, ay_crc_writer) = array_y.finish()?;
-    let (_ay_crc, mut ay_buf) = ay_crc_writer.finalize();
+    let (ay_entries, ay_bits_per_entry, mut ay_buf) = array_y.finish()?;
     ay_buf.flush()?;
 
-    let (bz_bits, bz_crc_writer) = bitmap_z.finish()?;
-    let (_bz_crc, mut bz_buf) = bz_crc_writer.finalize();
+    let (bz_bits, mut bz_buf) = bitmap_z.finish()?;
     bz_buf.flush()?;
 
-    let (az_entries, az_bits_per_entry, az_crc_writer) = array_z.finish()?;
-    let (_az_crc, mut az_buf) = az_crc_writer.finalize();
+    let (az_entries, az_bits_per_entry, mut az_buf) = array_z.finish()?;
     az_buf.flush()?;
 
     Ok(BitmapTriplesFiles {

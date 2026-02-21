@@ -95,6 +95,7 @@ pub struct Crc32cWriter<W: Write> {
 }
 
 impl<W: Write> Crc32cWriter<W> {
+    #[allow(dead_code)]
     pub fn new(inner: W) -> Self {
         Self {
             inner,
@@ -103,6 +104,7 @@ impl<W: Write> Crc32cWriter<W> {
     }
 
     /// Finalize: returns the CRC32C checksum and the inner writer (does NOT write it).
+    #[allow(dead_code)]
     pub fn finalize(self) -> (u32, W) {
         (self.digest.finalize(), self.inner)
     }
