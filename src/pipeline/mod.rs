@@ -401,13 +401,15 @@ fn calculate_group_a(memory_budget: usize) -> (usize, usize, usize, usize) {
 // Group B1: Stage 4 (vocab merger — runs alone after Group A)
 // ---------------------------------------------------------------------------
 // Gets the full memory budget.  The main consumers are:
-//   - id_mappings: Vec<IdMapping> — all batches' SO + P mapping arrays in RAM
+//   - id_mappings: Vec<IdMapping> — per-batch SO + P mapping arrays accumulated
+//     in RAM during Stage 4 before being flushed to temporary files on disk
 //   - PFC encoders: accumulate all dictionary strings (currently unbounded)
 //   - Merge stream channel: bounded buffer of StreamEntry items
 //   - Per-batch partial vocab reader threads
 //
 // We reserve a fraction for the stream channel and I/O; the rest is available
-// for id_mappings and PFC accumulators.
+// for PFC accumulators and the transient in-RAM id_mappings before they are
+// written to disk.
 
 fn calculate_stage4_budget(memory_budget: usize) -> usize {
     // Stage 4 runs alone — it can use nearly all available memory.
