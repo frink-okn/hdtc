@@ -131,11 +131,46 @@ pub struct StreamingBitmapResult {
     pub num_bits: u64,
 }
 
+impl StreamingBitmapResult {
+    /// Size of this component when framed into the HDT file:
+    /// preamble (type byte + VByte(num_bits)) + CRC8 + raw data + CRC32C.
+    pub fn framed_size(&self) -> Result<u64> {
+        let data_size = std::fs::metadata(&self.path)
+            .with_context(|| format!("Failed to stat {}", self.path.display()))?
+            .len();
+        // preamble: 1 (type) + vbyte_len(num_bits)
+        let preamble_len = 1 + vbyte_encoded_len(self.num_bits);
+        Ok(preamble_len as u64 + 1 /* CRC8 */ + data_size + 4 /* CRC32C */)
+    }
+}
+
 /// Metadata for a log array component written to a temp file.
 pub struct StreamingLogArrayResult {
     pub path: PathBuf,
     pub bits_per_entry: u8,
     pub num_entries: u64,
+}
+
+impl StreamingLogArrayResult {
+    /// Size of this component when framed into the HDT file:
+    /// preamble (type byte + bits_per_entry byte + VByte(num_entries)) + CRC8 + raw data + CRC32C.
+    pub fn framed_size(&self) -> Result<u64> {
+        let data_size = std::fs::metadata(&self.path)
+            .with_context(|| format!("Failed to stat {}", self.path.display()))?
+            .len();
+        // preamble: 1 (type) + 1 (bits_per_entry) + vbyte_len(num_entries)
+        let preamble_len = 2 + vbyte_encoded_len(self.num_entries);
+        Ok(preamble_len as u64 + 1 /* CRC8 */ + data_size + 4 /* CRC32C */)
+    }
+}
+
+/// Number of bytes needed to VByte-encode a value.
+fn vbyte_encoded_len(value: u64) -> usize {
+    if value == 0 {
+        return 1;
+    }
+    let bits = 64 - value.leading_zeros() as usize;
+    bits.div_ceil(7)
 }
 
 /// Result of streaming BitmapTriples construction to temp files.
@@ -148,16 +183,13 @@ pub struct BitmapTriplesFiles {
 }
 
 impl BitmapTriplesFiles {
-    /// Total encoded size of all four components on disk (data + preambles + CRCs).
+    /// Total encoded size of all four components as they will appear in the HDT file,
+    /// including preambles, CRC8, raw data, and CRC32C per component.
     pub fn total_encoded_size(&self) -> Result<u64> {
-        let mut total = 0u64;
-        for path in [&self.bitmap_y.path, &self.array_y.path,
-                     &self.bitmap_z.path, &self.array_z.path] {
-            total += std::fs::metadata(path)
-                .with_context(|| format!("Failed to stat {}", path.display()))?
-                .len();
-        }
-        Ok(total)
+        Ok(self.bitmap_y.framed_size()?
+            + self.bitmap_z.framed_size()?
+            + self.array_y.framed_size()?
+            + self.array_z.framed_size()?)
     }
 
     /// Clean up temp files.
