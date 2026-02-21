@@ -325,8 +325,11 @@ struct ObjectIndexResult {
 
 impl ObjectIndexResult {
     fn cleanup(&self) {
-        let _ = std::fs::remove_file(&self.bitmap_index_z.path);
-        let _ = std::fs::remove_file(&self.index_z.path);
+        for path in [&self.bitmap_index_z.path, &self.index_z.path] {
+            if let Err(e) = std::fs::remove_file(path) {
+                tracing::warn!("Failed to delete index temp file {}: {}", path.display(), e);
+            }
+        }
     }
 }
 
