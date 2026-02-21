@@ -54,7 +54,7 @@ const MIB: usize = 1024 * 1024;
 #[derive(Debug, Clone, Copy)]
 struct Stage56Budget {
     sort_budget_bytes: usize,
-    remap_budget_bytes: usize,
+    remap_threads: usize,
     remap_to_sort_channel_capacity: usize,
 }
 
@@ -456,16 +456,9 @@ fn calculate_stage56_budget(memory_budget: usize) -> Stage56Budget {
 
     Stage56Budget {
         sort_budget_bytes,
-        remap_budget_bytes,
+        remap_threads,
         remap_to_sort_channel_capacity,
     }
-}
-
-fn calculate_remapper_threads(available_cpus: usize, remap_budget_bytes: usize) -> usize {
-    let per_worker_mib = tune_usize("HDTC_TUNE_REMAP_WORKER_MIB", 128);
-    let per_worker_bytes = per_worker_mib * MIB;
-    let memory_limited = (remap_budget_bytes / per_worker_bytes).max(1);
-    memory_limited.min(available_cpus.max(1))
 }
 
 fn build_memory_plan(memory_budget: usize) -> PipelineMemoryPlan {
@@ -853,14 +846,14 @@ pub fn run_pipeline(
         tracing::info!(
             "Memory plan — Group A: parser {} MiB, batch_size {}, channels {}/{} | \
              Group B1 (stage4): {} MiB | \
-             Group B2: sort {} MiB, remap {} MiB, queue {} chunks",
+             Group B2: sort {} MiB, remap {} threads, queue {} chunks",
             memory_plan.parser_budget_bytes / MIB,
             memory_plan.batch_size,
             memory_plan.batch_channel_cap,
             memory_plan.processed_channel_cap,
             memory_plan.stage4_budget_bytes / MIB,
             memory_plan.stage56_budget.sort_budget_bytes / MIB,
-            memory_plan.stage56_budget.remap_budget_bytes / MIB,
+            memory_plan.stage56_budget.remap_threads,
             memory_plan.stage56_budget.remap_to_sort_channel_capacity,
         );
     }
@@ -1015,15 +1008,10 @@ pub fn run_pipeline(
     drop(remap_tx); // Signal completion
 
     // Spawn remapper in separate thread
-    let num_cpus = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
-    let remap_threads = calculate_remapper_threads(num_cpus, stage56_budget.remap_budget_bytes);
+    let remap_threads = stage56_budget.remap_threads;
     tracing::info!(
-        "Stage 5 remapper threads: {} (available CPUs: {}, remapper budget: {} MiB)",
+        "Stage 5 remapper threads: {}",
         remap_threads,
-        num_cpus,
-        stage56_budget.remap_budget_bytes / MIB
     );
     let remapper_handle = std::thread::spawn(move || {
         id_remapper::id_remapper_stage(
