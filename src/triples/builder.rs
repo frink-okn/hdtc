@@ -6,11 +6,23 @@
 //! - ArrayZ (So): object ID sequence
 //! - BitmapZ (Bo): marks last object for each (subject,predicate) pair (1 = last object of pair)
 
-use crate::io::{BitmapWriter, LogArrayWriter};
+use crate::io::crc_utils::Crc32cWriter;
+use crate::io::{StreamingBitmapEncoder, StreamingLogArrayEncoder};
 use crate::triples::id_triple::IdTriple;
-use anyhow::Result;
+use anyhow::{Context, Result};
+use std::fs::File;
+use std::io::{BufWriter, Write};
+use std::path::{Path, PathBuf};
 
-/// Result of building BitmapTriples.
+#[cfg(test)]
+use crate::io::crc_utils::crc8;
+#[cfg(test)]
+use crate::io::vbyte::encode_vbyte;
+#[cfg(test)]
+use crate::io::{BitmapWriter, LogArrayWriter};
+
+/// Result of building BitmapTriples (in-memory, used in tests).
+#[cfg(test)]
 pub struct BitmapTriplesData {
     /// Encoded BitmapY (Bp) bytes
     pub bitmap_y: Vec<u8>,
@@ -24,12 +36,8 @@ pub struct BitmapTriplesData {
     pub num_triples: u64,
 }
 
-/// Build BitmapTriples from a sorted iterator of ID triples.
-///
-/// `max_subject`, `max_predicate`, `max_object` must be upper bounds on the
-/// corresponding ID values in the input. They are used to determine the bit
-/// width for LogArray encoding upfront, enabling single-pass streaming
-/// construction without intermediate vectors.
+/// Build BitmapTriples from a sorted iterator of ID triples (in-memory, used in tests).
+#[cfg(test)]
 pub fn build_bitmap_triples(
     sorted_triples: impl Iterator<Item = Result<IdTriple>>,
     max_subject: u64,
@@ -117,11 +125,176 @@ pub fn build_bitmap_triples(
     })
 }
 
+/// Metadata for a bitmap component written to a temp file.
+pub struct StreamingBitmapResult {
+    pub path: PathBuf,
+    pub num_bits: u64,
+}
+
+/// Metadata for a log array component written to a temp file.
+pub struct StreamingLogArrayResult {
+    pub path: PathBuf,
+    pub bits_per_entry: u8,
+    pub num_entries: u64,
+}
+
+/// Result of streaming BitmapTriples construction to temp files.
+pub struct BitmapTriplesFiles {
+    pub bitmap_y: StreamingBitmapResult,
+    pub array_y: StreamingLogArrayResult,
+    pub bitmap_z: StreamingBitmapResult,
+    pub array_z: StreamingLogArrayResult,
+    pub num_triples: u64,
+}
+
+impl BitmapTriplesFiles {
+    /// Total encoded size of all four components on disk (data + preambles + CRCs).
+    pub fn total_encoded_size(&self) -> Result<u64> {
+        let mut total = 0u64;
+        for path in [&self.bitmap_y.path, &self.array_y.path,
+                     &self.bitmap_z.path, &self.array_z.path] {
+            total += std::fs::metadata(path)
+                .with_context(|| format!("Failed to stat {}", path.display()))?
+                .len();
+        }
+        Ok(total)
+    }
+
+    /// Clean up temp files.
+    pub fn cleanup(&self) {
+        for path in [&self.bitmap_y.path, &self.array_y.path,
+                     &self.bitmap_z.path, &self.array_z.path] {
+            if let Err(e) = std::fs::remove_file(path) {
+                tracing::warn!("Failed to delete triples temp file {}: {}", path.display(), e);
+            }
+        }
+    }
+}
+
+/// Build BitmapTriples from a sorted iterator, streaming each component to a temp file.
+///
+/// This uses O(1) memory for the triples data (vs O(num_triples) for `build_bitmap_triples`).
+/// Each component (BitmapY, ArrayY, BitmapZ, ArrayZ) is written as raw packed data
+/// to its own temp file, with CRC32C computed incrementally.
+pub fn build_bitmap_triples_to_files(
+    sorted_triples: impl Iterator<Item = Result<IdTriple>>,
+    max_subject: u64,
+    max_predicate: u64,
+    max_object: u64,
+    temp_dir: &Path,
+) -> Result<BitmapTriplesFiles> {
+    // Create temp files for each component
+    let bitmap_y_path = temp_dir.join("bt_bitmap_y.tmp");
+    let array_y_path = temp_dir.join("bt_array_y.tmp");
+    let bitmap_z_path = temp_dir.join("bt_bitmap_z.tmp");
+    let array_z_path = temp_dir.join("bt_array_z.tmp");
+
+    let make_writer = |path: &Path| -> Result<BufWriter<File>> {
+        let file = File::create(path)
+            .with_context(|| format!("Failed to create temp file {}", path.display()))?;
+        Ok(BufWriter::with_capacity(256 * 1024, file))
+    };
+
+    // Each component writes: raw packed data bytes (no preamble).
+    // CRC32C is computed incrementally via Crc32cWriter wrapper.
+    // The preamble + CRC32C framing is written during HDT assembly.
+    let mut bitmap_y = StreamingBitmapEncoder::new(
+        Crc32cWriter::new(make_writer(&bitmap_y_path)?));
+    let mut array_y = StreamingLogArrayEncoder::for_max_value(
+        max_predicate.max(1),
+        Crc32cWriter::new(make_writer(&array_y_path)?));
+    let mut bitmap_z = StreamingBitmapEncoder::new(
+        Crc32cWriter::new(make_writer(&bitmap_z_path)?));
+    let max_obj_or_shared = max_object.max(max_subject).max(1);
+    let mut array_z = StreamingLogArrayEncoder::for_max_value(
+        max_obj_or_shared,
+        Crc32cWriter::new(make_writer(&array_z_path)?));
+
+    let mut prev_subject: u64 = 0;
+    let mut prev_predicate: u64 = 0;
+    let mut num_triples: u64 = 0;
+
+    for result in sorted_triples {
+        let triple = result?;
+
+        if triple.subject != prev_subject {
+            if num_triples > 0 {
+                bitmap_y.set_last(true);
+                bitmap_z.set_last(true);
+            }
+            bitmap_y.push(false)?;
+            array_y.push(triple.predicate)?;
+            bitmap_z.push(false)?;
+            array_z.push(triple.object)?;
+            prev_subject = triple.subject;
+            prev_predicate = triple.predicate;
+        } else if triple.predicate != prev_predicate {
+            bitmap_z.set_last(true);
+            bitmap_y.push(false)?;
+            array_y.push(triple.predicate)?;
+            bitmap_z.push(false)?;
+            array_z.push(triple.object)?;
+            prev_predicate = triple.predicate;
+        } else {
+            bitmap_z.push(false)?;
+            array_z.push(triple.object)?;
+        }
+
+        num_triples += 1;
+    }
+
+    if num_triples > 0 {
+        bitmap_y.set_last(true);
+        bitmap_z.set_last(true);
+    }
+
+    tracing::info!("BitmapTriples: {num_triples} triples encoded (streamed to files)");
+
+    // Finish each encoder: flush final partial word, get CRC, flush file
+    let (by_bits, by_crc_writer) = bitmap_y.finish()?;
+    let (_by_crc, mut by_buf) = by_crc_writer.finalize();
+    by_buf.flush()?;
+
+    let (ay_entries, ay_bits_per_entry, ay_crc_writer) = array_y.finish()?;
+    let (_ay_crc, mut ay_buf) = ay_crc_writer.finalize();
+    ay_buf.flush()?;
+
+    let (bz_bits, bz_crc_writer) = bitmap_z.finish()?;
+    let (_bz_crc, mut bz_buf) = bz_crc_writer.finalize();
+    bz_buf.flush()?;
+
+    let (az_entries, az_bits_per_entry, az_crc_writer) = array_z.finish()?;
+    let (_az_crc, mut az_buf) = az_crc_writer.finalize();
+    az_buf.flush()?;
+
+    Ok(BitmapTriplesFiles {
+        bitmap_y: StreamingBitmapResult {
+            path: bitmap_y_path,
+            num_bits: by_bits,
+        },
+        array_y: StreamingLogArrayResult {
+            path: array_y_path,
+            bits_per_entry: ay_bits_per_entry,
+            num_entries: ay_entries,
+        },
+        bitmap_z: StreamingBitmapResult {
+            path: bitmap_z_path,
+            num_bits: bz_bits,
+        },
+        array_z: StreamingLogArrayResult {
+            path: array_z_path,
+            bits_per_entry: az_bits_per_entry,
+            num_entries: az_entries,
+        },
+        num_triples,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::io::{BitmapReader, LogArrayReader};
-    use std::io::Cursor;
+    use std::io::{Cursor, Read as _};
 
     #[test]
     fn test_single_triple() {
@@ -205,5 +378,99 @@ mod tests {
         assert_eq!(az.get(1), 2);
         assert_eq!(az.get(2), 3);
         assert_eq!(az.get(3), 1);
+    }
+
+    /// Helper: read a temp file's raw data bytes and reassemble it with preamble + CRC
+    /// as a bitmap section, then verify it matches the in-memory version.
+    fn read_and_assemble_bitmap(path: &Path, num_bits: u64) -> Vec<u8> {
+        let mut data = Vec::new();
+        File::open(path).unwrap().read_to_end(&mut data).unwrap();
+        let data_crc = crate::io::crc_utils::crc32c(&data);
+
+        let mut out = Vec::new();
+        let mut preamble = Vec::new();
+        preamble.push(1u8); // TYPE_BITMAP
+        preamble.extend_from_slice(&encode_vbyte(num_bits));
+        out.extend_from_slice(&preamble);
+        out.push(crc8(&preamble));
+        out.extend_from_slice(&data);
+        out.extend_from_slice(&data_crc.to_le_bytes());
+        out
+    }
+
+    fn read_and_assemble_log_array(path: &Path, bits_per_entry: u8, num_entries: u64) -> Vec<u8> {
+        let mut data = Vec::new();
+        File::open(path).unwrap().read_to_end(&mut data).unwrap();
+        let data_crc = crate::io::crc_utils::crc32c(&data);
+
+        let mut out = Vec::new();
+        let mut preamble = Vec::new();
+        preamble.push(1u8); // TYPE_LOG
+        preamble.push(bits_per_entry);
+        preamble.extend_from_slice(&encode_vbyte(num_entries));
+        out.extend_from_slice(&preamble);
+        out.push(crc8(&preamble));
+        out.extend_from_slice(&data);
+        out.extend_from_slice(&data_crc.to_le_bytes());
+        out
+    }
+
+    #[test]
+    fn test_streaming_matches_inmemory() {
+        let make_triples = || vec![
+            Ok(IdTriple { subject: 1, predicate: 1, object: 1 }),
+            Ok(IdTriple { subject: 1, predicate: 1, object: 2 }),
+            Ok(IdTriple { subject: 1, predicate: 2, object: 3 }),
+            Ok(IdTriple { subject: 2, predicate: 1, object: 1 }),
+        ];
+
+        let inmem = build_bitmap_triples(make_triples().into_iter(), 2, 2, 3).unwrap();
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let files = build_bitmap_triples_to_files(
+            make_triples().into_iter(), 2, 2, 3, temp_dir.path(),
+        ).unwrap();
+
+        assert_eq!(files.num_triples, inmem.num_triples);
+
+        // Reassemble each component from the temp file and compare
+        let by = read_and_assemble_bitmap(&files.bitmap_y.path, files.bitmap_y.num_bits);
+        assert_eq!(by, inmem.bitmap_y, "BitmapY mismatch");
+
+        let ay = read_and_assemble_log_array(
+            &files.array_y.path, files.array_y.bits_per_entry, files.array_y.num_entries);
+        assert_eq!(ay, inmem.array_y, "ArrayY mismatch");
+
+        let bz = read_and_assemble_bitmap(&files.bitmap_z.path, files.bitmap_z.num_bits);
+        assert_eq!(bz, inmem.bitmap_z, "BitmapZ mismatch");
+
+        let az = read_and_assemble_log_array(
+            &files.array_z.path, files.array_z.bits_per_entry, files.array_z.num_entries);
+        assert_eq!(az, inmem.array_z, "ArrayZ mismatch");
+
+        files.cleanup();
+    }
+
+    #[test]
+    fn test_streaming_single_triple() {
+        let make_triple = || vec![Ok(IdTriple { subject: 1, predicate: 1, object: 1 })];
+
+        let inmem = build_bitmap_triples(make_triple().into_iter(), 1, 1, 1).unwrap();
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let files = build_bitmap_triples_to_files(
+            make_triple().into_iter(), 1, 1, 1, temp_dir.path(),
+        ).unwrap();
+
+        assert_eq!(files.num_triples, 1);
+
+        let by = read_and_assemble_bitmap(&files.bitmap_y.path, files.bitmap_y.num_bits);
+        assert_eq!(by, inmem.bitmap_y);
+
+        let az = read_and_assemble_log_array(
+            &files.array_z.path, files.array_z.bits_per_entry, files.array_z.num_entries);
+        assert_eq!(az, inmem.array_z);
+
+        files.cleanup();
     }
 }

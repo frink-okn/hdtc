@@ -7,36 +7,38 @@
 //! 4. Triples (Control Info + BitmapY + ArrayY + BitmapZ + ArrayZ)
 
 use crate::dictionary::DictCounts;
+use crate::io::crc_utils::crc8;
+use crate::io::vbyte::encode_vbyte;
 use crate::io::{ControlInfo, ControlType};
-use crate::triples::builder::BitmapTriplesData;
+use crate::triples::BitmapTriplesFiles;
 use anyhow::{Context, Result};
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
-/// Write a complete HDT file.
-pub fn write_hdt(
+/// Write a complete HDT file, reading triples data from streaming temp files.
+///
+/// This avoids holding the entire triples section in memory. Dict sections are
+/// still in memory (typically much smaller than triples).
+pub fn write_hdt_streaming(
     output_path: &Path,
     base_uri: &str,
     counts: &DictCounts,
     dict_sections: &[Vec<u8>],
-    triples: &BitmapTriplesData,
+    triples: &BitmapTriplesFiles,
     ntriples_size: u64,
 ) -> Result<()> {
     let file = File::create(output_path)
         .with_context(|| format!("Failed to create output file {}", output_path.display()))?;
     let mut writer = BufWriter::with_capacity(256 * 1024, file);
 
-    // 1. Global Control Information (no properties, per hdt-java spec)
+    // 1. Global Control Information
     let global_ci = ControlInfo::new(ControlType::Global, "<http://purl.org/HDT/hdt#HDTv1>");
     global_ci.write_to(&mut writer)?;
 
-    // Calculate actual dictionary size and HDT data size from encoded sections
+    // Calculate sizes for header metadata
     let dict_size: u64 = dict_sections.iter().map(|s| s.len() as u64).sum();
-    let triples_size: u64 = (triples.bitmap_y.len()
-        + triples.bitmap_z.len()
-        + triples.array_y.len()
-        + triples.array_z.len()) as u64;
+    let triples_size: u64 = triples.total_encoded_size()?;
     let hdt_data_size = dict_size + triples_size;
 
     // 2. Header
@@ -62,8 +64,6 @@ pub fn write_hdt(
     dict_ci.set_property("elements", total_elements.to_string());
     dict_ci.write_to(&mut writer)?;
 
-    // Write dictionary sections: shared, subjects, predicates, objects
-    // (Each section includes its own PFC type byte prefix)
     for section_data in dict_sections {
         writer.write_all(section_data)?;
     }
@@ -76,20 +76,84 @@ pub fn write_hdt(
     triples_ci.set_property("order", "1"); // SPO
     triples_ci.write_to(&mut writer)?;
 
-    // Write: BitmapY, BitmapZ, SeqY, SeqZ (hdt-java reads in this order)
-    writer.write_all(&triples.bitmap_y)?;
-    writer.write_all(&triples.bitmap_z)?;
-    writer.write_all(&triples.array_y)?;
-    writer.write_all(&triples.array_z)?;
+    // Write each component: preamble + CRC8 + data (from temp file) + CRC32C
+    // Order: BitmapY, BitmapZ, ArrayY (SeqY), ArrayZ (SeqZ) — matching hdt-java
+    write_bitmap_from_file(&mut writer, &triples.bitmap_y.path, triples.bitmap_y.num_bits)?;
+    write_bitmap_from_file(&mut writer, &triples.bitmap_z.path, triples.bitmap_z.num_bits)?;
+    write_log_array_from_file(
+        &mut writer, &triples.array_y.path,
+        triples.array_y.bits_per_entry, triples.array_y.num_entries)?;
+    write_log_array_from_file(
+        &mut writer, &triples.array_z.path,
+        triples.array_z.bits_per_entry, triples.array_z.num_entries)?;
 
     writer.flush()?;
 
     tracing::info!(
-        "HDT file written: {}",
+        "HDT file written (streaming): {}",
         output_path.display()
     );
 
     Ok(())
+}
+
+/// Write a Bitmap section from a temp file containing raw packed data.
+/// Writes: preamble (type + VByte(num_bits)) + CRC8 + data + CRC32C
+fn write_bitmap_from_file<W: Write>(writer: &mut W, path: &Path, num_bits: u64) -> Result<()> {
+    // Preamble
+    let mut preamble = Vec::new();
+    preamble.push(1u8); // TYPE_BITMAP
+    preamble.extend_from_slice(&encode_vbyte(num_bits));
+    writer.write_all(&preamble)?;
+    writer.write_all(&[crc8(&preamble)])?;
+
+    // Copy data from temp file while computing CRC32C
+    let data_crc = copy_file_with_crc(writer, path)?;
+    writer.write_all(&data_crc.to_le_bytes())?;
+
+    Ok(())
+}
+
+/// Write a LogArray section from a temp file containing raw packed data.
+/// Writes: preamble (type + bits_per_entry + VByte(num_entries)) + CRC8 + data + CRC32C
+fn write_log_array_from_file<W: Write>(
+    writer: &mut W, path: &Path, bits_per_entry: u8, num_entries: u64,
+) -> Result<()> {
+    // Preamble
+    let mut preamble = Vec::new();
+    preamble.push(1u8); // TYPE_LOG
+    preamble.push(bits_per_entry);
+    preamble.extend_from_slice(&encode_vbyte(num_entries));
+    writer.write_all(&preamble)?;
+    writer.write_all(&[crc8(&preamble)])?;
+
+    // Copy data from temp file while computing CRC32C
+    let data_crc = copy_file_with_crc(writer, path)?;
+    writer.write_all(&data_crc.to_le_bytes())?;
+
+    Ok(())
+}
+
+/// Copy a file's contents to a writer, computing CRC32C over the data.
+fn copy_file_with_crc<W: Write>(writer: &mut W, path: &Path) -> Result<u32> {
+    let file = File::open(path)
+        .with_context(|| format!("Failed to open temp file {}", path.display()))?;
+    let mut reader = BufReader::with_capacity(256 * 1024, file);
+
+    let mut buf = [0u8; 64 * 1024];
+    let crc_algo = crc::Crc::<u32>::new(&crc::CRC_32_ISCSI);
+    let mut digest = crc_algo.digest();
+
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        digest.update(&buf[..n]);
+        writer.write_all(&buf[..n])?;
+    }
+
+    Ok(digest.finalize())
 }
 
 /// Build the header section content as N-Triples (Java-compatible format).

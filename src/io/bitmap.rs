@@ -125,6 +125,84 @@ impl Default for BitmapWriter {
     }
 }
 
+/// Streaming bitmap encoder that writes packed bit data to a `Write` target
+/// as words fill up, using O(1) memory regardless of bitmap size.
+///
+/// Data is written as byte-packed little-endian words. The caller is responsible
+/// for writing the preamble (type + VByte(num_bits) + CRC8) before the data
+/// and the CRC32C after the data.
+///
+/// Use `Crc32cWriter` as the inner writer to compute CRC32C incrementally.
+pub struct StreamingBitmapEncoder<W: Write> {
+    writer: W,
+    current_word: u64,
+    num_bits: u64,
+}
+
+impl<W: Write> StreamingBitmapEncoder<W> {
+    pub fn new(writer: W) -> Self {
+        Self {
+            writer,
+            current_word: 0,
+            num_bits: 0,
+        }
+    }
+
+    /// Append a bit (true = 1, false = 0).
+    pub fn push(&mut self, value: bool) -> io::Result<()> {
+        let bit_idx = (self.num_bits % 64) as u32;
+
+        // If starting a new word and previous word exists, flush it
+        if bit_idx == 0 && self.num_bits > 0 {
+            self.writer.write_all(&self.current_word.to_le_bytes())?;
+            self.current_word = 0;
+        }
+
+        if value {
+            self.current_word |= 1u64 << bit_idx;
+        }
+
+        self.num_bits += 1;
+        Ok(())
+    }
+
+    /// Set the most recently pushed bit to the given value.
+    /// The last bit is always in the current (unflushed) word.
+    pub fn set_last(&mut self, value: bool) {
+        assert!(self.num_bits > 0, "Cannot set_last on empty bitmap");
+        let bit_idx = ((self.num_bits - 1) % 64) as u32;
+        if value {
+            self.current_word |= 1u64 << bit_idx;
+        } else {
+            self.current_word &= !(1u64 << bit_idx);
+        }
+    }
+
+    /// Number of bits pushed so far.
+    #[allow(dead_code)]
+    pub fn num_bits(&self) -> u64 {
+        self.num_bits
+    }
+
+    /// Flush the final partial word and return (num_bits, inner_writer).
+    pub fn finish(mut self) -> io::Result<(u64, W)> {
+        if self.num_bits > 0 {
+            // Write only the bytes needed for the final partial word
+            let total_data_bytes = self.num_bits.div_ceil(8) as usize;
+            let complete_words = if self.num_bits > 0 {
+                ((self.num_bits - 1) / 64) as usize
+            } else {
+                0
+            };
+            let bytes_already_written = complete_words * 8;
+            let remaining = total_data_bytes - bytes_already_written;
+            let word_bytes = self.current_word.to_le_bytes();
+            self.writer.write_all(&word_bytes[..remaining])?;
+        }
+        Ok((self.num_bits, self.writer))
+    }
+}
+
 /// Reader for decoding a Bitmap from bytes.
 pub struct BitmapReader {
     words: Vec<u64>,
@@ -418,6 +496,123 @@ mod tests {
         assert_eq!(reader.select1(4), Some(5)); // fourth 1 at position 5
         assert_eq!(reader.select1(5), Some(8)); // fifth 1 at position 8
         assert_eq!(reader.select1(6), None);    // no sixth 1
+    }
+
+    #[test]
+    fn test_streaming_matches_inmemory() {
+        // Verify StreamingBitmapEncoder produces identical data bytes to BitmapWriter
+        use crate::io::crc_utils::{crc8, Crc32cWriter};
+        use crate::io::vbyte::encode_vbyte;
+
+        let pattern = [true, false, true, true, false, false, true, false, true, true];
+
+        // In-memory version
+        let mut writer = BitmapWriter::new();
+        for &b in &pattern {
+            writer.push(b);
+        }
+        let mut expected = Vec::new();
+        writer.write_to(&mut expected).unwrap();
+
+        // Streaming version: write data through CRC wrapper
+        let data_buf: Vec<u8> = Vec::new();
+        let crc_writer = Crc32cWriter::new(data_buf);
+        let mut encoder = StreamingBitmapEncoder::new(crc_writer);
+        for &b in &pattern {
+            encoder.push(b).unwrap();
+        }
+        let (num_bits, crc_writer) = encoder.finish().unwrap();
+        let (data_crc, data_buf) = crc_writer.finalize();
+
+        // Assemble full output: preamble + CRC8 + data + CRC32C
+        let mut assembled = Vec::new();
+        let mut preamble = Vec::new();
+        preamble.push(1u8); // TYPE_BITMAP
+        preamble.extend_from_slice(&encode_vbyte(num_bits));
+        assembled.extend_from_slice(&preamble);
+        assembled.push(crc8(&preamble));
+        assembled.extend_from_slice(&data_buf);
+        assembled.extend_from_slice(&data_crc.to_le_bytes());
+
+        assert_eq!(assembled, expected, "streaming bitmap output differs from in-memory");
+    }
+
+    #[test]
+    fn test_streaming_cross_word_boundary() {
+        use crate::io::crc_utils::{crc8, Crc32cWriter};
+        use crate::io::vbyte::encode_vbyte;
+
+        // 200 bits — crosses multiple 64-bit word boundaries
+        let mut writer = BitmapWriter::new();
+        let data_buf: Vec<u8> = Vec::new();
+        let crc_writer = Crc32cWriter::new(data_buf);
+        let mut encoder = StreamingBitmapEncoder::new(crc_writer);
+
+        for i in 0..200u64 {
+            let val = i % 5 == 0;
+            writer.push(val);
+            encoder.push(val).unwrap();
+        }
+
+        let mut expected = Vec::new();
+        writer.write_to(&mut expected).unwrap();
+
+        let (num_bits, crc_writer) = encoder.finish().unwrap();
+        let (data_crc, data_buf) = crc_writer.finalize();
+
+        let mut assembled = Vec::new();
+        let mut preamble = Vec::new();
+        preamble.push(1u8);
+        preamble.extend_from_slice(&encode_vbyte(num_bits));
+        assembled.extend_from_slice(&preamble);
+        assembled.push(crc8(&preamble));
+        assembled.extend_from_slice(&data_buf);
+        assembled.extend_from_slice(&data_crc.to_le_bytes());
+
+        assert_eq!(assembled, expected);
+    }
+
+    #[test]
+    fn test_streaming_set_last() {
+        use crate::io::crc_utils::{crc8, Crc32cWriter};
+        use crate::io::vbyte::encode_vbyte;
+
+        // Simulate BitmapTriples pattern: push(false), then later set_last(true)
+        let mut writer = BitmapWriter::new();
+        let data_buf: Vec<u8> = Vec::new();
+        let crc_writer = Crc32cWriter::new(data_buf);
+        let mut encoder = StreamingBitmapEncoder::new(crc_writer);
+
+        // Push some bits, then retroactively set some to true
+        for _ in 0..5 {
+            writer.push(false);
+            encoder.push(false).unwrap();
+        }
+        writer.set_last(true);
+        encoder.set_last(true);
+        for _ in 0..3 {
+            writer.push(false);
+            encoder.push(false).unwrap();
+        }
+        writer.set_last(true);
+        encoder.set_last(true);
+
+        let mut expected = Vec::new();
+        writer.write_to(&mut expected).unwrap();
+
+        let (num_bits, crc_writer) = encoder.finish().unwrap();
+        let (data_crc, data_buf) = crc_writer.finalize();
+
+        let mut assembled = Vec::new();
+        let mut preamble = Vec::new();
+        preamble.push(1u8);
+        preamble.extend_from_slice(&encode_vbyte(num_bits));
+        assembled.extend_from_slice(&preamble);
+        assembled.push(crc8(&preamble));
+        assembled.extend_from_slice(&data_buf);
+        assembled.extend_from_slice(&data_crc.to_le_bytes());
+
+        assert_eq!(assembled, expected);
     }
 
     #[test]

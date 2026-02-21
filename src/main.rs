@@ -105,8 +105,8 @@ fn create_hdt(args: cli::CreateArgs, benchmark: bool) -> Result<()> {
         benchmark,
     )?;
 
-    // Write HDT file
-    hdt::write_hdt(
+    // Write HDT file (streaming: reads triples from temp files, O(1) triples memory)
+    hdt::write_hdt_streaming(
         &args.output,
         &base_uri,
         &pipeline_result.counts,
@@ -114,6 +114,11 @@ fn create_hdt(args: cli::CreateArgs, benchmark: bool) -> Result<()> {
         &pipeline_result.bitmap_triples,
         pipeline_result.ntriples_size,
     )?;
+
+    let num_triples = pipeline_result.bitmap_triples.num_triples;
+
+    // Clean up triples temp files
+    pipeline_result.bitmap_triples.cleanup();
 
     // Optionally create index file
     if args.index {
@@ -131,7 +136,7 @@ fn create_hdt(args: cli::CreateArgs, benchmark: bool) -> Result<()> {
 
     tracing::info!(
         "Done! {} triples written to {}",
-        pipeline_result.bitmap_triples.num_triples,
+        num_triples,
         args.output.display()
     );
 

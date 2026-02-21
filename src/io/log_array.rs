@@ -122,6 +122,115 @@ impl LogArrayWriter {
     }
 }
 
+/// Streaming log array encoder that writes bit-packed integers to a `Write` target
+/// as u64 words fill up, using O(1) memory regardless of array size.
+///
+/// Data is written as byte-packed little-endian words. The caller is responsible
+/// for writing the preamble (type + bits_per_entry + VByte(num_entries) + CRC8)
+/// before the data and the CRC32C after the data.
+///
+/// Use `Crc32cWriter` as the inner writer to compute CRC32C incrementally.
+pub struct StreamingLogArrayEncoder<W: Write> {
+    writer: W,
+    bits_per_entry: u8,
+    num_entries: u64,
+    /// The current word being packed into.
+    current_word: u64,
+    /// The next word (entries can span two words).
+    next_word: u64,
+    /// Index of `current_word` in the logical word array.
+    word_index: u64,
+}
+
+impl<W: Write> StreamingLogArrayEncoder<W> {
+    pub fn new(bits_per_entry: u8, writer: W) -> Self {
+        assert!(bits_per_entry <= 64);
+        Self {
+            writer,
+            bits_per_entry,
+            num_entries: 0,
+            current_word: 0,
+            next_word: 0,
+            word_index: 0,
+        }
+    }
+
+    pub fn for_max_value(max_value: u64, writer: W) -> Self {
+        Self::new(bits_for(max_value), writer)
+    }
+
+    /// Add a value to the array, flushing completed words to the writer.
+    pub fn push(&mut self, value: u64) -> io::Result<()> {
+        if self.bits_per_entry == 0 {
+            self.num_entries += 1;
+            return Ok(());
+        }
+
+        debug_assert!(
+            self.bits_per_entry == 64 || value < (1u64 << self.bits_per_entry),
+            "Value {value} does not fit in {} bits",
+            self.bits_per_entry
+        );
+
+        let bit_pos = self.num_entries * self.bits_per_entry as u64;
+        let target_word = bit_pos / 64;
+        let bit_offset = (bit_pos % 64) as u32;
+
+        debug_assert!(target_word == self.word_index);
+
+        // Pack value into current word
+        self.current_word |= value << bit_offset;
+
+        // Handle overflow into next word
+        if bit_offset + self.bits_per_entry as u32 > 64 {
+            self.next_word |= value >> (64 - bit_offset);
+        }
+
+        self.num_entries += 1;
+
+        // Check if current_word is fully committed (next entry starts in a later word)
+        let next_bit_pos = self.num_entries * self.bits_per_entry as u64;
+        let next_word_idx = next_bit_pos / 64;
+
+        if next_word_idx > self.word_index {
+            // Flush current_word (all 8 bytes — it's fully packed)
+            self.writer.write_all(&self.current_word.to_le_bytes())?;
+            self.current_word = self.next_word;
+            self.next_word = 0;
+            self.word_index = next_word_idx;
+        }
+
+        Ok(())
+    }
+
+    /// Bits per entry.
+    #[allow(dead_code)]
+    pub fn bits_per_entry(&self) -> u8 {
+        self.bits_per_entry
+    }
+
+    /// Number of entries pushed so far.
+    #[allow(dead_code)]
+    pub fn num_entries(&self) -> u64 {
+        self.num_entries
+    }
+
+    /// Flush the final partial word and return (num_entries, bits_per_entry, inner_writer).
+    pub fn finish(mut self) -> io::Result<(u64, u8, W)> {
+        if self.bits_per_entry > 0 && self.num_entries > 0 {
+            let total_data_bytes =
+                bytes_needed(self.num_entries, self.bits_per_entry) as usize;
+            let bytes_already_written = self.word_index as usize * 8;
+            let remaining = total_data_bytes - bytes_already_written;
+            if remaining > 0 {
+                let word_bytes = self.current_word.to_le_bytes();
+                self.writer.write_all(&word_bytes[..remaining])?;
+            }
+        }
+        Ok((self.num_entries, self.bits_per_entry, self.writer))
+    }
+}
+
 /// Reader for decoding a LogArray from bytes.
 pub struct LogArrayReader {
     words: Vec<u64>,
@@ -389,6 +498,129 @@ mod tests {
         for (i, &expected) in values.iter().enumerate() {
             assert_eq!(reader.get(i as u64), expected, "mismatch at index {i}");
         }
+    }
+
+    /// Helper: assemble a full LogArray from streaming encoder output.
+    fn assemble_log_array(num_entries: u64, bits_per_entry: u8, data: &[u8], crc: u32) -> Vec<u8> {
+        use crate::io::crc_utils::crc8;
+        use crate::io::vbyte::encode_vbyte;
+
+        let mut out = Vec::new();
+        let mut preamble = Vec::new();
+        preamble.push(1u8); // TYPE_LOG
+        preamble.push(bits_per_entry);
+        preamble.extend_from_slice(&encode_vbyte(num_entries));
+        out.extend_from_slice(&preamble);
+        out.push(crc8(&preamble));
+        out.extend_from_slice(data);
+        out.extend_from_slice(&crc.to_le_bytes());
+        out
+    }
+
+    #[test]
+    fn test_streaming_matches_inmemory_small() {
+        use crate::io::crc_utils::Crc32cWriter;
+
+        let mut writer = LogArrayWriter::for_max_value(100);
+        let values = [0, 1, 50, 99, 100];
+        let data_buf: Vec<u8> = Vec::new();
+        let crc_writer = Crc32cWriter::new(data_buf);
+        let mut encoder = StreamingLogArrayEncoder::for_max_value(100, crc_writer);
+
+        for &v in &values {
+            writer.push(v);
+            encoder.push(v).unwrap();
+        }
+
+        let mut expected = Vec::new();
+        writer.write_to(&mut expected).unwrap();
+
+        let (num_entries, bits, crc_writer) = encoder.finish().unwrap();
+        let (data_crc, data_buf) = crc_writer.finalize();
+        let assembled = assemble_log_array(num_entries, bits, &data_buf, data_crc);
+
+        assert_eq!(assembled, expected, "streaming log array differs from in-memory");
+    }
+
+    #[test]
+    fn test_streaming_matches_word_boundary() {
+        use crate::io::crc_utils::Crc32cWriter;
+
+        // 13-bit entries cross word boundaries frequently
+        let mut writer = LogArrayWriter::new(13);
+        let values: Vec<u64> = (0..20).map(|i| i * 400).collect();
+
+        let data_buf: Vec<u8> = Vec::new();
+        let crc_writer = Crc32cWriter::new(data_buf);
+        let mut encoder = StreamingLogArrayEncoder::new(13, crc_writer);
+
+        for &v in &values {
+            writer.push(v);
+            encoder.push(v).unwrap();
+        }
+
+        let mut expected = Vec::new();
+        writer.write_to(&mut expected).unwrap();
+
+        let (num_entries, bits, crc_writer) = encoder.finish().unwrap();
+        let (data_crc, data_buf) = crc_writer.finalize();
+        let assembled = assemble_log_array(num_entries, bits, &data_buf, data_crc);
+
+        assert_eq!(assembled, expected);
+    }
+
+    #[test]
+    fn test_streaming_matches_64bit() {
+        use crate::io::crc_utils::Crc32cWriter;
+
+        let mut writer = LogArrayWriter::new(64);
+        let values = [0, 1, u64::MAX / 2, u64::MAX - 1, u64::MAX];
+
+        let data_buf: Vec<u8> = Vec::new();
+        let crc_writer = Crc32cWriter::new(data_buf);
+        let mut encoder = StreamingLogArrayEncoder::new(64, crc_writer);
+
+        for &v in &values {
+            writer.push(v);
+            encoder.push(v).unwrap();
+        }
+
+        let mut expected = Vec::new();
+        writer.write_to(&mut expected).unwrap();
+
+        let (num_entries, bits, crc_writer) = encoder.finish().unwrap();
+        let (data_crc, data_buf) = crc_writer.finalize();
+        let assembled = assemble_log_array(num_entries, bits, &data_buf, data_crc);
+
+        assert_eq!(assembled, expected);
+    }
+
+    #[test]
+    fn test_streaming_matches_many_entries() {
+        use crate::io::crc_utils::Crc32cWriter;
+
+        // 1000 entries at 20 bits — tests many word flushes
+        let max_val = (1u64 << 20) - 1;
+        let mut writer = LogArrayWriter::for_max_value(max_val);
+
+        let data_buf: Vec<u8> = Vec::new();
+        let crc_writer = Crc32cWriter::new(data_buf);
+        let mut encoder = StreamingLogArrayEncoder::for_max_value(max_val, crc_writer);
+
+        for i in 0..1000u64 {
+            let v = i * 1049 % (max_val + 1); // pseudo-random values
+            writer.push(v);
+            encoder.push(v).unwrap();
+        }
+
+        let mut expected = Vec::new();
+        writer.write_to(&mut expected).unwrap();
+
+        let (num_entries, bits, crc_writer) = encoder.finish().unwrap();
+        let (data_crc, data_buf) = crc_writer.finalize();
+        let assembled = assemble_log_array(num_entries, bits, &data_buf, data_crc);
+
+        assert_eq!(assembled, expected);
     }
 
     #[test]
