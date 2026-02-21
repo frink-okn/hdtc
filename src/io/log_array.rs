@@ -348,6 +348,11 @@ impl LogArrayReader {
         self.num_entries
     }
 
+    /// Approximate heap memory used by this reader (bytes).
+    pub fn heap_size(&self) -> usize {
+        self.words.len() * std::mem::size_of::<u64>()
+    }
+
     /// Whether the array is empty.
     #[cfg(test)]
     pub fn is_empty(&self) -> bool {

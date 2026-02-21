@@ -99,7 +99,7 @@ pub fn write_hdt_streaming(
 
 /// Write a Bitmap section from a temp file containing raw packed data.
 /// Writes: preamble (type + VByte(num_bits)) + CRC8 + data + CRC32C
-fn write_bitmap_from_file<W: Write>(writer: &mut W, path: &Path, num_bits: u64) -> Result<()> {
+pub(crate) fn write_bitmap_from_file<W: Write>(writer: &mut W, path: &Path, num_bits: u64) -> Result<()> {
     // Preamble
     let mut preamble = Vec::new();
     preamble.push(1u8); // TYPE_BITMAP
@@ -116,7 +116,7 @@ fn write_bitmap_from_file<W: Write>(writer: &mut W, path: &Path, num_bits: u64) 
 
 /// Write a LogArray section from a temp file containing raw packed data.
 /// Writes: preamble (type + bits_per_entry + VByte(num_entries)) + CRC8 + data + CRC32C
-fn write_log_array_from_file<W: Write>(
+pub(crate) fn write_log_array_from_file<W: Write>(
     writer: &mut W, path: &Path, bits_per_entry: u8, num_entries: u64,
 ) -> Result<()> {
     // Preamble

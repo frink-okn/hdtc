@@ -2,8 +2,10 @@
 //!
 //! Writes the 5-section index file format used by hdt-java.
 
-use crate::io::ControlInfo;
+use crate::hdt::writer::{write_bitmap_from_file, write_log_array_from_file};
 use crate::index::predicate_index::PredicateIndex;
+use crate::io::ControlInfo;
+use crate::triples::{StreamingBitmapResult, StreamingLogArrayResult};
 use anyhow::{Context, Result};
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -18,20 +20,14 @@ use std::path::Path;
 /// 4. predicateIndex.sequence - Position mappings for predicate occurrences
 /// 5. predicateCount - Per-predicate occurrence counts
 ///
-/// # Arguments
-/// - `output_path`: Path where the index file will be created
-/// - `num_triples`: Number of triples in the dataset
-/// - `triples_order`: Triple order ordinal from main HDT triples control info
-/// - `bitmap_index_z`: Serialized bitmapIndexZ component bytes
-/// - `index_z`: Serialized indexZ component bytes
-/// - `predicate_index`: PredicateIndex structures
-/// - `predicate_count`: Serialized predicate count sequence
+/// Sections 1-2 are streamed from temp files to avoid holding them in memory.
+/// Sections 3-5 are small (proportional to predicate count) and written from memory.
 pub fn write_index(
     output_path: &Path,
     num_triples: u64,
     triples_order: u64,
-    bitmap_index_z: &[u8],
-    index_z: &[u8],
+    bitmap_index_z: &StreamingBitmapResult,
+    index_z: &StreamingLogArrayResult,
     predicate_index: &PredicateIndex,
     predicate_count: &[u8],
 ) -> Result<()> {
@@ -40,7 +36,6 @@ pub fn write_index(
     let mut writer = BufWriter::with_capacity(256 * 1024, file);
 
     // Write Control Information
-    // The index file uses indexFoQ format and INDEX control type (per hdt-java)
     let mut ci = ControlInfo::new(
         crate::io::ControlType::Index,
         "<http://purl.org/HDT/hdt#indexFoQ>",
@@ -50,34 +45,30 @@ pub fn write_index(
     ci.write_to(&mut writer)
         .context("Failed to write control info to index file")?;
 
-    // Write five sections in order
-
-    // Section 1: bitmapIndexZ (BitmapZ from OPS BitmapTriples)
-    // This marks object boundaries in the permuted order
-    writer
-        .write_all(bitmap_index_z)
+    // Section 1: bitmapIndexZ — streamed from temp file
+    write_bitmap_from_file(&mut writer, &bitmap_index_z.path, bitmap_index_z.num_bits)
         .context("Failed to write bitmapIndexZ section")?;
 
-    // Section 2: indexZ (ArrayZ from OPS BitmapTriples)
-    // This is the subject ID sequence in OPS order
-    writer
-        .write_all(index_z)
-        .context("Failed to write indexZ section")?;
+    // Section 2: indexZ — streamed from temp file
+    write_log_array_from_file(
+        &mut writer,
+        &index_z.path,
+        index_z.bits_per_entry,
+        index_z.num_entries,
+    )
+    .context("Failed to write indexZ section")?;
 
-    // Section 3: predicateIndex.bitmap
-    // Inverted index boundaries for predicates
+    // Section 3: predicateIndex.bitmap (small, from memory)
     writer
         .write_all(&predicate_index.bitmap)
         .context("Failed to write predicateIndex bitmap section")?;
 
-    // Section 4: predicateIndex.sequence
-    // Position mappings for predicate occurrences
+    // Section 4: predicateIndex.sequence (small, from memory)
     writer
         .write_all(&predicate_index.sequence)
         .context("Failed to write predicateIndex sequence section")?;
 
-    // Section 5: predicateCount
-    // Per-predicate occurrence counts
+    // Section 5: predicateCount (small, from memory)
     writer
         .write_all(predicate_count)
         .context("Failed to write predicateCount section")?;
@@ -92,10 +83,66 @@ pub fn write_index(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::io::{BitmapReader, BitmapWriter, ControlType, LogArrayReader, LogArrayWriter};
+    use crate::io::crc_utils::Crc32cWriter;
+    use crate::io::{
+        BitmapReader, BitmapWriter, ControlType, LogArrayReader, LogArrayWriter,
+        StreamingBitmapEncoder, StreamingLogArrayEncoder,
+    };
     use std::io::Cursor;
+    use tempfile::TempDir;
 
-    fn build_bitmap(bits: &[bool]) -> Vec<u8> {
+    /// Write a bitmap to a temp file using the streaming encoder, returning a StreamingBitmapResult.
+    fn build_streaming_bitmap(bits: &[bool], dir: &Path, name: &str) -> StreamingBitmapResult {
+        let path = dir.join(name);
+        let file = File::create(&path).unwrap();
+        let crc_writer = Crc32cWriter::new(BufWriter::new(file));
+        let mut encoder = StreamingBitmapEncoder::new(crc_writer);
+
+        for &bit in bits {
+            encoder.push(bit).unwrap();
+        }
+
+        let (num_bits, crc_writer) = encoder.finish().unwrap();
+        let (_, mut inner) = crc_writer.finalize();
+        inner.flush().unwrap();
+
+        StreamingBitmapResult { path, num_bits }
+    }
+
+    /// Write a log array to a temp file using the streaming encoder, returning a StreamingLogArrayResult.
+    fn build_streaming_logarray(
+        values: &[u64],
+        max_value: u64,
+        dir: &Path,
+        name: &str,
+    ) -> StreamingLogArrayResult {
+        let bits_per_entry = if max_value == 0 {
+            1
+        } else {
+            64 - max_value.leading_zeros() as u8
+        };
+
+        let path = dir.join(name);
+        let file = File::create(&path).unwrap();
+        let crc_writer = Crc32cWriter::new(BufWriter::new(file));
+        let mut encoder = StreamingLogArrayEncoder::new(bits_per_entry, crc_writer);
+
+        for &value in values {
+            encoder.push(value).unwrap();
+        }
+
+        let (num_entries, bits_per_entry, crc_writer) = encoder.finish().unwrap();
+        let (_, mut inner) = crc_writer.finalize();
+        inner.flush().unwrap();
+
+        StreamingLogArrayResult {
+            path,
+            bits_per_entry,
+            num_entries,
+        }
+    }
+
+    fn build_inmem_bitmap(bits: &[bool]) -> Vec<u8> {
         let mut writer = BitmapWriter::new();
         for &bit in bits {
             writer.push(bit);
@@ -105,7 +152,7 @@ mod tests {
         buf
     }
 
-    fn build_logarray(values: &[u64], max_value: u64) -> Vec<u8> {
+    fn build_inmem_logarray(values: &[u64], max_value: u64) -> Vec<u8> {
         let mut writer = LogArrayWriter::for_max_value(max_value);
         for &value in values {
             writer.push(value);
@@ -117,34 +164,41 @@ mod tests {
 
     #[test]
     fn test_index_file_created() -> Result<()> {
-        // Create a minimal test index in memory
-        let output_path = std::env::temp_dir().join("test_index.hdt.index.v1-1");
+        let tmp = TempDir::new()?;
+        let output_path = tmp.path().join("test_index.hdt.index.v1-1");
+
+        let bitmap_index_z = build_streaming_bitmap(&[], tmp.path(), "biz.tmp");
+        let index_z = build_streaming_logarray(&[], 0, tmp.path(), "iz.tmp");
 
         let predicate_index = PredicateIndex {
             bitmap: vec![],
             sequence: vec![],
         };
 
-        write_index(&output_path, 0, 1, &[], &[], &predicate_index, &[])?;
+        write_index(
+            &output_path,
+            0,
+            1,
+            &bitmap_index_z,
+            &index_z,
+            &predicate_index,
+            &[],
+        )?;
 
-        // Verify file was created
         assert!(output_path.exists());
-
-        // Clean up
-        let _ = std::fs::remove_file(&output_path);
-
         Ok(())
     }
 
     #[test]
     fn test_index_control_info_type_and_properties() -> Result<()> {
-        let output_path = std::env::temp_dir().join("test_index_control_info.hdt.index.v1-1");
+        let tmp = TempDir::new()?;
+        let output_path = tmp.path().join("test_index_ci.hdt.index.v1-1");
 
-        let bitmap_index_z = build_bitmap(&[true, false, true]);
-        let index_z = build_logarray(&[0, 1, 2], 2);
-        let pred_bitmap = build_bitmap(&[true, true]);
-        let pred_seq = build_logarray(&[0, 1], 1);
-        let pred_count = build_logarray(&[2, 1], 2);
+        let bitmap_index_z = build_streaming_bitmap(&[true, false, true], tmp.path(), "biz.tmp");
+        let index_z = build_streaming_logarray(&[0, 1, 2], 2, tmp.path(), "iz.tmp");
+        let pred_bitmap = build_inmem_bitmap(&[true, true]);
+        let pred_seq = build_inmem_logarray(&[0, 1], 1);
+        let pred_count = build_inmem_logarray(&[2, 1], 2);
 
         let predicate_index = PredicateIndex {
             bitmap: pred_bitmap,
@@ -172,23 +226,24 @@ mod tests {
         assert_eq!(ci.get_property("numTriples"), Some("3"));
         assert_eq!(ci.get_property("order"), Some("1"));
 
-        let _ = std::fs::remove_file(&output_path);
         Ok(())
     }
 
     #[test]
     fn test_index_components_roundtrip_and_boundaries() -> Result<()> {
-        let output_path = std::env::temp_dir().join("test_index_components.hdt.index.v1-1");
+        let tmp = TempDir::new()?;
+        let output_path = tmp.path().join("test_index_components.hdt.index.v1-1");
 
-        let bitmap_index_z = build_bitmap(&[false, true, false, true]);
-        let index_z = build_logarray(&[0, 2, 1, 3], 3);
-        let pred_bitmap = build_bitmap(&[true, false, true]);
-        let pred_seq = build_logarray(&[0, 2, 1], 2);
-        let pred_count = build_logarray(&[2, 1, 1], 2);
+        let bitmap_index_z =
+            build_streaming_bitmap(&[false, true, false, true], tmp.path(), "biz.tmp");
+        let index_z = build_streaming_logarray(&[0, 2, 1, 3], 3, tmp.path(), "iz.tmp");
+        let pred_bitmap = build_inmem_bitmap(&[true, false, true]);
+        let pred_seq = build_inmem_logarray(&[0, 2, 1], 2);
+        let pred_count = build_inmem_logarray(&[2, 1, 1], 2);
 
         let predicate_index = PredicateIndex {
-            bitmap: pred_bitmap.clone(),
-            sequence: pred_seq.clone(),
+            bitmap: pred_bitmap,
+            sequence: pred_seq,
         };
 
         write_index(
@@ -211,14 +266,17 @@ mod tests {
         let c4 = LogArrayReader::read_from(&mut cursor)?;
         let c5 = LogArrayReader::read_from(&mut cursor)?;
 
-        assert_eq!(cursor.position() as usize, bytes.len(), "all index components should consume file exactly");
+        assert_eq!(
+            cursor.position() as usize,
+            bytes.len(),
+            "all index components should consume file exactly"
+        );
         assert_eq!(c1.len(), 4);
         assert_eq!(c2.len(), 4);
         assert_eq!(c3.len(), 3);
         assert_eq!(c4.len(), 3);
         assert_eq!(c5.len(), 3);
 
-        let _ = std::fs::remove_file(&output_path);
         Ok(())
     }
 }

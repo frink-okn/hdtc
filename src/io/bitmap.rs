@@ -310,6 +310,11 @@ impl BitmapReader {
         self.num_bits == 0
     }
 
+    /// Approximate heap memory used by this reader (bytes).
+    pub fn heap_size(&self) -> usize {
+        (self.words.len() + self.rank_prefix.len()) * std::mem::size_of::<u64>()
+    }
+
     /// Count the number of 1 bits up to and including position `pos` (rank1).
     pub fn rank1(&self, pos: u64) -> u64 {
         assert!(pos < self.num_bits);
