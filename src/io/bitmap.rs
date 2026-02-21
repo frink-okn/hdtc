@@ -189,11 +189,7 @@ impl<W: Write> StreamingBitmapEncoder<W> {
         if self.num_bits > 0 {
             // Write only the bytes needed for the final partial word
             let total_data_bytes = self.num_bits.div_ceil(8) as usize;
-            let complete_words = if self.num_bits > 0 {
-                ((self.num_bits - 1) / 64) as usize
-            } else {
-                0
-            };
+            let complete_words = ((self.num_bits - 1) / 64) as usize;
             let bytes_already_written = complete_words * 8;
             let remaining = total_data_bytes - bytes_already_written;
             let word_bytes = self.current_word.to_le_bytes();

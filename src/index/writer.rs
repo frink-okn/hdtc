@@ -83,7 +83,6 @@ pub fn write_index(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::io::crc_utils::Crc32cWriter;
     use crate::io::{
         BitmapReader, BitmapWriter, ControlType, LogArrayReader, LogArrayWriter,
         StreamingBitmapEncoder, StreamingLogArrayEncoder,
@@ -95,16 +94,14 @@ mod tests {
     fn build_streaming_bitmap(bits: &[bool], dir: &Path, name: &str) -> StreamingBitmapResult {
         let path = dir.join(name);
         let file = File::create(&path).unwrap();
-        let crc_writer = Crc32cWriter::new(BufWriter::new(file));
-        let mut encoder = StreamingBitmapEncoder::new(crc_writer);
+        let mut encoder = StreamingBitmapEncoder::new(BufWriter::new(file));
 
         for &bit in bits {
             encoder.push(bit).unwrap();
         }
 
-        let (num_bits, crc_writer) = encoder.finish().unwrap();
-        let (_, mut inner) = crc_writer.finalize();
-        inner.flush().unwrap();
+        let (num_bits, mut writer) = encoder.finish().unwrap();
+        writer.flush().unwrap();
 
         StreamingBitmapResult { path, num_bits }
     }
@@ -124,16 +121,14 @@ mod tests {
 
         let path = dir.join(name);
         let file = File::create(&path).unwrap();
-        let crc_writer = Crc32cWriter::new(BufWriter::new(file));
-        let mut encoder = StreamingLogArrayEncoder::new(bits_per_entry, crc_writer);
+        let mut encoder = StreamingLogArrayEncoder::new(bits_per_entry, BufWriter::new(file));
 
         for &value in values {
             encoder.push(value).unwrap();
         }
 
-        let (num_entries, bits_per_entry, crc_writer) = encoder.finish().unwrap();
-        let (_, mut inner) = crc_writer.finalize();
-        inner.flush().unwrap();
+        let (num_entries, bits_per_entry, mut writer) = encoder.finish().unwrap();
+        writer.flush().unwrap();
 
         StreamingLogArrayResult {
             path,
