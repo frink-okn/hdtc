@@ -8,13 +8,17 @@ mod writer;
 pub use predicate_index::{build_predicate_index, build_predicate_count};
 pub use writer::write_index;
 
-use crate::io::{BitmapReader, BitmapWriter, ControlInfo, ControlType, LogArrayReader, LogArrayWriter};
+use crate::io::{
+    BitmapReader, ControlInfo, ControlType, LogArrayReader,
+    StreamingBitmapEncoder, StreamingLogArrayEncoder,
+};
 use crate::sort::{ExternalSorter, Sortable};
+use crate::triples::{StreamingBitmapResult, StreamingLogArrayResult};
 use anyhow::{bail, Context, Result};
 use oxrdf::Term;
 use std::fs::File;
 use std::io::Cursor;
-use std::io::{BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -218,9 +222,10 @@ pub fn create_index(
 
     tracing::info!("Decoded main HDT: {} triples", num_triples_from_header);
 
-    // Read BitmapTriples structures (order: Y, Z, Y, Z)
-    let _bitmap_y = BitmapReader::read_from(&mut reader)
-        .context("Failed to read BitmapY")?;
+    // Read BitmapTriples structures (order: BitmapY, BitmapZ, ArrayY, ArrayZ)
+    // BitmapY is not needed for index creation — drop it immediately
+    drop(BitmapReader::read_from(&mut reader).context("Failed to read BitmapY")?);
+
     let bitmap_z = BitmapReader::read_from(&mut reader)
         .context("Failed to read BitmapZ")?;
     let array_y = LogArrayReader::read_from(&mut reader)
@@ -230,7 +235,7 @@ pub fn create_index(
 
     let num_triples = num_triples_from_header;
 
-    // Extract seqY for later PredicateIndex building
+    // Extract seqY from ArrayY, then drop the LogArrayReader to free its packed words
     tracing::info!("Extracting seqY from ArrayY ({} entries)", array_y.len());
     let seq_y_start = Instant::now();
     let mut seq_y = Vec::with_capacity(array_y.len() as usize);
@@ -245,43 +250,86 @@ pub fn create_index(
             );
         }
     }
+    let array_y_freed = array_y.heap_size();
+    drop(array_y);
     tracing::info!(
-        "Extracted seqY in {:.3}s",
-        seq_y_start.elapsed().as_secs_f64()
+        "Extracted seqY in {:.3}s (freed ArrayY: {} MiB)",
+        seq_y_start.elapsed().as_secs_f64(),
+        array_y_freed / 1024 / 1024
+    );
+
+    // Compute reader memory that coexists with the sort buffer so we can subtract
+    // it from the sort budget. bitmap_z, array_z, and seq_y are alive during sorting.
+    let reader_memory = bitmap_z.heap_size() + array_z.heap_size()
+        + seq_y.len() * std::mem::size_of::<u64>();
+    tracing::info!(
+        "Reader memory during sort: {} MiB (bitmap_z={} MiB, array_z={} MiB, seq_y={} MiB)",
+        reader_memory / 1024 / 1024,
+        bitmap_z.heap_size() / 1024 / 1024,
+        array_z.heap_size() / 1024 / 1024,
+        (seq_y.len() * std::mem::size_of::<u64>()) / 1024 / 1024
     );
 
     // Build bitmapIndexZ + indexZ exactly as hdt-java does for indexFoQ:
     // for each triple position i in SPO stream, compute (object=seqZ[i], posY=rank1(bitmapZ, i-1)),
     // group by object, sort each object-group by (predicate at posY, posY), then serialize posY values.
-    let (bitmap_index_z, index_z, max_predicate) =
-        build_object_index(&seq_y, &bitmap_z, &array_z, num_triples, memory_budget, temp_dir)
+    let sort_budget = memory_budget.saturating_sub(reader_memory);
+    let obj_index =
+        build_object_index(&seq_y, &bitmap_z, &array_z, num_triples, sort_budget, temp_dir)
             .context("Failed to build bitmapIndexZ/indexZ")?;
+
+    // Drop readers — they're no longer needed after the object index is built
+    let freed = bitmap_z.heap_size() + array_z.heap_size();
+    drop(bitmap_z);
+    drop(array_z);
+    tracing::debug!("Dropped bitmap_z + array_z (freed {} MiB)", freed / 1024 / 1024);
 
     // Build PredicateIndex
     tracing::info!("Building PredicateIndex structures...");
 
     let pred_index =
-        build_predicate_index(&seq_y, max_predicate).context("Failed to build predicate index")?;
-    let pred_count = build_predicate_count(&seq_y, max_predicate)
+        build_predicate_index(&seq_y, obj_index.max_predicate)
+            .context("Failed to build predicate index")?;
+    let pred_count = build_predicate_count(&seq_y, obj_index.max_predicate)
         .context("Failed to build predicate count")?;
 
-    // Write index file
+    // Write index file — streams bitmap_index_z and index_z from temp files
     let index_path = hdt_path.with_extension("hdt.index.v1-1");
 
     write_index(
         &index_path,
         num_triples,
         triples_order,
-        &bitmap_index_z,
-        &index_z,
+        &obj_index.bitmap_index_z,
+        &obj_index.index_z,
         &pred_index,
         &pred_count,
     )
         .context("Failed to write index file")?;
 
+    // Clean up temp files
+    obj_index.cleanup();
+
     tracing::info!("Index creation complete: {}", index_path.display());
 
     Ok(index_path)
+}
+
+/// Result of building the object index with streaming encoders.
+struct ObjectIndexResult {
+    bitmap_index_z: StreamingBitmapResult,
+    index_z: StreamingLogArrayResult,
+    max_predicate: u64,
+}
+
+impl ObjectIndexResult {
+    fn cleanup(&self) {
+        for path in [&self.bitmap_index_z.path, &self.index_z.path] {
+            if let Err(e) = std::fs::remove_file(path) {
+                tracing::warn!("Failed to delete index temp file {}: {}", path.display(), e);
+            }
+        }
+    }
 }
 
 fn build_object_index(
@@ -291,15 +339,32 @@ fn build_object_index(
     num_triples: u64,
     memory_budget: usize,
     temp_dir: &Path,
-) -> Result<(Vec<u8>, Vec<u8>, u64)> {
+) -> Result<ObjectIndexResult> {
+    // Set up streaming encoders writing to temp files
+    let bitmap_path = temp_dir.join("idx_bitmap_index_z.tmp");
+    let index_path = temp_dir.join("idx_index_z.tmp");
+
     if num_triples == 0 {
-        let mut bitmap_buf = Vec::new();
-        BitmapWriter::new().write_to(&mut bitmap_buf)?;
+        // Write empty structures to temp files
+        let bitmap_file = File::create(&bitmap_path)
+            .context("Failed to create bitmap_index_z temp file")?;
+        let index_file = File::create(&index_path)
+            .context("Failed to create index_z temp file")?;
+        drop(bitmap_file);
+        drop(index_file);
 
-        let mut index_buf = Vec::new();
-        LogArrayWriter::for_max_value(0).write_to(&mut index_buf)?;
-
-        return Ok((bitmap_buf, index_buf, 0));
+        return Ok(ObjectIndexResult {
+            bitmap_index_z: StreamingBitmapResult {
+                path: bitmap_path,
+                num_bits: 0,
+            },
+            index_z: StreamingLogArrayResult {
+                path: index_path,
+                bits_per_entry: 1,
+                num_entries: 0,
+            },
+            max_predicate: 0,
+        });
     }
 
     tracing::info!(
@@ -364,9 +429,20 @@ fn build_object_index(
         sorter.chunk_file_count()
     );
 
+    // Create streaming encoders backed by temp files
     let max_pos_y = (seq_y.len() as u64).saturating_sub(1);
-    let mut index_z_writer = LogArrayWriter::for_max_value(max_pos_y);
-    let mut bitmap_index_z_writer = BitmapWriter::new();
+    let bits_per_entry = if max_pos_y == 0 { 1 } else { 64 - max_pos_y.leading_zeros() as u8 };
+
+    let bitmap_file = File::create(&bitmap_path)
+        .context("Failed to create bitmap_index_z temp file")?;
+    let mut bitmap_encoder =
+        StreamingBitmapEncoder::new(BufWriter::with_capacity(256 * 1024, bitmap_file));
+
+    let index_file = File::create(&index_path)
+        .context("Failed to create index_z temp file")?;
+    let mut index_encoder =
+        StreamingLogArrayEncoder::new(bits_per_entry, BufWriter::with_capacity(256 * 1024, index_file));
+
     let mut current_object: Option<u64> = None;
     let mut emitted = 0u64;
     let emit_start = Instant::now();
@@ -381,12 +457,12 @@ fn build_object_index(
         if let Some(prev_object) = current_object
             && entry.object != prev_object
         {
-            bitmap_index_z_writer.set_last(true);
+            bitmap_encoder.set_last(true);
         }
         current_object = Some(entry.object);
 
-        index_z_writer.push(entry.pos_y);
-        bitmap_index_z_writer.push(false);
+        index_encoder.push(entry.pos_y)?;
+        bitmap_encoder.push(false)?;
         emitted += 1;
 
         if emitted.is_multiple_of(5_000_000) {
@@ -399,30 +475,42 @@ fn build_object_index(
     }
 
     if current_object.is_some() {
-        bitmap_index_z_writer.set_last(true);
+        bitmap_encoder.set_last(true);
     }
 
-    if bitmap_index_z_writer.len() != num_triples {
+    // Finish streaming encoders
+    let (bitmap_num_bits, mut bitmap_writer) = bitmap_encoder.finish()?;
+    bitmap_writer.flush()?;
+
+    if bitmap_num_bits != num_triples {
         bail!(
             "bitmapIndexZ length mismatch: got {}, expected {}",
-            bitmap_index_z_writer.len(),
+            bitmap_num_bits,
             num_triples
         );
     }
 
+    let (index_num_entries, index_bpe, mut index_writer) = index_encoder.finish()?;
+    index_writer.flush()?;
+
     tracing::info!(
-        "Object-index pass 3 complete in {:.3}s ({} serialized entries)",
+        "Object-index pass 3 complete in {:.3}s ({} entries streamed to temp files)",
         emit_start.elapsed().as_secs_f64(),
         emitted
     );
 
-    let mut bitmap_buf = Vec::new();
-    bitmap_index_z_writer.write_to(&mut bitmap_buf)?;
-
-    let mut index_buf = Vec::new();
-    index_z_writer.write_to(&mut index_buf)?;
-
-    Ok((bitmap_buf, index_buf, max_predicate))
+    Ok(ObjectIndexResult {
+        bitmap_index_z: StreamingBitmapResult {
+            path: bitmap_path,
+            num_bits: bitmap_num_bits,
+        },
+        index_z: StreamingLogArrayResult {
+            path: index_path,
+            bits_per_entry: index_bpe,
+            num_entries: index_num_entries,
+        },
+        max_predicate,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -6,7 +6,6 @@
 //! - CRC32C (poly 0x1EDC6F41): after data payloads
 
 use crc::{Crc, CRC_32_ISCSI};
-#[cfg(test)]
 use std::io::{self, Write};
 
 // CRC8-CCITT: polynomial 0x07
@@ -90,14 +89,13 @@ impl<W: Write> Write for Crc8Writer<W> {
 }
 
 /// A writer wrapper that incrementally computes a CRC32C over all bytes written.
-#[cfg(test)]
 pub struct Crc32cWriter<W: Write> {
     inner: W,
     digest: crc::Digest<'static, u32>,
 }
 
-#[cfg(test)]
 impl<W: Write> Crc32cWriter<W> {
+    #[allow(dead_code)]
     pub fn new(inner: W) -> Self {
         Self {
             inner,
@@ -105,15 +103,21 @@ impl<W: Write> Crc32cWriter<W> {
         }
     }
 
+    /// Finalize: returns the CRC32C checksum and the inner writer (does NOT write it).
+    #[allow(dead_code)]
+    pub fn finalize(self) -> (u32, W) {
+        (self.digest.finalize(), self.inner)
+    }
+
     /// Finalize and write the CRC32C checksum (little-endian). Returns the inner writer.
-    pub fn finalize(mut self) -> io::Result<W> {
+    #[allow(dead_code)]
+    pub fn finalize_and_write(mut self) -> io::Result<W> {
         let checksum = self.digest.finalize();
         self.inner.write_all(&checksum.to_le_bytes())?;
         Ok(self.inner)
     }
 }
 
-#[cfg(test)]
 impl<W: Write> Write for Crc32cWriter<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let n = self.inner.write(buf)?;
@@ -186,7 +190,7 @@ mod tests {
         {
             let mut writer = Crc32cWriter::new(&mut buf);
             writer.write_all(data).unwrap();
-            writer.finalize().unwrap();
+            writer.finalize_and_write().unwrap();
         }
 
         assert_eq!(&buf[..data.len()], data);
@@ -208,7 +212,7 @@ mod tests {
             writer.write_all(&data[..5]).unwrap();
             writer.write_all(&data[5..11]).unwrap();
             writer.write_all(&data[11..]).unwrap();
-            writer.finalize().unwrap();
+            writer.finalize_and_write().unwrap();
         }
 
         let stored_crc = u32::from_le_bytes([

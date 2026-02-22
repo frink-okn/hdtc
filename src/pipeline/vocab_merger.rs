@@ -168,14 +168,13 @@ pub struct VocabMergeResult {
     pub counts: DictCounts,
     #[allow(dead_code)]
     pub predicate_ids: HashMap<String, u64>,
-    #[allow(dead_code)]
-    pub id_mappings: Vec<IdMapping>,
 }
 
 /// Merge partial vocabularies into global dictionary.
 pub fn merge_vocabularies(
     batch_infos: Vec<(usize, PathBuf)>, // (batch_id, vocab_path)
     temp_dir: &Path,
+    memory_budget: usize,
 ) -> Result<VocabMergeResult> {
     tracing::info!("Merging {} partial vocabularies", batch_infos.len());
 
@@ -224,7 +223,14 @@ pub fn merge_vocabularies(
     tracing::debug!("Single-pass merge: assigning global IDs with provisional SO offsets");
 
     let stream_init_start = Instant::now();
-    let (stream_rx, worker_handles) = build_parallel_vocab_stream(&batch_infos, 2048)?;
+    let stream_channel_capacity = calculate_stage4_stream_channel_capacity(memory_budget);
+    tracing::debug!(
+        "Stage 4 stream settings: capacity={} (memory budget: {} MiB)",
+        stream_channel_capacity,
+        memory_budget / 1024 / 1024
+    );
+    let (stream_rx, worker_handles) =
+        build_parallel_vocab_stream(&batch_infos, stream_channel_capacity)?;
     stream_reader_init_time += stream_init_start.elapsed();
 
     let stream_result = (|| -> Result<()> {
@@ -371,8 +377,22 @@ pub fn merge_vocabularies(
         dict_sections,
         counts,
         predicate_ids,
-        id_mappings,
     })
+}
+
+/// Calculate the bounded channel capacity for the k-way merge stream.
+///
+/// `stage4_budget` is the full Stage 4 memory budget (which owns the entire
+/// memory limit since Stage 4 runs alone).  We allocate a small fraction for
+/// the stream channel; the rest is available for id_mappings, PFC encoders,
+/// and per-batch reader threads.
+fn calculate_stage4_stream_channel_capacity(stage4_budget: usize) -> usize {
+    const MIB: usize = 1024 * 1024;
+
+    // ~5% of the stage budget for the channel, clamped to reasonable bounds.
+    let estimated_entry_bytes = 160usize; // term bytes + metadata per StreamEntry
+    let queue_budget = (stage4_budget / 20).clamp(8 * MIB, 128 * MIB);
+    (queue_budget / estimated_entry_bytes).clamp(64, 4096)
 }
 
 fn read_stream_entry(rx: &Receiver<Result<StreamEntry>>) -> Result<Option<StreamEntry>> {
@@ -600,6 +620,13 @@ mod tests {
     use crate::pipeline::partial_vocab::{PartialVocabWriter, PartialVocabEntry};
     use tempfile::TempDir;
 
+    const TEST_MEMORY_BUDGET: usize = 512 * 1024 * 1024;
+
+    fn read_mapping_from_temp(temp_path: &Path, batch_id: usize) -> Result<IdMapping> {
+        let mapping_path = temp_path.join(format!("id_mapping_{:06}.map.zst", batch_id));
+        IdMapping::read_from_file(&mapping_path)
+    }
+
     /// Create a test partial vocabulary file with given entries.
     fn create_test_partial_vocab(
         path: &Path,
@@ -657,7 +684,7 @@ mod tests {
         )?;
 
         let batch_infos = vec![(0, batch0_path), (1, batch1_path)];
-        let result = merge_vocabularies(batch_infos, temp_path)?;
+        let result = merge_vocabularies(batch_infos, temp_path, TEST_MEMORY_BUDGET)?;
 
         // Verify counts
         assert_eq!(result.counts.shared, 0);
@@ -665,18 +692,19 @@ mod tests {
         assert_eq!(result.counts.objects, 2);
         assert_eq!(result.counts.predicates, 2);
 
-        // Verify ID mappings are correct
-        assert_eq!(result.id_mappings.len(), 2);
+        // Verify ID mapping files are correct
+        let mapping_0 = read_mapping_from_temp(temp_path, 0)?;
+        let mapping_1 = read_mapping_from_temp(temp_path, 1)?;
 
         // Batch 0 mappings: a→1 (first subject), b→1 (first object, same ID offset), c→1 (first predicate)
-        assert_eq!(result.id_mappings[0].so_map[0], 1); // a (first subject-only)
-        assert_eq!(result.id_mappings[0].so_map[1], 1); // b (first object-only)
-        assert_eq!(result.id_mappings[0].p_map[0], 1);  // c (first predicate)
+        assert_eq!(mapping_0.so_map[0], 1); // a (first subject-only)
+        assert_eq!(mapping_0.so_map[1], 1); // b (first object-only)
+        assert_eq!(mapping_0.p_map[0], 1);  // c (first predicate)
 
         // Batch 1 mappings: d→2 (second subject), e→2 (second object, same ID offset), f→2 (second predicate)
-        assert_eq!(result.id_mappings[1].so_map[0], 2); // d (second subject-only)
-        assert_eq!(result.id_mappings[1].so_map[1], 2); // e (second object-only)
-        assert_eq!(result.id_mappings[1].p_map[0], 2);  // f (second predicate)
+        assert_eq!(mapping_1.so_map[0], 2); // d (second subject-only)
+        assert_eq!(mapping_1.so_map[1], 2); // e (second object-only)
+        assert_eq!(mapping_1.p_map[0], 2);  // f (second predicate)
 
         Ok(())
     }
@@ -708,7 +736,7 @@ mod tests {
         )?;
 
         let batch_infos = vec![(0, batch0_path), (1, batch1_path)];
-        let result = merge_vocabularies(batch_infos, temp_path)?;
+        let result = merge_vocabularies(batch_infos, temp_path, TEST_MEMORY_BUDGET)?;
 
         // "x" should be shared (appears as both subject and object)
         // "p1" should be a predicate
@@ -717,13 +745,16 @@ mod tests {
         assert_eq!(result.counts.objects, 0);
         assert_eq!(result.counts.predicates, 1); // p1
 
+        let mapping_0 = read_mapping_from_temp(temp_path, 0)?;
+        let mapping_1 = read_mapping_from_temp(temp_path, 1)?;
+
         // Both batches should map "x" to the same global ID (1, the shared ID)
-        assert_eq!(result.id_mappings[0].so_map[0], 1); // x from batch 0
-        assert_eq!(result.id_mappings[1].so_map[0], 1); // x from batch 1
+        assert_eq!(mapping_0.so_map[0], 1); // x from batch 0
+        assert_eq!(mapping_1.so_map[0], 1); // x from batch 1
 
         // Both batches should map "p1" to the same global predicate ID (1)
-        assert_eq!(result.id_mappings[0].p_map[0], 1); // p1 from batch 0
-        assert_eq!(result.id_mappings[1].p_map[0], 1); // p1 from batch 1
+        assert_eq!(mapping_0.p_map[0], 1); // p1 from batch 0
+        assert_eq!(mapping_1.p_map[0], 1); // p1 from batch 1
 
         Ok(())
     }
@@ -760,20 +791,24 @@ mod tests {
             (1, batch1_path),
             (2, batch2_path),
         ];
-        let result = merge_vocabularies(batch_infos, temp_path)?;
+        let result = merge_vocabularies(batch_infos, temp_path, TEST_MEMORY_BUDGET)?;
 
         // "multi" should be shared (appears as both subject and object)
         // and also as predicate
         assert_eq!(result.counts.shared, 1);
         assert_eq!(result.counts.predicates, 1);
 
+        let mapping_0 = read_mapping_from_temp(temp_path, 0)?;
+        let mapping_1 = read_mapping_from_temp(temp_path, 1)?;
+        let mapping_2 = read_mapping_from_temp(temp_path, 2)?;
+
         // Verify mappings for each batch
         // Batch 0: "multi" as subject → global ID 1 (shared section starts at 1)
-        assert_eq!(result.id_mappings[0].so_map[0], 1);
+        assert_eq!(mapping_0.so_map[0], 1);
         // Batch 1: "multi" as predicate → global ID 1
-        assert_eq!(result.id_mappings[1].p_map[0], 1);
+        assert_eq!(mapping_1.p_map[0], 1);
         // Batch 2: "multi" as object → global ID 1 (shared)
-        assert_eq!(result.id_mappings[2].so_map[0], 1);
+        assert_eq!(mapping_2.so_map[0], 1);
 
         Ok(())
     }
@@ -820,24 +855,28 @@ mod tests {
             (1, batch1_path),
             (2, batch2_path),
         ];
-        let result = merge_vocabularies(batch_infos, temp_path)?;
+        let result = merge_vocabularies(batch_infos, temp_path, TEST_MEMORY_BUDGET)?;
 
         // "a" shared (subject + object), "b" shared (subject + object) + predicate, "c" predicate, "d" subject
         assert_eq!(result.counts.shared, 2);     // a, b
         assert_eq!(result.counts.subjects, 1);   // d
         assert_eq!(result.counts.predicates, 2); // b, c
 
+        let mapping_0 = read_mapping_from_temp(temp_path, 0)?;
+        let mapping_1 = read_mapping_from_temp(temp_path, 1)?;
+        let mapping_2 = read_mapping_from_temp(temp_path, 2)?;
+
         // Verify ID mappings are consistent across batches
-        let a_global_b0 = result.id_mappings[0].so_map[0]; // a from batch 0 (subject)
-        let a_global_b1 = result.id_mappings[1].so_map[0]; // a from batch 1 (object)
+        let a_global_b0 = mapping_0.so_map[0]; // a from batch 0 (subject)
+        let a_global_b1 = mapping_1.so_map[0]; // a from batch 1 (object)
         assert_eq!(a_global_b0, a_global_b1, "a should map to same global ID whether it's subject or object");
 
         // Verify that b appears as shared (not just in one role)
-        let b_so_id = result.id_mappings[1].so_map[1]; // b as subject/object from batch 1
+        let b_so_id = mapping_1.so_map[1]; // b as subject/object from batch 1
         assert!(b_so_id <= result.counts.shared as u64, "b's SO ID should be in shared section");
 
         // Verify d is subject-only (not shared)
-        let d_id = result.id_mappings[2].so_map[1];
+        let d_id = mapping_2.so_map[1];
         assert!(d_id > result.counts.shared as u64, "d should have subject-only ID");
 
         Ok(())
@@ -861,18 +900,21 @@ mod tests {
         create_test_partial_vocab(&batch1_path, vec![])?;
 
         let batch_infos = vec![(0, batch0_path), (1, batch1_path)];
-        let result = merge_vocabularies(batch_infos, temp_path)?;
+        let result = merge_vocabularies(batch_infos, temp_path, TEST_MEMORY_BUDGET)?;
 
         // Should only count terms from batch 0
         assert_eq!(result.counts.shared, 0);
         assert_eq!(result.counts.subjects, 1);
 
+        let mapping_0 = read_mapping_from_temp(temp_path, 0)?;
+        let mapping_1 = read_mapping_from_temp(temp_path, 1)?;
+
         // Batch 0 should have a mapping
-        assert_eq!(result.id_mappings[0].so_map.len(), 1);
+        assert_eq!(mapping_0.so_map.len(), 1);
 
         // Batch 1 might have pre-allocated but empty mapping (header said max_so_id = 0, max_p_id = 0)
-        // Just verify it exists and isn't panicking
-        assert_eq!(result.id_mappings.len(), 2);
+        // Verify mapping files exist and are readable
+        assert_eq!(mapping_1.batch_id, 1);
 
         Ok(())
     }

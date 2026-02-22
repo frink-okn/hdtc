@@ -21,7 +21,6 @@ pub use partial_vocab::{PartialVocabEntry, PartialVocabReader, PartialVocabWrite
 use crate::dictionary::DictCounts;
 use crate::rdf::{stream_quads_with_options, ExtractedQuad, ParseOptions, RdfInput};
 use crate::sort::ExternalSorter;
-use crate::triples::builder::BitmapTriplesData;
 use crate::triples::id_triple::IdTriple;
 use anyhow::{Context, Result};
 use crossbeam_channel::{bounded, Receiver, Sender};
@@ -34,6 +33,72 @@ use std::time::{Duration, Instant};
 use batch_vocab::{LocalIdTriple, Roles, VocabEntry};
 
 const STAGE5_TO_STAGE6_CHUNK_SIZE: usize = 16_384;
+const RECOMMENDED_MIN_MEMORY_BUDGET: usize = 2 * 1024 * 1024 * 1024;
+const MIB: usize = 1024 * 1024;
+
+// ---------------------------------------------------------------------------
+// Memory planning
+// ---------------------------------------------------------------------------
+//
+// The pipeline has two temporally disjoint groups:
+//
+//   Group A (concurrent): Stages 1-3 — parser, batch vocab builder, vocab writer
+//   Group B (sequential after A):
+//     B1: Stage 4 — vocab merger (runs alone)
+//     B2: Stages 5+6 — ID remapper + external sort (concurrent with each other)
+//
+// Because Group A finishes before Group B starts, and B1 finishes before B2,
+// each group can independently use the *full* memory budget.  Within a group
+// we split the budget among the concurrent consumers.
+
+#[derive(Debug, Clone, Copy)]
+struct Stage56Budget {
+    sort_budget_bytes: usize,
+    remap_threads: usize,
+    remap_to_sort_channel_capacity: usize,
+}
+
+/// Complete memory plan for all pipeline stages.
+#[derive(Debug, Clone, Copy)]
+struct PipelineMemoryPlan {
+    // Group A
+    parser_budget_bytes: usize,
+    batch_size: usize,
+    batch_channel_cap: usize,      // Stage 1→2 channel capacity (batches of quads)
+    processed_channel_cap: usize,   // Stage 2→3 channel capacity (processed batches)
+
+    // Group B1
+    stage4_budget_bytes: usize,
+
+    // Group B2
+    stage56_budget: Stage56Budget,
+}
+
+pub(super) fn tune_f64(name: &str, default: f64) -> f64 {
+    match std::env::var(name) {
+        Ok(raw) => match raw.parse::<f64>() {
+            Ok(v) if v.is_finite() && v > 0.0 => v,
+            _ => {
+                tracing::warn!("Ignoring invalid {}='{}', using default {}", name, raw, default);
+                default
+            }
+        },
+        Err(_) => default,
+    }
+}
+
+pub(super) fn tune_usize(name: &str, default: usize) -> usize {
+    match std::env::var(name) {
+        Ok(raw) => match raw.parse::<usize>() {
+            Ok(v) if v > 0 => v,
+            _ => {
+                tracing::warn!("Ignoring invalid {}='{}', using default {}", name, raw, default);
+                default
+            }
+        },
+        Err(_) => default,
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct ParserParallelismConfig {
@@ -47,7 +112,7 @@ pub struct ParserParallelismConfig {
 pub struct PipelineResult {
     pub counts: DictCounts,
     pub dict_sections: Vec<Vec<u8>>, // PFC-encoded sections
-    pub bitmap_triples: BitmapTriplesData,
+    pub bitmap_triples: crate::triples::BitmapTriplesFiles,
     pub ntriples_size: u64, // N-Triples serialization size of parsed data
 }
 
@@ -260,27 +325,163 @@ fn local_triples_path(temp_dir: &Path, batch_id: usize) -> PathBuf {
     temp_dir.join(format!("local_triples_{:06}.ltr.zst", batch_id))
 }
 
-/// Calculate adaptive batch size based on memory budget.
-fn calculate_batch_size(memory_budget: usize) -> usize {
-    // Reserve 1GB for external sorter and misc overhead
-    let available = memory_budget.saturating_sub(1024 * 1024 * 1024);
+// ---------------------------------------------------------------------------
+// Group A: Stages 1-3 (parser + batch vocab builder + vocab writer)
+// ---------------------------------------------------------------------------
+// These run concurrently.  Memory consumers differ by stage:
+//
+//   Batch channel (Stage 1→2):  `batch_channel_cap` batches of Vec<ExtractedQuad>.
+//     Each ExtractedQuad has 3 heap-allocated Strings (subject, predicate, object)
+//     + Option<String> graph.  Stack: ~96 bytes, heap: ~240 bytes → ~350 bytes/quad.
+//
+//   Stage 2 processing (1 batch): arena (~100 bytes/triple for unique terms) +
+//     hashmap (~80 bytes/unique term) + LocalIdTriple vec (12 bytes/triple).
+//     Effective: ~200 bytes/triple.
+//
+//   Processed channel (Stage 2→3): `processed_channel_cap` ProcessedBatch items.
+//     Each holds Vec<VocabEntry> (amortized ~20 bytes/triple for unique terms) +
+//     Vec<LocalIdTriple> (12 bytes/triple).  Effective: ~50 bytes/triple.
+//
+//   Parser I/O: chunk buffers + in-flight bytes, allocated separately.
+//
+// We compute batch_size by solving:
+//   batch_size × (batch_cap × raw_cost + 1 × processing_cost +
+//                 processed_cap × processed_cost) ≤ batch_budget
+//
+// Group A throughput is I/O-bound (parsing), not batch-size-bound.  Empirically,
+// larger batches past ~3-5M triples don't improve throughput and just waste memory.
+// We therefore cap the total Group A memory footprint so that extra --memory-limit
+// budget flows to later stages (sort, merge) where more memory genuinely helps.
 
-    // Each triple needs ~150 bytes when buffered across all pipeline stages
-    // With 5 batches in flight: ~750 bytes per triple total
-    let bytes_per_triple = 150;
-    let num_batches_buffered = 5;
+fn calculate_group_a(memory_budget: usize) -> (usize, usize, usize, usize) {
+    // Parser gets a moderate share; it's I/O-bound so diminishing returns past ~15%.
+    let parser_share = tune_f64("HDTC_TUNE_PARSER_SHARE", 0.15).clamp(0.05, 0.40);
+    let parser_min = tune_usize("HDTC_TUNE_PARSER_MIN_MIB", 64) * MIB;
+    let parser_max = tune_usize("HDTC_TUNE_PARSER_MAX_MIB", 2048) * MIB;
+    let parser_budget = (((memory_budget as f64) * parser_share) as usize)
+        .clamp(parser_min, parser_max.max(parser_min));
 
-    let batch_size = available / (bytes_per_triple * num_batches_buffered);
+    // Channel depths
+    let batch_channel_cap = tune_usize("HDTC_TUNE_BATCH_CHANNEL_CAP", 3).clamp(1, 16);
+    let processed_channel_cap = tune_usize("HDTC_TUNE_PROCESSED_CHANNEL_CAP", 2).clamp(1, 8);
 
-    // Clamp to reasonable range: 1M - 20M triples per batch
-    batch_size.clamp(1_000_000, 20_000_000)
+    // Per-triple memory costs at each pipeline stage.
+    // ExtractedQuad: 3 Strings (24 bytes stack + ~80 bytes heap each) + Option<String>
+    // = ~96 bytes stack + ~240 bytes heap ≈ 350 bytes per quad.
+    let raw_bytes_per_quad = tune_usize("HDTC_TUNE_RAW_BYTES_PER_QUAD", 350).max(100);
+    // Stage 2: arena + hashmap + LocalIdTriple vec
+    let processing_bytes_per_triple = tune_usize("HDTC_TUNE_PROCESSING_BYTES_PER_TRIPLE", 200).max(50);
+    // ProcessedBatch: Vec<LocalIdTriple> (12b) + amortized Vec<VocabEntry>
+    let processed_bytes_per_triple = tune_usize("HDTC_TUNE_PROCESSED_BYTES_PER_TRIPLE", 50).max(16);
+
+    let min_batch = tune_usize("HDTC_TUNE_MIN_BATCH", 50_000);
+    let max_batch = tune_usize("HDTC_TUNE_MAX_BATCH", 20_000_000).max(min_batch);
+
+    // Cap total Group A memory: past ~8 GiB for batches there's no throughput gain,
+    // just wasted memory that could help the sorter.  At default costs (1350 bytes/
+    // triple), 8 GiB ≈ 6.2M triples/batch which is well past the throughput plateau.
+    let group_a_max_mib = tune_usize("HDTC_TUNE_GROUP_A_MAX_MIB", 8192);
+    let batch_budget = memory_budget
+        .saturating_sub(parser_budget)
+        .min(group_a_max_mib * MIB);
+
+    // Weighted cost per triple across all in-flight positions
+    let weighted_cost_per_triple =
+        batch_channel_cap * raw_bytes_per_quad
+        + processing_bytes_per_triple
+        + processed_channel_cap * processed_bytes_per_triple;
+
+    let batch_size = (batch_budget / weighted_cost_per_triple)
+        .clamp(min_batch, max_batch);
+
+    (parser_budget, batch_size, batch_channel_cap, processed_channel_cap)
+}
+
+// ---------------------------------------------------------------------------
+// Group B1: Stage 4 (vocab merger — runs alone after Group A)
+// ---------------------------------------------------------------------------
+// Gets the full memory budget.  The main consumers are:
+//   - id_mappings: Vec<IdMapping> — per-batch SO + P mapping arrays accumulated
+//     in RAM during Stage 4 before being flushed to temporary files on disk
+//   - PFC encoders: accumulate all dictionary strings (currently unbounded)
+//   - Merge stream channel: bounded buffer of StreamEntry items
+//   - Per-batch partial vocab reader threads
+//
+// We reserve a fraction for the stream channel and I/O; the rest is available
+// for PFC accumulators and the transient in-RAM id_mappings before they are
+// written to disk.
+
+fn calculate_stage4_budget(memory_budget: usize) -> usize {
+    // Stage 4 runs alone — it can use nearly all available memory.
+    // We reserve a small margin for OS/allocator overhead.
+    let stage4_share = tune_f64("HDTC_TUNE_STAGE4_SHARE", 0.85).clamp(0.30, 0.95);
+    let stage4_min = tune_usize("HDTC_TUNE_STAGE4_MIN_MIB", 256) * MIB;
+    (((memory_budget as f64) * stage4_share) as usize).max(stage4_min)
+}
+
+// ---------------------------------------------------------------------------
+// Group B2: Stages 5+6 (remapper + external sort — concurrent)
+// ---------------------------------------------------------------------------
+// The external sort is the primary throughput bottleneck: more sort memory =
+// fewer disk spills = dramatically faster.  The remapper's overhead is modest
+// and predictable (threads × per-worker mapping size), so we derive it
+// directly and give the rest to the sorter.
+
+fn calculate_stage56_budget(memory_budget: usize) -> Stage56Budget {
+    let available_cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .max(1);
+
+    // Remapper: each worker holds one decompressed IdMapping + decoder + chunk buffer.
+    let per_worker_mib = tune_usize("HDTC_TUNE_REMAP_WORKER_MIB", 128);
+    let per_worker_bytes = per_worker_mib * MIB;
+
+    // Number of remapper threads: limited by CPUs and memory.
+    let max_remap_threads = (memory_budget / 4 / per_worker_bytes).max(1); // don't let remap exceed 25%
+    let remap_threads = max_remap_threads.min(available_cpus);
+    let remap_budget_bytes = remap_threads * per_worker_bytes;
+
+    // Remap→sort channel capacity: small bounded queue.
+    let chunk_bytes = STAGE5_TO_STAGE6_CHUNK_SIZE * std::mem::size_of::<IdTriple>();
+    let queue_budget = (memory_budget / 32).clamp(16 * MIB, 256 * MIB);
+    let remap_to_sort_channel_capacity = (queue_budget / chunk_bytes).clamp(16, 256);
+
+    // Sorter gets the full budget minus remapper overhead and channel.
+    let sort_min = tune_usize("HDTC_TUNE_SORT_MIN_MIB", 256) * MIB;
+    let sort_budget_bytes = memory_budget
+        .saturating_sub(remap_budget_bytes)
+        .saturating_sub(queue_budget)
+        .max(sort_min);
+
+    Stage56Budget {
+        sort_budget_bytes,
+        remap_threads,
+        remap_to_sort_channel_capacity,
+    }
+}
+
+fn build_memory_plan(memory_budget: usize) -> PipelineMemoryPlan {
+    let (parser_budget_bytes, batch_size, batch_channel_cap, processed_channel_cap) =
+        calculate_group_a(memory_budget);
+    let stage4_budget_bytes = calculate_stage4_budget(memory_budget);
+    let stage56_budget = calculate_stage56_budget(memory_budget);
+
+    PipelineMemoryPlan {
+        parser_budget_bytes,
+        batch_size,
+        batch_channel_cap,
+        processed_channel_cap,
+        stage4_budget_bytes,
+        stage56_budget,
+    }
 }
 
 /// Stage 1: Parse RDF and batch quads.
 fn parser_stage(
     inputs: Vec<RdfInput>,
     batch_size: usize,
-    memory_budget: usize,
+    parser_budget_total: usize,
     _include_graphs: bool,
     base_uri: String,
     parser_parallelism: ParserParallelismConfig,
@@ -305,14 +506,11 @@ fn parser_stage(
         .unwrap_or(capped_default_chunk_workers)
         .max(1);
 
-    // Keep parser memory bounded relative to global memory budget.
-    // Reserve most memory for downstream stages and sorting.
-    let parser_budget_total = (memory_budget / 8).clamp(64 * 1024 * 1024, 2 * 1024 * 1024 * 1024);
-    let parser_budget_per_file = (parser_budget_total / file_workers.max(1)).max(16 * 1024 * 1024);
+    let parser_budget_per_file = (parser_budget_total / file_workers.max(1)).max(16 * MIB);
 
     let chunk_size_bytes = parser_parallelism
         .chunk_size_bytes
-        .unwrap_or((parser_budget_per_file / 8).clamp(1 * 1024 * 1024, 8 * 1024 * 1024))
+        .unwrap_or((parser_budget_per_file / 8).clamp(MIB, 8 * MIB))
         .max(1);
     let max_inflight_bytes = parser_parallelism
         .max_inflight_bytes
@@ -623,31 +821,58 @@ pub fn run_pipeline(
 ) -> Result<PipelineResult> {
     tracing::info!("Starting pipelined HDT construction");
 
+    if memory_budget < RECOMMENDED_MIN_MEMORY_BUDGET {
+        tracing::warn!(
+            "Configured memory limit {} MiB is below the recommended floor {} MiB; enabling low-memory tuning (smaller batches, tighter stage budgets) may reduce throughput.",
+            memory_budget / 1024 / 1024,
+            RECOMMENDED_MIN_MEMORY_BUDGET / 1024 / 1024
+        );
+    }
+
+    let memory_plan = build_memory_plan(memory_budget);
+
     let mut stage_metrics: Vec<StageMetric> = Vec::new();
     let rss_start = if benchmark { process_peak_rss_bytes() } else { None };
     let stages123_start = Instant::now();
 
-    let batch_size = calculate_batch_size(memory_budget);
+    let batch_size = memory_plan.batch_size;
     tracing::info!(
-        "Batch size: {} triples (memory budget: {} MB)",
+        "Batch size: {} triples (memory budget: {} MiB)",
         batch_size,
-        memory_budget / 1024 / 1024
+        memory_budget / MIB
     );
 
+    if benchmark {
+        tracing::info!(
+            "Memory plan — Group A: parser {} MiB, batch_size {}, channels {}/{} | \
+             Group B1 (stage4): {} MiB | \
+             Group B2: sort {} MiB, remap {} threads, queue {} chunks",
+            memory_plan.parser_budget_bytes / MIB,
+            memory_plan.batch_size,
+            memory_plan.batch_channel_cap,
+            memory_plan.processed_channel_cap,
+            memory_plan.stage4_budget_bytes / MIB,
+            memory_plan.stage56_budget.sort_budget_bytes / MIB,
+            memory_plan.stage56_budget.remap_threads,
+            memory_plan.stage56_budget.remap_to_sort_channel_capacity,
+        );
+    }
+
     // Set up channels with bounded capacities for backpressure
-    let (batch_tx, batch_rx) = bounded::<BatchedQuads>(3); // 3 batches buffered
-    let (processed_tx, processed_rx) = bounded::<ProcessedBatch>(2); // 2 processed batches buffered
-    let (complete_tx, complete_rx) = bounded::<BatchComplete>(10); // 10 completion notifications
+    let (batch_tx, batch_rx) = bounded::<BatchedQuads>(memory_plan.batch_channel_cap);
+    let (processed_tx, processed_rx) = bounded::<ProcessedBatch>(memory_plan.processed_channel_cap);
+    let (complete_tx, complete_rx) = bounded::<BatchComplete>(10);
 
     // Spawn stages in separate threads
     let inputs_owned = inputs.to_vec();
     let base_uri_owned = base_uri.to_string();
     let parser_parallelism_owned = parser_parallelism.clone();
+    let parser_budget = memory_plan.parser_budget_bytes;
     let parser_handle = std::thread::spawn(move || {
         parser_stage(
             inputs_owned,
             batch_size,
-            memory_budget,
+            parser_budget,
             include_graphs,
             base_uri_owned,
             parser_parallelism_owned,
@@ -733,8 +958,11 @@ pub fn run_pipeline(
         .iter()
         .map(|b| (b.batch_id, b.vocab_path.clone()))
         .collect();
+    let stage4_budget = memory_plan.stage4_budget_bytes;
+    tracing::info!("Stage 4 merge budget: {} MiB", stage4_budget / MIB);
 
-    let merge_result = vocab_merger::merge_vocabularies(batch_infos, temp_dir)?;
+    let merge_result =
+        vocab_merger::merge_vocabularies(batch_infos, temp_dir, stage4_budget)?;
 
     tracing::info!(
         "Dictionary built: {} shared, {} subjects, {} predicates, {} objects",
@@ -757,8 +985,11 @@ pub fn run_pipeline(
     let stage5_start = Instant::now();
     let stage5_rss_before = if benchmark { process_peak_rss_bytes() } else { None };
 
+    let stage56_budget = memory_plan.stage56_budget;
+
     // Set up channel for global-ID triples (chunked to reduce per-message overhead)
-    let (global_triple_tx, global_triple_rx) = bounded::<Vec<IdTriple>>(256);
+    let (global_triple_tx, global_triple_rx) =
+        bounded::<Vec<IdTriple>>(stage56_budget.remap_to_sort_channel_capacity);
 
     // Prepare batch remap info and track mapping paths for cleanup
     let (remap_tx, remap_rx) = bounded(batches.len());
@@ -777,14 +1008,16 @@ pub fn run_pipeline(
     drop(remap_tx); // Signal completion
 
     // Spawn remapper in separate thread
-    let num_cpus = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
+    let remap_threads = stage56_budget.remap_threads;
+    tracing::info!(
+        "Stage 5 remapper threads: {}",
+        remap_threads,
+    );
     let remapper_handle = std::thread::spawn(move || {
         id_remapper::id_remapper_stage(
             remap_rx,
             global_triple_tx,
-            num_cpus,
+            remap_threads,
             STAGE5_TO_STAGE6_CHUNK_SIZE,
         )
     });
@@ -793,7 +1026,7 @@ pub fn run_pipeline(
     tracing::info!("Stage 6: Sorting global-ID triples in SPO order");
 
     // Collect triples into external sorter, tracking max IDs for BitmapTriples bit widths
-    let mut sorter = ExternalSorter::new(temp_dir, memory_budget);
+    let mut sorter = ExternalSorter::new(temp_dir, stage56_budget.sort_budget_bytes);
     let mut buffer: Vec<IdTriple> = Vec::new();
     let mut mem_used: usize = 0;
     let mut triple_count = 0u64;
@@ -843,15 +1076,16 @@ pub fn run_pipeline(
         benchmark,
     );
 
-    // Build BitmapTriples (max IDs enable single-pass streaming construction)
-    tracing::info!("Building BitmapTriples");
+    // Build BitmapTriples — stream each component to temp files (O(1) memory)
+    tracing::info!("Building BitmapTriples (streaming to files)");
     let bitmap_start = Instant::now();
     let bitmap_rss_before = if benchmark { process_peak_rss_bytes() } else { None };
-    let bitmap_triples = crate::triples::build_bitmap_triples(
+    let bitmap_triples = crate::triples::build_bitmap_triples_to_files(
         sorted_triples,
         max_subject,
         max_predicate,
         max_object,
+        temp_dir,
     )?;
 
     push_stage_metric(

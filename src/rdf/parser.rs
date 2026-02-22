@@ -277,6 +277,7 @@ fn make_lenient_parser(format: oxrdfio::RdfFormat, base_uri: Option<&str>) -> ox
     parser
 }
 
+#[allow(clippy::too_many_arguments)]
 fn consume_parsed_chunk<F>(
     input: &RdfInput,
     parsed: ChunkParsed,
