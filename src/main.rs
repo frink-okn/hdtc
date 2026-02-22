@@ -70,8 +70,8 @@ fn create_hdt(args: cli::CreateArgs, benchmark: bool) -> Result<()> {
     };
     tracing::info!("Temp directory: {}", temp_dir.display());
 
-    // Memory budget: default ~4GB or user-specified
-    let memory_budget = args.memory_limit.unwrap_or(4096) * 1024 * 1024;
+    let memory_budget = args.memory_limit.as_bytes();
+    tracing::info!("Memory limit: {}", args.memory_limit);
 
     let include_graphs = matches!(args.mode, cli::OutputMode::Quads);
     let parser_parallelism = pipeline::ParserParallelismConfig {
@@ -93,8 +93,7 @@ fn create_hdt(args: cli::CreateArgs, benchmark: bool) -> Result<()> {
         }
     };
 
-    // Run the new pipelined HDT construction
-    tracing::info!("Using new pipelined architecture");
+    // Run the pipelined HDT construction
     let pipeline_result = pipeline::run_pipeline(
         &inputs,
         &temp_dir,
@@ -122,10 +121,11 @@ fn create_hdt(args: cli::CreateArgs, benchmark: bool) -> Result<()> {
 
     // Optionally create index file
     if args.index {
-        tracing::info!("Creating index file...");
+        let expected_index_path = args.output.with_extension("hdt.index.v1-1");
+        tracing::info!("Creating index: {}", expected_index_path.display());
         match index::create_index(&args.output, memory_budget, &temp_dir) {
             Ok(index_path) => {
-                tracing::info!("Index created: {}", index_path.display());
+                tracing::info!("Index written: {}", index_path.display());
             }
             Err(e) => {
                 tracing::error!("Failed to create index: {}", e);
@@ -150,8 +150,6 @@ fn create_index_from_hdt(args: cli::IndexArgs, benchmark: bool) -> Result<()> {
         anyhow::bail!("HDT file not found: {}", args.hdt_file.display());
     }
 
-    tracing::info!("Creating index for: {}", args.hdt_file.display());
-
     // Set up temp directory
     let temp_dir = match &args.temp_dir {
         Some(dir) => {
@@ -165,16 +163,19 @@ fn create_index_from_hdt(args: cli::IndexArgs, benchmark: bool) -> Result<()> {
             dir
         }
     };
-    tracing::info!("Temp directory: {}", temp_dir.display());
 
-    // Memory budget: default ~4GB or user-specified
-    let memory_budget = args.memory_limit.unwrap_or(4096) * 1024 * 1024;
+    let memory_budget = args.memory_limit.as_bytes();
+
+    let expected_index_path = args.hdt_file.with_extension("hdt.index.v1-1");
+    tracing::info!("Creating index: {}", expected_index_path.display());
+    tracing::info!("Temp directory: {}", temp_dir.display());
+    tracing::info!("Memory limit: {}", args.memory_limit);
 
     // Create the index
     let index_start = std::time::Instant::now();
     match index::create_index(&args.hdt_file, memory_budget, &temp_dir) {
         Ok(index_path) => {
-            tracing::info!("Index created: {}", index_path.display());
+            tracing::info!("Index written: {}", index_path.display());
             if benchmark {
                 tracing::info!(
                     "Benchmark summary (index): total {:.3}s",

@@ -90,10 +90,10 @@ hdtc create people.nt places.nt -o data.hdt -m quads \
 
 ### Create: Tuning for large datasets
 
-Set a higher memory limit (in MB) for better throughput:
+Set a higher memory limit for better throughput:
 
 ```sh
-hdtc create huge.nt.gz -o huge.hdt --memory-limit 16384
+hdtc create huge.nt.gz -o huge.hdt --memory-limit 16G
 ```
 
 Direct temporary files to a fast disk with sufficient space:
@@ -114,7 +114,7 @@ hdtc index existing.hdt
 With custom memory and temp settings:
 
 ```sh
-hdtc index existing.hdt --memory-limit 8192 --temp-dir /mnt/fast-ssd/tmp
+hdtc index existing.hdt --memory-limit 8G --temp-dir /mnt/fast-ssd/tmp
 ```
 
 ### Create: All options
@@ -129,7 +129,7 @@ hdtc index existing.hdt --memory-limit 8192 --temp-dir /mnt/fast-ssd/tmp
 | `--base-uri`                       | `http://example.org/dataset` | Base URI for the HDT header                         |
 | `--graph-map PATH=URI`             | —                            | Map input paths to named graph URIs (quads mode)    |
 | `--default-graph URI`              | —                            | Default graph for triples without an explicit graph |
-| `--memory-limit MB`                | 4096                         | Soft memory limit for internal buffers              |
+| `--memory-limit SIZE`              | `4G`                         | Soft memory limit for internal buffers (e.g. `4G`, `2000M`) |
 | `--parse-file-workers N`           | auto                         | Number of files parsed concurrently                 |
 | `--parse-chunk-workers N`          | auto (capped)                | Parser workers per active NT/NQ file                |
 | `--parse-chunk-bytes BYTES`        | auto                         | Target NT/NQ chunk size in bytes                    |
@@ -138,7 +138,7 @@ hdtc index existing.hdt --memory-limit 8192 --temp-dir /mnt/fast-ssd/tmp
 | `-v, --verbose`                    | —                            | Increase log verbosity (`-v` debug, `-vv` trace)    |
 | `-q, --quiet`                      | —                            | Suppress all output except errors                   |
 
-Auto parser tuning is derived from `--memory-limit`: by default hdtc allocates a bounded parser budget, caps chunk-worker fanout, and computes chunk size / in-flight chunk bytes from that budget.
+Auto parser tuning is derived from `--memory-limit` (accepts `G`/`M` suffixes, e.g. `16G` or `2000M`): by default hdtc allocates a bounded parser budget, caps chunk-worker fanout, and computes chunk size / in-flight chunk bytes from that budget.
 
 ### Index: All options
 
@@ -146,7 +146,7 @@ Auto parser tuning is derived from `--memory-limit`: by default hdtc allocates a
 | ------------------- | ------------ | ------------------------------------------------ |
 | `<HDT_FILE>`        | _(required)_ | Path to existing HDT file                        |
 | `--temp-dir`        | system temp  | Directory for temporary working files            |
-| `--memory-limit MB` | 4096         | Soft memory limit for sorting operations         |
+| `--memory-limit SIZE` | `4G`       | Soft memory limit for sorting operations (e.g. `4G`, `2000M`) |
 | `--benchmark`       | off          | Emit stage timing and RSS high-water summary     |
 | `-v, --verbose`     | —            | Increase log verbosity (`-v` debug, `-vv` trace) |
 | `-q, --quiet`       | —            | Suppress all output except errors                |
@@ -155,7 +155,7 @@ Auto parser tuning is derived from `--memory-limit`: by default hdtc allocates a
 
 ### Memory
 
-Default is 4 GB, configurable with `--memory-limit`. For datasets over 10 billion triples, 16–32 GB is recommended.
+Default is 4 GB, configurable with `--memory-limit` (e.g. `--memory-limit 16G`). For datasets over 10 billion triples, 16–32 GB is recommended.
 
 ### Temporary disk space
 

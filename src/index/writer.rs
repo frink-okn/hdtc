@@ -75,7 +75,7 @@ pub fn write_index(
 
     writer.flush()?;
 
-    tracing::info!("Index file written: {}", output_path.display());
+    tracing::debug!("Index file written: {}", output_path.display());
 
     Ok(())
 }

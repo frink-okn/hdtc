@@ -1,6 +1,53 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
+/// A memory size parsed from a human-readable string like "4G" or "2000M".
+/// Stores the value in bytes internally.
+#[derive(Debug, Clone, Copy)]
+pub struct MemorySize(usize);
+
+impl MemorySize {
+    pub fn as_bytes(self) -> usize {
+        self.0
+    }
+}
+
+impl std::str::FromStr for MemorySize {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let s = s.trim();
+        let (num_str, multiplier) = if let Some(n) = s.strip_suffix(['G', 'g']) {
+            (n, 1024 * 1024 * 1024usize)
+        } else if let Some(n) = s.strip_suffix(['M', 'm']) {
+            (n, 1024 * 1024usize)
+        } else {
+            return Err(format!(
+                "expected a size with suffix G or M (e.g. 4G, 2000M), got '{}'",
+                s
+            ));
+        };
+        let n: usize = num_str.trim().parse().map_err(|_| {
+            format!(
+                "expected a size with suffix G or M (e.g. 4G, 2000M), got '{}'",
+                s
+            )
+        })?;
+        Ok(MemorySize(n * multiplier))
+    }
+}
+
+impl std::fmt::Display for MemorySize {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let bytes = self.0;
+        if bytes % (1024 * 1024 * 1024) == 0 {
+            write!(f, "{}G", bytes / (1024 * 1024 * 1024))
+        } else {
+            write!(f, "{}M", bytes / (1024 * 1024))
+        }
+    }
+}
+
 #[derive(Debug, Clone, ValueEnum)]
 pub enum OutputMode {
     Triples,
@@ -75,9 +122,9 @@ pub struct CreateArgs {
     #[arg(long)]
     pub default_graph: Option<String>,
 
-    /// Soft memory limit in megabytes for internal buffers
-    #[arg(long, value_name = "MB")]
-    pub memory_limit: Option<usize>,
+    /// Soft memory limit for internal buffers (e.g. 4G, 2000M)
+    #[arg(long, value_name = "SIZE", default_value = "4G")]
+    pub memory_limit: MemorySize,
 
     /// Number of files to parse concurrently (default: auto)
     #[arg(long, value_name = "N")]
@@ -105,7 +152,7 @@ pub struct IndexArgs {
     #[arg(long)]
     pub temp_dir: Option<PathBuf>,
 
-    /// Soft memory limit in megabytes for sorting operations
-    #[arg(long, value_name = "MB")]
-    pub memory_limit: Option<usize>,
+    /// Soft memory limit for sorting operations (e.g. 4G, 2000M)
+    #[arg(long, value_name = "SIZE", default_value = "4G")]
+    pub memory_limit: MemorySize,
 }

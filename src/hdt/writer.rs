@@ -89,10 +89,7 @@ pub fn write_hdt_streaming(
 
     writer.flush()?;
 
-    tracing::info!(
-        "HDT file written (streaming): {}",
-        output_path.display()
-    );
+    tracing::info!("HDT file written: {}", output_path.display());
 
     Ok(())
 }
