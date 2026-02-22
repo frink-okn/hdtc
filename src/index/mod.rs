@@ -360,7 +360,7 @@ fn build_object_index(
             },
             index_z: StreamingLogArrayResult {
                 path: index_path,
-                bits_per_entry: 0,
+                bits_per_entry: 1,
                 num_entries: 0,
             },
             max_predicate: 0,
