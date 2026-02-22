@@ -1235,6 +1235,7 @@ fn canonicalize_bnodes(triples: Vec<[String; 3]>) -> Vec<[String; 3]> {
         .collect();
 
     result.sort();
+    result.dedup();
     result
 }
 
