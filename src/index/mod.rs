@@ -137,8 +137,8 @@ pub fn create_index(
     memory_budget: usize,
     temp_dir: &Path,
 ) -> Result<PathBuf> {
-    tracing::info!("Creating index for {}", hdt_path.display());
-    tracing::info!(
+    tracing::debug!("Creating index for {}", hdt_path.display());
+    tracing::debug!(
         "Index settings: memory budget={} MiB, temp dir={}",
         memory_budget / 1024 / 1024,
         temp_dir.display()
@@ -195,13 +195,13 @@ pub fn create_index(
         .parse()
         .context("Dictionary control info has invalid non-numeric 'elements' property")?;
 
-    tracing::info!("Skipping 4 PFC dictionary sections to reach triples section");
+    tracing::debug!("Skipping 4 PFC dictionary sections to reach triples section");
     let dict_skip_start = Instant::now();
     for section_idx in 0..4 {
         skip_pfc_section(&mut reader)
             .with_context(|| format!("Failed to skip dictionary section {}", section_idx + 1))?;
     }
-    tracing::info!(
+    tracing::debug!(
         "Dictionary sections skipped in {:.3}s",
         dict_skip_start.elapsed().as_secs_f64()
     );
@@ -236,13 +236,13 @@ pub fn create_index(
     let num_triples = num_triples_from_header;
 
     // Extract seqY from ArrayY, then drop the LogArrayReader to free its packed words
-    tracing::info!("Extracting seqY from ArrayY ({} entries)", array_y.len());
+    tracing::debug!("Extracting seqY from ArrayY ({} entries)", array_y.len());
     let seq_y_start = Instant::now();
     let mut seq_y = Vec::with_capacity(array_y.len() as usize);
     for i in 0..array_y.len() {
         seq_y.push(array_y.get(i));
         if (i + 1).is_multiple_of(5_000_000) {
-            tracing::info!(
+            tracing::debug!(
                 "Extracted seqY entries: {} / {} ({:.1}%)",
                 i + 1,
                 array_y.len(),
@@ -252,7 +252,7 @@ pub fn create_index(
     }
     let array_y_freed = array_y.heap_size();
     drop(array_y);
-    tracing::info!(
+    tracing::debug!(
         "Extracted seqY in {:.3}s (freed ArrayY: {} MiB)",
         seq_y_start.elapsed().as_secs_f64(),
         array_y_freed / 1024 / 1024
@@ -262,7 +262,7 @@ pub fn create_index(
     // it from the sort budget. bitmap_z, array_z, and seq_y are alive during sorting.
     let reader_memory = bitmap_z.heap_size() + array_z.heap_size()
         + seq_y.len() * std::mem::size_of::<u64>();
-    tracing::info!(
+    tracing::debug!(
         "Reader memory during sort: {} MiB (bitmap_z={} MiB, array_z={} MiB, seq_y={} MiB)",
         reader_memory / 1024 / 1024,
         bitmap_z.heap_size() / 1024 / 1024,
@@ -310,7 +310,7 @@ pub fn create_index(
     // Clean up temp files
     obj_index.cleanup();
 
-    tracing::info!("Index creation complete: {}", index_path.display());
+    tracing::debug!("Index creation complete: {}", index_path.display());
 
     Ok(index_path)
 }
@@ -367,7 +367,7 @@ fn build_object_index(
         });
     }
 
-    tracing::info!(
+    tracing::debug!(
         "Building object index with external-sort path: {} triples, memory budget={} MiB",
         num_triples,
         memory_budget / 1024 / 1024
@@ -403,7 +403,7 @@ fn build_object_index(
         )?;
 
         if (i + 1).is_multiple_of(5_000_000) {
-            tracing::info!(
+            tracing::debug!(
                 "Object-index pass 1: {} / {} triples ({:.1}%), chunks={}, elapsed {:.1}s",
                 i + 1,
                 num_triples,
@@ -415,18 +415,16 @@ fn build_object_index(
     }
 
     tracing::info!(
-        "Object-index pass 1 complete in {:.3}s (chunks so far: {})",
-        stage_start.elapsed().as_secs_f64(),
-        sorter.chunk_file_count()
+        "Object index: pass 1 complete ({:.1}s)",
+        stage_start.elapsed().as_secs_f64()
     );
 
-    tracing::info!("Object-index pass 2: sorting/merging entries");
+    tracing::debug!("Object-index pass 2: sorting/merging entries");
     let sort_start = Instant::now();
     let sorted_entries = sorter.finish(&mut sort_buffer)?;
     tracing::info!(
-        "Object-index pass 2 complete in {:.3}s (total chunks: {})",
-        sort_start.elapsed().as_secs_f64(),
-        sorter.chunk_file_count()
+        "Object index: pass 2 complete ({:.1}s)",
+        sort_start.elapsed().as_secs_f64()
     );
 
     // Create streaming encoders backed by temp files
@@ -466,7 +464,7 @@ fn build_object_index(
         emitted += 1;
 
         if emitted.is_multiple_of(5_000_000) {
-            tracing::info!(
+            tracing::debug!(
                 "Object-index pass 3: serialized {} entries, elapsed {:.1}s",
                 emitted,
                 emit_start.elapsed().as_secs_f64()
@@ -494,9 +492,8 @@ fn build_object_index(
     index_writer.flush()?;
 
     tracing::info!(
-        "Object-index pass 3 complete in {:.3}s ({} entries streamed to temp files)",
-        emit_start.elapsed().as_secs_f64(),
-        emitted
+        "Object index: pass 3 complete ({:.1}s)",
+        emit_start.elapsed().as_secs_f64()
     );
 
     Ok(ObjectIndexResult {

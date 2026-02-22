@@ -482,7 +482,7 @@ fn parser_stage(
     inputs: Vec<RdfInput>,
     batch_size: usize,
     parser_budget_total: usize,
-    _include_graphs: bool,
+    include_graphs: bool,
     base_uri: String,
     parser_parallelism: ParserParallelismConfig,
     batch_tx: Sender<BatchedQuads>,
@@ -517,7 +517,7 @@ fn parser_stage(
         .unwrap_or((parser_budget_per_file / 2).max(chunk_size_bytes))
         .max(chunk_size_bytes);
 
-    tracing::info!(
+    tracing::debug!(
         "Parser parallelism: {} file worker(s), {} chunk worker(s)/file, {} chunk bytes, {} in-flight bytes/file (parser budget total: {})",
         file_workers,
         chunk_workers,
@@ -631,10 +631,11 @@ fn parser_stage(
     let total_quads = assembler.total_quads()?;
 
     tracing::info!(
-        "Parsed {} quads total, N-Triples size: {} bytes",
+        "Parsed {} {} total",
         total_quads,
-        ntriples_size
+        if include_graphs { "quads" } else { "triples" }
     );
+    tracing::debug!("N-Triples size: {} bytes", ntriples_size);
     Ok(ntriples_size)
 }
 
@@ -674,9 +675,10 @@ fn vocab_builder_stage(
 
         let stats = builder.stats();
         tracing::info!(
-            "Batch {}: {} quads, {} unique terms",
+            "Batch {}: {} {}, {} unique terms",
             batch_id,
             stats.num_triples,
+            if include_graphs { "quads" } else { "triples" },
             stats.num_terms
         );
 
@@ -698,7 +700,7 @@ fn vocab_builder_stage(
         batch_id += 1;
     }
 
-    tracing::info!("Processed {} batches total", batch_id);
+    tracing::debug!("Processed {} batches total", batch_id);
     Ok(())
 }
 
@@ -819,7 +821,7 @@ pub fn run_pipeline(
     parser_parallelism: &ParserParallelismConfig,
     benchmark: bool,
 ) -> Result<PipelineResult> {
-    tracing::info!("Starting pipelined HDT construction");
+    tracing::info!("Stage 1-3: Parsing, building vocabulary, writing batches");
 
     if memory_budget < RECOMMENDED_MIN_MEMORY_BUDGET {
         tracing::warn!(
@@ -836,7 +838,7 @@ pub fn run_pipeline(
     let stages123_start = Instant::now();
 
     let batch_size = memory_plan.batch_size;
-    tracing::info!(
+    tracing::debug!(
         "Batch size: {} triples (memory budget: {} MiB)",
         batch_size,
         memory_budget / MIB
@@ -903,7 +905,11 @@ pub fn run_pipeline(
         batches.push(batch);
     }
 
-    tracing::info!("All batches written, {} batches total", batches.len());
+    tracing::info!(
+        "Stage 1-3 complete: {} batches written (elapsed: {:.1}s)",
+        batches.len(),
+        stages123_start.elapsed().as_secs_f64()
+    );
 
     // Wait for all stages to complete
     let ntriples_size = match parser_handle.join() {
@@ -951,7 +957,7 @@ pub fn run_pipeline(
     );
 
     // Stage 4: Merge vocabularies and build global dictionary
-    tracing::info!("Stage 4: Merging vocabularies");
+    tracing::info!("Stage 4: Merging {} partial vocabularies", batches.len());
     let stage4_start = Instant::now();
     let stage4_rss_before = if benchmark { process_peak_rss_bytes() } else { None };
     let batch_infos: Vec<(usize, PathBuf)> = batches
@@ -959,17 +965,18 @@ pub fn run_pipeline(
         .map(|b| (b.batch_id, b.vocab_path.clone()))
         .collect();
     let stage4_budget = memory_plan.stage4_budget_bytes;
-    tracing::info!("Stage 4 merge budget: {} MiB", stage4_budget / MIB);
+    tracing::debug!("Stage 4 merge budget: {} MiB", stage4_budget / MIB);
 
     let merge_result =
         vocab_merger::merge_vocabularies(batch_infos, temp_dir, stage4_budget)?;
 
     tracing::info!(
-        "Dictionary built: {} shared, {} subjects, {} predicates, {} objects",
+        "Stage 4 complete: {} shared, {} subjects, {} predicates, {} objects (elapsed: {:.1}s)",
         merge_result.counts.shared,
         merge_result.counts.subjects,
         merge_result.counts.predicates,
-        merge_result.counts.objects
+        merge_result.counts.objects,
+        stage4_start.elapsed().as_secs_f64()
     );
 
     push_stage_metric(
@@ -1009,10 +1016,7 @@ pub fn run_pipeline(
 
     // Spawn remapper in separate thread
     let remap_threads = stage56_budget.remap_threads;
-    tracing::info!(
-        "Stage 5 remapper threads: {}",
-        remap_threads,
-    );
+    tracing::debug!("Stage 5 remapper threads: {}", remap_threads);
     let remapper_handle = std::thread::spawn(move || {
         id_remapper::id_remapper_stage(
             remap_rx,
@@ -1053,7 +1057,11 @@ pub fn run_pipeline(
         .join()
         .map_err(|_| anyhow::anyhow!("Remapper thread panicked"))??;
 
-    tracing::info!("Remapped {} triples, sorting...", remapped_count);
+    tracing::info!(
+        "Stage 5 complete: {} triples remapped ({:.1}s), sorting...",
+        remapped_count,
+        stage5_start.elapsed().as_secs_f64()
+    );
 
     push_stage_metric(
         &mut stage_metrics,
@@ -1077,7 +1085,6 @@ pub fn run_pipeline(
     );
 
     // Build BitmapTriples — stream each component to temp files (O(1) memory)
-    tracing::info!("Building BitmapTriples (streaming to files)");
     let bitmap_start = Instant::now();
     let bitmap_rss_before = if benchmark { process_peak_rss_bytes() } else { None };
     let bitmap_triples = crate::triples::build_bitmap_triples_to_files(
@@ -1097,8 +1104,9 @@ pub fn run_pipeline(
     );
 
     tracing::info!(
-        "Pipeline complete: {} triples encoded",
-        bitmap_triples.num_triples
+        "Stage 6 complete: {} triples encoded (elapsed: {:.1}s)",
+        bitmap_triples.num_triples,
+        sort_start.elapsed().as_secs_f64()
     );
 
     // Clean up temporary files

@@ -176,7 +176,7 @@ pub fn merge_vocabularies(
     temp_dir: &Path,
     memory_budget: usize,
 ) -> Result<VocabMergeResult> {
-    tracing::info!("Merging {} partial vocabularies", batch_infos.len());
+    tracing::debug!("Merging {} partial vocabularies", batch_infos.len());
 
     let mut stream_reader_init_time = Duration::ZERO;
     let mut stream_read_time = Duration::ZERO;
@@ -316,7 +316,7 @@ pub fn merge_vocabularies(
     finalize_provisional_so_ids(&mut id_mappings, counts.shared)?;
     so_map_finalize_time += so_finalize_start.elapsed();
 
-    tracing::info!(
+    tracing::debug!(
         "Merged vocabulary: {} shared, {} subjects, {} predicates, {} objects",
         counts.shared,
         counts.subjects,

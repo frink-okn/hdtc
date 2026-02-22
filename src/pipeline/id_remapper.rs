@@ -114,7 +114,7 @@ pub fn id_remapper_stage(
                 .map(|batch_info| {
                     match remap_batch(batch_info, &global_triple_tx, chunk_size) {
                         Ok(count) => {
-                            tracing::info!(
+                            tracing::debug!(
                                 "Batch {}: remapped {} triples",
                                 batch_info.batch_id,
                                 count
@@ -136,7 +136,7 @@ pub fn id_remapper_stage(
         total += result? as u64;
     }
 
-    tracing::info!("ID remapping complete: {} total triples remapped", total);
+    tracing::debug!("ID remapping complete: {} total triples remapped", total);
     Ok(total)
 }
 
