@@ -1,0 +1,889 @@
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix sesame: <http://www.openrdf.org/schema/sesame#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+@prefix fn: <http://www.w3.org/2005/xpath-functions#> .
+@prefix foaf: <http://xmlns.com/foaf/0.1/> .
+@prefix dc: <http://purl.org/dc/elements/1.1/> .
+@prefix hint: <http://www.bigdata.com/queryHints#> .
+@prefix bd: <http://www.bigdata.com/rdf#> .
+@prefix bds: <http://www.bigdata.com/rdf/search#> .
+@prefix psn: <http://www.wikidata.org/prop/statement/value-normalized/> .
+@prefix pqn: <http://www.wikidata.org/prop/qualifier/value-normalized/> .
+@prefix prn: <http://www.wikidata.org/prop/reference/value-normalized/> .
+@prefix mwapi: <https://www.mediawiki.org/ontology#API/> .
+@prefix gas: <http://www.bigdata.com/rdf/gas#> .
+@prefix wdsubgraph: <https://query.wikidata.org/subgraph/> .
+@prefix wdt: <http://www.wikidata.org/prop/direct/> .
+@prefix wdtn: <http://www.wikidata.org/prop/direct-normalized/> .
+@prefix psv: <http://www.wikidata.org/prop/statement/value/> .
+@prefix ps: <http://www.wikidata.org/prop/statement/> .
+@prefix pqv: <http://www.wikidata.org/prop/qualifier/value/> .
+@prefix pq: <http://www.wikidata.org/prop/qualifier/> .
+@prefix prv: <http://www.wikidata.org/prop/reference/value/> .
+@prefix pr: <http://www.wikidata.org/prop/reference/> .
+@prefix wdno: <http://www.wikidata.org/prop/novalue/> .
+@prefix p: <http://www.wikidata.org/prop/> .
+@prefix wikibase: <http://wikiba.se/ontology#> .
+@prefix wd: <http://www.wikidata.org/entity/> .
+@prefix wdata: <http://www.wikidata.org/wiki/Special:EntityData/> .
+@prefix wds: <http://www.wikidata.org/entity/statement/> .
+@prefix wdv: <http://www.wikidata.org/value/> .
+@prefix wdref: <http://www.wikidata.org/reference/> .
+@prefix schema: <http://schema.org/> .
+@prefix prov: <http://www.w3.org/ns/prov#> .
+@prefix skos: <http://www.w3.org/2004/02/skos/core#> .
+@prefix geo: <http://www.opengis.net/ont/geosparql#> .
+@prefix geof: <http://www.opengis.net/def/geosparql/function/> .
+@prefix mediawiki: <https://www.mediawiki.org/ontology#> .
+@prefix ontolex: <http://www.w3.org/ns/lemon/ontolex#> .
+@prefix dct: <http://purl.org/dc/terms/> .
+@prefix wikibaseqs: <http://wikiba.se/queryService#> .
+
+wd:Q97884992 wdt:P361 wd:Q9141 .
+
+wd:Q100375116 wdt:P180 wd:Q9141 .
+
+wd:Q100783517 wdt:P180 wd:Q9141 .
+
+wd:Q104581308 wdt:P971 wd:Q9141 .
+
+wd:Q107412021 wdt:P915 wd:Q9141 .
+
+wd:Q107805290 owl:sameAs wd:Q9141 .
+
+wd:Q110820773 wdt:P138 wd:Q9141 .
+
+wd:Q118313017 wdt:P180 wd:Q9141 .
+
+wd:Q126392514 wdt:P921 wd:Q9141 .
+
+<https://hu.wikipedia.org/wiki/T%C3%A1dzs_Mahal> schema:about wd:Q9141 .
+
+<https://hy.wikipedia.org/wiki/%D4%B9%D5%A1%D5%BB_%D5%84%D5%A1%D5%B0%D5%A1%D5%AC> schema:about wd:Q9141 .
+
+<https://hyw.wikipedia.org/wiki/%D4%B9%D5%A1%D5%AA_%D5%84%D5%A1%D5%B0%D5%A1%D5%AC> schema:about wd:Q9141 .
+
+<https://id.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://ie.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://ig.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://ilo.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://inh.wikipedia.org/wiki/%D0%A2%D0%B0%D0%B4%D0%B6-%D0%9C%D0%B0%D1%85%D1%8C%D0%B0%D0%BB> schema:about wd:Q9141 .
+
+<https://io.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://is.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://it.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://it.wikiquote.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://ja.wikipedia.org/wiki/%E3%82%BF%E3%83%BC%E3%82%B8%E3%83%BB%E3%83%9E%E3%83%8F%E3%83%AB> schema:about wd:Q9141 .
+
+<https://jbo.wikipedia.org/wiki/la_.taj.me%27%C3%A8l.> schema:about wd:Q9141 .
+
+<https://jv.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://ka.wikipedia.org/wiki/%E1%83%97%E1%83%90%E1%83%AF-%E1%83%9B%E1%83%90%E1%83%B0%E1%83%90%E1%83%9A%E1%83%98> schema:about wd:Q9141 .
+
+<https://kab.wikipedia.org/wiki/Ta%C7%A7_Ma%E1%B8%A5al> schema:about wd:Q9141 .
+
+<https://kbp.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://kge.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://kk.wikipedia.org/wiki/%D0%A2%D3%99%D0%B6_%D0%9C%D0%B0%D1%85%D0%B0%D0%BB> schema:about wd:Q9141 .
+
+<https://km.wikipedia.org/wiki/%E1%9E%8F%E1%9F%81%E1%9E%87%E1%9E%98%E1%9E%A0%E1%9E%B6%E1%9E%9B%E1%9F%8B> schema:about wd:Q9141 .
+
+<https://kn.wikipedia.org/wiki/%E0%B2%A4%E0%B2%BE%E0%B2%9C%E0%B3%8D_%E0%B2%AE%E0%B2%B9%E0%B2%B2%E0%B3%8D> schema:about wd:Q9141 .
+
+<https://ko.wikipedia.org/wiki/%ED%83%80%EC%A7%80%EB%A7%88%ED%95%A0> schema:about wd:Q9141 .
+
+<https://ks.wikipedia.org/wiki/%D8%AA%D8%A7%D8%AC_%D9%85%D9%8E%D8%AD%D9%84> schema:about wd:Q9141 .
+
+<https://ku.wikipedia.org/wiki/Tac_Mehel> schema:about wd:Q9141 .
+
+<https://kw.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://ky.wikipedia.org/wiki/%D0%A2%D0%B0%D0%B6-%D0%9C%D0%B0%D1%85%D0%B0%D0%BB> schema:about wd:Q9141 .
+
+<https://la.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://lb.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://lfn.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://li.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://lt.wikipedia.org/wiki/Tad%C5%BEmahalas> schema:about wd:Q9141 .
+
+<https://lv.wikipedia.org/wiki/Tad%C5%BEmah%C4%81ls> schema:about wd:Q9141 .
+
+<https://mai.wikipedia.org/wiki/%E0%A4%A4%E0%A4%BE%E0%A4%9C%E0%A4%AE%E0%A4%B9%E0%A4%B2> schema:about wd:Q9141 .
+
+<https://min.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://mk.wikipedia.org/wiki/%D0%A2%D0%B0%D1%9F_%D0%9C%D0%B0%D1%85%D0%B0%D0%BB> schema:about wd:Q9141 .
+
+<https://ml.wikipedia.org/wiki/%E0%B4%A4%E0%B4%BE%E0%B4%9C%E0%B5%8D_%E0%B4%AE%E0%B4%B9%E0%B5%BD> schema:about wd:Q9141 .
+
+<https://mn.wikipedia.org/wiki/%D0%A2%D0%B0%D0%B6_%D0%9C%D0%B0%D1%85%D0%B0%D0%BB> schema:about wd:Q9141 .
+
+<https://mni.wikipedia.org/wiki/%EA%AF%87%EA%AF%A5%EA%AF%96_%EA%AF%83%EA%AF%8D%EA%AF%9C> schema:about wd:Q9141 .
+
+<https://mr.wikipedia.org/wiki/%E0%A4%A4%E0%A4%BE%E0%A4%9C_%E0%A4%AE%E0%A4%B9%E0%A4%BE%E0%A4%B2> schema:about wd:Q9141 .
+
+<https://ms.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://mt.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://my.wikipedia.org/wiki/%E1%80%90%E1%80%AC%E1%80%B7%E1%80%82%E1%80%BB%E1%80%BA%E1%80%99%E1%80%9F%E1%80%AC%E1%80%9B%E1%80%BA> schema:about wd:Q9141 .
+
+<https://mzn.wikipedia.org/wiki/%D8%AA%D8%A7%D8%AC_%D9%85%D8%AD%D9%84> schema:about wd:Q9141 .
+
+<https://nds.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://ne.wikipedia.org/wiki/%E0%A4%A4%E0%A4%BE%E0%A4%9C%E0%A4%AE%E0%A4%B9%E0%A4%B2> schema:about wd:Q9141 .
+
+<https://nl.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://nn.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://no.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://nqo.wikipedia.org/wiki/%DF%95%DF%8A%DF%96_%DF%A1%DF%A4%DF%8A%DF%9F> schema:about wd:Q9141 .
+
+<https://oc.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://olo.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://om.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://or.wikipedia.org/wiki/%E0%AC%A4%E0%AC%BE%E0%AC%9C%E0%AC%AE%E0%AC%B9%E0%AC%B2> schema:about wd:Q9141 .
+
+<https://os.wikipedia.org/wiki/%D0%A2%D0%B0%D0%B4%D0%B6-%D0%9C%D0%B0%D1%85%D0%B0%D0%BB> schema:about wd:Q9141 .
+
+<https://pa.wikipedia.org/wiki/%E0%A8%A4%E0%A8%BE%E0%A8%9C_%E0%A8%AE%E0%A8%B9%E0%A8%BF%E0%A8%B2> schema:about wd:Q9141 .
+
+<https://pl.wikipedia.org/wiki/Tad%C5%BA_Mahal> schema:about wd:Q9141 .
+
+<https://pl.wikiquote.org/wiki/Tad%C5%BA_Mahal> schema:about wd:Q9141 .
+
+<https://pms.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://pnb.wikipedia.org/wiki/%D8%AA%D8%A7%D8%AC_%D9%85%D8%AD%D9%84> schema:about wd:Q9141 .
+
+<https://ps.wikipedia.org/wiki/%D8%AA%D8%A7%D8%AC_%D9%85%D8%AD%D9%84> schema:about wd:Q9141 .
+
+<https://pt.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://qu.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://ro.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://ru.wikipedia.org/wiki/%D0%A2%D0%B0%D0%B4%D0%B6-%D0%9C%D0%B0%D1%85%D0%B0%D0%BB> schema:about wd:Q9141 .
+
+<https://rue.wikipedia.org/wiki/%D0%A2%D0%B0%D0%B4%D0%B6_%D0%9C%D0%B0%D1%85%D0%B0%D0%BB> schema:about wd:Q9141 .
+
+<https://sa.wikipedia.org/wiki/%E0%A4%A4%E0%A4%BE%E0%A4%9C%E0%A4%AE%E0%A4%B9%E0%A4%B2> schema:about wd:Q9141 .
+
+<https://sah.wikipedia.org/wiki/%D0%A2%D0%B0%D0%B4%D0%B6_%D0%9C%D0%B0%D1%85%D0%B0%D0%BB> schema:about wd:Q9141 .
+
+<https://sat.wikipedia.org/wiki/%E1%B1%9B%E1%B1%9F%E1%B1%A1%E1%B1%BD%E1%B1%A2%E1%B1%9A%E1%B1%A6%E1%B1%9A%E1%B1%9E> schema:about wd:Q9141 .
+
+<https://scn.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://sco.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://sd.wikipedia.org/wiki/%D8%AA%D8%A7%D8%AC_%D9%85%D8%AD%D9%84> schema:about wd:Q9141 .
+
+<https://sh.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://si.wikipedia.org/wiki/%E0%B6%A7%E0%B6%A2%E0%B7%8A_%E0%B6%B8%E0%B7%84%E0%B6%BD%E0%B7%8A> schema:about wd:Q9141 .
+
+<https://simple.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://sk.wikipedia.org/wiki/T%C3%A1d%C5%BE_Mahal> schema:about wd:Q9141 .
+
+<https://sl.wikipedia.org/wiki/Tad%C5%BE_Mahal> schema:about wd:Q9141 .
+
+<https://so.wikipedia.org/wiki/Taaj_maxal> schema:about wd:Q9141 .
+
+<https://sq.wikipedia.org/wiki/Taxh_Mahali> schema:about wd:Q9141 .
+
+<https://sr.wikipedia.org/wiki/%D0%A2%D0%B0%D1%9F_%D0%9C%D0%B0%D1%85%D0%B0%D0%BB> schema:about wd:Q9141 .
+
+<https://stq.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://su.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://sv.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://sw.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://syl.wikipedia.org/wiki/%EA%A0%94%EA%A0%A3%EA%A0%8E_%EA%A0%9D%EA%A0%9F> schema:about wd:Q9141 .
+
+<https://szl.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://ta.wikipedia.org/wiki/%E0%AE%A4%E0%AE%BE%E0%AE%9C%E0%AF%8D_%E0%AE%AE%E0%AE%95%E0%AE%BE%E0%AE%B2%E0%AF%8D> schema:about wd:Q9141 .
+
+<https://tcy.wikipedia.org/wiki/%E0%B2%A4%E0%B2%BE%E0%B2%9C%E0%B3%8D_%E0%B2%AE%E0%B2%B9%E0%B2%B2%E0%B3%8D> schema:about wd:Q9141 .
+
+<https://te.wikipedia.org/wiki/%E0%B0%A4%E0%B0%BE%E0%B0%9C%E0%B1%8D_%E0%B0%AE%E0%B0%B9%E0%B0%B2%E0%B1%8D> schema:about wd:Q9141 .
+
+<https://tg.wikipedia.org/wiki/%D0%A2%D0%BE%D2%B7%D0%BC%D0%B0%D2%B3%D0%B0%D0%BB> schema:about wd:Q9141 .
+
+<https://th.wikipedia.org/wiki/%E0%B8%97%E0%B8%B1%E0%B8%8A%E0%B8%A1%E0%B8%B2%E0%B8%AE%E0%B8%B2%E0%B8%A5> schema:about wd:Q9141 .
+
+<https://tk.wikipedia.org/wiki/T%C3%A4%C3%A7mahal> schema:about wd:Q9141 .
+
+<https://tl.wikipedia.org/wiki/T%C4%81j_Mahal> schema:about wd:Q9141 .
+
+<https://tr.wikipedia.org/wiki/Tac_Mahal> schema:about wd:Q9141 .
+
+<https://tt.wikipedia.org/wiki/%D0%A2%D0%B0%D2%97_%D0%9C%D0%B0%D1%85%D0%B0%D0%BB> schema:about wd:Q9141 .
+
+<https://uk.wikipedia.org/wiki/%D0%A2%D0%B0%D0%B4%D0%B6_%D0%9C%D0%B0%D1%85%D0%B0%D0%BB> schema:about wd:Q9141 .
+
+<https://ur.wikipedia.org/wiki/%D8%AA%D8%A7%D8%AC_%D9%85%D8%AD%D9%84> schema:about wd:Q9141 .
+
+<https://uz.wikipedia.org/wiki/Toj_Mahal> schema:about wd:Q9141 .
+
+<https://vep.wikipedia.org/wiki/Tad%C5%BE_Mahal> schema:about wd:Q9141 .
+
+<https://vi.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+wd:Q1282259 wdt:P138 wd:Q9141 .
+
+wd:Q2084992 wdt:P8546 wd:Q9141 .
+
+wd:Q2551253 wdt:P800 wd:Q9141 .
+
+wd:Q7102634 wdt:P1269 wd:Q9141 .
+
+wd:Q8827804 wdt:P301 wd:Q9141 .
+
+wd:Q17334578 wdt:P180 wd:Q9141 .
+
+wd:Q18713967 wdt:P941 wd:Q9141 .
+
+wd:Q19685296 owl:sameAs wd:Q9141 .
+
+wd:Q20188426 wdt:P180 wd:Q9141 .
+
+wd:Q24259080 wdt:P2959 wd:Q9141 .
+
+wd:Q24945883 wdt:P144 wd:Q9141 .
+
+wd:Q25583619 owl:sameAs wd:Q9141 .
+
+wd:Q28840324 wdt:P180 wd:Q9141 .
+
+wds:Q97884946-BBCEF11D-110C-4213-8CFE-17C6FC2F8FA7 ps:P276 wd:Q9141 .
+
+wds:Q97884946-A4806E7F-EB0A-4057-9CA4-943734F6B33B ps:P361 wd:Q9141 .
+
+wds:Q97884948-21C19B33-11C6-481E-AB08-832E83B82981 ps:P276 wd:Q9141 .
+
+wds:Q97884948-55B1A891-E6DE-486F-81C6-5724783963D7 ps:P361 wd:Q9141 .
+
+wds:Q97884951-18AAC4C1-15D2-47D8-84D1-F2FED086A1C7 ps:P276 wd:Q9141 .
+
+wds:Q97884951-32B9CE34-30C7-451D-81EE-4E993BAA9B31 ps:P361 wd:Q9141 .
+
+wds:Q97884955-3F506E75-9D03-4768-A4BF-3E0FC9B080D5 ps:P361 wd:Q9141 .
+
+wds:Q97884955-8D598898-3C4C-46FF-9CC4-A33E990C1E7D ps:P276 wd:Q9141 .
+
+wds:Q97884959-1C718EF8-4C4A-4DDD-905B-723A2FB5806D ps:P276 wd:Q9141 .
+
+wds:Q97884959-7515A6C0-B633-4177-BDBD-6BD4ED6F9B7B ps:P361 wd:Q9141 .
+
+wds:Q97884964-45DEC935-5B63-4821-8DD4-D3D3B484A6B7 ps:P276 wd:Q9141 .
+
+wds:Q97884964-E061DE80-254E-4935-B383-033793B019EB ps:P361 wd:Q9141 .
+
+wds:Q97884968-7A922A79-DFFA-4DFB-9555-A86D1D403A79 ps:P276 wd:Q9141 .
+
+wds:Q97884968-AC436402-E407-4736-81E0-C118BB7EE177 ps:P361 wd:Q9141 .
+
+wds:Q97884972-AACFEB9A-9A23-486F-960F-A34EA63DC835 ps:P361 wd:Q9141 .
+
+wds:Q97884972-FF2178DC-0DA6-488B-AAA4-25F769CCE1CD ps:P276 wd:Q9141 .
+
+wds:Q97884976-0AB30D60-0857-4112-8EAA-11DD8686572C ps:P361 wd:Q9141 .
+
+wds:Q97884976-8B136396-4C35-4856-BCBA-6869F633AB92 ps:P276 wd:Q9141 .
+
+wds:Q97884977-2241713C-B4ED-4861-9EAC-13C11BF7D95D ps:P361 wd:Q9141 .
+
+wds:Q97884977-D11E53DD-D95B-48DD-9E9D-9FEC03DEB553 ps:P276 wd:Q9141 .
+
+wds:Q97884981-2B97F595-E197-4EB4-8794-5ADE3268E06D ps:P276 wd:Q9141 .
+
+wds:Q97884981-D1F7887F-0088-4185-AB7B-F8829DE69F02 ps:P361 wd:Q9141 .
+
+wds:Q97884983-04D0B65A-CA50-4C8B-B611-CB3047263C37 ps:P361 wd:Q9141 .
+
+wds:Q97884983-5FFDB521-F410-453A-8178-F03449632D75 ps:P276 wd:Q9141 .
+
+wds:Q97884986-6C7A454F-F66A-49C3-BD4C-D0FCB6FBD8ED ps:P276 wd:Q9141 .
+
+wds:Q97884986-C1BFC768-ACA1-40A6-A536-E9EBAC3A0240 ps:P361 wd:Q9141 .
+
+wds:Q97884990-A001580F-A7B6-4F1F-B709-FA748CE9241B ps:P276 wd:Q9141 .
+
+wds:Q97884990-40280EB4-EA9D-4D04-99C3-0AC97AD2FC5B ps:P361 wd:Q9141 .
+
+wds:Q97884992-4F6D7D17-AC8B-4786-8DB3-7335260B3CF9 ps:P276 wd:Q9141 .
+
+wds:Q97884992-3AAB688F-733B-47C9-9B19-4F8DA541DEFB ps:P361 wd:Q9141 .
+
+wd:Q51269980 wdt:P138 wd:Q9141 .
+
+wd:Q51540857 wdt:P921 wd:Q9141 .
+
+wd:Q54800642 wdt:P840 wd:Q9141 .
+
+wd:P1371 wdt:P1855 wd:Q9141 .
+
+wd:P2614 wdt:P1855 wd:Q9141 .
+
+wd:Q19104 wdt:P138 wd:Q9141 .
+
+wd:Q41176 wdt:P5869 wd:Q9141 .
+
+wd:Q83496197 wdt:P180 wd:Q9141 .
+
+wd:Q83497656 wdt:P180 wd:Q9141 .
+
+wd:Q83687566 wdt:P180 wd:Q9141 .
+
+<https://vo.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+wd:Q97372778 owl:sameAs wd:Q9141 .
+
+wd:Q97884946 wdt:P276 wd:Q9141 ;
+	wdt:P361 wd:Q9141 .
+
+wd:Q97884951 wdt:P276 wd:Q9141 .
+
+wd:Q97884948 wdt:P276 wd:Q9141 .
+
+wd:Q97884951 wdt:P361 wd:Q9141 .
+
+wd:Q97884948 wdt:P361 wd:Q9141 .
+
+wd:Q97884955 wdt:P276 wd:Q9141 ;
+	wdt:P361 wd:Q9141 .
+
+wd:Q97884959 wdt:P276 wd:Q9141 ;
+	wdt:P361 wd:Q9141 .
+
+wd:Q97884964 wdt:P276 wd:Q9141 ;
+	wdt:P361 wd:Q9141 .
+
+wd:Q97884968 wdt:P276 wd:Q9141 ;
+	wdt:P361 wd:Q9141 .
+
+wd:Q97884972 wdt:P276 wd:Q9141 ;
+	wdt:P361 wd:Q9141 .
+
+wd:Q97884976 wdt:P276 wd:Q9141 .
+
+wd:Q97884977 wdt:P276 wd:Q9141 .
+
+wd:Q97884976 wdt:P361 wd:Q9141 .
+
+wd:Q97884983 wdt:P276 wd:Q9141 .
+
+wd:Q97884977 wdt:P361 wd:Q9141 .
+
+wd:Q97884981 wdt:P276 wd:Q9141 .
+
+wd:Q97884983 wdt:P361 wd:Q9141 .
+
+wd:Q97884986 wdt:P276 wd:Q9141 .
+
+wd:Q97884981 wdt:P361 wd:Q9141 .
+
+wd:Q97884986 wdt:P361 wd:Q9141 .
+
+wd:Q97884990 wdt:P276 wd:Q9141 ;
+	wdt:P361 wd:Q9141 .
+
+wd:Q97884992 wdt:P276 wd:Q9141 .
+
+<https://lo.wikipedia.org/wiki/%E0%BA%97%E0%BA%B1%E0%BA%8A%E0%BA%A1%E0%BA%B2%E0%BA%AE%E0%BA%B2%E0%BA%A5> schema:about wd:Q9141 .
+
+<https://war.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://wuu.wikipedia.org/wiki/%E6%B3%B0%E5%A7%AC%E9%99%B5> schema:about wd:Q9141 .
+
+<https://xmf.wikipedia.org/wiki/%E1%83%97%E1%83%90%E1%83%AF-%E1%83%9B%E1%83%90%E1%83%B0%E1%83%90%E1%83%9A%E1%83%98> schema:about wd:Q9141 .
+
+<https://yi.wikipedia.org/wiki/%D7%98%D7%90%D7%96%D7%A9_%D7%9E%D7%90%D7%94%D7%90%D7%9C> schema:about wd:Q9141 .
+
+<https://yo.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://zea.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://zh-min-nan.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://zh-yue.wikipedia.org/wiki/%E6%B3%B0%E5%A7%AC%E9%99%B5> schema:about wd:Q9141 .
+
+<https://zh.wikipedia.org/wiki/%E6%B3%B0%E5%A7%AC%E9%99%B5> schema:about wd:Q9141 .
+
+<https://tok.wikipedia.org/wiki/tomo_Tamala> schema:about wd:Q9141 .
+
+<https://gor.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+wd:Q83672 wdt:P119 wd:Q9141 .
+
+wd:Q125021 wdt:P1889 wd:Q9141 .
+
+wd:Q231693 wdt:P119 wd:Q9141 .
+
+wd:Q712728 wdt:P527 wd:Q9141 .
+
+wd:Q9141 rdfs:label "Tadj Mahal"@af , "ታጅ ማሃል"@am , "Tach Mahal"@an , "ताज महल"@anp , "তাজমহল"@as , "Tac Mahal"@az , "تاج محل"@azb , "Тадж Махал"@ba , "Taj Mahal"@ban , "Taj Mahal"@bcl , "Тадж-Махал"@be , "Тадж Махал"@be-tarask , "Тадж Махал"@bg , "ताजमहल"@bho , "ཐེ་ཇི་བང་སོ།"@bo , "তাজ মহল"@bpy , "Taj Mahal"@bs , "Тадж-Махал"@bxr , "Тадж-Махал"@ce , "تاج مەحەل"@ckb , "Taj Mahal"@co , "Tac Mahal"@crh , "Tádž Mahal"@cs , "Taj Mahal"@cy , "Taj Mahal"@de-ch , "Tac Mehel"@diq , "ތާޖް މަޙަލް"@dv , "Τατζ Μαχάλ"@el , "Taj Mahal"@en-ca , "Taj Mahal"@en-gb , "Taĝ-Mahalo"@eo , "Tāj Mahal"@et , "تاجمحل"@fa , "Taj Mahal"@gaa , "Taj Mahal"@gcr , "تاج محل"@glk , "Taj Mahal"@gn , "Taj Mahal"@gom , "ताजमहाल"@gom-deva , "Taj Mahal"@gom-latn , "Taj Mahal"@gpe , "Taj Mahal"@gsw , "તાજ મહેલ"@gu , "Taj Mahal"@ha , "טאג' מהאל"@he , "Taj Mahal"@hif , "Taj Mahal"@hr , "Թաջ Մահալ"@hy , "Թաժ Մահալ"@hyw , "Taj Mahal"@ie , "Taj Mahal"@ig , "Taj Mahal"@ilo , "Тадж-Махьал"@inh , "Taj Mahal"@io , "Taj Mahal"@is , "la .taj.me'èl."@jbo , "Taj Mahal"@jv , "თაჯ-მაჰალი"@ka , "Taǧ Maḥal"@kab , "Taj Mahal"@kbp , "Taj Mahal"@kge , "Тәж Махал"@kk , "តះ ម៉ាហាល់"@km , "타지마할"@ko , "تاج مَحل"@ks , "Tac Mehel"@ku , "Taj Mahal"@kw , "Таж-Махал"@ky , "Taj Mahal"@la , "Taj Mahal"@lfn , "Taj Mahal"@li , "Tadžmahalas"@lt , "Tadžmahāls"@lv , "ताजमहल"@mai , "Taj Mahal"@min , "Таџ Махал"@mk , "Таж Махал"@mn , "ꯇꯥꯖ ꯃꯍꯜ"@mni , "ताजमहाल"@mr , "Taj Mahal"@mt , "တာ့ဂျ်မဟာရ်"@my , "تاج محل"@mzn , "Taj Mahal"@nds , "ताजमहल"@ne , "ߕߊߖ ߡߤߊߟ"@nqo , "Taj Mahal"@oc , "Taj Mahal"@olo , "Taj Mahal"@om , "ତାଜମହଲ"@or , "Тадж-Махал"@os , "ਤਾਜ ਮਹਿਲ"@pa , "Tadź Mahal"@pl , "Taj Mahal"@pms , "تاج محل"@pnb , "تاج محل"@ps , "Taj Mahal"@qu , "Тадж Махал"@rue , "ताजमहल्"@sa , "Тадж Махал"@sah , "ᱛᱟᱡᱽᱢᱚᱦᱚᱞ"@sat ;
+	p:P12800 wds:Q9141-19672BAB-52C4-499B-A646-0F2FF6E88FD5 , wds:Q9141-1E0F0E8E-83A1-4C06-8045-BE3900086367 , wds:Q9141-2CA6EC24-B858-4FAD-BCBF-3B7DFD01718F , wds:Q9141-E5C4C45C-3F2A-4AF1-94F1-B4F62C598F1B ;
+	p:P13591 wds:Q9141-1DC27294-ECC9-4B6D-AAE5-9A44299C3E44 ;
+	p:P13750 wds:Q9141-E087FC3E-B84C-4D54-9847-04DEA36A433B ;
+	wdt:P2959 wd:Q24259080 ;
+	wdt:P5023 wd:Q51728721 ;
+	wdt:P5008 wd:Q73852346 ;
+	wdt:P8596 wd:Q104581308 ;
+	wdt:P1343 wd:Q126374795 ;
+	wdt:P1435 wd:Q9259 ;
+	wdt:P2046 17.0 ;
+	wdt:P2048 73.0 ;
+	wdt:P2130 32000000.0 ;
+	wdt:P757 "252" ;
+	wdt:P9811 "148" ;
+	wdt:P1566 "1255231" ;
+	wdt:P5383 "3845" ;
+	wdt:P10565 "580235" ;
+	wdt:P9957 "33125" ;
+	wdt:P11729 "50782" ;
+	wdt:P8687 171381.0 ;
+	wdt:P373 "Taj Mahal" ;
+	wdt:P10565 "580684" ;
+	wdt:P2163 "1142155" ;
+	wdt:P10565 "392597" ;
+	wdt:P454 "20000293" ;
+	wdt:P3134 "317329" ;
+	wdt:P269 "030147409" ;
+	wdt:P1296 "0064986" ;
+	wdt:P1371 "N-UP-A28" ;
+	wdt:P12637 "0372" ;
+	wdt:P10565 "537353" ;
+	wdt:P2924 "4178873" ;
+	wdt:P1174 6532366.0 ;
+	wdt:P7305 "3984842" ;
+	wdt:P1705 "ताज महल"@hi , "تاج محل"@fa ;
+	wdt:P3222 "taj-mahal" ;
+	wdt:P12385 "taj-mahal" ;
+	wdt:P948 <http://commons.wikimedia.org/wiki/Special:FilePath/TajMahal%20Banner.jpg> ;
+	wdt:P1619 "1653-01-01T00:00:00Z"^^xsd:dateTime ;
+	wdt:P625 "Point(78.041944444 27.175)"^^geo:wktLiteral ;
+	wdt:P443 <http://commons.wikimedia.org/wiki/Special:FilePath/LL-Q34239%20%28kok%29-Fredericknoronha-Taj%20Mahal.wav> ;
+	wdt:P3311 <http://commons.wikimedia.org/wiki/Special:FilePath/Taj%20site%20plan.png> ;
+	wdt:P268 "12162158x" ;
+	wdt:P349 "00954708" ;
+	wdt:P646 "/m/0l8cb" ;
+	wdt:P856 <https://www.tajmahal.gov.in/> ;
+	wdt:P691 "xx0082572" ;
+	wdt:P5775 <http://commons.wikimedia.org/wiki/Special:FilePath/Tombs-in-crypt.jpg> ;
+	wdt:P935 "Taj Mahal - ताजमहल" ;
+	wdt:P1669 "700000214" ;
+	wdt:P1617 "bc151ca3-e7bc-4892-9a02-0ba00b4f8f2a" ;
+	wdt:P1417 "topic/Taj-Mahal" ;
+	wdt:P2581 "00075929n" ;
+	wdt:P2002 "TajMahal" ;
+	wdt:P2966 "taj-mahal-india" ;
+	wdt:P3749 "15936801470875598302" ;
+	wdt:P1705 "تاج مَحَل"@ur ;
+	wdt:P3219 "tadj-mahall" ;
+	wdt:P3417 "Taj-Mahal" ;
+	wdt:P2561 "ꠔꠣꠎ ꠝꠟ"@syl ;
+	wdt:P4342 "Taj_Mahal" ;
+	wdt:P9721 <http://commons.wikimedia.org/wiki/Special:FilePath/Taj%20Mahal%20gate-5.jpg> ;
+	wdt:P5063 "i59966" ;
+	wdt:P5905 "4020-60080" ;
+	wdt:P6262 "memory-beta:Taj_Mahal" ;
+	wdt:P6385 "kultura_i_obrazovanie/izobrazitelnoe_iskusstvo/TADZH-MAHAL.html" ;
+	wdt:P6573 "Taj_Mahal" ;
+	wdt:P7314 "tac-mahal" ;
+	wdt:P7502 "Taj_Mahal-AZ5MJ" ;
+	wdt:P8189 "987007558314005171" ;
+	wdt:P8814 "04393370-n" ;
+	wdt:P8408 "TajMahal" ;
+	wdt:P8988 "osm&id=1082279554" ;
+	wdt:P10689 "375257537" ;
+	wdt:P10297 "m0l8cb" ;
+	wdt:P12086 "Taj_Mahal" ;
+	wdt:P12800 "en:Taj_Mahal" , "es:Taj_Mahal" , "fr:Taj_Mahal" ;
+	wdt:P12749 "Q142660" ;
+	p:P149 wds:Q9141-391c0f47-4164-7ae3-c335-7ed9d249c113 , wds:Q9141-614a7c7f-406c-990c-1d3b-d74260c2d5ee , wds:Q9141-aad474d1-463f-10cc-406b-135b5f2f350b ;
+	p:P131 wds:Q9141-dff77b08-4558-b59b-0ead-96924dce6868 , wds:Q9141-f1a482c2-4dc6-9c17-19fe-faf21eaccd07 ;
+	p:P138 wds:Q9141-cb0a10a0-4cb2-c5fb-9a91-e0bce8f1db2e ;
+	p:P140 wds:Q9141-911ff355-4a0d-0b31-2d3d-86d651ee0f57 ;
+	p:P186 wds:Q9141-d604d454-4649-1000-cc7b-c1e9d5926cc2 ;
+	p:P214 wds:Q9141-5AE7A322-CC46-459E-8B60-0D837DF06F70 ;
+	p:P244 wds:Q9141-4b83d574-48a4-c7d5-39c4-de42ede25e90 ;
+	p:P245 wds:Q9141-D0550B32-69CE-4C06-953D-0DAA3101ABBD ;
+	p:P227 wds:Q9141-2FA0B652-123E-4516-BDD4-1B12AB52D8E3 ;
+	wdt:P11408 "タージ・マハル" ;
+	wdt:P571 "1631-01-01T00:00:00Z"^^xsd:dateTime ;
+	wdt:P1889 wd:Q125021 ;
+	wdt:P793 wd:Q385378 ;
+	wdt:P1343 wd:Q3181656 ;
+	wdt:P5008 wd:Q5460604 , wd:Q6173448 ;
+	wdt:P910 wd:Q8827804 ;
+	wdt:P1435 wd:Q17047513 ;
+	wdt:P2614 wd:Q23038972 ;
+	wdtn:P214 <http://viaf.org/viaf/172481610> ;
+	wdt:P17 wd:Q668 ;
+	wdt:P140 wd:Q432 ;
+	wdt:P131 wd:Q1498 ;
+	wdt:P31 wd:Q9259 ;
+	wdt:P186 wd:Q40861 ;
+	wdt:P131 wd:Q42941 ;
+	wikibase:statements 117 ;
+	wikibase:sitelinks 179 ;
+	wikibase:identifiers 61 ;
+	wdt:P214 "172481610" ;
+	wdt:P18 <http://commons.wikimedia.org/wiki/Special:FilePath/Taj%20Mahal%2C%20Agra%2C%20India%20edit3.jpg> ;
+	skos:altLabel "ताजमहाल"@gom , "Tadsch Mahal"@de , "タージマハル"@ja ;
+	wdt:P10 <http://commons.wikimedia.org/wiki/Special:FilePath/Eu.Video-Taj%20Mahal.webm> , <http://commons.wikimedia.org/wiki/Special:FilePath/Taj%20Mahal%20-%20Mausoleum%20der%20Liebe%20%28CC%20BY-SA%204.0%29.webm> ;
+	p:P18 wds:Q9141-3279b34a-419c-0068-6dee-8526040bfc3c , wds:q9141-B6DFAD2E-AEAA-4F5E-A39A-6887C164C5F1 ;
+	p:P17 wds:q9141-FDA6603D-F113-4CF7-9D84-EE67672825BF ;
+	p:P31 wds:Q9141-249802D6-7576-4B5E-BE07-110A9356DCF6 , wds:Q9141-cafbf1fb-40ea-4bb2-e37b-d867e48b98c2 , wds:Q9141-e531e905-49c4-d519-b9c5-753f519ee6a0 ;
+	p:P10 wds:Q9141-39eeb470-4639-6cd3-fd0a-0982aface2a3 , wds:Q9141-9488A34A-D9CF-4F97-9C80-378299B3CD46 ;
+	p:P84 wds:Q9141-30b8f30e-4baa-d054-5bf6-7c9af88684b0 ;
+	p:P88 wds:Q9141-21808497-45ba-7414-7faf-977f50594310 ;
+	p:P112 wds:Q9141-7bf20a2e-4c37-b166-18ff-c9ab975d6e1a ;
+	wdtn:P244 <http://id.loc.gov/authorities/names/sh85132019> ;
+	wdtn:P245 <http://vocab.getty.edu/ulan/500304454> ;
+	wdtn:P227 <https://d-nb.info/gnd/4086583-6> ;
+	wdt:P227 "4086583-6" ;
+	wdt:P245 "500304454" ;
+	wdt:P244 "sh85132019" ;
+	skos:altLabel "ताज"@bho , "ताज महल"@bho , "Crown of the Palace"@en , "Crown of de Palace"@gpe , "महल का मुकुट"@hi , "タージ・マハール"@ja , "タージ・マハル廟"@ja , "タージ＝マハル"@ja , "タージマハール"@ja , "ਤਾਜ ਮਹਲ"@pa , "تاجمحل"@ps , "Taje Maal"@pt , "ꠡꠝ꠆ꠞꠣꠐ ꠡꠣ ꠎꠣꠘꠞ ꠔꠣꠎ ꠝꠟ"@syl , "రాజభవన కిరీటం"@te , "tomo Ta Maka"@tok , "tomo Ta Mawa"@tok ;
+	rdfs:label "Taj Mahal"@scn , "Taj Mahal"@sco , "تاج محل"@sd , "Tadžmahals"@sgs , "Taj Mahal"@sh , "ටජ්මහල්"@si , "Tádž Mahal"@sk , "Tadž Mahal"@sl , "Taaj maxal"@so , "Taxh Mahall"@sq , "Таџ Махал"@sr , "Taj Mahal"@stq , "Taj Mahal"@su , "Taj Mahal"@sw , "ꠔꠣꠎ ꠝꠟ"@syl , "Taj Mahal"@szl , "தாஜ் மகால்"@ta , "ತಾಜ್ ಮಹಲ್"@tcy , "Täçmahal"@tk , "Tāj Mahal"@tl , "tomo Ta Maja"@tok , "Tac Mahal"@tr , "Таҗ Махал"@tt , "Taj Mahal"@tw , "Тадж-Махал"@udm , "Тадж Махал"@uk , "Tojmahal"@uz , "Tadž Mahal"@vep , "Taj Mahal"@vi , "Tadž Mahal"@vro , "Taj Mahal"@war , "泰姬陵"@wuu , "თაჯ-მაჰალი"@xmf , "טאזש מאהאל"@yi , "Taj Mahal"@yo , "泰姬陵"@yue , "Taj Mahal"@zea , "Taj Mahal"@vo , "ທັຊມາຮາລ"@lo ;
+	p:P31 wds:Q9141-8be6272e-4912-e997-1e62-fe66a57eead4 ;
+	wdt:P88 wd:Q83672 ;
+	wdt:P112 wd:Q83672 ;
+	wdt:P31 wd:Q162875 ;
+	wdt:P149 wd:Q212940 ;
+	wdt:P138 wd:Q231693 ;
+	wdt:P31 wd:Q381885 ;
+	wdt:P149 wd:Q542261 ;
+	wdt:P31 wd:Q570116 ;
+	wdt:P149 wd:Q1501585 ;
+	wdt:P84 wd:Q2551253 ;
+	schema:version 2462819855 ;
+	schema:description "mausoleo"@it , "താജ്മഹൽ"@ml ;
+	rdfs:label "Taj Mahal"@en , "Taj Mahal"@ast , "Taj Mahal"@es , "Taj Mahal"@fr , "Taj Mahal"@nl , "Taj Mahal"@ca , "Taj Mahal"@de ;
+	schema:description "bangunan kuil di India"@id , "bouwwerk in India"@nl , "Mausoleum in Indien"@de ;
+	rdfs:label "Taj Mahal"@br , "Taj Mahal"@da , "Taj Mahal"@eu , "Taj Mahal"@fi , "Taj Mahal"@gl , "ताजमहल"@hi , "Tádzs Mahal"@hu , "Taj Mahal"@it , "タージ・マハル"@ja , "താജ് മഹൽ"@ml , "Taj Mahal"@nb , "Taj Mahal"@nn , "Taj Mahal"@pt , "Taj Mahal"@ro , "Тадж-Махал"@ru , "Taj Mahal"@sv , "ทัชมาฮาล"@th , "Taj Mahal"@ga , "Taj Mahal"@ms , "তাজমহল"@bn , "Taj Mahal"@nan , "ತಾಜ್ ಮಹಲ್"@kn ;
+	schema:description "mausoleumi Intiassa"@fi ;
+	rdfs:label "泰姬陵"@zh , "తాజ్ మహల్"@te , "ताज्मकाल्"@new , "تاج محل"@ar , "تاج محل"@arz , "Taj Mahal"@fy , "Taj Mahal"@lb , "Taj Mahal"@pt-br , "تاج محل"@ur , "Тоҷмаҳал"@tg , "Taj Mahal"@id ;
+	schema:dateModified "2026-02-12T12:03:04Z"^^xsd:dateTime ;
+	schema:description "marmer mausoleum in Agra, Indië"@af , "ضريح أنيق من الرخام الأبيض شيده الإمبراطور المغولي شاه جهان"@ar , "भारत के उत्तर प्रदेश राज्य में एक ठो सफ़ेद संगमरमर के मकबरा"@bho , "ভারতের উত্তর প্রদেশে আগ্রায় অবস্থিত একটি রাজকীয় সমাধি"@bn , "mramorni mauzolej u Agri (Indija)"@bs , "mausoleu a l'Índia"@ca , "کۆشکێک لە ھیندستان"@ckb , "mauzoleum v Indii"@cs , "nordindisk mausoleum nær Agra opført 1632-1653"@da , "Μαυσωλείο στην Ινδία"@el , "marble mausoleum in Agra, India"@en , "Indian mausoleum"@en-gb , "maŭzoleo en Barato"@eo , "آرامگاهی در نزدیکی شهر آگرا در هند"@fa , "mausolée de marbre à Agra, État de l'Uttar Pradesh, Inde"@fr , "mausoleo de mármore branco construído entre 1632 e 1652"@gl , "marble mausoleum insyd Agra, India"@gpe , "આગ્રા, ભારતમાં આવેલ પ્રસિદ્ધ કબર, સાત અજાયબીમાંની એક"@gu , "מבנה מונומנטלי בהודו"@he , "आगरा में स्थित भारत का सुप्रसिद्ध पर्यटक स्थल"@hi , "marmol a mausoleo idiay India"@ilo , "къубба-маьждиг"@inh , "leghöll á Indlandi"@is , "インド北部アーグラにある墓廟"@ja , "Kuburan miwah di India"@kge , "무굴 제국의 대표적 건축물"@ko , "سَفید سَنٛگہِ مَر مَر قَبَر"@ks , "भारतक आगरा सहरमे स्थित एक समाधिस्थल"@mai , "जगातील १ आश्र्चर्य"@mr , "mawżolew tal-irħam f’Agra, l-Indja"@mt , "အိန္ဒိယနိုင်ငံ၊ အာဂရာမြို့ရှိ စကျင်ကျောက် ဂူဗိမာန်"@my , "ताज महल भारतको आगरा शहरमा स्थित एक समाधिस्थल हो । यसको निर्माण मुगल सम्राट शाहजहाँले, आफ्नो स्वास्नी मुमताज महलको सम्झनामा गराए ।"@ne , "ߌ߲ߘߌ߫ ߘߐ߬ߝߐ ߓߏ߲ ߘߏ߫ ߎߕߊߙ ߔߙߊߘߍߛ߭ ߞߊ߬ߝߏ ߞߣߐ߫߸ ߣߴߊ߬ ߟߐ߬ ߘߊ߫ ߡߜ߭ߏߟ ߝߊ߰ߡߊ߫ ߛߊ ߖߊ߬ߤߊ ߓߟߏ߫ ߓߍߟߍ߲ߘߊ ߘߴߊ߬ ߡߏ߬ߛߏ ߓߊ߲߬ߘߊ߬ߣߍ߲ ߛߊ߬ߣߍ߲ ߛߌ߲ߞߐ߲ ߘߌ߫"@nqo , "ଆଗ୍ରା, ଉତ୍ତରପ୍ରଦେଶ"@or , "ਪਿਆਰ ਦੀ ਨਿਸ਼ਾਨੀ"@pa , "mauzoleum (Agra, Indie)"@pl , "د هند په اگره ښار کې يو مړيستون او ليدنځی"@ps , "mausoléu de mármore em Agra, Índia"@pt , "мавзолей-мечеть в Агре, Индия"@ru , "мраморни маузолеј у Агри, Индија"@sr , "masjid ti India"@su , "mausoleum i Indien"@sv , "ꠄꠘ꠆ꠒꠤꠀꠞ ꠀꠉ꠆ꠞꠣꠔ ꠙꠞ꠆ꠍꠦ"@syl , "ஏழு உலக அதிசயங்களுள் ஒன்று"@ta , "భారత దేశంలోని ఆగ్రా లో ఒక అత్యద్భుతం"@te , "อาคารฝังศพสร้างด้วยหินอ่อนในอาครา ประเทศอินเดีย"@th , "tomo li lon ma Palata"@tok , "Hindistan'ın Agra kenti'ndeki anıt mezar"@tr , "lăng mộ bằng đá cẩm thạch màu trắng ngà ở Ấn Độ"@vi , "今位于印度的莫卧儿王朝建筑"@zh , "complejo de edificios construido entre 1631 y 1654 en la ciudad de Agra, India y una de las 7 maravillas del mundo moderno"@es , "mausoleum yn India"@cy ;
+	wdt:P13750 "14221" ;
+	wdtn:P2163 <http://id.worldcat.org/fast/1142155> ;
+	wdtn:P269 <http://www.idref.fr/030147409/id> ;
+	wdtn:P268 <http://data.bnf.fr/ark:/12148/cb12162158x#about> ;
+	p:P268 wds:Q9141-BF4BF325-843F-4BC0-AC19-770328867431 ;
+	p:P269 wds:Q9141-DCFCBA19-AD90-439A-BD08-8F0A1139AB72 ;
+	wdtn:P349 <http://id.ndl.go.jp/auth/ndlna/00954708> ;
+	p:P349 wds:Q9141-0D10E33B-E62D-4CF1-B4BE-225279C378BD ;
+	p:P373 wds:q9141-1BEA7E75-F5DC-471F-A91E-91E8885B9C2F ;
+	p:P443 wds:Q9141-260d3517-136f-4e8b-b84c-575cc2e54505 ;
+	p:P454 wds:Q9141-42BD88B8-F6F5-47D9-891F-2F7E734EE328 ;
+	p:P571 wds:Q9141-b566e90d-453c-b754-c9e0-be2078d324a2 ;
+	p:P625 wds:q9141-9D6705EE-565B-4CF9-BB6E-AEA74626ED82 ;
+	p:P646 wds:Q9141-44EFA99D-6AB1-4480-8D1C-652AAB61F8D7 ;
+	p:P691 wds:Q9141-2E3CE507-E050-42FF-8098-164F0FF2FD59 ;
+	p:P757 wds:q9141-587B0642-3CAC-41CF-A976-FF58F036A74A ;
+	p:P793 wds:Q9141-792dd01b-4a2e-354c-5d40-5a00ff1d53a6 ;
+	p:P856 wds:Q9141-A85C2696-FA32-4AC1-8382-93EFD5AA7A70 ;
+	p:P910 wds:Q9141-3FF99EF3-6A87-4D04-8C2A-F186815F2EB3 ;
+	p:P948 wds:Q9141-6f3a3a90-4792-9122-1163-3aef46eb6932 ;
+	p:P935 wds:Q9141-130CF9CD-4A20-4EA8-91FE-4201496FC195 ;
+	p:P1174 wds:Q9141-0e60841e-4a18-5433-7253-0dc0d928aaee ;
+	p:P1296 wds:Q9141-55EE37DC-1690-4FEE-BB52-0105B6BB129A ;
+	p:P1343 wds:Q9141-7821adf4-48c9-e2c7-9ba0-dc94ae430cec , wds:Q9141-f3193d1a-44ea-3e7f-d428-d33183af9834 ;
+	p:P1371 wds:Q9141-aeda6f55-4937-bdbf-40d9-992a7cee8cd0 ;
+	p:P1435 wds:Q9141-608CD164-F9CB-4179-9768-F4209AD1CF6E , wds:Q9141-EF8544CE-A256-4305-AFD4-4A6399B0C2EE ;
+	p:P1417 wds:Q9141-A3248F0E-E07C-4441-AD40-989469C59A12 ;
+	p:P1566 wds:Q9141-61B9366F-159D-41E5-B944-16DED6175342 ;
+	p:P1617 wds:Q9141-AF1EBAD1-8CC8-4A5B-84E1-DA79C69D0B18 ;
+	wdtn:P1617 <http://www.bbc.co.uk/things/bc151ca3-e7bc-4892-9a02-0ba00b4f8f2a#id> ;
+	p:P1669 wds:Q9141-F627A223-5752-46F1-BC9C-C0F77ACC7723 ;
+	p:P1705 wds:Q9141-27606c46-4702-ec4f-ccf1-f94d8b3ddd0a , wds:Q9141-634b3061-493f-53a8-013c-00c3c7b348c3 , wds:Q9141-fb601caf-490a-f0d1-d06d-5de9f755677f ;
+	p:P1889 wds:Q9141-81956058-4106-7dde-6ae6-63d7585d4a7b ;
+	p:P2002 wds:Q9141-6970f702-4abb-1a36-d6d4-14a89a392403 ;
+	p:P2046 wds:Q9141-dc4fbcf8-49ad-d240-fc69-729316070da5 ;
+	p:P2048 wds:Q9141-0592f46f-42e8-b056-039b-e26c11f1c895 ;
+	p:P2130 wds:Q9141-f4823bb7-44f8-6771-2a7f-a8aba1899531 ;
+	p:P2163 wds:Q9141-415D24F5-0101-46FB-819A-43D564B87EA1 ;
+	wdtn:P2581 <http://babelnet.org/rdf/s00075929n> ;
+	p:P2581 wds:Q9141-413AFCA5-D7A5-4CE8-8414-0B797E6AF8B8 ;
+	p:P2561 wds:Q9141-2d989527-42d4-5b1c-c374-2b6e94473edf ;
+	p:P2614 wds:Q9141-310448A7-3E40-496A-9195-23A75D77D051 ;
+	p:P2924 wds:Q9141-C5D32A8F-427D-48FD-8305-D8C5F89FDB37 ;
+	p:P2966 wds:Q9141-3CE024F0-3168-478B-BA46-E8BF0B8B3A0C ;
+	p:P2959 wds:Q9141-54c95d65-d85d-4182-bf4d-10ee52aaa04e ;
+	p:P3134 wds:Q9141-3E98F77E-D031-4ACE-8389-F740DA760C91 ;
+	p:P3219 wds:Q9141-6D1F94CD-DA46-4FEC-AC65-7663FB38BC2A ;
+	p:P3222 wds:Q9141-9480910C-E3A3-496E-AFF1-FF9133484F54 ;
+	p:P3311 wds:Q9141-f80ba3e1-4530-e5b6-6084-c5fd3e6215be ;
+	p:P3417 wds:Q9141-c0a6ab25-4c79-73d4-54bd-6d3f2db25a98 ;
+	p:P3749 wds:Q9141-d11a2782-42cf-85dd-04c2-18cddf634fe4 ;
+	p:P4342 wds:Q9141-49808BEA-7114-4F7D-894A-288FA18B0861 ;
+	p:P5008 wds:Q9141-D3BE54E5-269B-4D5C-94BC-3D05F7AF00A3 , wds:Q9141-DD6D5A90-C07D-49C8-A26B-EE2BF38978F7 , wds:Q9141-FF57A3EB-A600-4EAB-B734-925ED53EF491 ;
+	p:P5023 wds:Q9141-82ec0927-46fc-d4cb-91fd-79743149fe62 ;
+	wdtn:P5063 <http://globalwordnet.org/ili/i59966> ;
+	p:P5063 wds:Q9141-39BB0A3D-49CF-4D62-B640-07F912EF73E9 ;
+	p:P5383 wds:Q9141-F44F7008-D043-4969-9527-7DDADE2381DA ;
+	wdtn:P1566 <https://sws.geonames.org/1255231/> ;
+	p:P5775 wds:Q9141-6d327721-410c-96cf-64a7-60a719291620 ;
+	p:P5905 wds:Q9141-486298F0-CB96-4106-BE0A-0767913B9E6B ;
+	p:P6262 wds:Q9141-B9095AA9-FD0E-4FCE-92D1-244E4F124CAF ;
+	p:P6385 wds:Q9141-b90fdc86-4395-8799-5ca2-74b34b57ed11 ;
+	p:P6573 wds:Q9141-9305588B-681D-42BF-B756-77899221A429 ;
+	p:P7314 wds:Q9141-751BCD48-6B87-4C70-966B-3EFB40B5A1DA ;
+	p:P7305 wds:Q9141-dd1b8299-4d64-15db-8803-f9205e022eba ;
+	p:P7502 wds:Q9141-9A6A2042-C962-4FEB-A9F5-2CFB703824B3 ;
+	p:P8189 wds:Q9141-0832921A-50E3-4DBA-8607-15889CC4D003 ;
+	wdtn:P8408 <http://kbpedia.org/kko/rc/TajMahal> ;
+	p:P8408 wds:Q9141-7B896F2E-C2BF-41B2-82C3-00F7CE121C22 ;
+	p:P8596 wds:Q9141-adeb0d0a-7716-4c65-b165-b05066ac8298 ;
+	p:P8687 wds:Q9141-1e9ea0f1-313f-43ef-b795-9da19070db90 , wds:Q9141-21ad49d1-3566-4fb3-b0c4-245744f4d07a , wds:Q9141-b0c624df-73be-4c3a-9995-939910ad14dd ;
+	wdtn:P8814 <http://wordnet-rdf.princeton.edu/rdf/id/04393370-n> ;
+	p:P8814 wds:Q9141-786ECE85-F6F7-4EBC-BC94-7BED6898F943 ;
+	p:P8988 wds:Q9141-a49194f9-44d2-ea79-a930-d7b21a1b0ee8 ;
+	p:P9721 wds:Q9141-30eca84b-49fb-80a3-b7a8-e3db422daade ;
+	p:P9811 wds:Q9141-0316b0f1-474c-6f04-cccf-2b96855624c6 ;
+	p:P9957 wds:Q9141-95840215-847D-4AF1-8E4F-ECC0849449AA ;
+	p:P10297 wds:Q9141-146ba35e-4734-6db4-7ba7-a5eec6db7330 ;
+	p:P10565 wds:Q9141-10E7BADE-A6A2-4578-9D3C-7A3D490FB8C1 , wds:Q9141-2BBFA6D1-4405-40A4-9064-BC5407A3266D , wds:Q9141-995940DC-0AB6-4831-85C8-041435F4AF57 , wds:Q9141-A40C6840-CD6B-4CFD-AADD-9C47249B961F ;
+	p:P10689 wds:Q9141-5ca92060-4a41-aa96-6f80-ad651b0dddc5 ;
+	p:P11729 wds:Q9141-57B2E6A0-9BA1-4F9B-AA2A-14AC8CA7ABB2 ;
+	p:P12086 wds:Q9141-76763D96-DE1D-4BB7-AE98-446169E068DE ;
+	p:P12385 wds:Q9141-74ecee41-9d69-48a7-a66c-8b6dde0e78f8 ;
+	p:P12637 wds:Q9141-46331b9c-4d3f-f22f-23af-00d05f3307d9 ;
+	p:P12749 wds:Q9141-65A25279-B069-4130-86FE-8215154780E1 ;
+	wdt:P12800 "it:Taj_Mahal" ;
+	wdt:P13591 "place/122e2aff-062a-4c3b-b462-9f1104ed1ff1" ;
+	p:P11408 wds:Q9141-25cbd628-4d87-4e6e-cb03-cf2bc9d516b5 ;
+	p:P1619 wds:Q9141-669549d6-4e78-7a7c-8852-e3639d360c4e .
+
+wds:Q41176-6699a8a6-4ea3-bedf-d0d5-c6b506289e49 ps:P5869 wd:Q9141 .
+
+wds:Q110820773-e9fa1a3d-4e8d-807b-c38d-77dbd8179804 ps:P138 wd:Q9141 .
+
+wds:Q24259080-F6C20807-76CC-4EA4-AB20-3F305A7218FA ps:P2959 wd:Q9141 .
+
+wds:P1371-b5cfe0cd-4a6b-6f37-f1d6-471ff588766c ps:P1855 wd:Q9141 .
+
+wds:P2614-A6BB2F0B-3186-442B-93E9-D91A6CDE8F82 ps:P1855 wd:Q9141 .
+
+wds:Q18713967-766e6a7d-4256-75d3-345f-51d940d32bc5 ps:P941 wd:Q9141 .
+
+wds:Q100375116-4B5E87FC-820D-4443-8A03-A6B59C2009F5 ps:P180 wd:Q9141 .
+
+wds:Q100783517-cb9bdef8-44bb-6500-c8a3-5b1aa1652299 ps:P180 wd:Q9141 .
+
+wds:Q19104-754AB31B-9A0C-4004-8AB8-C35D00748C9A ps:P138 wd:Q9141 .
+
+wds:Q24945883-65e38ae8-456c-27c9-923b-c5d1c52e3aa5 pq:P144 wd:Q9141 .
+
+wds:Q24945883-901FBAA3-461A-4D70-9A42-ABE05909D6B3 ps:P144 wd:Q9141 .
+
+wds:Q2551253-CA8161C3-F78C-4A23-B3A3-B69104C3A9B2 ps:P800 wd:Q9141 .
+
+wds:Q7102634-cc5d668b-43d5-cc18-cbfe-36bd3dc77ef1 ps:P1269 wd:Q9141 .
+
+wds:Q712728-a3d4ffc0-49b9-2b49-3073-cfbdaad50ab8 ps:P527 wd:Q9141 .
+
+wds:Q125021-823a896f-4860-4831-bd11-9a31bfb2ab38 ps:P1889 wd:Q9141 .
+
+wds:Q8827804-D553CCF1-84E6-4128-BD53-4D5333122140 ps:P301 wd:Q9141 .
+
+wds:Q104581308-99938c82-5595-45bf-bc0b-ff016d92c37d ps:P971 wd:Q9141 .
+
+wds:Q20188426-e88bfea3-4fa3-b425-5d17-6aa36b9cc1da ps:P180 wd:Q9141 .
+
+wds:Q126392514-3a7b37a6-47f4-1555-3d28-251c3e9b06fe ps:P921 wd:Q9141 .
+
+wds:Q126392514-bb0e65c5-495f-febf-2049-b746124edbac pq:P180 wd:Q9141 .
+
+wds:Q1282259-8253e802-47d6-246a-200a-4f70810f88fb ps:P138 wd:Q9141 .
+
+wds:Q2084992-DC5AD81F-FB51-4C5C-93B3-0E18E66C45C4 ps:P8546 wd:Q9141 .
+
+wds:Q83496197-6C9C4127-261E-4C19-A35C-54EBCF85B6D7 ps:P180 wd:Q9141 .
+
+wds:Q83497656-0f4dcbb4-4e3d-7552-d95e-02415a5ae85e ps:P180 wd:Q9141 .
+
+wds:Q83672-70AE2415-96F3-4115-BF1B-6BC2FCC896F7 ps:P119 wd:Q9141 .
+
+wds:Q83687566-6e59288b-40b8-bfcc-2c2e-13f3949827b4 ps:P180 wd:Q9141 .
+
+<https://af.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://als.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://am.wikipedia.org/wiki/%E1%89%B3%E1%8C%85_%E1%88%9B%E1%88%83%E1%88%8D> schema:about wd:Q9141 .
+
+<https://an.wikipedia.org/wiki/Tach_Mahal> schema:about wd:Q9141 .
+
+<https://anp.wikipedia.org/wiki/%E0%A4%A4%E0%A4%BE%E0%A4%9C_%E0%A4%AE%E0%A4%B9%E0%A4%B2> schema:about wd:Q9141 .
+
+<https://ar.wikipedia.org/wiki/%D8%AA%D8%A7%D8%AC_%D9%85%D8%AD%D9%84> schema:about wd:Q9141 .
+
+<https://arz.wikipedia.org/wiki/%D8%AA%D8%A7%D8%AC_%D9%85%D8%AD%D9%84> schema:about wd:Q9141 .
+
+<https://as.wikipedia.org/wiki/%E0%A6%A4%E0%A6%BE%E0%A6%9C%E0%A6%AE%E0%A6%B9%E0%A6%B2> schema:about wd:Q9141 .
+
+<https://ast.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://az.wikipedia.org/wiki/Tac_Mahal> schema:about wd:Q9141 .
+
+<https://azb.wikipedia.org/wiki/%D8%AA%D8%A7%D8%AC_%D9%85%D8%AD%D9%84> schema:about wd:Q9141 .
+
+<https://ba.wikipedia.org/wiki/%D0%A2%D0%B0%D0%B6_%D0%9C%D0%B0%D1%85%D0%B0%D0%BB> schema:about wd:Q9141 .
+
+<https://ban.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://bat-smg.wikipedia.org/wiki/Tad%C5%BEmahals> schema:about wd:Q9141 .
+
+<https://bcl.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://be-tarask.wikipedia.org/wiki/%D0%A2%D0%B0%D0%B4%D0%B6_%D0%9C%D0%B0%D0%B3%D0%B0%D0%BB> schema:about wd:Q9141 .
+
+<https://be.wikipedia.org/wiki/%D0%A2%D0%B0%D0%B4%D0%B6-%D0%9C%D0%B0%D1%85%D0%B0%D0%BB> schema:about wd:Q9141 .
+
+<https://bg.wikipedia.org/wiki/%D0%A2%D0%B0%D0%B4%D0%B6_%D0%9C%D0%B0%D1%85%D0%B0%D0%BB> schema:about wd:Q9141 .
+
+<https://bh.wikipedia.org/wiki/%E0%A4%A4%E0%A4%BE%E0%A4%9C%E0%A4%AE%E0%A4%B9%E0%A4%B2> schema:about wd:Q9141 .
+
+<https://bn.wikipedia.org/wiki/%E0%A6%A4%E0%A6%BE%E0%A6%9C%E0%A6%AE%E0%A6%B9%E0%A6%B2> schema:about wd:Q9141 .
+
+<https://bn.wikiquote.org/wiki/%E0%A6%A4%E0%A6%BE%E0%A6%9C%E0%A6%AE%E0%A6%B9%E0%A6%B2> schema:about wd:Q9141 .
+
+<https://bn.wikivoyage.org/wiki/%E0%A6%A4%E0%A6%BE%E0%A6%9C%E0%A6%AE%E0%A6%B9%E0%A6%B2> schema:about wd:Q9141 .
+
+<https://bo.wikipedia.org/wiki/%E0%BD%90%E0%BD%BA%E0%BC%8B%E0%BD%87%E0%BD%B2%E0%BC%8B%E0%BD%96%E0%BD%84%E0%BC%8B%E0%BD%A6%E0%BD%BC%E0%BC%8D> schema:about wd:Q9141 .
+
+<https://bpy.wikipedia.org/wiki/%E0%A6%A4%E0%A6%BE%E0%A6%9C_%E0%A6%AE%E0%A6%B9%E0%A6%B2> schema:about wd:Q9141 .
+
+<https://br.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://bs.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://bxr.wikipedia.org/wiki/%D0%A2%D0%B0%D0%B4%D0%B6-%D0%9C%D0%B0%D1%85%D0%B0%D0%BB> schema:about wd:Q9141 .
+
+<https://ca.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://ce.wikipedia.org/wiki/%D0%A2%D0%B0%D0%B4%D0%B6-%D0%9C%D0%B0%D1%85%D0%B0%D0%BB> schema:about wd:Q9141 .
+
+<https://ckb.wikipedia.org/wiki/%D8%AA%D8%A7%D8%AC_%D9%85%DB%95%D8%AD%DB%95%D9%84> schema:about wd:Q9141 .
+
+<https://co.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://commons.wikimedia.org/wiki/Taj_Mahal_-_%E0%A4%A4%E0%A4%BE%E0%A4%9C%E0%A4%AE%E0%A4%B9%E0%A4%B2> schema:about wd:Q9141 .
+
+<https://crh.wikipedia.org/wiki/Tac_Mahal> schema:about wd:Q9141 .
+
+<https://cs.wikipedia.org/wiki/T%C3%A1d%C5%BE_Mahal> schema:about wd:Q9141 .
+
+<https://cy.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://da.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://de.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://diq.wikipedia.org/wiki/Tac_Mehel> schema:about wd:Q9141 .
+
+<https://dv.wikipedia.org/wiki/%DE%8C%DE%A7%DE%96%DE%B0_%DE%89%DE%A6%DE%99%DE%A6%DE%8D%DE%B0> schema:about wd:Q9141 .
+
+<https://el.wikipedia.org/wiki/%CE%A4%CE%B1%CF%84%CE%B6_%CE%9C%CE%B1%CF%87%CE%AC%CE%BB> schema:about wd:Q9141 .
+
+<https://en.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://en.wikiquote.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://en.wikivoyage.org/wiki/Taj_mahal> schema:about wd:Q9141 .
+
+<https://eo.wikipedia.org/wiki/Ta%C4%9D-Mahalo> schema:about wd:Q9141 .
+
+<https://es.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://et.wikipedia.org/wiki/T%C4%81j_Mahal> schema:about wd:Q9141 .
+
+<https://eu.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://fa.wikipedia.org/wiki/%D8%AA%D8%A7%D8%AC_%D9%85%D8%AD%D9%84> schema:about wd:Q9141 .
+
+<https://fa.wikivoyage.org/wiki/%D8%AA%D8%A7%D8%AC_%D9%85%D8%AD%D9%84> schema:about wd:Q9141 .
+
+<https://fi.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://fiu-vro.wikipedia.org/wiki/Tad%C5%BE_Mahal> schema:about wd:Q9141 .
+
+<https://fr.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://fy.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://ga.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://gcr.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://gl.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://glk.wikipedia.org/wiki/%D8%AA%D8%A7%D8%AC_%D9%85%D8%AD%D9%84> schema:about wd:Q9141 .
+
+<https://gn.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://gom.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://gpe.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://gu.wikipedia.org/wiki/%E0%AA%A4%E0%AA%BE%E0%AA%9C_%E0%AA%AE%E0%AA%B9%E0%AB%87%E0%AA%B2> schema:about wd:Q9141 .
+
+<https://ha.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://he.wikipedia.org/wiki/%D7%98%D7%90%D7%92%27_%D7%9E%D7%94%D7%90%D7%9C> schema:about wd:Q9141 .
+
+<https://hi.wikipedia.org/wiki/%E0%A4%A4%E0%A4%BE%E0%A4%9C%E0%A4%AE%E0%A4%B9%E0%A4%B2> schema:about wd:Q9141 .
+
+<https://hif.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+<https://hr.wikipedia.org/wiki/Taj_Mahal> schema:about wd:Q9141 .
+
+wds:Q51269980-2837d92e-417c-9485-94a5-dd5c401f648c ps:P138 wd:Q9141 .
+
+wds:Q51540857-81aa7697-4d89-e50a-4b06-2db360c75484 ps:P921 wd:Q9141 .
+
+wds:Q28840324-fbdd8c33-41a6-286a-092e-a198a6f118b0 ps:P180 wd:Q9141 .
+
+wds:Q118313017-2636ab6a-4398-8895-e55e-843ae6023e0a ps:P180 wd:Q9141 .
+
+wds:Q107412021-A528602C-7783-4C7D-ABEC-DC64A1F8E01A ps:P915 wd:Q9141 .
+
+wds:Q17334578-2f032f01-4960-fe8e-3f52-5e0db60a9ade ps:P180 wd:Q9141 .
+
+wds:Q54800642-30B9B54F-7EEC-406E-A43D-81AA51FBEB49 ps:P840 wd:Q9141 .
+
+wds:Q231693-319f880c-4b14-9a4f-be1e-663be6a6ae1c ps:P119 wd:Q9141 .
