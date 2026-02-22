@@ -29,6 +29,11 @@ libc = "0.2"
 
 [dev-dependencies]
 hdt = "0.4"
+libtest-mimic = "0.8"
+
+[[test]]
+name = "roundtrip_test"
+harness = false
 
 [profile.release]
 lto = true
