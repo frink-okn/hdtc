@@ -1198,16 +1198,19 @@ fn parse_rdf_to_triples(path: &Path, format: oxrdfio::RdfFormat) -> Result<Vec<[
     Ok(triples)
 }
 
-/// Assign canonical blank node labels (`_:b0`, `_:b1`, …) to a triple set so
-/// that two isomorphic graphs produce identical sorted triple lists.
+/// Deterministically relabel blank nodes in a triple set to `_:b0`, `_:b1`, …
+/// to make many practically equivalent graphs easier to compare in tests.
 ///
 /// Algorithm: sort the triples, then walk them in order and assign a fresh
-/// sequential label the first time each blank node ID is seen.  Re-sort after
-/// relabelling so the canonical order is stable.
+/// sequential label the first time each blank node ID is seen. Re-sort after
+/// relabelling so the order is stable for a given input.
 ///
-/// This handles the common case where hdtc and hdt-java preserve the original
-/// blank node labels through the round-trip, but also accommodates output that
-/// uses different label strings for the same blank nodes.
+/// This is a *heuristic* normalisation that assumes hdtc and hdt-java mostly
+/// preserve blank node structure and often even labels. It tolerates differing
+/// label *strings* for the same blank nodes but is still dependent on their
+/// original IDs and sort order, and it is **not** a full graph-isomorphism or
+/// RDF canonicalisation algorithm. Two isomorphic graphs can still canonicalise
+/// differently in corner cases.
 fn canonicalize_bnodes(triples: Vec<[String; 3]>) -> Vec<[String; 3]> {
     let mut triples = triples;
     triples.sort();
