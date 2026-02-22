@@ -1074,7 +1074,7 @@ fn test_many_small_batches_backpressure() {
             "-o", hdt_path.to_str().unwrap(),
             "--base-uri", "http://example.org/dataset",
             "--temp-dir", work_dir.to_str().unwrap(),
-            "--memory-limit", "10",  // Small limit (10 MB) forces multiple batches
+            "--memory-limit", "10M",  // Small limit (10 MB) forces multiple batches
         ])
         .output()
         .expect("Failed to execute hdtc");
