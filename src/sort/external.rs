@@ -9,6 +9,14 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use zstd::{Decoder, Encoder};
 
+use super::parallel_merge::{
+    build_merge_tree, DedupIterator, MergeSource, MergeTreeConfig, MergeTreeIterator,
+};
+
+/// Threshold: use parallel merge tree when chunk count exceeds this.
+/// Below this, the single-threaded BinaryHeap merge is faster (no thread overhead).
+const PARALLEL_MERGE_THRESHOLD: usize = 16;
+
 /// Trait for items that can be externally sorted.
 /// Items must be serializable to/from bytes for disk storage.
 pub trait Sortable: Ord + Sized + Send + Clone {
@@ -47,7 +55,7 @@ impl ExternalSorter {
     /// Sort items from an iterator, writing sorted chunks to disk as needed.
     /// Returns a merge iterator over all chunks in sorted order.
     #[cfg(test)]
-    pub fn sort<T: Sortable>(
+    pub fn sort<T: Sortable + PartialEq + 'static>(
         &mut self,
         items: impl Iterator<Item = T>,
     ) -> Result<MergeIterator<T>> {
@@ -90,7 +98,7 @@ impl ExternalSorter {
     }
 
     /// Flush remaining buffer and create the merge iterator.
-    pub fn finish<T: Sortable>(&mut self, buffer: &mut Vec<T>) -> Result<MergeIterator<T>> {
+    pub fn finish<T: Sortable + PartialEq + 'static>(&mut self, buffer: &mut Vec<T>) -> Result<MergeIterator<T>> {
         if !buffer.is_empty() {
             self.flush_chunk(buffer)?;
         }
@@ -122,15 +130,38 @@ impl ExternalSorter {
     }
 
     /// Create a k-way merge iterator over all sorted chunks.
-    fn merge<T: Sortable>(&self) -> Result<MergeIterator<T>> {
-        let mut readers = Vec::with_capacity(self.chunk_files.len());
-        for path in &self.chunk_files {
-            let file = File::open(path)
-                .with_context(|| format!("Failed to open chunk file {}", path.display()))?;
-            let decoder = Decoder::new(file)?;
-            readers.push(decoder);
+    ///
+    /// For small chunk counts (≤16), uses a single-threaded BinaryHeap merge.
+    /// For larger counts, uses a parallel binary merge tree with bounded fan-in
+    /// to avoid exhausting file descriptors and to pipeline zstd decompression.
+    fn merge<T: Sortable + PartialEq + 'static>(&self) -> Result<MergeIterator<T>> {
+        if self.chunk_files.len() <= PARALLEL_MERGE_THRESHOLD {
+            // Fast path: single-threaded heap merge (no thread overhead)
+            let mut readers = Vec::with_capacity(self.chunk_files.len());
+            for path in &self.chunk_files {
+                let file = File::open(path)
+                    .with_context(|| format!("Failed to open chunk file {}", path.display()))?;
+                let decoder = Decoder::new(file)?;
+                readers.push(decoder);
+            }
+            MergeIterator::from_heap(readers)
+        } else {
+            // Parallel path: binary merge tree with bounded fan-in
+            tracing::info!(
+                "Using parallel merge tree for {} sort chunks",
+                self.chunk_files.len()
+            );
+            let sources: Vec<MergeSource<T>> = self
+                .chunk_files
+                .iter()
+                .map(|p| MergeSource::File(p.clone()))
+                .collect();
+            let channel_capacity = calculate_merge_channel_capacity(self.memory_budget);
+            let config = MergeTreeConfig::new(&self.temp_dir)
+                .with_channel_capacity(channel_capacity);
+            let handle = build_merge_tree(sources, &config)?;
+            MergeIterator::from_tree(handle)
         }
-        MergeIterator::new(readers)
     }
 
     /// Number of chunk files currently produced.
@@ -154,11 +185,57 @@ impl Drop for ExternalSorter {
     }
 }
 
+/// Calculate bounded channel capacity for the parallel merge tree.
+///
+/// Uses ~5% of the sort memory budget for channel buffers, clamped to
+/// reasonable bounds. This mirrors the vocab merger's approach.
+fn calculate_merge_channel_capacity(memory_budget: usize) -> usize {
+    const MIB: usize = 1024 * 1024;
+    // IdTriple is ~24 bytes; estimate ~32 bytes per item with overhead.
+    let estimated_entry_bytes = 32usize;
+    let queue_budget = (memory_budget / 20).clamp(2 * MIB, 64 * MIB);
+    (queue_budget / estimated_entry_bytes).clamp(64, 4096)
+}
+
 /// K-way merge iterator over sorted chunk files with deduplication.
-pub struct MergeIterator<T: Sortable> {
+///
+/// Supports two backends:
+/// - **Heap**: Single-threaded BinaryHeap merge (used for small chunk counts, ≤16)
+/// - **Tree**: Parallel binary merge tree with bounded fan-in (used for larger counts)
+pub enum MergeIterator<T: Sortable + 'static> {
+    Heap(HeapMergeIterator<T>),
+    Tree(DedupIterator<MergeTreeIterator<T>, T>),
+}
+
+impl<T: Sortable + PartialEq + 'static> MergeIterator<T> {
+    /// Create from a set of zstd decoders (single-threaded heap merge).
+    fn from_heap(readers: Vec<Decoder<'static, BufReader<File>>>) -> Result<Self> {
+        Ok(MergeIterator::Heap(HeapMergeIterator::new(readers)?))
+    }
+
+    /// Create from a parallel merge tree handle (with deduplication).
+    fn from_tree(handle: super::parallel_merge::MergeTreeHandle<T>) -> Result<Self> {
+        let tree_iter = MergeTreeIterator::new(handle);
+        Ok(MergeIterator::Tree(DedupIterator::new(tree_iter)))
+    }
+}
+
+impl<T: Sortable + PartialEq + 'static> Iterator for MergeIterator<T> {
+    type Item = Result<T>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            MergeIterator::Heap(heap) => heap.next(),
+            MergeIterator::Tree(tree) => tree.next(),
+        }
+    }
+}
+
+/// Single-threaded BinaryHeap k-way merge with deduplication.
+pub struct HeapMergeIterator<T: Sortable> {
     heap: BinaryHeap<HeapEntry<T>>,
     readers: Vec<Option<Decoder<'static, BufReader<File>>>>,
-    last_item: Option<T>, // Track last emitted item for deduplication
+    last_item: Option<T>,
 }
 
 /// Entry in the merge heap. Wraps an item with its source chunk index.
@@ -189,10 +266,11 @@ impl<T: Sortable> Ord for HeapEntry<T> {
     }
 }
 
-impl<T: Sortable> MergeIterator<T> {
+impl<T: Sortable> HeapMergeIterator<T> {
     fn new(mut readers: Vec<Decoder<'static, BufReader<File>>>) -> Result<Self> {
         let mut heap = BinaryHeap::with_capacity(readers.len());
-        let mut opt_readers: Vec<Option<Decoder<'static, BufReader<File>>>> = Vec::with_capacity(readers.len());
+        let mut opt_readers: Vec<Option<Decoder<'static, BufReader<File>>>> =
+            Vec::with_capacity(readers.len());
 
         for (i, mut reader) in readers.drain(..).enumerate() {
             match T::read_from(&mut reader) {
@@ -215,7 +293,7 @@ impl<T: Sortable> MergeIterator<T> {
     }
 }
 
-impl<T: Sortable> Iterator for MergeIterator<T> {
+impl<T: Sortable> Iterator for HeapMergeIterator<T> {
     type Item = Result<T>;
 
     fn next(&mut self) -> Option<Self::Item> {

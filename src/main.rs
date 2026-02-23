@@ -13,7 +13,35 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
+/// Raise the soft file descriptor limit toward the hard limit.
+///
+/// This is a best-effort safety net for stages that open many files
+/// simultaneously (vocab merger k-way merge, external sort merge).
+/// The parallel merge tree also bounds fan-in, but raising the limit
+/// provides additional headroom.
+fn raise_fd_limit() {
+    #[cfg(unix)]
+    unsafe {
+        let mut rlim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) == 0 {
+            let target = rlim.rlim_max.min(65536);
+            if rlim.rlim_cur < target {
+                let old = rlim.rlim_cur;
+                rlim.rlim_cur = target;
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &rlim) == 0 {
+                    eprintln!("Raised file descriptor limit: {} → {}", old, target);
+                }
+            }
+        }
+    }
+}
+
 fn main() -> Result<()> {
+    raise_fd_limit();
+
     let cli = cli::Cli::parse();
     let benchmark = cli.benchmark;
 
