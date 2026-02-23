@@ -3,14 +3,16 @@
 use crate::dictionary::pfc::PfcEncoder;
 use crate::dictionary::DictCounts;
 use crate::pipeline::PartialVocabReader;
+use crate::sort::parallel_merge::{
+    build_merge_tree, Mergeable, MergeSource, MergeTreeConfig, MergeTreeHandle,
+};
 use anyhow::{Context, Result};
-use crossbeam_channel::{bounded, Receiver};
 use rayon::prelude::*;
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use super::batch_vocab::Roles;
@@ -122,8 +124,73 @@ struct StreamEntry {
     source_batch: usize,
 }
 
-type StreamRx = Receiver<Result<StreamEntry>>;
-type WorkerHandles = Vec<JoinHandle<()>>;
+impl Mergeable for StreamEntry {
+    fn merge_cmp(&self, other: &Self) -> Ordering {
+        self.term.cmp(&other.term)
+    }
+
+    fn write_to<W: Write>(&self, writer: &mut W) -> Result<()> {
+        // term_len (u32) + term + roles (u8) + conditional IDs + source_batch (u32)
+        writer.write_all(&(self.term.len() as u32).to_le_bytes())?;
+        writer.write_all(&self.term)?;
+        writer.write_all(&[self.roles.bits()])?;
+        if self.roles.intersects(Roles::SUBJECT | Roles::OBJECT) {
+            let so_id = self.so_local_id.expect("SO local ID must be present");
+            writer.write_all(&so_id.to_le_bytes())?;
+        }
+        if self.roles.contains(Roles::PREDICATE) {
+            let p_id = self.p_local_id.expect("P local ID must be present");
+            writer.write_all(&p_id.to_le_bytes())?;
+        }
+        writer.write_all(&(self.source_batch as u32).to_le_bytes())?;
+        Ok(())
+    }
+
+    fn read_from<R: Read>(reader: &mut R) -> Result<Option<Self>> {
+        let mut len_buf = [0u8; 4];
+        match reader.read_exact(&mut len_buf) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => return Err(e.into()),
+        }
+        let term_len = u32::from_le_bytes(len_buf) as usize;
+
+        let mut term = vec![0u8; term_len];
+        reader.read_exact(&mut term)?;
+
+        let mut roles_buf = [0u8; 1];
+        reader.read_exact(&mut roles_buf)?;
+        let roles = Roles::from_bits_truncate(roles_buf[0]);
+
+        let so_local_id = if roles.intersects(Roles::SUBJECT | Roles::OBJECT) {
+            let mut buf = [0u8; 4];
+            reader.read_exact(&mut buf)?;
+            Some(u32::from_le_bytes(buf))
+        } else {
+            None
+        };
+
+        let p_local_id = if roles.contains(Roles::PREDICATE) {
+            let mut buf = [0u8; 4];
+            reader.read_exact(&mut buf)?;
+            Some(u32::from_le_bytes(buf))
+        } else {
+            None
+        };
+
+        let mut batch_buf = [0u8; 4];
+        reader.read_exact(&mut batch_buf)?;
+        let source_batch = u32::from_le_bytes(batch_buf) as usize;
+
+        Ok(Some(StreamEntry {
+            term,
+            roles,
+            so_local_id,
+            p_local_id,
+            source_batch,
+        }))
+    }
+}
 
 const PROVISIONAL_SO_ID_TAG: u64 = 1 << 63;
 const PROVISIONAL_SO_ID_MASK: u64 = !PROVISIONAL_SO_ID_TAG;
@@ -229,8 +296,8 @@ pub fn merge_vocabularies(
         stream_channel_capacity,
         memory_budget / 1024 / 1024
     );
-    let (stream_rx, worker_handles) =
-        build_parallel_vocab_stream(&batch_infos, stream_channel_capacity)?;
+    let merge_handle = build_vocab_merge_tree(&batch_infos, stream_channel_capacity, temp_dir)?;
+    let stream_rx = &merge_handle.rx;
     stream_reader_init_time += stream_init_start.elapsed();
 
     let stream_result = (|| -> Result<()> {
@@ -309,7 +376,7 @@ pub fn merge_vocabularies(
         Ok(())
     })();
 
-    join_worker_handles(worker_handles)?;
+    merge_handle.join()?;
     stream_result?;
 
     let so_finalize_start = Instant::now();
@@ -395,157 +462,44 @@ fn calculate_stage4_stream_channel_capacity(stage4_budget: usize) -> usize {
     (queue_budget / estimated_entry_bytes).clamp(64, 4096)
 }
 
-fn read_stream_entry(rx: &Receiver<Result<StreamEntry>>) -> Result<Option<StreamEntry>> {
-    match rx.recv() {
-        Ok(Ok(entry)) => Ok(Some(entry)),
-        Ok(Err(e)) => Err(e),
-        Err(_) => Ok(None),
-    }
-}
-
-fn build_parallel_vocab_stream(
+/// Build a parallel merge tree over partial vocabulary files.
+///
+/// Each leaf thread opens a `PartialVocabReader` and maps entries to
+/// `StreamEntry` with the correct `source_batch`. When the number of
+/// batches exceeds the merge tree's max fan-in, multi-round merging
+/// with intermediate temp files is used automatically.
+fn build_vocab_merge_tree(
     batch_infos: &[(usize, PathBuf)],
     channel_capacity: usize,
-) -> Result<(StreamRx, WorkerHandles)> {
-    let mut handles: WorkerHandles = Vec::new();
-    let mut layer: Vec<StreamRx> = Vec::new();
+    temp_dir: &Path,
+) -> Result<MergeTreeHandle<StreamEntry>> {
+    let sources: Vec<MergeSource<StreamEntry>> = batch_infos
+        .iter()
+        .map(|(batch_id, vocab_path)| {
+            let batch_id = *batch_id;
+            let vocab_path = vocab_path.clone();
+            MergeSource::Factory(Box::new(move || {
+                let reader = PartialVocabReader::open(&vocab_path).with_context(|| {
+                    format!("Failed to open partial vocab for batch {}", batch_id)
+                })?;
+                Ok(Box::new(reader.map(move |entry_result| {
+                    entry_result.map(|entry| StreamEntry {
+                        term: entry.term,
+                        roles: entry.roles,
+                        so_local_id: entry.so_local_id,
+                        p_local_id: entry.p_local_id,
+                        source_batch: batch_id,
+                    })
+                }))
+                    as Box<dyn Iterator<Item = Result<StreamEntry>> + Send>)
+            }))
+        })
+        .collect();
 
-    for (batch_id, vocab_path) in batch_infos {
-        let (tx, rx) = bounded(channel_capacity);
-        let batch_id = *batch_id;
-        let vocab_path = vocab_path.clone();
+    let config = MergeTreeConfig::new(temp_dir)
+        .with_channel_capacity(channel_capacity);
 
-        let handle = std::thread::spawn(move || {
-            let mut reader = match PartialVocabReader::open(&vocab_path)
-                .with_context(|| format!("Failed to re-open partial vocab for batch {}", batch_id))
-            {
-                Ok(reader) => reader,
-                Err(e) => {
-                    let _ = tx.send(Err(e));
-                    return;
-                }
-            };
-
-            loop {
-                match reader.read_entry() {
-                    Ok(Some(entry)) => {
-                        let send_result = tx.send(Ok(StreamEntry {
-                            term: entry.term,
-                            roles: entry.roles,
-                            so_local_id: entry.so_local_id,
-                            p_local_id: entry.p_local_id,
-                            source_batch: batch_id,
-                        }));
-                        if send_result.is_err() {
-                            return;
-                        }
-                    }
-                    Ok(None) => return,
-                    Err(e) => {
-                        let _ = tx.send(Err(e));
-                        return;
-                    }
-                }
-            }
-        });
-
-        handles.push(handle);
-        layer.push(rx);
-    }
-
-    if layer.is_empty() {
-        let (_tx, rx) = bounded(1);
-        return Ok((rx, handles));
-    }
-
-    while layer.len() > 1 {
-        let mut next_layer: Vec<StreamRx> = Vec::new();
-        let i = 0;
-
-        while i < layer.len() {
-            if i + 1 >= layer.len() {
-                next_layer.push(layer.remove(i));
-                continue;
-            }
-
-            let left = layer.remove(i);
-            let right = layer.remove(i);
-            let (tx, rx) = bounded(channel_capacity);
-
-            let handle = std::thread::spawn(move || {
-                let mut left_next = match read_stream_entry(&left) {
-                    Ok(entry) => entry,
-                    Err(e) => {
-                        let _ = tx.send(Err(e));
-                        return;
-                    }
-                };
-                let mut right_next = match read_stream_entry(&right) {
-                    Ok(entry) => entry,
-                    Err(e) => {
-                        let _ = tx.send(Err(e));
-                        return;
-                    }
-                };
-
-                while left_next.is_some() || right_next.is_some() {
-                    let send_item = match (&left_next, &right_next) {
-                        (Some(left_entry), Some(right_entry)) => {
-                            if left_entry.term <= right_entry.term {
-                                left_next.take()
-                            } else {
-                                right_next.take()
-                            }
-                        }
-                        (Some(_), None) => left_next.take(),
-                        (None, Some(_)) => right_next.take(),
-                        (None, None) => None,
-                    };
-
-                    if let Some(item) = send_item
-                        && tx.send(Ok(item)).is_err()
-                    {
-                        return;
-                    }
-
-                    if left_next.is_none() {
-                        left_next = match read_stream_entry(&left) {
-                            Ok(entry) => entry,
-                            Err(e) => {
-                                let _ = tx.send(Err(e));
-                                return;
-                            }
-                        };
-                    }
-                    if right_next.is_none() {
-                        right_next = match read_stream_entry(&right) {
-                            Ok(entry) => entry,
-                            Err(e) => {
-                                let _ = tx.send(Err(e));
-                                return;
-                            }
-                        };
-                    }
-                }
-            });
-
-            handles.push(handle);
-            next_layer.push(rx);
-        }
-
-        layer = next_layer;
-    }
-
-    Ok((layer.pop().expect("non-empty stream layer"), handles))
-}
-
-fn join_worker_handles(handles: Vec<JoinHandle<()>>) -> Result<()> {
-    for handle in handles {
-        if handle.join().is_err() {
-            anyhow::bail!("Stage 4 worker thread panicked during parallel merge");
-        }
-    }
-    Ok(())
+    build_merge_tree(sources, &config)
 }
 
 /// Assign global IDs and record mappings for a single term.
@@ -943,17 +897,17 @@ mod tests {
         )?;
 
         let batch_infos = vec![(0usize, batch0_path), (1usize, batch1_path)];
-        let (rx, handles) = build_parallel_vocab_stream(&batch_infos, 1)?;
+        let handle = build_vocab_merge_tree(&batch_infos, 1, temp_path)?;
 
         let mut observed_terms: Vec<String> = Vec::new();
         let mut observed_batches: Vec<usize> = Vec::new();
-        while let Ok(item) = rx.recv() {
+        while let Ok(item) = handle.rx.recv() {
             let entry = item?;
             observed_terms.push(String::from_utf8(entry.term).expect("test terms should be valid UTF-8"));
             observed_batches.push(entry.source_batch);
         }
 
-        join_worker_handles(handles)?;
+        handle.join()?;
 
         assert_eq!(observed_terms, vec!["a", "b", "c", "d"]);
         assert_eq!(observed_batches, vec![0, 1, 0, 1]);
@@ -967,28 +921,16 @@ mod tests {
         let missing_path = temp_dir.path().join("does_not_exist.vocab.zst");
         let batch_infos = vec![(42usize, missing_path)];
 
-        let (rx, handles) = build_parallel_vocab_stream(&batch_infos, 2)?;
+        let handle = build_vocab_merge_tree(&batch_infos, 2, temp_dir.path())?;
 
-        let first = rx.recv().expect("expected an error item from missing-file source");
+        let first = handle.rx.recv().expect("expected an error item from missing-file source");
         let err = first.expect_err("expected error result for missing partial vocab file");
         assert!(
-            err.to_string().contains("Failed to re-open partial vocab for batch 42"),
+            err.to_string().contains("Failed to open partial vocab for batch 42"),
             "unexpected error: {err}"
         );
 
-        join_worker_handles(handles)?;
+        handle.join()?;
         Ok(())
-    }
-
-    #[test]
-    fn test_join_worker_handles_reports_panic() {
-        let panicking_handle = std::thread::spawn(|| {
-            panic!("intentional panic for test");
-        });
-
-        let result = join_worker_handles(vec![panicking_handle]);
-        assert!(result.is_err());
-        let message = result.expect_err("expected panic error").to_string();
-        assert!(message.contains("panicked"), "unexpected panic message: {message}");
     }
 }
