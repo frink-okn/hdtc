@@ -8,7 +8,7 @@
 //! Used by both the vocabulary merger (Stage 4) and the external sort (Stage 6).
 
 use anyhow::{Context, Result};
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender, bounded};
 use std::cmp::Ordering;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -133,16 +133,20 @@ pub struct MergeTreeHandle<T: Mergeable> {
     temp_files: Vec<PathBuf>,
 }
 
+fn join_worker_handles(handles: &mut Vec<JoinHandle<()>>) -> Result<()> {
+    for handle in handles.drain(..) {
+        if handle.join().is_err() {
+            anyhow::bail!("Merge tree worker thread panicked");
+        }
+    }
+    Ok(())
+}
+
 impl<T: Mergeable> MergeTreeHandle<T> {
     /// Wait for all worker threads to complete. Returns an error if any
     /// worker thread panicked.
     pub fn join(mut self) -> Result<()> {
-        for handle in self.handles.drain(..) {
-            if handle.join().is_err() {
-                anyhow::bail!("Merge tree worker thread panicked");
-            }
-        }
-        Ok(())
+        join_worker_handles(&mut self.handles)
     }
 }
 
@@ -396,7 +400,9 @@ fn build_binary_tree<T: Mergeable>(
         layer = next_layer;
     }
 
-    layer.pop().expect("non-empty layer after tree construction")
+    layer
+        .pop()
+        .expect("non-empty layer after tree construction")
 }
 
 /// Perform a 2-way merge of two sorted input channels into a single output.
@@ -476,8 +482,12 @@ fn recv_item<T>(rx: &Receiver<Result<T>>) -> Result<Option<T>> {
 
 /// Drain a merge tree's output into a zstd-compressed intermediate file.
 fn write_merged_to_file<T: Mergeable>(rx: &Receiver<Result<T>>, path: &Path) -> Result<()> {
-    let file = std::fs::File::create(path)
-        .with_context(|| format!("Failed to create intermediate merge file: {}", path.display()))?;
+    let file = std::fs::File::create(path).with_context(|| {
+        format!(
+            "Failed to create intermediate merge file: {}",
+            path.display()
+        )
+    })?;
     let buf_writer = BufWriter::with_capacity(256 * 1024, file);
     let mut encoder = zstd::Encoder::new(buf_writer, 1)?; // level 1 for speed
 
@@ -511,12 +521,14 @@ fn write_merged_to_file<T: Mergeable>(rx: &Receiver<Result<T>>, path: &Path) -> 
 /// On drop, joins all worker threads and cleans up temp files.
 pub struct MergeTreeIterator<T: Mergeable> {
     handle: Option<MergeTreeHandle<T>>,
+    terminal_error: Option<anyhow::Error>,
 }
 
 impl<T: Mergeable> MergeTreeIterator<T> {
     pub fn new(handle: MergeTreeHandle<T>) -> Self {
         Self {
             handle: Some(handle),
+            terminal_error: None,
         }
     }
 }
@@ -525,8 +537,28 @@ impl<T: Mergeable> Iterator for MergeTreeIterator<T> {
     type Item = Result<T>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let handle = self.handle.as_ref()?;
-        handle.rx.recv().ok() // None when channel closed
+        if let Some(err) = self.terminal_error.take() {
+            return Some(Err(err));
+        }
+
+        let recv_result = {
+            let handle = self.handle.as_ref()?;
+            handle.rx.recv()
+        };
+
+        match recv_result {
+            Ok(item) => Some(item),
+            Err(_) => {
+                if let Some(mut handle) = self.handle.take() {
+                    if let Err(e) = join_worker_handles(&mut handle.handles) {
+                        drop(handle);
+                        return Some(Err(e));
+                    }
+                    drop(handle);
+                }
+                None
+            }
+        }
     }
 }
 
@@ -633,8 +665,7 @@ mod tests {
         let temp_dir = TempDir::new()?;
         let config = MergeTreeConfig::new(temp_dir.path());
         let handle = build_merge_tree::<TestItem>(vec![], &config)?;
-        let items: Vec<TestItem> = MergeTreeIterator::new(handle)
-            .collect::<Result<Vec<_>>>()?;
+        let items: Vec<TestItem> = MergeTreeIterator::new(handle).collect::<Result<Vec<_>>>()?;
         assert!(items.is_empty());
         Ok(())
     }
@@ -645,8 +676,7 @@ mod tests {
         let config = MergeTreeConfig::new(temp_dir.path());
         let sources = vec![factory_source(vec![1, 3, 5])];
         let handle = build_merge_tree(sources, &config)?;
-        let items: Vec<TestItem> = MergeTreeIterator::new(handle)
-            .collect::<Result<Vec<_>>>()?;
+        let items: Vec<TestItem> = MergeTreeIterator::new(handle).collect::<Result<Vec<_>>>()?;
         assert_eq!(items, vec![TestItem(1), TestItem(3), TestItem(5)]);
         Ok(())
     }
@@ -660,8 +690,7 @@ mod tests {
             factory_source(vec![2, 4, 6, 8]),
         ];
         let handle = build_merge_tree(sources, &config)?;
-        let items: Vec<TestItem> = MergeTreeIterator::new(handle)
-            .collect::<Result<Vec<_>>>()?;
+        let items: Vec<TestItem> = MergeTreeIterator::new(handle).collect::<Result<Vec<_>>>()?;
         let expected: Vec<TestItem> = (1..=8).map(TestItem).collect();
         assert_eq!(items, expected);
         Ok(())
@@ -670,16 +699,16 @@ mod tests {
     #[test]
     fn test_many_sources() -> Result<()> {
         let temp_dir = TempDir::new()?;
-        let config = MergeTreeConfig::new(temp_dir.path())
-            .with_channel_capacity(2); // Small capacity for backpressure testing
+        let config = MergeTreeConfig::new(temp_dir.path()).with_channel_capacity(2); // Small capacity for backpressure testing
         let sources: Vec<MergeSource<TestItem>> = (0..10)
             .map(|i| factory_source(vec![i * 3, i * 3 + 1, i * 3 + 2]))
             .collect();
         let handle = build_merge_tree(sources, &config)?;
-        let items: Vec<TestItem> = MergeTreeIterator::new(handle)
-            .collect::<Result<Vec<_>>>()?;
+        let items: Vec<TestItem> = MergeTreeIterator::new(handle).collect::<Result<Vec<_>>>()?;
         // Should contain 0..30 in sorted order (with duplicates since ranges overlap)
-        let mut expected: Vec<u64> = (0..10).flat_map(|i| vec![i * 3, i * 3 + 1, i * 3 + 2]).collect();
+        let mut expected: Vec<u64> = (0..10)
+            .flat_map(|i| vec![i * 3, i * 3 + 1, i * 3 + 2])
+            .collect();
         expected.sort();
         let expected: Vec<TestItem> = expected.into_iter().map(TestItem).collect();
         assert_eq!(items, expected);
@@ -699,8 +728,7 @@ mod tests {
             .map(|i| factory_source(vec![i * 2, i * 2 + 1]))
             .collect();
         let handle = build_merge_tree(sources, &config)?;
-        let items: Vec<TestItem> = MergeTreeIterator::new(handle)
-            .collect::<Result<Vec<_>>>()?;
+        let items: Vec<TestItem> = MergeTreeIterator::new(handle).collect::<Result<Vec<_>>>()?;
 
         let mut expected: Vec<u64> = (0..10).flat_map(|i| vec![i * 2, i * 2 + 1]).collect();
         expected.sort();
@@ -710,9 +738,16 @@ mod tests {
         // Verify intermediate files were cleaned up
         let remaining_files: Vec<_> = std::fs::read_dir(temp_dir.path())?
             .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy().starts_with("merge_intermediate"))
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("merge_intermediate")
+            })
             .collect();
-        assert!(remaining_files.is_empty(), "Intermediate files should be cleaned up");
+        assert!(
+            remaining_files.is_empty(),
+            "Intermediate files should be cleaned up"
+        );
 
         Ok(())
     }
@@ -739,13 +774,17 @@ mod tests {
             factory_source(vec![5, 15, 25, 35]),
         ];
         let handle = build_merge_tree(sources, &config)?;
-        let items: Vec<TestItem> = MergeTreeIterator::new(handle)
-            .collect::<Result<Vec<_>>>()?;
+        let items: Vec<TestItem> = MergeTreeIterator::new(handle).collect::<Result<Vec<_>>>()?;
         assert_eq!(
             items,
             vec![
-                TestItem(5), TestItem(10), TestItem(15), TestItem(20),
-                TestItem(25), TestItem(30), TestItem(35)
+                TestItem(5),
+                TestItem(10),
+                TestItem(15),
+                TestItem(20),
+                TestItem(25),
+                TestItem(30),
+                TestItem(35)
             ]
         );
         Ok(())
@@ -755,16 +794,40 @@ mod tests {
     fn test_error_propagation() -> Result<()> {
         let temp_dir = TempDir::new()?;
         let config = MergeTreeConfig::new(temp_dir.path());
-        let sources = vec![
-            MergeSource::<TestItem>::Factory(Box::new(|| {
-                Err(anyhow::anyhow!("intentional test error"))
-            })),
-        ];
+        let sources = vec![MergeSource::<TestItem>::Factory(Box::new(|| {
+            Err(anyhow::anyhow!("intentional test error"))
+        }))];
         let handle = build_merge_tree(sources, &config)?;
-        let result: Result<Vec<TestItem>> = MergeTreeIterator::new(handle)
-            .collect::<Result<Vec<_>>>();
+        let result: Result<Vec<TestItem>> =
+            MergeTreeIterator::new(handle).collect::<Result<Vec<_>>>();
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("intentional test error"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("intentional test error")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_iterator_surfaces_worker_panic() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let config = MergeTreeConfig::new(temp_dir.path());
+
+        let sources = vec![MergeSource::<TestItem>::Factory(Box::new(|| {
+            let iter =
+                std::iter::once_with(|| -> Result<TestItem> { panic!("intentional worker panic") });
+            Ok(Box::new(iter))
+        }))];
+
+        let mut iter = MergeTreeIterator::new(build_merge_tree(sources, &config)?);
+        let first = iter
+            .next()
+            .expect("expected a terminal panic error")
+            .expect_err("expected panic to surface as error");
+        assert!(first.to_string().contains("panicked"));
+        assert!(iter.next().is_none());
         Ok(())
     }
 
@@ -779,12 +842,7 @@ mod tests {
 
     #[test]
     fn test_dedup_iterator_with_errors() {
-        let items: Vec<Result<u64>> = vec![
-            Ok(1),
-            Ok(2),
-            Err(anyhow::anyhow!("error")),
-            Ok(3),
-        ];
+        let items: Vec<Result<u64>> = vec![Ok(1), Ok(2), Err(anyhow::anyhow!("error")), Ok(3)];
         let mut iter = DedupIterator::new(items.into_iter());
         assert_eq!(iter.next().unwrap().unwrap(), 1);
         assert_eq!(iter.next().unwrap().unwrap(), 2);
@@ -797,19 +855,19 @@ mod tests {
         let temp_dir = TempDir::new()?;
         let config = MergeTreeConfig::new(temp_dir.path());
         // Same values in multiple sources — merge tree does NOT deduplicate
-        let sources = vec![
-            factory_source(vec![1, 2, 3]),
-            factory_source(vec![1, 2, 3]),
-        ];
+        let sources = vec![factory_source(vec![1, 2, 3]), factory_source(vec![1, 2, 3])];
         let handle = build_merge_tree(sources, &config)?;
-        let items: Vec<TestItem> = MergeTreeIterator::new(handle)
-            .collect::<Result<Vec<_>>>()?;
+        let items: Vec<TestItem> = MergeTreeIterator::new(handle).collect::<Result<Vec<_>>>()?;
         // All 6 items present (no dedup in merge tree)
         assert_eq!(
             items,
             vec![
-                TestItem(1), TestItem(1), TestItem(2), TestItem(2),
-                TestItem(3), TestItem(3)
+                TestItem(1),
+                TestItem(1),
+                TestItem(2),
+                TestItem(2),
+                TestItem(3),
+                TestItem(3)
             ]
         );
         Ok(())

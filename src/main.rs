@@ -19,7 +19,7 @@ use tracing_subscriber::EnvFilter;
 /// simultaneously (vocab merger k-way merge, external sort merge).
 /// The parallel merge tree also bounds fan-in, but raising the limit
 /// provides additional headroom.
-fn raise_fd_limit() {
+fn raise_fd_limit() -> Option<(u64, u64)> {
     #[cfg(unix)]
     unsafe {
         let mut rlim = libc::rlimit {
@@ -32,15 +32,17 @@ fn raise_fd_limit() {
                 let old = rlim.rlim_cur;
                 rlim.rlim_cur = target;
                 if libc::setrlimit(libc::RLIMIT_NOFILE, &rlim) == 0 {
-                    eprintln!("Raised file descriptor limit: {} → {}", old, target);
+                    return Some((old as u64, target as u64));
                 }
             }
         }
     }
+
+    None
 }
 
 fn main() -> Result<()> {
-    raise_fd_limit();
+    let raised_fd_limit = raise_fd_limit();
 
     let cli = cli::Cli::parse();
     let benchmark = cli.benchmark;
@@ -57,6 +59,10 @@ fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .with_target(false)
         .init();
+
+    if let Some((old, target)) = raised_fd_limit {
+        tracing::debug!(old, target, "Raised file descriptor limit");
+    }
 
     tracing::info!("hdtc - HDT Creator");
 
