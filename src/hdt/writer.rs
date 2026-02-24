@@ -14,17 +14,17 @@ use crate::triples::BitmapTriplesFiles;
 use anyhow::{Context, Result};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-/// Write a complete HDT file, reading triples data from streaming temp files.
+/// Write a complete HDT file, reading triples and dict sections from temp files.
 ///
-/// This avoids holding the entire triples section in memory. Dict sections are
-/// still in memory (typically much smaller than triples).
+/// This avoids holding either the dictionary or triples in memory.
 pub fn write_hdt_streaming(
     output_path: &Path,
     base_uri: &str,
     counts: &DictCounts,
-    dict_sections: &[Vec<u8>],
+    dict_section_paths: &[PathBuf],
+    dict_section_sizes: &[u64],
     triples: &BitmapTriplesFiles,
     ntriples_size: u64,
 ) -> Result<()> {
@@ -37,7 +37,7 @@ pub fn write_hdt_streaming(
     global_ci.write_to(&mut writer)?;
 
     // Calculate sizes for header metadata
-    let dict_size: u64 = dict_sections.iter().map(|s| s.len() as u64).sum();
+    let dict_size: u64 = dict_section_sizes.iter().sum();
     let triples_size: u64 = triples.total_encoded_size()?;
     let hdt_data_size = dict_size + triples_size;
 
@@ -64,8 +64,12 @@ pub fn write_hdt_streaming(
     dict_ci.set_property("elements", total_elements.to_string());
     dict_ci.write_to(&mut writer)?;
 
-    for section_data in dict_sections {
-        writer.write_all(section_data)?;
+    for section_path in dict_section_paths {
+        let section_file = File::open(section_path)
+            .with_context(|| format!("Failed to open dict section {}", section_path.display()))?;
+        let mut reader = BufReader::new(section_file);
+        std::io::copy(&mut reader, &mut writer)
+            .with_context(|| format!("Failed to copy dict section {}", section_path.display()))?;
     }
 
     // 4. Triples

@@ -40,7 +40,7 @@ impl std::str::FromStr for MemorySize {
 impl std::fmt::Display for MemorySize {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let bytes = self.0;
-        if bytes % (1024 * 1024 * 1024) == 0 {
+        if bytes.is_multiple_of(1024 * 1024 * 1024) {
             write!(f, "{}G", bytes / (1024 * 1024 * 1024))
         } else {
             write!(f, "{}M", bytes / (1024 * 1024))

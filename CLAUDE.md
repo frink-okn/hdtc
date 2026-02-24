@@ -69,6 +69,7 @@ Key design points:
 - Testing: standard `#[cfg(test)]` modules + integration tests in `tests/`
 - No `unsafe` code unless absolutely necessary and well-justified
 - Blank node disambiguation: prefix blank node IDs with per-file identifier
+- **Clippy**: Run `cargo clippy` before committing and fix all warnings. Zero warnings required.
 
 ## File Structure
 

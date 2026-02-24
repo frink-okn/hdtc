@@ -1,17 +1,16 @@
 //! K-way merge of partial vocabularies into global dictionary with ID mappings.
 
-use crate::dictionary::pfc::PfcEncoder;
+use crate::dictionary::pfc::StreamingPfcEncoder;
 use crate::dictionary::DictCounts;
 use crate::pipeline::PartialVocabReader;
 use crate::sort::parallel_merge::{
     build_merge_tree, Mergeable, MergeSource, MergeTreeConfig, MergeTreeHandle,
 };
 use anyhow::{Context, Result};
-use rayon::prelude::*;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufWriter, Read, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -37,14 +36,6 @@ pub struct IdMapping {
 }
 
 impl IdMapping {
-    fn new(batch_id: usize) -> Self {
-        Self {
-            batch_id,
-            so_map: Vec::new(),
-            p_map: Vec::new(),
-        }
-    }
-
     /// Write ID mapping to a file.
     pub fn write_to_file(&self, path: &Path) -> Result<()> {
         let file = File::create(path)?;
@@ -112,6 +103,282 @@ impl IdMapping {
             so_map,
             p_map,
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sharded ID mapping writer
+// ---------------------------------------------------------------------------
+
+const NUM_MAPPING_SHARDS: usize = 128;
+
+/// Shard entry: (batch_id, local_id, global_id) packed as 16 bytes.
+#[derive(Clone, Copy)]
+struct ShardEntry {
+    batch_id: u32,
+    local_id: u32,
+    global_id: u64,
+}
+
+impl ShardEntry {
+    fn write_to<W: Write>(&self, w: &mut W) -> std::io::Result<()> {
+        w.write_all(&self.batch_id.to_le_bytes())?;
+        w.write_all(&self.local_id.to_le_bytes())?;
+        w.write_all(&self.global_id.to_le_bytes())?;
+        Ok(())
+    }
+
+    fn read_from<R: Read>(r: &mut R) -> std::io::Result<Option<Self>> {
+        let mut buf = [0u8; 16];
+        match r.read_exact(&mut buf) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => return Err(e),
+        }
+        Ok(Some(Self {
+            batch_id: u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]),
+            local_id: u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]),
+            global_id: u64::from_le_bytes([buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15]]),
+        }))
+    }
+}
+
+/// Writes ID mapping entries to sharded temp files during the merge.
+///
+/// Uses `NUM_MAPPING_SHARDS` shard files each for SO and P mappings (256 total FDs).
+/// Entry format: (batch_id: u32, local_id: u32, global_id: u64) = 16 bytes.
+/// Shard selection: `batch_id % NUM_MAPPING_SHARDS`.
+struct ShardedMappingWriter {
+    so_shards: Vec<BufWriter<File>>,
+    p_shards: Vec<BufWriter<File>>,
+    so_shard_paths: Vec<PathBuf>,
+    p_shard_paths: Vec<PathBuf>,
+    /// Max SO local ID per batch (indexed by batch_id).
+    batch_max_so: Vec<u32>,
+    /// Max P local ID per batch (indexed by batch_id).
+    batch_max_p: Vec<u32>,
+}
+
+impl ShardedMappingWriter {
+    fn new(
+        temp_dir: &Path,
+        batch_max_so: Vec<u32>,
+        batch_max_p: Vec<u32>,
+    ) -> Result<Self> {
+        let mut so_shards = Vec::with_capacity(NUM_MAPPING_SHARDS);
+        let mut p_shards = Vec::with_capacity(NUM_MAPPING_SHARDS);
+        let mut so_shard_paths = Vec::with_capacity(NUM_MAPPING_SHARDS);
+        let mut p_shard_paths = Vec::with_capacity(NUM_MAPPING_SHARDS);
+
+        for i in 0..NUM_MAPPING_SHARDS {
+            let so_path = temp_dir.join(format!("id_shard_so_{i:03}.tmp"));
+            let p_path = temp_dir.join(format!("id_shard_p_{i:03}.tmp"));
+            so_shards.push(BufWriter::new(File::create(&so_path)?));
+            p_shards.push(BufWriter::new(File::create(&p_path)?));
+            so_shard_paths.push(so_path);
+            p_shard_paths.push(p_path);
+        }
+
+        Ok(Self {
+            so_shards,
+            p_shards,
+            so_shard_paths,
+            p_shard_paths,
+            batch_max_so,
+            batch_max_p,
+        })
+    }
+
+    fn write_so(&mut self, batch_id: usize, local_id: u32, global_id: u64) -> Result<()> {
+        let shard_idx = batch_id % NUM_MAPPING_SHARDS;
+        let entry = ShardEntry {
+            batch_id: batch_id as u32,
+            local_id,
+            global_id,
+        };
+        entry.write_to(&mut self.so_shards[shard_idx])?;
+        Ok(())
+    }
+
+    fn write_p(&mut self, batch_id: usize, local_id: u32, global_id: u64) -> Result<()> {
+        let shard_idx = batch_id % NUM_MAPPING_SHARDS;
+        let entry = ShardEntry {
+            batch_id: batch_id as u32,
+            local_id,
+            global_id,
+        };
+        entry.write_to(&mut self.p_shards[shard_idx])?;
+        Ok(())
+    }
+
+    /// Flush all shard writers and process shards into per-batch mapping files.
+    fn finish(mut self, shared_count: u64, temp_dir: &Path) -> Result<()> {
+        // Flush and close all writers
+        for w in &mut self.so_shards {
+            w.flush()?;
+        }
+        for w in &mut self.p_shards {
+            w.flush()?;
+        }
+        drop(self.so_shards);
+        drop(self.p_shards);
+
+        let num_batches = self.batch_max_so.len();
+
+        // Process SO shards
+        for shard_idx in 0..NUM_MAPPING_SHARDS {
+            let shard_path = &self.so_shard_paths[shard_idx];
+            let file_len = std::fs::metadata(shard_path)?.len();
+            if file_len == 0 {
+                continue;
+            }
+
+            // Read all entries from this shard
+            let file = File::open(shard_path)?;
+            let mut reader = BufReader::new(file);
+            let mut entries: Vec<ShardEntry> = Vec::new();
+            while let Some(entry) = ShardEntry::read_from(&mut reader)? {
+                entries.push(entry);
+            }
+
+            // Group by batch_id and build per-batch dense SO maps
+            // Collect unique batch IDs in this shard
+            let mut batch_ids: Vec<u32> = entries.iter().map(|e| e.batch_id).collect();
+            batch_ids.sort_unstable();
+            batch_ids.dedup();
+
+            for &bid in &batch_ids {
+                let bid_usize = bid as usize;
+                if bid_usize >= num_batches {
+                    continue;
+                }
+                let map_size = (self.batch_max_so[bid_usize] + 1) as usize;
+                let mut so_map = vec![0u64; map_size];
+
+                for entry in &entries {
+                    if entry.batch_id == bid
+                        && (entry.local_id as usize) < map_size
+                    {
+                        let mut gid = entry.global_id;
+                        // Apply provisional ID fixup
+                        if is_provisional_so_id(gid) {
+                            let section_id = decode_provisional_so_id(gid);
+                            gid = shared_count + section_id;
+                        }
+                        so_map[entry.local_id as usize] = gid;
+                    }
+                }
+
+                // Read existing P map if it exists, or create empty one
+                let mapping_path =
+                    temp_dir.join(format!("id_mapping_{bid_usize:06}.map.zst"));
+                let p_map_size = (self.batch_max_p[bid_usize] + 1) as usize;
+
+                // Check if P mapping was already written (from a P shard processed earlier)
+                let (existing_p_map, _) = if mapping_path.exists() {
+                    let existing = IdMapping::read_from_file(&mapping_path)?;
+                    (existing.so_map, existing.p_map)
+                } else {
+                    (Vec::new(), Vec::new())
+                };
+
+                // Write final mapping (SO map + placeholder P map if no P shard yet)
+                let mapping = IdMapping {
+                    batch_id: bid_usize,
+                    so_map,
+                    p_map: if existing_p_map.is_empty() {
+                        vec![0u64; p_map_size]
+                    } else {
+                        // This shouldn't happen since we process SO shards first
+                        existing_p_map
+                    },
+                };
+                mapping.write_to_file(&mapping_path)?;
+            }
+        }
+
+        // Process P shards
+        for shard_idx in 0..NUM_MAPPING_SHARDS {
+            let shard_path = &self.p_shard_paths[shard_idx];
+            let file_len = std::fs::metadata(shard_path)?.len();
+            if file_len == 0 {
+                continue;
+            }
+
+            let file = File::open(shard_path)?;
+            let mut reader = BufReader::new(file);
+            let mut entries: Vec<ShardEntry> = Vec::new();
+            while let Some(entry) = ShardEntry::read_from(&mut reader)? {
+                entries.push(entry);
+            }
+
+            let mut batch_ids: Vec<u32> = entries.iter().map(|e| e.batch_id).collect();
+            batch_ids.sort_unstable();
+            batch_ids.dedup();
+
+            for &bid in &batch_ids {
+                let bid_usize = bid as usize;
+                if bid_usize >= num_batches {
+                    continue;
+                }
+
+                // Read existing mapping (should have SO map from previous phase)
+                let mapping_path =
+                    temp_dir.join(format!("id_mapping_{bid_usize:06}.map.zst"));
+
+                let existing = if mapping_path.exists() {
+                    IdMapping::read_from_file(&mapping_path)?
+                } else {
+                    // SO shard was empty for this batch — create from scratch
+                    let so_size = (self.batch_max_so[bid_usize] + 1) as usize;
+                    IdMapping {
+                        batch_id: bid_usize,
+                        so_map: vec![0u64; so_size],
+                        p_map: Vec::new(),
+                    }
+                };
+
+                let p_map_size = (self.batch_max_p[bid_usize] + 1) as usize;
+                let mut p_map = vec![0u64; p_map_size];
+
+                for entry in &entries {
+                    if entry.batch_id == bid && (entry.local_id as usize) < p_map_size {
+                        p_map[entry.local_id as usize] = entry.global_id;
+                    }
+                }
+
+                let mapping = IdMapping {
+                    batch_id: bid_usize,
+                    so_map: existing.so_map,
+                    p_map,
+                };
+                mapping.write_to_file(&mapping_path)?;
+            }
+        }
+
+        // Write mapping files for batches that had no entries in any shard
+        // (empty batches still need a mapping file for the remapper)
+        for bid in 0..num_batches {
+            let mapping_path = temp_dir.join(format!("id_mapping_{bid:06}.map.zst"));
+            if !mapping_path.exists() {
+                let mapping = IdMapping {
+                    batch_id: bid,
+                    so_map: vec![0u64; (self.batch_max_so[bid] + 1) as usize],
+                    p_map: vec![0u64; (self.batch_max_p[bid] + 1) as usize],
+                };
+                mapping.write_to_file(&mapping_path)?;
+            }
+        }
+
+        // Clean up shard temp files
+        for path in &self.so_shard_paths {
+            let _ = std::fs::remove_file(path);
+        }
+        for path in &self.p_shard_paths {
+            let _ = std::fs::remove_file(path);
+        }
+
+        Ok(())
     }
 }
 
@@ -209,29 +476,10 @@ fn decode_provisional_so_id(id: u64) -> u64 {
     id & PROVISIONAL_SO_ID_MASK
 }
 
-fn finalize_provisional_so_ids(id_mappings: &mut [IdMapping], shared_count: u64) -> Result<()> {
-    if shared_count > PROVISIONAL_SO_ID_MASK {
-        anyhow::bail!(
-            "Shared term count {} exceeds provisional ID range",
-            shared_count
-        );
-    }
-
-    for mapping in id_mappings {
-        for mapped_id in &mut mapping.so_map {
-            if is_provisional_so_id(*mapped_id) {
-                let local_section_id = decode_provisional_so_id(*mapped_id);
-                *mapped_id = shared_count + local_section_id;
-            }
-        }
-    }
-
-    Ok(())
-}
-
 /// Result of vocabulary merge.
 pub struct VocabMergeResult {
-    pub dict_sections: Vec<Vec<u8>>, // PFC-encoded: [shared, subjects, predicates, objects]
+    pub dict_section_paths: Vec<PathBuf>, // PFC section files: [shared, subjects, predicates, objects]
+    pub dict_section_sizes: Vec<u64>,     // Corresponding file sizes
     pub counts: DictCounts,
     #[allow(dead_code)]
     pub predicate_ids: HashMap<String, u64>,
@@ -253,7 +501,8 @@ pub fn merge_vocabularies(
     let mut mapping_write_time = Duration::ZERO;
     let mut stream_bytes_read = 0u64;
 
-    let mut id_mappings: Vec<IdMapping> = Vec::new();
+    let mut batch_max_so: Vec<u32> = Vec::with_capacity(batch_infos.len());
+    let mut batch_max_p: Vec<u32> = Vec::with_capacity(batch_infos.len());
 
     for (batch_id, vocab_path) in &batch_infos {
         let init_start = Instant::now();
@@ -264,21 +513,24 @@ pub fn merge_vocabularies(
         let reader = PartialVocabReader::open(vocab_path)
             .with_context(|| format!("Failed to open partial vocab for batch {}", batch_id))?;
 
-        // Pre-allocate ID mappings based on max IDs from this batch
-        let max_so_id = reader.max_so_id();
-        let max_p_id = reader.max_p_id();
-        let mut mapping = IdMapping::new(*batch_id);
-        mapping.so_map = vec![0u64; (max_so_id + 1) as usize];
-        mapping.p_map = vec![0u64; (max_p_id + 1) as usize];
-        id_mappings.push(mapping);
+        // Record max IDs from header (used to size dense mapping arrays later)
+        batch_max_so.push(reader.max_so_id());
+        batch_max_p.push(reader.max_p_id());
         stream_reader_init_time += init_start.elapsed();
     }
 
-    // Initialize PFC encoders for each section
-    let mut shared_enc = PfcEncoder::new();
-    let mut subjects_enc = PfcEncoder::new();
-    let mut predicates_enc = PfcEncoder::new();
-    let mut objects_enc = PfcEncoder::new();
+    let mut shard_writer = ShardedMappingWriter::new(temp_dir, batch_max_so, batch_max_p)
+        .context("Failed to create sharded mapping writer")?;
+
+    // Initialize streaming PFC encoders for each section
+    let mut shared_enc = StreamingPfcEncoder::new(temp_dir, "shared")
+        .context("Failed to create shared PFC encoder")?;
+    let mut subjects_enc = StreamingPfcEncoder::new(temp_dir, "subjects")
+        .context("Failed to create subjects PFC encoder")?;
+    let mut predicates_enc = StreamingPfcEncoder::new(temp_dir, "predicates")
+        .context("Failed to create predicates PFC encoder")?;
+    let mut objects_enc = StreamingPfcEncoder::new(temp_dir, "objects")
+        .context("Failed to create objects PFC encoder")?;
 
     let mut counts = DictCounts::default();
     let mut predicate_ids = HashMap::new();
@@ -338,7 +590,7 @@ pub fn merge_vocabularies(
                     &mut predicates_enc,
                     &mut objects_enc,
                     &mut predicate_ids,
-                    &mut id_mappings,
+                    &mut shard_writer,
                 )?;
                 id_assignment_time += assign_start.elapsed();
 
@@ -368,7 +620,7 @@ pub fn merge_vocabularies(
                 &mut predicates_enc,
                 &mut objects_enc,
                 &mut predicate_ids,
-                &mut id_mappings,
+                &mut shard_writer,
             )?;
             id_assignment_time += assign_start.elapsed();
         }
@@ -379,10 +631,6 @@ pub fn merge_vocabularies(
     merge_handle.join()?;
     stream_result?;
 
-    let so_finalize_start = Instant::now();
-    finalize_provisional_so_ids(&mut id_mappings, counts.shared)?;
-    so_map_finalize_time += so_finalize_start.elapsed();
-
     tracing::debug!(
         "Merged vocabulary: {} shared, {} subjects, {} predicates, {} objects",
         counts.shared,
@@ -391,42 +639,35 @@ pub fn merge_vocabularies(
         counts.objects
     );
 
-    // Encode dictionary sections
-    let mut dict_sections = Vec::new();
+    // Finalize streaming PFC encoders to section files
     let serialize_start = Instant::now();
 
-    let mut shared_buf = Vec::new();
-    shared_enc.write_to(&mut shared_buf)?;
-    dict_sections.push(shared_buf);
+    let shared_section = shared_enc.finish().context("Failed to finish shared PFC encoder")?;
+    let subjects_section = subjects_enc.finish().context("Failed to finish subjects PFC encoder")?;
+    let predicates_section = predicates_enc.finish().context("Failed to finish predicates PFC encoder")?;
+    let objects_section = objects_enc.finish().context("Failed to finish objects PFC encoder")?;
 
-    let mut subjects_buf = Vec::new();
-    subjects_enc.write_to(&mut subjects_buf)?;
-    dict_sections.push(subjects_buf);
-
-    let mut predicates_buf = Vec::new();
-    predicates_enc.write_to(&mut predicates_buf)?;
-    dict_sections.push(predicates_buf);
-
-    let mut objects_buf = Vec::new();
-    objects_enc.write_to(&mut objects_buf)?;
-    dict_sections.push(objects_buf);
+    let dict_section_paths = vec![
+        shared_section.path,
+        subjects_section.path,
+        predicates_section.path,
+        objects_section.path,
+    ];
+    let dict_section_sizes = vec![
+        shared_section.size,
+        subjects_section.size,
+        predicates_section.size,
+        objects_section.size,
+    ];
     pfc_serialize_time += serialize_start.elapsed();
 
-    // Write ID mappings to files
+    // Process sharded mapping entries into per-batch mapping files
     let mapping_write_start = Instant::now();
-    id_mappings.par_iter().try_for_each(|mapping| -> Result<()> {
-        let mapping_path = temp_dir.join(format!("id_mapping_{:06}.map.zst", mapping.batch_id));
-        mapping
-            .write_to_file(&mapping_path)
-            .with_context(|| format!("Failed to write ID mapping for batch {}", mapping.batch_id))?;
-        tracing::debug!(
-            "Wrote ID mapping for batch {}: {} SO entries, {} P entries",
-            mapping.batch_id,
-            mapping.so_map.len(),
-            mapping.p_map.len()
-        );
-        Ok(())
-    })?;
+    let so_finalize_start = Instant::now();
+    shard_writer
+        .finish(counts.shared, temp_dir)
+        .context("Failed to process sharded ID mappings")?;
+    so_map_finalize_time += so_finalize_start.elapsed();
     mapping_write_time += mapping_write_start.elapsed();
 
     tracing::debug!(
@@ -441,7 +682,8 @@ pub fn merge_vocabularies(
     );
 
     Ok(VocabMergeResult {
-        dict_sections,
+        dict_section_paths,
+        dict_section_sizes,
         counts,
         predicate_ids,
     })
@@ -509,12 +751,12 @@ fn assign_global_ids_and_record_mappings(
     roles: Roles,
     batches: &[TermBatchInfo],
     counts: &mut DictCounts,
-    shared_enc: &mut PfcEncoder,
-    subjects_enc: &mut PfcEncoder,
-    predicates_enc: &mut PfcEncoder,
-    objects_enc: &mut PfcEncoder,
+    shared_enc: &mut StreamingPfcEncoder,
+    subjects_enc: &mut StreamingPfcEncoder,
+    predicates_enc: &mut StreamingPfcEncoder,
+    objects_enc: &mut StreamingPfcEncoder,
     predicate_ids: &mut HashMap<String, u64>,
-    id_mappings: &mut [IdMapping],
+    shard_writer: &mut ShardedMappingWriter,
 ) -> Result<()> {
     let term_str = std::str::from_utf8(term)
         .with_context(|| format!("Invalid UTF-8 in term: {:?}", term))?;
@@ -523,7 +765,7 @@ fn assign_global_ids_and_record_mappings(
     if roles.contains(Roles::PREDICATE) {
         counts.predicates += 1;
         let global_pred_id = counts.predicates;
-        predicates_enc.push(term_str);
+        predicates_enc.push(term_str)?;
         predicate_ids.insert(term_str.to_string(), global_pred_id);
 
         // Record mapping for each batch that had this predicate
@@ -531,7 +773,7 @@ fn assign_global_ids_and_record_mappings(
             if info.roles.contains(Roles::PREDICATE)
                 && let Some(local_p_id) = info.p_local_id
             {
-                id_mappings[info.batch_id].p_map[local_p_id as usize] = global_pred_id;
+                shard_writer.write_p(info.batch_id, local_p_id, global_pred_id)?;
             }
         }
     }
@@ -541,17 +783,17 @@ fn assign_global_ids_and_record_mappings(
         let global_so_id = if roles.contains(Roles::SUBJECT | Roles::OBJECT) {
             // Shared: appears as both subject and object
             counts.shared += 1;
-            shared_enc.push(term_str);
+            shared_enc.push(term_str)?;
             counts.shared
         } else if roles.contains(Roles::SUBJECT) {
             // Subject-only: use provisional section-local ID, fix offset after stream completes
             counts.subjects += 1;
-            subjects_enc.push(term_str);
+            subjects_enc.push(term_str)?;
             encode_provisional_so_id(counts.subjects)
         } else {
             // Object-only: use provisional section-local ID, fix offset after stream completes
             counts.objects += 1;
-            objects_enc.push(term_str);
+            objects_enc.push(term_str)?;
             encode_provisional_so_id(counts.objects)
         };
 
@@ -560,7 +802,7 @@ fn assign_global_ids_and_record_mappings(
             if info.roles.intersects(Roles::SUBJECT | Roles::OBJECT)
                 && let Some(local_so_id) = info.so_local_id
             {
-                id_mappings[info.batch_id].so_map[local_so_id as usize] = global_so_id;
+                shard_writer.write_so(info.batch_id, local_so_id, global_so_id)?;
             }
         }
     }

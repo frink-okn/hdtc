@@ -111,7 +111,8 @@ pub struct ParserParallelismConfig {
 /// Result of pipeline execution.
 pub struct PipelineResult {
     pub counts: DictCounts,
-    pub dict_sections: Vec<Vec<u8>>, // PFC-encoded sections
+    pub dict_section_paths: Vec<PathBuf>, // PFC section temp files
+    pub dict_section_sizes: Vec<u64>,     // Corresponding file sizes
     pub bitmap_triples: crate::triples::BitmapTriplesFiles,
     pub ntriples_size: u64, // N-Triples serialization size of parsed data
 }
@@ -256,6 +257,61 @@ fn process_peak_rss_bytes() -> Option<u64> {
         return None;
     }
     Some(usage.ru_maxrss as u64)
+}
+
+/// Get current (not peak) resident set size.
+#[cfg(target_os = "macos")]
+#[allow(dead_code, deprecated)] // diagnostic utility; mach_task_self deprecated in libc
+fn current_rss_bytes() -> Option<u64> {
+    use std::mem::MaybeUninit;
+    // mach_task_basic_info gives current resident_size
+    const MACH_TASK_BASIC_INFO: u32 = 20;
+    #[repr(C)]
+    struct MachTaskBasicInfo {
+        virtual_size: u64,
+        resident_size: u64,
+        resident_size_max: u64,
+        user_time: [u32; 2],   // time_value_t
+        system_time: [u32; 2], // time_value_t
+        policy: i32,
+        suspend_count: i32,
+    }
+    unsafe {
+        let mut info = MaybeUninit::<MachTaskBasicInfo>::uninit();
+        let mut count = (std::mem::size_of::<MachTaskBasicInfo>() / std::mem::size_of::<u32>()) as u32;
+        let kr = libc::task_info(
+            libc::mach_task_self(),
+            MACH_TASK_BASIC_INFO,
+            info.as_mut_ptr() as *mut i32,
+            &mut count,
+        );
+        if kr != 0 {
+            return None;
+        }
+        Some(info.assume_init().resident_size)
+    }
+}
+
+/// Get current (not peak) resident set size.
+#[cfg(target_os = "linux")]
+#[allow(dead_code)]
+fn current_rss_bytes() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            let kb_str = rest.trim().strip_suffix("kB")?.trim();
+            let kb: u64 = kb_str.parse().ok()?;
+            return Some(kb * 1024);
+        }
+    }
+    None
+}
+
+/// Get current (not peak) resident set size — fallback for other platforms.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[allow(dead_code)]
+fn current_rss_bytes() -> Option<u64> {
+    None
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -646,6 +702,7 @@ fn vocab_builder_stage(
     include_graphs: bool,
 ) -> Result<()> {
     let mut batch_id = 0;
+    let mut cumulative_triples: u64 = 0;
 
     for quads_batch in batch_rx {
         // ~100 bytes per triple for unique term storage after dedup, floor 10MB
@@ -674,12 +731,14 @@ fn vocab_builder_stage(
         }
 
         let stats = builder.stats();
+        cumulative_triples += stats.num_triples as u64;
         tracing::info!(
-            "Batch {}: {} {}, {} unique terms",
+            "Batch {}: {} {}, {} unique terms (cumulative: {})",
             batch_id,
             stats.num_triples,
             if include_graphs { "quads" } else { "triples" },
-            stats.num_terms
+            stats.num_terms,
+            cumulative_triples,
         );
 
         // Finish and get sorted vocab + triples
@@ -1116,7 +1175,8 @@ pub fn run_pipeline(
 
     Ok(PipelineResult {
         counts: merge_result.counts,
-        dict_sections: merge_result.dict_sections,
+        dict_section_paths: merge_result.dict_section_paths,
+        dict_section_sizes: merge_result.dict_section_sizes,
         bitmap_triples,
         ntriples_size,
     })
