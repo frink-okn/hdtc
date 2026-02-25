@@ -114,6 +114,19 @@ pub fn id_remapper_stage(
                 .map(|batch_info| {
                     match remap_batch(batch_info, &global_triple_tx, chunk_size) {
                         Ok(count) => {
+                            // Files fully consumed — delete immediately to free disk space
+                            if let Err(e) = std::fs::remove_file(&batch_info.triples_path) {
+                                tracing::warn!(
+                                    "Failed to delete {}: {}",
+                                    batch_info.triples_path.display(), e
+                                );
+                            }
+                            if let Err(e) = std::fs::remove_file(&batch_info.mapping_path) {
+                                tracing::warn!(
+                                    "Failed to delete {}: {}",
+                                    batch_info.mapping_path.display(), e
+                                );
+                            }
                             tracing::debug!(
                                 "Batch {}: remapped {} triples",
                                 batch_info.batch_id,

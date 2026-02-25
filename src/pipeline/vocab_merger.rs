@@ -149,8 +149,8 @@ impl ShardEntry {
 /// Entry format: (batch_id: u32, local_id: u32, global_id: u64) = 16 bytes.
 /// Shard selection: `batch_id % NUM_MAPPING_SHARDS`.
 struct ShardedMappingWriter {
-    so_shards: Vec<BufWriter<File>>,
-    p_shards: Vec<BufWriter<File>>,
+    so_shards: Vec<zstd::Encoder<'static, BufWriter<File>>>,
+    p_shards: Vec<zstd::Encoder<'static, BufWriter<File>>>,
     so_shard_paths: Vec<PathBuf>,
     p_shard_paths: Vec<PathBuf>,
     /// Max SO local ID per batch (indexed by batch_id).
@@ -171,10 +171,10 @@ impl ShardedMappingWriter {
         let mut p_shard_paths = Vec::with_capacity(NUM_MAPPING_SHARDS);
 
         for i in 0..NUM_MAPPING_SHARDS {
-            let so_path = temp_dir.join(format!("id_shard_so_{i:03}.tmp"));
-            let p_path = temp_dir.join(format!("id_shard_p_{i:03}.tmp"));
-            so_shards.push(BufWriter::new(File::create(&so_path)?));
-            p_shards.push(BufWriter::new(File::create(&p_path)?));
+            let so_path = temp_dir.join(format!("id_shard_so_{i:03}.tmp.zst"));
+            let p_path = temp_dir.join(format!("id_shard_p_{i:03}.tmp.zst"));
+            so_shards.push(zstd::Encoder::new(BufWriter::new(File::create(&so_path)?), 3)?);
+            p_shards.push(zstd::Encoder::new(BufWriter::new(File::create(&p_path)?), 3)?);
             so_shard_paths.push(so_path);
             p_shard_paths.push(p_path);
         }
@@ -213,29 +213,23 @@ impl ShardedMappingWriter {
 
     /// Flush all shard writers and process shards into per-batch mapping files.
     fn finish(mut self, shared_count: u64, temp_dir: &Path) -> Result<()> {
-        // Flush and close all writers
-        for w in &mut self.so_shards {
-            w.flush()?;
+        // Finalize all zstd encoders
+        for w in self.so_shards.drain(..) {
+            w.finish()?;
         }
-        for w in &mut self.p_shards {
-            w.flush()?;
+        for w in self.p_shards.drain(..) {
+            w.finish()?;
         }
-        drop(self.so_shards);
-        drop(self.p_shards);
 
         let num_batches = self.batch_max_so.len();
 
         // Process SO shards
         for shard_idx in 0..NUM_MAPPING_SHARDS {
             let shard_path = &self.so_shard_paths[shard_idx];
-            let file_len = std::fs::metadata(shard_path)?.len();
-            if file_len == 0 {
-                continue;
-            }
 
-            // Read all entries from this shard
+            // Read all entries from this zstd-compressed shard
             let file = File::open(shard_path)?;
-            let mut reader = BufReader::new(file);
+            let mut reader = zstd::Decoder::new(BufReader::new(file))?;
             let mut entries: Vec<ShardEntry> = Vec::new();
             while let Some(entry) = ShardEntry::read_from(&mut reader)? {
                 entries.push(entry);
@@ -300,13 +294,9 @@ impl ShardedMappingWriter {
         // Process P shards
         for shard_idx in 0..NUM_MAPPING_SHARDS {
             let shard_path = &self.p_shard_paths[shard_idx];
-            let file_len = std::fs::metadata(shard_path)?.len();
-            if file_len == 0 {
-                continue;
-            }
 
             let file = File::open(shard_path)?;
-            let mut reader = BufReader::new(file);
+            let mut reader = zstd::Decoder::new(BufReader::new(file))?;
             let mut entries: Vec<ShardEntry> = Vec::new();
             while let Some(entry) = ShardEntry::read_from(&mut reader)? {
                 entries.push(entry);
@@ -704,12 +694,38 @@ fn calculate_stage4_stream_channel_capacity(stage4_budget: usize) -> usize {
     (queue_budget / estimated_entry_bytes).clamp(64, 4096)
 }
 
+/// Iterator wrapper that deletes a file when dropped (when the iterator
+/// is exhausted or the leaf thread exits). Used to eagerly free partial
+/// vocab files during the merge instead of waiting until the pipeline ends.
+struct DeleteOnDrop<I> {
+    inner: I,
+    path: PathBuf,
+}
+
+impl<I: Iterator> Iterator for DeleteOnDrop<I> {
+    type Item = I::Item;
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next()
+    }
+}
+
+impl<I> Drop for DeleteOnDrop<I> {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_file(&self.path) {
+            tracing::warn!("Failed to delete {}: {}", self.path.display(), e);
+        }
+    }
+}
+
 /// Build a parallel merge tree over partial vocabulary files.
 ///
 /// Each leaf thread opens a `PartialVocabReader` and maps entries to
 /// `StreamEntry` with the correct `source_batch`. When the number of
 /// batches exceeds the merge tree's max fan-in, multi-round merging
 /// with intermediate temp files is used automatically.
+///
+/// Each partial vocab file is deleted as soon as its leaf thread finishes
+/// reading it (via `DeleteOnDrop`), freeing disk space during the merge.
 fn build_vocab_merge_tree(
     batch_infos: &[(usize, PathBuf)],
     channel_capacity: usize,
@@ -721,10 +737,11 @@ fn build_vocab_merge_tree(
             let batch_id = *batch_id;
             let vocab_path = vocab_path.clone();
             MergeSource::Factory(Box::new(move || {
+                let delete_path = vocab_path.clone();
                 let reader = PartialVocabReader::open(&vocab_path).with_context(|| {
                     format!("Failed to open partial vocab for batch {}", batch_id)
                 })?;
-                Ok(Box::new(reader.map(move |entry_result| {
+                let iter = reader.map(move |entry_result| {
                     entry_result.map(|entry| StreamEntry {
                         term: entry.term,
                         roles: entry.roles,
@@ -732,7 +749,8 @@ fn build_vocab_merge_tree(
                         p_local_id: entry.p_local_id,
                         source_batch: batch_id,
                     })
-                }))
+                });
+                Ok(Box::new(DeleteOnDrop { inner: iter, path: delete_path })
                     as Box<dyn Iterator<Item = Result<StreamEntry>> + Send>)
             }))
         })

@@ -832,42 +832,19 @@ fn vocab_writer_stage(
     Ok(())
 }
 
-/// Clean up temporary files created during pipeline execution.
-fn cleanup_temp_files(batches: &[BatchComplete], mapping_paths: &[PathBuf]) {
-    // Delete partial vocabulary files
+/// Clean up batch temp files on error (vocab + triples only).
+///
+/// Used for early-abort error paths in Stages 1-3 before ID mappings exist.
+/// During normal execution, files are cleaned up eagerly:
+/// - `.pvoc.zst` — deleted per-file during Stage 4 merge (DeleteOnDrop)
+/// - `.ltr.zst` — deleted per-batch during Stage 5 (id_remapper)
+/// - `.map.zst` — deleted per-batch during Stage 5 (id_remapper)
+fn cleanup_batch_files(batches: &[BatchComplete]) {
     for batch in batches {
-        if let Err(e) = std::fs::remove_file(&batch.vocab_path) {
-            tracing::warn!(
-                "Failed to delete partial vocab file {}: {}",
-                batch.vocab_path.display(),
-                e
-            );
-        }
+        let _ = std::fs::remove_file(&batch.vocab_path);
+        let _ = std::fs::remove_file(&batch.triples_path);
     }
-
-    // Delete local triples files
-    for batch in batches {
-        if let Err(e) = std::fs::remove_file(&batch.triples_path) {
-            tracing::warn!(
-                "Failed to delete local triples file {}: {}",
-                batch.triples_path.display(),
-                e
-            );
-        }
-    }
-
-    // Delete ID mapping files
-    for path in mapping_paths {
-        if let Err(e) = std::fs::remove_file(path) {
-            tracing::warn!(
-                "Failed to delete ID mapping file {}: {}",
-                path.display(),
-                e
-            );
-        }
-    }
-
-    tracing::debug!("Temporary files cleaned up");
+    tracing::debug!("Cleaned up {} batch temp files", batches.len());
 }
 
 /// Run the complete pipeline: RDF → HDT.
@@ -974,22 +951,22 @@ pub fn run_pipeline(
     let ntriples_size = match parser_handle.join() {
         Ok(Ok(size)) => size,
         Ok(Err(e)) => {
-            cleanup_temp_files(&batches, &[]);
+            cleanup_batch_files(&batches);
             return Err(e);
         }
         Err(_) => {
-            cleanup_temp_files(&batches, &[]);
+            cleanup_batch_files(&batches);
             return Err(anyhow::anyhow!("Parser thread panicked"));
         }
     };
 
     match builder_handle.join() {
         Ok(Err(e)) => {
-            cleanup_temp_files(&batches, &[]);
+            cleanup_batch_files(&batches);
             return Err(e);
         }
         Err(_) => {
-            cleanup_temp_files(&batches, &[]);
+            cleanup_batch_files(&batches);
             return Err(anyhow::anyhow!("Builder thread panicked"));
         }
         Ok(Ok(())) => {}
@@ -997,11 +974,11 @@ pub fn run_pipeline(
 
     match writer_handle.join() {
         Ok(Err(e)) => {
-            cleanup_temp_files(&batches, &[]);
+            cleanup_batch_files(&batches);
             return Err(e);
         }
         Err(_) => {
-            cleanup_temp_files(&batches, &[]);
+            cleanup_batch_files(&batches);
             return Err(anyhow::anyhow!("Writer thread panicked"));
         }
         Ok(Ok(())) => {}
@@ -1057,12 +1034,10 @@ pub fn run_pipeline(
     let (global_triple_tx, global_triple_rx) =
         bounded::<Vec<IdTriple>>(stage56_budget.remap_to_sort_channel_capacity);
 
-    // Prepare batch remap info and track mapping paths for cleanup
+    // Prepare batch remap info (files are cleaned up per-batch by the remapper)
     let (remap_tx, remap_rx) = bounded(batches.len());
-    let mut mapping_paths: Vec<PathBuf> = Vec::new();
     for batch in &batches {
         let mapping_path = temp_dir.join(format!("id_mapping_{:06}.map.zst", batch.batch_id));
-        mapping_paths.push(mapping_path.clone());
         remap_tx
             .send(id_remapper::BatchRemapInfo {
                 batch_id: batch.batch_id,
@@ -1167,9 +1142,6 @@ pub fn run_pipeline(
         bitmap_triples.num_triples,
         sort_start.elapsed().as_secs_f64()
     );
-
-    // Clean up temporary files
-    cleanup_temp_files(&batches, &mapping_paths);
 
     log_benchmark_summary(&stage_metrics, benchmark);
 

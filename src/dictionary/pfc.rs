@@ -150,10 +150,10 @@ pub struct StreamingPfcEncoder {
     /// Last string pushed (for sort-order validation across blocks).
     last_string: Option<String>,
 
-    /// Writer for encoded string data.
-    string_buf_writer: BufWriter<File>,
-    /// Writer for block offsets (raw u64 LE).
-    offsets_writer: BufWriter<File>,
+    /// Writer for encoded string data (zstd-compressed).
+    string_buf_writer: zstd::Encoder<'static, BufWriter<File>>,
+    /// Writer for block offsets (zstd-compressed, raw u64 LE).
+    offsets_writer: zstd::Encoder<'static, BufWriter<File>>,
     /// Number of block offsets written.
     num_offsets: u64,
 
@@ -180,14 +180,17 @@ impl StreamingPfcEncoder {
         let string_buf_file = File::create(&string_buf_path)?;
         let offsets_file = File::create(&offsets_path)?;
 
+        let string_buf_encoder = zstd::Encoder::new(BufWriter::new(string_buf_file), 3)?;
+        let offsets_encoder = zstd::Encoder::new(BufWriter::new(offsets_file), 3)?;
+
         Ok(Self {
             block_size: DEFAULT_BLOCK_SIZE,
             string_count: 0,
             total_buffer_bytes: 0,
             current_block: Vec::with_capacity(DEFAULT_BLOCK_SIZE),
             last_string: None,
-            string_buf_writer: BufWriter::new(string_buf_file),
-            offsets_writer: BufWriter::new(offsets_file),
+            string_buf_writer: string_buf_encoder,
+            offsets_writer: offsets_encoder,
             num_offsets: 0,
             string_buf_crc: CRC32C_ALGO.digest(),
             string_buf_path,
@@ -267,11 +270,9 @@ impl StreamingPfcEncoder {
         // Flush any remaining partial block
         self.flush_block()?;
 
-        // Flush and close temp file writers
-        self.string_buf_writer.flush()?;
-        self.offsets_writer.flush()?;
-        drop(self.string_buf_writer);
-        drop(self.offsets_writer);
+        // Finalize zstd encoders (flush + write end frame)
+        self.string_buf_writer.finish()?;
+        self.offsets_writer.finish()?;
 
         // Finalize string buffer CRC
         let string_buf_crc = self.string_buf_crc.finalize();
@@ -311,9 +312,9 @@ impl StreamingPfcEncoder {
             let crc_writer = Crc32cWriter::new(&mut writer);
             let mut la_encoder = StreamingLogArrayEncoder::new(bits_per_entry, crc_writer);
 
-            // Read offsets back from temp file
+            // Read offsets back from zstd-compressed temp file
             let offsets_file = File::open(&self.offsets_path)?;
-            let mut offsets_reader = BufReader::new(offsets_file);
+            let mut offsets_reader = zstd::Decoder::new(BufReader::new(offsets_file))?;
             let mut offset_buf = [0u8; 8];
             for _ in 0..self.num_offsets {
                 offsets_reader.read_exact(&mut offset_buf)?;
@@ -332,10 +333,10 @@ impl StreamingPfcEncoder {
             log_array.write_to(&mut writer)?;
         }
 
-        // 3. Copy string buffer from temp file + CRC32C
+        // 3. Decompress string buffer from temp file and copy to output + CRC32C
         {
             let string_buf_file = File::open(&self.string_buf_path)?;
-            let mut reader = BufReader::new(string_buf_file);
+            let mut reader = zstd::Decoder::new(BufReader::new(string_buf_file))?;
             io::copy(&mut reader, &mut writer)?;
         }
         writer.write_all(&string_buf_crc.to_le_bytes())?;
