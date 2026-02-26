@@ -3,7 +3,6 @@
 //! Writes the 5-section index file format used by hdt-java.
 
 use crate::hdt::writer::{write_bitmap_from_file, write_log_array_from_file};
-use crate::index::predicate_index::PredicateIndex;
 use crate::io::ControlInfo;
 use crate::triples::{StreamingBitmapResult, StreamingLogArrayResult};
 use anyhow::{Context, Result};
@@ -78,67 +77,11 @@ pub fn write_index_streaming(
     Ok(())
 }
 
-/// Write HDT index file with in-memory predicate index structures.
-/// Used for backward compatibility with tests and small datasets.
-#[allow(dead_code)]
-pub fn write_index(
-    output_path: &Path,
-    num_triples: u64,
-    triples_order: u64,
-    bitmap_index_z: &StreamingBitmapResult,
-    index_z: &StreamingLogArrayResult,
-    predicate_index: &PredicateIndex,
-    predicate_count: &[u8],
-) -> Result<()> {
-    let file = File::create(output_path)
-        .with_context(|| format!("Failed to create index file {}", output_path.display()))?;
-    let mut writer = BufWriter::with_capacity(256 * 1024, file);
-
-    let mut ci = ControlInfo::new(
-        crate::io::ControlType::Index,
-        "<http://purl.org/HDT/hdt#indexFoQ>",
-    );
-    ci.set_property("numTriples", num_triples.to_string());
-    ci.set_property("order", triples_order.to_string());
-    ci.write_to(&mut writer)
-        .context("Failed to write control info to index file")?;
-
-    write_bitmap_from_file(&mut writer, &bitmap_index_z.path, bitmap_index_z.num_bits)
-        .context("Failed to write bitmapIndexZ section")?;
-
-    write_log_array_from_file(
-        &mut writer,
-        &index_z.path,
-        index_z.bits_per_entry,
-        index_z.num_entries,
-    )
-    .context("Failed to write indexZ section")?;
-
-    writer
-        .write_all(&predicate_index.bitmap)
-        .context("Failed to write predicateIndex bitmap section")?;
-
-    writer
-        .write_all(&predicate_index.sequence)
-        .context("Failed to write predicateIndex sequence section")?;
-
-    writer
-        .write_all(predicate_count)
-        .context("Failed to write predicateCount section")?;
-
-    writer.flush()?;
-
-    tracing::debug!("Index file written: {}", output_path.display());
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::io::{
-        BitmapReader, BitmapWriter, ControlType, LogArrayReader, LogArrayWriter,
-        StreamingBitmapEncoder, StreamingLogArrayEncoder,
+        BitmapReader, ControlType, LogArrayReader, StreamingBitmapEncoder, StreamingLogArrayEncoder,
     };
     use std::io::Cursor;
     use tempfile::TempDir;
@@ -190,26 +133,6 @@ mod tests {
         }
     }
 
-    fn build_inmem_bitmap(bits: &[bool]) -> Vec<u8> {
-        let mut writer = BitmapWriter::new();
-        for &bit in bits {
-            writer.push(bit);
-        }
-        let mut buf = Vec::new();
-        writer.write_to(&mut buf).expect("serialize bitmap");
-        buf
-    }
-
-    fn build_inmem_logarray(values: &[u64], max_value: u64) -> Vec<u8> {
-        let mut writer = LogArrayWriter::for_max_value(max_value);
-        for &value in values {
-            writer.push(value);
-        }
-        let mut buf = Vec::new();
-        writer.write_to(&mut buf).expect("serialize logarray");
-        buf
-    }
-
     #[test]
     fn test_index_file_created() -> Result<()> {
         let tmp = TempDir::new()?;
@@ -217,19 +140,17 @@ mod tests {
 
         let bitmap_index_z = build_streaming_bitmap(&[], tmp.path(), "biz.tmp");
         let index_z = build_streaming_logarray(&[], 0, tmp.path(), "iz.tmp");
+        let pred_bitmap = build_streaming_bitmap(&[], tmp.path(), "pb.tmp");
+        let pred_sequence = build_streaming_logarray(&[], 0, tmp.path(), "ps.tmp");
 
-        let predicate_index = PredicateIndex {
-            bitmap: vec![],
-            sequence: vec![],
-        };
-
-        write_index(
+        write_index_streaming(
             &output_path,
             0,
             1,
             &bitmap_index_z,
             &index_z,
-            &predicate_index,
+            &pred_bitmap,
+            &pred_sequence,
             &[],
         )?;
 
@@ -244,23 +165,26 @@ mod tests {
 
         let bitmap_index_z = build_streaming_bitmap(&[true, false, true], tmp.path(), "biz.tmp");
         let index_z = build_streaming_logarray(&[0, 1, 2], 2, tmp.path(), "iz.tmp");
-        let pred_bitmap = build_inmem_bitmap(&[true, true]);
-        let pred_seq = build_inmem_logarray(&[0, 1], 1);
-        let pred_count = build_inmem_logarray(&[2, 1], 2);
+        let pred_bitmap = build_streaming_bitmap(&[true, true], tmp.path(), "pb.tmp");
+        let pred_sequence = build_streaming_logarray(&[0, 1], 1, tmp.path(), "ps.tmp");
+        let pred_count = build_streaming_logarray(&[2, 1], 2, tmp.path(), "pc.tmp");
+        let mut predicate_count = Vec::new();
+        write_log_array_from_file(
+            &mut predicate_count,
+            &pred_count.path,
+            pred_count.bits_per_entry,
+            pred_count.num_entries,
+        )?;
 
-        let predicate_index = PredicateIndex {
-            bitmap: pred_bitmap,
-            sequence: pred_seq,
-        };
-
-        write_index(
+        write_index_streaming(
             &output_path,
             3,
             1,
             &bitmap_index_z,
             &index_z,
-            &predicate_index,
-            &pred_count,
+            &pred_bitmap,
+            &pred_sequence,
+            &predicate_count,
         )?;
 
         let bytes = std::fs::read(&output_path)?;
@@ -285,23 +209,26 @@ mod tests {
         let bitmap_index_z =
             build_streaming_bitmap(&[false, true, false, true], tmp.path(), "biz.tmp");
         let index_z = build_streaming_logarray(&[0, 2, 1, 3], 3, tmp.path(), "iz.tmp");
-        let pred_bitmap = build_inmem_bitmap(&[true, false, true]);
-        let pred_seq = build_inmem_logarray(&[0, 2, 1], 2);
-        let pred_count = build_inmem_logarray(&[2, 1, 1], 2);
+        let pred_bitmap = build_streaming_bitmap(&[true, false, true], tmp.path(), "pb.tmp");
+        let pred_sequence = build_streaming_logarray(&[0, 2, 1], 2, tmp.path(), "ps.tmp");
+        let pred_count = build_streaming_logarray(&[2, 1, 1], 2, tmp.path(), "pc.tmp");
+        let mut predicate_count = Vec::new();
+        write_log_array_from_file(
+            &mut predicate_count,
+            &pred_count.path,
+            pred_count.bits_per_entry,
+            pred_count.num_entries,
+        )?;
 
-        let predicate_index = PredicateIndex {
-            bitmap: pred_bitmap,
-            sequence: pred_seq,
-        };
-
-        write_index(
+        write_index_streaming(
             &output_path,
             4,
             1,
             &bitmap_index_z,
             &index_z,
-            &predicate_index,
-            &pred_count,
+            &pred_bitmap,
+            &pred_sequence,
+            &predicate_count,
         )?;
 
         let bytes = std::fs::read(&output_path)?;

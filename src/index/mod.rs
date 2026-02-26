@@ -7,12 +7,6 @@
 mod predicate_index;
 mod writer;
 
-// Used by integration tests
-#[allow(unused_imports)]
-pub use predicate_index::{build_predicate_count, build_predicate_index};
-#[allow(unused_imports)]
-pub use writer::write_index;
-
 use crate::io::log_array::bits_for;
 use crate::io::{
     ControlInfo, ControlType, LogArrayReader, StreamingBitmapDecoder, StreamingBitmapEncoder,
@@ -957,26 +951,26 @@ mod tests {
             bitmap_bits.push(false);
             index_values.push(entry.pos_y);
         }
-        if current_object.is_some() {
-            if let Some(last) = bitmap_bits.last_mut() {
-                *last = true;
-            }
+        if current_object.is_some()
+            && let Some(last) = bitmap_bits.last_mut()
+        {
+            *last = true;
         }
 
         assert_eq!(bitmap_bits.len(), 6);
         assert_eq!(index_values.len(), 6);
 
         // Object 1 group: 3 entries, boundary at position 2
-        assert_eq!(bitmap_bits[0], false);
-        assert_eq!(bitmap_bits[1], false);
-        assert_eq!(bitmap_bits[2], true); // end of object 1 group
+        assert!(!bitmap_bits[0]);
+        assert!(!bitmap_bits[1]);
+        assert!(bitmap_bits[2]); // end of object 1 group
 
         // Object 2 group: 2 entries, boundary at position 4
-        assert_eq!(bitmap_bits[3], false);
-        assert_eq!(bitmap_bits[4], true); // end of object 2 group
+        assert!(!bitmap_bits[3]);
+        assert!(bitmap_bits[4]); // end of object 2 group
 
         // Object 3 group: 1 entry, boundary at position 5
-        assert_eq!(bitmap_bits[5], true); // end of object 3 group
+        assert!(bitmap_bits[5]); // end of object 3 group
 
         assert_eq!(index_values, vec![0, 2, 4, 1, 3, 5]);
     }

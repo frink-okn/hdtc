@@ -1184,7 +1184,7 @@ fn parse_bitmap_preamble(data: &[u8], offset: usize) -> (u64, usize, usize, usiz
     assert_eq!(data[offset], 0x01, "Expected bitmap type byte 0x01");
     let (num_bits, vbyte_len) = parse_vbyte(&data[offset + 1..]);
     let data_start = offset + 1 + vbyte_len + 1; // +1 for CRC8
-    let data_bytes = ((num_bits + 7) / 8) as usize;
+    let data_bytes = num_bits.div_ceil(8) as usize;
     let section_end = data_start + data_bytes + 4; // +4 for CRC32C
     (num_bits, data_start, data_bytes, section_end)
 }
@@ -1197,7 +1197,7 @@ fn parse_logarray_preamble(data: &[u8], offset: usize) -> (u8, u64, usize, usize
     let (num_entries, vbyte_len) = parse_vbyte(&data[offset + 2..]);
     let data_start = offset + 2 + vbyte_len + 1; // +1 for CRC8
     let total_bits = num_entries * bpe as u64;
-    let data_bytes = ((total_bits + 7) / 8) as usize;
+    let data_bytes = total_bits.div_ceil(8) as usize;
     let section_end = data_start + data_bytes + 4; // +4 for CRC32C
     (bpe, num_entries, data_start, section_end)
 }
@@ -1350,9 +1350,8 @@ fn test_index_creation_structural_and_semantic() {
     // ── Structural invariants ──
 
     // bitmapIndexZ: last bit in each object group is set (true), others are false
-    assert_eq!(
+    assert!(
         *bitmap_index_z.last().unwrap(),
-        true,
         "Last bit of bitmapIndexZ must be set"
     );
 
@@ -1449,7 +1448,7 @@ fn test_index_creation_structural_and_semantic() {
 /// With 2000 triples and 1MB memory limit:
 /// - OPS sort budget = 768KB → ~24K ObjectPosEntry (32 bytes each) per chunk → ~83 chunks
 /// - Pred sort budget = 256KB → ~8K PredicateEntry (16 bytes each) per chunk
-/// This well exceeds the PARALLEL_MERGE_THRESHOLD of 16.
+/// - This well exceeds the PARALLEL_MERGE_THRESHOLD of 16.
 #[test]
 fn test_index_creation_many_sort_chunks() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -1552,7 +1551,7 @@ fn test_index_creation_many_sort_chunks() {
     );
 
     // Structural invariants
-    assert_eq!(*bitmap_index_z.last().unwrap(), true);
+    assert!(*bitmap_index_z.last().unwrap());
 
     // All indexZ values must be valid Y-positions
     for (i, &pos_y) in index_z.iter().enumerate() {

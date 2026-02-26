@@ -4,144 +4,14 @@
 //! 1. Bitmap marking predicate group boundaries
 //! 2. Sequence mapping predicate occurrences to their positions
 
-use crate::io::{BitmapWriter, LogArrayWriter, StreamingBitmapEncoder, StreamingLogArrayEncoder};
 use crate::io::log_array::bits_for;
+use crate::io::{LogArrayWriter, StreamingBitmapEncoder, StreamingLogArrayEncoder};
 use crate::sort::Sortable;
 use crate::triples::{StreamingBitmapResult, StreamingLogArrayResult};
 use anyhow::{Context, Result};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
-
-/// PredicateIndex auxiliary structures for fast predicate lookups.
-#[allow(dead_code)]
-pub struct PredicateIndex {
-    /// Serialized bitmap marking predicate group boundaries.
-    pub bitmap: Vec<u8>,
-    /// Serialized sequence mapping predicate occurrences to positions.
-    pub sequence: Vec<u8>,
-}
-
-/// Build PredicateIndex from a predicate sequence (seqY).
-///
-/// Algorithm (from hdt-java PredicateIndexArray):
-/// 1. Count occurrences of each predicate value
-/// 2. Build bitmap marking group boundaries (accumulated counts)
-/// 3. Build sequence mapping occurrences to original positions
-///
-/// # Arguments
-/// - `predicates`: seqY from BitmapTriples (predicate IDs in permuted order)
-/// - `max_predicate`: Maximum predicate ID value
-#[allow(dead_code)]
-pub fn build_predicate_index(predicates: &[u64], max_predicate: u64) -> Result<PredicateIndex> {
-    let num_predicates = predicates.len() as u64;
-
-    if num_predicates == 0 {
-        // Edge case: no predicates
-        let bitmap = BitmapWriter::new();
-        let mut bitmap_buf = Vec::new();
-        bitmap.write_to(&mut bitmap_buf)?;
-
-        let array = LogArrayWriter::for_max_value(0);
-        let mut array_buf = Vec::new();
-        array.write_to(&mut array_buf)?;
-
-        return Ok(PredicateIndex {
-            bitmap: bitmap_buf,
-            sequence: array_buf,
-        });
-    }
-
-    // Phase 1: Count predicate occurrences
-    let mut pred_count = vec![0u64; (max_predicate + 1) as usize];
-    for &p in predicates {
-        if (p as usize) < pred_count.len() {
-            pred_count[p as usize] += 1;
-        }
-    }
-
-    // Phase 2: Build bitmap marking predicate group boundaries
-    // Bitmap marks the position of the last occurrence of each predicate group
-    let mut bitmap = BitmapWriter::new();
-    let mut accumulated = 0u64;
-
-    for count in pred_count[1..].iter() {
-        accumulated += count;
-        if accumulated > num_predicates {
-            break;
-        }
-
-        // We need to set bit at position (accumulated - 1) to mark group boundary
-        // But BitmapWriter only supports push() and set_last()
-        // So we build incrementally by pushing and then adjust
-        while bitmap.len() < accumulated {
-            bitmap.push(false);
-        }
-        if bitmap.len() == accumulated {
-            bitmap.set_last(true);
-        }
-    }
-
-    // Ensure we have exactly num_predicates bits
-    while bitmap.len() < num_predicates {
-        bitmap.push(false);
-    }
-
-    // Make sure last bit is set (marks end of last group)
-    if !bitmap.is_empty() {
-        bitmap.set_last(true);
-    }
-
-    // Phase 3: Build sequence mapping occurrences to positions
-    // Calculate base positions for each predicate using accumulated counts
-    let mut bases = vec![0u64; (max_predicate + 1) as usize];
-    let mut accumulated = 0u64;
-    for p in 1..=max_predicate {
-        bases[p as usize] = accumulated;
-        if (p as usize) < pred_count.len() {
-            accumulated += pred_count[p as usize];
-        }
-    }
-
-    // Build inverted sequence - maps predicate occurrences to positions
-    let mut temp_array = vec![0u64; num_predicates as usize];
-    let mut insert_positions = vec![0u64; (max_predicate + 1) as usize];
-
-    for (pos, &pred) in predicates.iter().enumerate() {
-        if (pred as usize) < bases.len() {
-            let base = bases[pred as usize];
-            let offset = insert_positions[pred as usize];
-            let idx = (base + offset) as usize;
-            if idx < temp_array.len() {
-                temp_array[idx] = pos as u64;
-            }
-            insert_positions[pred as usize] += 1;
-        }
-    }
-
-    // Serialize bitmap
-    let mut bitmap_buf = Vec::new();
-    bitmap.write_to(&mut bitmap_buf)?;
-
-    // Serialize sequence
-    let max_pos = if num_predicates > 0 {
-        num_predicates - 1
-    } else {
-        0
-    };
-    let mut array = LogArrayWriter::for_max_value(max_pos);
-    for val in temp_array {
-        array.push(val);
-    }
-
-    let mut array_buf = Vec::new();
-    array.write_to(&mut array_buf)?;
-
-    Ok(PredicateIndex {
-        bitmap: bitmap_buf,
-        sequence: array_buf,
-    })
-}
 
 /// Sort entry for streaming predicate index construction.
 /// Sorted by (predicate, pos_y) to group entries by predicate.
@@ -202,7 +72,11 @@ impl StreamingPredicateIndexResult {
     pub fn cleanup(&self) {
         for path in [&self.bitmap.path, &self.sequence.path] {
             if let Err(e) = std::fs::remove_file(path) {
-                tracing::warn!("Failed to delete predicate index temp file {}: {}", path.display(), e);
+                tracing::warn!(
+                    "Failed to delete predicate index temp file {}: {}",
+                    path.display(),
+                    e
+                );
             }
         }
     }
@@ -230,7 +104,10 @@ pub fn build_predicate_index_streaming(
         let pred_count_buf = build_predicate_count_from_counts(&[], 0)?;
 
         return Ok(StreamingPredicateIndexResult {
-            bitmap: StreamingBitmapResult { path: bitmap_path, num_bits: 0 },
+            bitmap: StreamingBitmapResult {
+                path: bitmap_path,
+                num_bits: 0,
+            },
             sequence: StreamingLogArrayResult {
                 path: sequence_path,
                 bits_per_entry: 1,
@@ -330,99 +207,102 @@ fn build_predicate_count_from_counts(counts: &[u64], num_sp_pairs: u64) -> Resul
     Ok(buf)
 }
 
-/// Build predicate count sequence (for index file).
-///
-/// This stores the count of occurrences for each predicate ID.
-///
-/// # Arguments
-/// - `predicates`: seqY from BitmapTriples
-/// - `max_predicate`: Maximum predicate ID value
-#[allow(dead_code)]
-pub fn build_predicate_count(predicates: &[u64], max_predicate: u64) -> Result<Vec<u8>> {
-    let mut counts = vec![0u64; max_predicate as usize];
-    for &p in predicates {
-        if p > 0 && (p as usize) <= counts.len() {
-            counts[(p - 1) as usize] += 1;
-        }
-    }
-
-    let bits = if predicates.is_empty() {
-        1
-    } else {
-        (64 - (predicates.len() as u64).leading_zeros()) as u8
-    };
-    let mut writer = LogArrayWriter::new(bits);
-
-    for &count in &counts {
-        writer.push(count);
-    }
-
-    let mut buf = Vec::new();
-    writer.write_to(&mut buf)?;
-    Ok(buf)
-}
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::io::{BitmapReader, LogArrayReader};
     use std::io::Cursor;
-    use crate::io::LogArrayReader;
+    use tempfile::TempDir;
 
     #[test]
-    fn test_predicate_count() -> Result<()> {
-        // Test predicates: [1, 1, 2, 1, 3]
-        let predicates = vec![1u64, 1, 2, 1, 3];
-
-        let counts_buf = build_predicate_count(&predicates, 3)?;
-
-        // Parse back to verify
+    fn test_predicate_count_from_counts() -> Result<()> {
+        let counts_buf = build_predicate_count_from_counts(&[3, 1, 1], 5)?;
         let reader = LogArrayReader::read_from(&mut Cursor::new(counts_buf))?;
         assert_eq!(reader.len(), 3);
-        assert_eq!(reader.get(0), 3); // pred 1 has 3 occurrences
-        assert_eq!(reader.get(1), 1); // pred 2 has 1 occurrence
-        assert_eq!(reader.get(2), 1); // pred 3 has 1 occurrence
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_single_predicate() -> Result<()> {
-        let predicates = vec![1u64, 1, 1];
-
-        let pred_index = build_predicate_index(&predicates, 1)?;
-
-        // Should have bitmap and sequence
-        assert!(!pred_index.bitmap.is_empty());
-        assert!(!pred_index.sequence.is_empty());
-
-        // Verify count
-        let counts_buf = build_predicate_count(&predicates, 1)?;
-        let reader = LogArrayReader::read_from(&mut Cursor::new(counts_buf))?;
-        assert_eq!(reader.len(), 1);
         assert_eq!(reader.get(0), 3);
+        assert_eq!(reader.get(1), 1);
+        assert_eq!(reader.get(2), 1);
 
         Ok(())
     }
 
     #[test]
-    fn test_multiple_predicates() -> Result<()> {
-        // Test with mixed predicates
-        let predicates = vec![1u64, 2, 1, 3, 2, 1];
-        let max_pred = 3;
+    fn test_build_predicate_index_streaming_empty() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let result = build_predicate_index_streaming(std::iter::empty(), 0, 0, tmp.path())?;
 
-        let pred_index = build_predicate_index(&predicates, max_pred)?;
-        assert!(!pred_index.bitmap.is_empty());
-        assert!(!pred_index.sequence.is_empty());
+        let counts_reader = LogArrayReader::read_from(&mut Cursor::new(&result.predicate_count))?;
+        assert_eq!(counts_reader.len(), 0);
 
-        // Verify counts
-        let counts_buf = build_predicate_count(&predicates, max_pred)?;
-        let reader = LogArrayReader::read_from(&mut Cursor::new(counts_buf))?;
-        assert_eq!(reader.len(), 3);
-        assert_eq!(reader.get(0), 3); // pred 1 appears 3 times
-        assert_eq!(reader.get(1), 2); // pred 2 appears 2 times
-        assert_eq!(reader.get(2), 1); // pred 3 appears 1 time
+        result.cleanup();
+        Ok(())
+    }
 
+    #[test]
+    fn test_build_predicate_index_streaming_groups_and_sequence() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let entries = vec![
+            PredicateEntry {
+                predicate: 1,
+                pos_y: 0,
+            },
+            PredicateEntry {
+                predicate: 1,
+                pos_y: 2,
+            },
+            PredicateEntry {
+                predicate: 2,
+                pos_y: 1,
+            },
+            PredicateEntry {
+                predicate: 3,
+                pos_y: 3,
+            },
+            PredicateEntry {
+                predicate: 3,
+                pos_y: 4,
+            },
+        ];
+
+        let result =
+            build_predicate_index_streaming(entries.into_iter().map(Ok), 5, 3, tmp.path())?;
+
+        let mut bitmap_section = Vec::new();
+        crate::hdt::writer::write_bitmap_from_file(
+            &mut bitmap_section,
+            &result.bitmap.path,
+            result.bitmap.num_bits,
+        )?;
+        let bitmap = BitmapReader::read_from(&mut Cursor::new(bitmap_section))?;
+        assert_eq!(bitmap.len(), 5);
+        assert!(!bitmap.get(0));
+        assert!(bitmap.get(1));
+        assert!(bitmap.get(2));
+        assert!(!bitmap.get(3));
+        assert!(bitmap.get(4));
+
+        let mut sequence_section = Vec::new();
+        crate::hdt::writer::write_log_array_from_file(
+            &mut sequence_section,
+            &result.sequence.path,
+            result.sequence.bits_per_entry,
+            result.sequence.num_entries,
+        )?;
+        let sequence = LogArrayReader::read_from(&mut Cursor::new(sequence_section))?;
+        assert_eq!(sequence.len(), 5);
+        assert_eq!(sequence.get(0), 0);
+        assert_eq!(sequence.get(1), 2);
+        assert_eq!(sequence.get(2), 1);
+        assert_eq!(sequence.get(3), 3);
+        assert_eq!(sequence.get(4), 4);
+
+        let counts_reader = LogArrayReader::read_from(&mut Cursor::new(&result.predicate_count))?;
+        assert_eq!(counts_reader.len(), 3);
+        assert_eq!(counts_reader.get(0), 2);
+        assert_eq!(counts_reader.get(1), 1);
+        assert_eq!(counts_reader.get(2), 2);
+
+        result.cleanup();
         Ok(())
     }
 }

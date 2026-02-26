@@ -508,7 +508,7 @@ The index can be created:
 - [x] Test index creation with sample RDF data and verify file format
 - [x] Streaming rewrite: `StreamingBitmapDecoder` + `StreamingLogArrayDecoder` for O(1) memory
 - [x] Integration test with full semantic verification (`test_index_creation_structural_and_semantic`)
-- [ ] Remove old in-memory index code (kept temporarily for writer.rs unit tests):
+- [x] Remove old in-memory index code (kept temporarily for writer.rs unit tests):
   - `PredicateIndex` struct in `predicate_index.rs`
   - `build_predicate_index()` in `predicate_index.rs`
   - `build_predicate_count()` in `predicate_index.rs`
