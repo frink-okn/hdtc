@@ -313,6 +313,9 @@ pub fn create_index(hdt_path: &Path, memory_budget: usize, temp_dir: &Path) -> R
         let p = array_y_dec
             .next_entry()?
             .context("ArrayY unexpectedly empty")?;
+        if p == 0 {
+            bail!("Invalid predicate ID 0 in ArrayY at pos_y=0");
+        }
         max_predicate = max_predicate.max(p);
         p
     } else {
@@ -375,6 +378,9 @@ pub fn create_index(hdt_path: &Path, memory_budget: usize, temp_dir: &Path) -> R
                 current_predicate = array_y_dec
                     .next_entry()?
                     .with_context(|| format!("ArrayY ended early at pos_y {pos_y}"))?;
+                if current_predicate == 0 {
+                    bail!("Invalid predicate ID 0 in ArrayY at pos_y={pos_y}");
+                }
                 max_predicate = max_predicate.max(current_predicate);
             }
         }
@@ -399,6 +405,10 @@ pub fn create_index(hdt_path: &Path, memory_budget: usize, temp_dir: &Path) -> R
         ops_sorter.chunk_file_count(),
         pred_sorter.chunk_file_count()
     );
+
+    if pos_y != num_sp_pairs {
+        bail!("BitmapZ boundary count mismatch: got {pos_y}, expected {num_sp_pairs}");
+    }
 
     if num_triples > 0 {
         tracing::info!("ArrayZ object ID range: [{}..={}]", min_object, max_object);
