@@ -1,10 +1,10 @@
 //! K-way merge of partial vocabularies into global dictionary with ID mappings.
 
-use crate::dictionary::pfc::StreamingPfcEncoder;
 use crate::dictionary::DictCounts;
+use crate::dictionary::pfc::StreamingPfcEncoder;
 use crate::pipeline::PartialVocabReader;
 use crate::sort::parallel_merge::{
-    build_merge_tree, Mergeable, MergeSource, MergeTreeConfig, MergeTreeHandle,
+    MergeSource, MergeTreeConfig, MergeTreeHandle, Mergeable, build_merge_tree,
 };
 use anyhow::{Context, Result};
 use std::cmp::Ordering;
@@ -138,7 +138,9 @@ impl ShardEntry {
         Ok(Some(Self {
             batch_id: u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]),
             local_id: u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]),
-            global_id: u64::from_le_bytes([buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15]]),
+            global_id: u64::from_le_bytes([
+                buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
+            ]),
         }))
     }
 }
@@ -160,11 +162,7 @@ struct ShardedMappingWriter {
 }
 
 impl ShardedMappingWriter {
-    fn new(
-        temp_dir: &Path,
-        batch_max_so: Vec<u32>,
-        batch_max_p: Vec<u32>,
-    ) -> Result<Self> {
+    fn new(temp_dir: &Path, batch_max_so: Vec<u32>, batch_max_p: Vec<u32>) -> Result<Self> {
         let mut so_shards = Vec::with_capacity(NUM_MAPPING_SHARDS);
         let mut p_shards = Vec::with_capacity(NUM_MAPPING_SHARDS);
         let mut so_shard_paths = Vec::with_capacity(NUM_MAPPING_SHARDS);
@@ -173,8 +171,14 @@ impl ShardedMappingWriter {
         for i in 0..NUM_MAPPING_SHARDS {
             let so_path = temp_dir.join(format!("id_shard_so_{i:03}.tmp.zst"));
             let p_path = temp_dir.join(format!("id_shard_p_{i:03}.tmp.zst"));
-            so_shards.push(zstd::Encoder::new(BufWriter::new(File::create(&so_path)?), 3)?);
-            p_shards.push(zstd::Encoder::new(BufWriter::new(File::create(&p_path)?), 3)?);
+            so_shards.push(zstd::Encoder::new(
+                BufWriter::new(File::create(&so_path)?),
+                3,
+            )?);
+            p_shards.push(zstd::Encoder::new(
+                BufWriter::new(File::create(&p_path)?),
+                3,
+            )?);
             so_shard_paths.push(so_path);
             p_shard_paths.push(p_path);
         }
@@ -250,9 +254,7 @@ impl ShardedMappingWriter {
                 let mut so_map = vec![0u64; map_size];
 
                 for entry in &entries {
-                    if entry.batch_id == bid
-                        && (entry.local_id as usize) < map_size
-                    {
+                    if entry.batch_id == bid && (entry.local_id as usize) < map_size {
                         let mut gid = entry.global_id;
                         // Apply provisional ID fixup
                         if is_provisional_so_id(gid) {
@@ -264,16 +266,14 @@ impl ShardedMappingWriter {
                 }
 
                 // Read existing P map if it exists, or create empty one
-                let mapping_path =
-                    temp_dir.join(format!("id_mapping_{bid_usize:06}.map.zst"));
+                let mapping_path = temp_dir.join(format!("id_mapping_{bid_usize:06}.map.zst"));
                 let p_map_size = (self.batch_max_p[bid_usize] + 1) as usize;
 
                 // Check if P mapping was already written (from a P shard processed earlier)
-                let (existing_p_map, _) = if mapping_path.exists() {
-                    let existing = IdMapping::read_from_file(&mapping_path)?;
-                    (existing.so_map, existing.p_map)
+                let existing_p_map = if mapping_path.exists() {
+                    IdMapping::read_from_file(&mapping_path)?.p_map
                 } else {
-                    (Vec::new(), Vec::new())
+                    Vec::new()
                 };
 
                 // Write final mapping (SO map + placeholder P map if no P shard yet)
@@ -313,8 +313,7 @@ impl ShardedMappingWriter {
                 }
 
                 // Read existing mapping (should have SO map from previous phase)
-                let mapping_path =
-                    temp_dir.join(format!("id_mapping_{bid_usize:06}.map.zst"));
+                let mapping_path = temp_dir.join(format!("id_mapping_{bid_usize:06}.map.zst"));
 
                 let existing = if mapping_path.exists() {
                     IdMapping::read_from_file(&mapping_path)?
@@ -496,7 +495,11 @@ pub fn merge_vocabularies(
 
     for (batch_id, vocab_path) in &batch_infos {
         let init_start = Instant::now();
-        tracing::debug!("Opening partial vocab header for batch {}: {:?}", batch_id, vocab_path);
+        tracing::debug!(
+            "Opening partial vocab header for batch {}: {:?}",
+            batch_id,
+            vocab_path
+        );
         stream_bytes_read += std::fs::metadata(vocab_path)
             .with_context(|| format!("Failed to stat partial vocab for batch {}", batch_id))?
             .len();
@@ -566,9 +569,7 @@ pub fn merge_vocabularies(
 
             let is_same_term = current_term.as_ref() == Some(&term);
 
-            if !is_same_term
-                && let Some(prev_term) = &current_term
-            {
+            if !is_same_term && let Some(prev_term) = &current_term {
                 let assign_start = Instant::now();
                 assign_global_ids_and_record_mappings(
                     prev_term,
@@ -632,10 +633,18 @@ pub fn merge_vocabularies(
     // Finalize streaming PFC encoders to section files
     let serialize_start = Instant::now();
 
-    let shared_section = shared_enc.finish().context("Failed to finish shared PFC encoder")?;
-    let subjects_section = subjects_enc.finish().context("Failed to finish subjects PFC encoder")?;
-    let predicates_section = predicates_enc.finish().context("Failed to finish predicates PFC encoder")?;
-    let objects_section = objects_enc.finish().context("Failed to finish objects PFC encoder")?;
+    let shared_section = shared_enc
+        .finish()
+        .context("Failed to finish shared PFC encoder")?;
+    let subjects_section = subjects_enc
+        .finish()
+        .context("Failed to finish subjects PFC encoder")?;
+    let predicates_section = predicates_enc
+        .finish()
+        .context("Failed to finish predicates PFC encoder")?;
+    let objects_section = objects_enc
+        .finish()
+        .context("Failed to finish objects PFC encoder")?;
 
     let dict_section_paths = vec![
         shared_section.path,
@@ -750,14 +759,16 @@ fn build_vocab_merge_tree(
                         source_batch: batch_id,
                     })
                 });
-                Ok(Box::new(DeleteOnDrop { inner: iter, path: delete_path })
+                Ok(Box::new(DeleteOnDrop {
+                    inner: iter,
+                    path: delete_path,
+                })
                     as Box<dyn Iterator<Item = Result<StreamEntry>> + Send>)
             }))
         })
         .collect();
 
-    let config = MergeTreeConfig::new(temp_dir)
-        .with_channel_capacity(channel_capacity);
+    let config = MergeTreeConfig::new(temp_dir).with_channel_capacity(channel_capacity);
 
     build_merge_tree(sources, &config)
 }
@@ -776,8 +787,8 @@ fn assign_global_ids_and_record_mappings(
     predicate_ids: &mut HashMap<String, u64>,
     shard_writer: &mut ShardedMappingWriter,
 ) -> Result<()> {
-    let term_str = std::str::from_utf8(term)
-        .with_context(|| format!("Invalid UTF-8 in term: {:?}", term))?;
+    let term_str =
+        std::str::from_utf8(term).with_context(|| format!("Invalid UTF-8 in term: {:?}", term))?;
 
     // Handle predicates (separate ID space)
     if roles.contains(Roles::PREDICATE) {
@@ -831,7 +842,7 @@ fn assign_global_ids_and_record_mappings(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pipeline::partial_vocab::{PartialVocabWriter, PartialVocabEntry};
+    use crate::pipeline::partial_vocab::{PartialVocabEntry, PartialVocabWriter};
     use tempfile::TempDir;
 
     const TEST_MEMORY_BUDGET: usize = 512 * 1024 * 1024;
@@ -913,12 +924,12 @@ mod tests {
         // Batch 0 mappings: a→1 (first subject), b→1 (first object, same ID offset), c→1 (first predicate)
         assert_eq!(mapping_0.so_map[0], 1); // a (first subject-only)
         assert_eq!(mapping_0.so_map[1], 1); // b (first object-only)
-        assert_eq!(mapping_0.p_map[0], 1);  // c (first predicate)
+        assert_eq!(mapping_0.p_map[0], 1); // c (first predicate)
 
         // Batch 1 mappings: d→2 (second subject), e→2 (second object, same ID offset), f→2 (second predicate)
         assert_eq!(mapping_1.so_map[0], 2); // d (second subject-only)
         assert_eq!(mapping_1.so_map[1], 2); // e (second object-only)
-        assert_eq!(mapping_1.p_map[0], 2);  // f (second predicate)
+        assert_eq!(mapping_1.p_map[0], 2); // f (second predicate)
 
         Ok(())
     }
@@ -981,10 +992,7 @@ mod tests {
 
         // Batch 0: "multi" as subject
         let batch0_path = temp_path.join("batch0.vocab.zst");
-        create_test_partial_vocab(
-            &batch0_path,
-            vec![("multi", Roles::SUBJECT, Some(0), None)],
-        )?;
+        create_test_partial_vocab(&batch0_path, vec![("multi", Roles::SUBJECT, Some(0), None)])?;
 
         // Batch 1: "multi" as predicate
         let batch1_path = temp_path.join("batch1.vocab.zst");
@@ -995,16 +1003,9 @@ mod tests {
 
         // Batch 2: "multi" as object
         let batch2_path = temp_path.join("batch2.vocab.zst");
-        create_test_partial_vocab(
-            &batch2_path,
-            vec![("multi", Roles::OBJECT, Some(0), None)],
-        )?;
+        create_test_partial_vocab(&batch2_path, vec![("multi", Roles::OBJECT, Some(0), None)])?;
 
-        let batch_infos = vec![
-            (0, batch0_path),
-            (1, batch1_path),
-            (2, batch2_path),
-        ];
+        let batch_infos = vec![(0, batch0_path), (1, batch1_path), (2, batch2_path)];
         let result = merge_vocabularies(batch_infos, temp_path, TEST_MEMORY_BUDGET)?;
 
         // "multi" should be shared (appears as both subject and object)
@@ -1064,16 +1065,12 @@ mod tests {
             ],
         )?;
 
-        let batch_infos = vec![
-            (0, batch0_path),
-            (1, batch1_path),
-            (2, batch2_path),
-        ];
+        let batch_infos = vec![(0, batch0_path), (1, batch1_path), (2, batch2_path)];
         let result = merge_vocabularies(batch_infos, temp_path, TEST_MEMORY_BUDGET)?;
 
         // "a" shared (subject + object), "b" shared (subject + object) + predicate, "c" predicate, "d" subject
-        assert_eq!(result.counts.shared, 2);     // a, b
-        assert_eq!(result.counts.subjects, 1);   // d
+        assert_eq!(result.counts.shared, 2); // a, b
+        assert_eq!(result.counts.subjects, 1); // d
         assert_eq!(result.counts.predicates, 2); // b, c
 
         let mapping_0 = read_mapping_from_temp(temp_path, 0)?;
@@ -1083,15 +1080,24 @@ mod tests {
         // Verify ID mappings are consistent across batches
         let a_global_b0 = mapping_0.so_map[0]; // a from batch 0 (subject)
         let a_global_b1 = mapping_1.so_map[0]; // a from batch 1 (object)
-        assert_eq!(a_global_b0, a_global_b1, "a should map to same global ID whether it's subject or object");
+        assert_eq!(
+            a_global_b0, a_global_b1,
+            "a should map to same global ID whether it's subject or object"
+        );
 
         // Verify that b appears as shared (not just in one role)
         let b_so_id = mapping_1.so_map[1]; // b as subject/object from batch 1
-        assert!(b_so_id <= result.counts.shared as u64, "b's SO ID should be in shared section");
+        assert!(
+            b_so_id <= result.counts.shared as u64,
+            "b's SO ID should be in shared section"
+        );
 
         // Verify d is subject-only (not shared)
         let d_id = mapping_2.so_map[1];
-        assert!(d_id > result.counts.shared as u64, "d should have subject-only ID");
+        assert!(
+            d_id > result.counts.shared as u64,
+            "d should have subject-only ID"
+        );
 
         Ok(())
     }
@@ -1104,10 +1110,7 @@ mod tests {
 
         // Batch 0: term
         let batch0_path = temp_path.join("batch0.vocab.zst");
-        create_test_partial_vocab(
-            &batch0_path,
-            vec![("term", Roles::SUBJECT, Some(0), None)],
-        )?;
+        create_test_partial_vocab(&batch0_path, vec![("term", Roles::SUBJECT, Some(0), None)])?;
 
         // Batch 1: empty
         let batch1_path = temp_path.join("batch1.vocab.zst");
@@ -1163,7 +1166,8 @@ mod tests {
         let mut observed_batches: Vec<usize> = Vec::new();
         while let Ok(item) = handle.rx.recv() {
             let entry = item?;
-            observed_terms.push(String::from_utf8(entry.term).expect("test terms should be valid UTF-8"));
+            observed_terms
+                .push(String::from_utf8(entry.term).expect("test terms should be valid UTF-8"));
             observed_batches.push(entry.source_batch);
         }
 
@@ -1183,14 +1187,42 @@ mod tests {
 
         let handle = build_vocab_merge_tree(&batch_infos, 2, temp_dir.path())?;
 
-        let first = handle.rx.recv().expect("expected an error item from missing-file source");
+        let first = handle
+            .rx
+            .recv()
+            .expect("expected an error item from missing-file source");
         let err = first.expect_err("expected error result for missing partial vocab file");
         assert!(
-            err.to_string().contains("Failed to open partial vocab for batch 42"),
+            err.to_string()
+                .contains("Failed to open partial vocab for batch 42"),
             "unexpected error: {err}"
         );
 
         handle.join()?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_so_phase_preserves_existing_p_map() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let temp_path = temp_dir.path();
+
+        let mapping_path = temp_path.join("id_mapping_000000.map.zst");
+        IdMapping {
+            batch_id: 0,
+            so_map: vec![111],
+            p_map: vec![222, 333],
+        }
+        .write_to_file(&mapping_path)?;
+
+        let mut writer = ShardedMappingWriter::new(temp_path, vec![0], vec![1])?;
+        writer.write_so(0, 0, 5)?;
+        writer.finish(0, temp_path)?;
+
+        let mapping = IdMapping::read_from_file(&mapping_path)?;
+        assert_eq!(mapping.so_map, vec![5]);
+        assert_eq!(mapping.p_map, vec![222, 333]);
+
         Ok(())
     }
 }
