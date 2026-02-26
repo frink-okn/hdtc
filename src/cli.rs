@@ -87,6 +87,9 @@ pub enum Commands {
     /// Create index file for an existing HDT file
     Index(IndexArgs),
 
+    /// Dump an HDT file to N-Triples
+    Dump(DumpArgs),
+
     /// Validate HDT triples structures (ArrayY/ArrayZ/BitmapZ) for indexing
     Validate(ValidateArgs),
 }
@@ -164,4 +167,14 @@ pub struct IndexArgs {
 pub struct ValidateArgs {
     /// Path to existing HDT file
     pub hdt_file: PathBuf,
+}
+
+#[derive(Debug, Parser)]
+pub struct DumpArgs {
+    /// Path to existing HDT file
+    pub hdt_file: PathBuf,
+
+    /// Output N-Triples file path (overwritten if it exists)
+    #[arg(short, long)]
+    pub output: PathBuf,
 }

@@ -32,7 +32,7 @@ cargo build --release
 
 ## Usage
 
-hdtc supports two main commands:
+hdtc supports three main commands:
 
 ### `hdtc create` — Convert RDF to HDT
 
@@ -44,6 +44,12 @@ hdtc create [OPTIONS] --output <OUTPUT> <INPUTS>...
 
 ```
 hdtc index [OPTIONS] <HDT_FILE>
+```
+
+### `hdtc dump` — Convert HDT to N-Triples
+
+```
+hdtc dump <HDT_FILE> --output <OUTPUT>
 ```
 
 ### Create: Basic examples
@@ -117,39 +123,59 @@ With custom memory and temp settings:
 hdtc index existing.hdt --memory-limit 8G --temp-dir /mnt/fast-ssd/tmp
 ```
 
+### Dump: Exporting to N-Triples
+
+Export an HDT file to N-Triples:
+
+```sh
+hdtc dump existing.hdt -o existing.nt
+```
+
+If the output file already exists, it is overwritten.
+
 ### Create: All options
 
-| Option                             | Default                      | Description                                         |
-| ---------------------------------- | ---------------------------- | --------------------------------------------------- |
-| `<INPUTS>...`                      | _(required)_                 | Input RDF files or directories                      |
-| `-o, --output`                     | _(required)_                 | Output HDT file path                                |
-| `-m, --mode`                       | `triples`                    | Output mode: `triples` or `quads`                   |
-| `--temp-dir`                       | system temp                  | Directory for temporary working files               |
-| `--index`                          | off                          | Generate `.hdt.index.v1-1` index file               |
-| `--base-uri`                       | `http://example.org/dataset` | Base URI for the HDT header                         |
-| `--graph-map PATH=URI`             | —                            | Map input paths to named graph URIs (quads mode)    |
-| `--default-graph URI`              | —                            | Default graph for triples without an explicit graph |
+| Option                             | Default                      | Description                                                 |
+| ---------------------------------- | ---------------------------- | ----------------------------------------------------------- |
+| `<INPUTS>...`                      | _(required)_                 | Input RDF files or directories                              |
+| `-o, --output`                     | _(required)_                 | Output HDT file path                                        |
+| `-m, --mode`                       | `triples`                    | Output mode: `triples` or `quads`                           |
+| `--temp-dir`                       | system temp                  | Directory for temporary working files                       |
+| `--index`                          | off                          | Generate `.hdt.index.v1-1` index file                       |
+| `--base-uri`                       | `http://example.org/dataset` | Base URI for the HDT header                                 |
+| `--graph-map PATH=URI`             | —                            | Map input paths to named graph URIs (quads mode)            |
+| `--default-graph URI`              | —                            | Default graph for triples without an explicit graph         |
 | `--memory-limit SIZE`              | `4G`                         | Soft memory limit for internal buffers (e.g. `4G`, `2000M`) |
-| `--parse-file-workers N`           | auto                         | Number of files parsed concurrently                 |
-| `--parse-chunk-workers N`          | auto (capped)                | Parser workers per active NT/NQ file                |
-| `--parse-chunk-bytes BYTES`        | auto                         | Target NT/NQ chunk size in bytes                    |
-| `--parse-max-inflight-bytes BYTES` | auto                         | Max in-flight parser chunk bytes per file           |
-| `--benchmark`                      | off                          | Emit stage timing and RSS high-water summary        |
-| `-v, --verbose`                    | —                            | Increase log verbosity (`-v` debug, `-vv` trace)    |
-| `-q, --quiet`                      | —                            | Suppress all output except errors                   |
+| `--parse-file-workers N`           | auto                         | Number of files parsed concurrently                         |
+| `--parse-chunk-workers N`          | auto (capped)                | Parser workers per active NT/NQ file                        |
+| `--parse-chunk-bytes BYTES`        | auto                         | Target NT/NQ chunk size in bytes                            |
+| `--parse-max-inflight-bytes BYTES` | auto                         | Max in-flight parser chunk bytes per file                   |
+| `--benchmark`                      | off                          | Emit stage timing and RSS high-water summary                |
+| `-v, --verbose`                    | —                            | Increase log verbosity (`-v` debug, `-vv` trace)            |
+| `-q, --quiet`                      | —                            | Suppress all output except errors                           |
 
 Auto parser tuning is derived from `--memory-limit` (accepts `G`/`M` suffixes, e.g. `16G` or `2000M`): by default hdtc allocates a bounded parser budget, caps chunk-worker fanout, and computes chunk size / in-flight chunk bytes from that budget.
 
 ### Index: All options
 
-| Option              | Default      | Description                                      |
-| ------------------- | ------------ | ------------------------------------------------ |
-| `<HDT_FILE>`        | _(required)_ | Path to existing HDT file                        |
-| `--temp-dir`        | system temp  | Directory for temporary working files            |
-| `--memory-limit SIZE` | `4G`       | Soft memory limit for sorting operations (e.g. `4G`, `2000M`) |
-| `--benchmark`       | off          | Emit stage timing and RSS high-water summary     |
-| `-v, --verbose`     | —            | Increase log verbosity (`-v` debug, `-vv` trace) |
-| `-q, --quiet`       | —            | Suppress all output except errors                |
+| Option                | Default      | Description                                                   |
+| --------------------- | ------------ | ------------------------------------------------------------- |
+| `<HDT_FILE>`          | _(required)_ | Path to existing HDT file                                     |
+| `--temp-dir`          | system temp  | Directory for temporary working files                         |
+| `--memory-limit SIZE` | `4G`         | Soft memory limit for sorting operations (e.g. `4G`, `2000M`) |
+| `--benchmark`         | off          | Emit stage timing and RSS high-water summary                  |
+| `-v, --verbose`       | —            | Increase log verbosity (`-v` debug, `-vv` trace)              |
+| `-q, --quiet`         | —            | Suppress all output except errors                             |
+
+### Dump: All options
+
+| Option          | Default      | Description                                      |
+| --------------- | ------------ | ------------------------------------------------ |
+| `<HDT_FILE>`    | _(required)_ | Path to existing HDT file                        |
+| `-o, --output`  | _(required)_ | Output N-Triples file path                       |
+| `--benchmark`   | off          | Emit stage timing and RSS high-water summary     |
+| `-v, --verbose` | —            | Increase log verbosity (`-v` debug, `-vv` trace) |
+| `-q, --quiet`   | —            | Suppress all output except errors                |
 
 ## Resource requirements
 

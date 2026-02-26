@@ -70,6 +70,7 @@ fn main() -> Result<()> {
     match cli.command {
         cli::Commands::Create(args) => create_hdt(args, benchmark),
         cli::Commands::Index(args) => create_index_from_hdt(args, benchmark),
+        cli::Commands::Dump(args) => dump_hdt_to_ntriples(args, benchmark),
         cli::Commands::Validate(args) => validate_hdt_file(args, benchmark),
     }
 }
@@ -231,6 +232,33 @@ fn create_index_from_hdt(args: cli::IndexArgs, benchmark: bool) -> Result<()> {
             Err(e)
         }
     }
+}
+
+/// Dump an existing HDT file to N-Triples.
+fn dump_hdt_to_ntriples(args: cli::DumpArgs, benchmark: bool) -> Result<()> {
+    if !args.hdt_file.exists() {
+        anyhow::bail!("HDT file not found: {}", args.hdt_file.display());
+    }
+
+    tracing::info!("Dumping HDT to N-Triples: {}", args.hdt_file.display());
+    tracing::info!("Output: {}", args.output.display());
+
+    let start = std::time::Instant::now();
+    let count = hdt::dump_hdt_to_ntriples_streaming(&args.hdt_file, &args.output)?;
+
+    if benchmark {
+        tracing::info!(
+            "Benchmark summary (dump): total {:.3}s",
+            start.elapsed().as_secs_f64()
+        );
+    }
+
+    tracing::info!(
+        "Done! {} triples written to {}",
+        count,
+        args.output.display()
+    );
+    Ok(())
 }
 
 /// Validate an existing HDT file's triples structures for indexing.

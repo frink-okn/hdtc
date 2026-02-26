@@ -2,6 +2,7 @@ mod common;
 
 use common::write_file;
 use oxrdf::Term;
+use std::collections::HashSet;
 use std::io::Write;
 use std::path::Path;
 use std::process::Command;
@@ -118,6 +119,69 @@ fn parse_header_num_triples(header_content: &str) -> u64 {
         (None, Some(h)) => h,
         (None, None) => panic!("Header is missing triple-count metadata"),
     }
+}
+
+#[test]
+fn test_dump_hdt_to_ntriples() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let input_nt = temp_dir.path().join("input.nt");
+    let hdt_path = temp_dir.path().join("data.hdt");
+    let output_nt = temp_dir.path().join("dumped.nt");
+
+    let content = r#"<http://example.org/s1> <http://example.org/p> <http://example.org/o1> .
+<http://example.org/s1> <http://example.org/p> <http://example.org/o2> .
+<http://example.org/s2> <http://example.org/p> "literal" .
+<http://example.org/s2> <http://example.org/p> "èpsilon" .
+<http://example.org/s2> <http://example.org/p> "éclair" .
+"#;
+    write_file(&input_nt, content.as_bytes());
+
+    let create_output = Command::new(env!("CARGO_BIN_EXE_hdtc"))
+        .args([
+            "create",
+            input_nt.to_str().unwrap(),
+            "-o",
+            hdt_path.to_str().unwrap(),
+            "--base-uri",
+            "http://example.org/dataset",
+            "--temp-dir",
+            temp_dir.path().join("work").to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute hdtc create");
+    assert!(
+        create_output.status.success(),
+        "hdtc create failed: {}",
+        String::from_utf8_lossy(&create_output.stderr)
+    );
+
+    let dump_output = Command::new(env!("CARGO_BIN_EXE_hdtc"))
+        .args([
+            "dump",
+            hdt_path.to_str().unwrap(),
+            "-o",
+            output_nt.to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute hdtc dump");
+    assert!(
+        dump_output.status.success(),
+        "hdtc dump failed: {}",
+        String::from_utf8_lossy(&dump_output.stderr)
+    );
+
+    let parse_all = |path: &Path| -> HashSet<String> {
+        let file = std::fs::File::open(path).unwrap();
+        let reader = std::io::BufReader::new(file);
+        let parser = oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::NTriples).for_reader(reader);
+        parser
+            .map(|q| q.unwrap().to_string())
+            .collect::<HashSet<_>>()
+    };
+
+    let expected = parse_all(&input_nt);
+    let actual = parse_all(&output_nt);
+    assert_eq!(expected, actual, "Dumped N-Triples should match input graph");
 }
 
 // =============================================================================
