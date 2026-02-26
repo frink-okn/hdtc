@@ -86,6 +86,9 @@ pub enum Commands {
 
     /// Create index file for an existing HDT file
     Index(IndexArgs),
+
+    /// Validate HDT triples structures (ArrayY/ArrayZ/BitmapZ) for indexing
+    Validate(ValidateArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -155,4 +158,10 @@ pub struct IndexArgs {
     /// Soft memory limit for sorting operations (e.g. 4G, 2000M)
     #[arg(long, value_name = "SIZE", default_value = "4G")]
     pub memory_limit: MemorySize,
+}
+
+#[derive(Debug, Parser)]
+pub struct ValidateArgs {
+    /// Path to existing HDT file
+    pub hdt_file: PathBuf,
 }

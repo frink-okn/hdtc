@@ -70,6 +70,7 @@ fn main() -> Result<()> {
     match cli.command {
         cli::Commands::Create(args) => create_hdt(args, benchmark),
         cli::Commands::Index(args) => create_index_from_hdt(args, benchmark),
+        cli::Commands::Validate(args) => validate_hdt_file(args, benchmark),
     }
 }
 
@@ -227,6 +228,36 @@ fn create_index_from_hdt(args: cli::IndexArgs, benchmark: bool) -> Result<()> {
         }
         Err(e) => {
             tracing::error!("Failed to create index: {}", e);
+            Err(e)
+        }
+    }
+}
+
+/// Validate an existing HDT file's triples structures for indexing.
+fn validate_hdt_file(args: cli::ValidateArgs, benchmark: bool) -> Result<()> {
+    if !args.hdt_file.exists() {
+        anyhow::bail!("HDT file not found: {}", args.hdt_file.display());
+    }
+
+    tracing::info!(
+        "Validating HDT triples structures: {}",
+        args.hdt_file.display()
+    );
+
+    let start = std::time::Instant::now();
+    match index::validate_hdt_triples(&args.hdt_file) {
+        Ok(()) => {
+            if benchmark {
+                tracing::info!(
+                    "Benchmark summary (validate): total {:.3}s",
+                    start.elapsed().as_secs_f64()
+                );
+            }
+            tracing::info!("Validation passed");
+            Ok(())
+        }
+        Err(e) => {
+            tracing::error!("Validation failed: {}", e);
             Err(e)
         }
     }

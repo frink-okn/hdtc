@@ -506,6 +506,15 @@ The index can be created:
   - [x] If set, call `index::create_index(&hdt_path, memory_budget, &temp_dir)`
   - [x] ExternalSorter auto-cleans temp files
 - [x] Test index creation with sample RDF data and verify file format
+- [x] Streaming rewrite: `StreamingBitmapDecoder` + `StreamingLogArrayDecoder` for O(1) memory
+- [x] Integration test with full semantic verification (`test_index_creation_structural_and_semantic`)
+- [ ] Remove old in-memory index code (kept temporarily for writer.rs unit tests):
+  - `PredicateIndex` struct in `predicate_index.rs`
+  - `build_predicate_index()` in `predicate_index.rs`
+  - `build_predicate_count()` in `predicate_index.rs`
+  - `write_index()` in `writer.rs` (non-streaming variant)
+  - Associated `#[allow(dead_code)]` / `#[allow(unused_imports)]` annotations
+  - Writer unit tests should be migrated to use streaming equivalents first
 
 **Index File Format (confirmed by hdt-java source):**
 

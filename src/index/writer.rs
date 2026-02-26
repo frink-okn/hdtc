@@ -13,22 +13,17 @@ use std::path::Path;
 
 /// Write HDT index file (.hdt.index.v1-1) in OPS order.
 ///
-/// The index file contains five binary sections:
-/// 1. bitmapIndexZ - Bitmap from OPS BitmapTriples Z component (marks object boundaries)
-/// 2. indexZ - Sequence from OPS BitmapTriples Z component (subject IDs)
-/// 3. predicateIndex.bitmap - Inverted index boundaries for predicates
-/// 4. predicateIndex.sequence - Position mappings for predicate occurrences
-/// 5. predicateCount - Per-predicate occurrence counts
-///
-/// Sections 1-2 are streamed from temp files to avoid holding them in memory.
-/// Sections 3-5 are small (proportional to predicate count) and written from memory.
-pub fn write_index(
+/// All bitmap/logarray sections are streamed from temp files to avoid holding them in memory.
+/// Only the predicate count (proportional to predicate count, not triple count) is in memory.
+#[allow(clippy::too_many_arguments)]
+pub fn write_index_streaming(
     output_path: &Path,
     num_triples: u64,
     triples_order: u64,
     bitmap_index_z: &StreamingBitmapResult,
     index_z: &StreamingLogArrayResult,
-    predicate_index: &PredicateIndex,
+    pred_bitmap: &StreamingBitmapResult,
+    pred_sequence: &StreamingLogArrayResult,
     predicate_count: &[u8],
 ) -> Result<()> {
     let file = File::create(output_path)
@@ -58,17 +53,75 @@ pub fn write_index(
     )
     .context("Failed to write indexZ section")?;
 
-    // Section 3: predicateIndex.bitmap (small, from memory)
+    // Section 3: predicateIndex.bitmap — streamed from temp file
+    write_bitmap_from_file(&mut writer, &pred_bitmap.path, pred_bitmap.num_bits)
+        .context("Failed to write predicateIndex bitmap section")?;
+
+    // Section 4: predicateIndex.sequence — streamed from temp file
+    write_log_array_from_file(
+        &mut writer,
+        &pred_sequence.path,
+        pred_sequence.bits_per_entry,
+        pred_sequence.num_entries,
+    )
+    .context("Failed to write predicateIndex sequence section")?;
+
+    // Section 5: predicateCount (small, proportional to predicate count — from memory)
+    writer
+        .write_all(predicate_count)
+        .context("Failed to write predicateCount section")?;
+
+    writer.flush()?;
+
+    tracing::debug!("Index file written: {}", output_path.display());
+
+    Ok(())
+}
+
+/// Write HDT index file with in-memory predicate index structures.
+/// Used for backward compatibility with tests and small datasets.
+#[allow(dead_code)]
+pub fn write_index(
+    output_path: &Path,
+    num_triples: u64,
+    triples_order: u64,
+    bitmap_index_z: &StreamingBitmapResult,
+    index_z: &StreamingLogArrayResult,
+    predicate_index: &PredicateIndex,
+    predicate_count: &[u8],
+) -> Result<()> {
+    let file = File::create(output_path)
+        .with_context(|| format!("Failed to create index file {}", output_path.display()))?;
+    let mut writer = BufWriter::with_capacity(256 * 1024, file);
+
+    let mut ci = ControlInfo::new(
+        crate::io::ControlType::Index,
+        "<http://purl.org/HDT/hdt#indexFoQ>",
+    );
+    ci.set_property("numTriples", num_triples.to_string());
+    ci.set_property("order", triples_order.to_string());
+    ci.write_to(&mut writer)
+        .context("Failed to write control info to index file")?;
+
+    write_bitmap_from_file(&mut writer, &bitmap_index_z.path, bitmap_index_z.num_bits)
+        .context("Failed to write bitmapIndexZ section")?;
+
+    write_log_array_from_file(
+        &mut writer,
+        &index_z.path,
+        index_z.bits_per_entry,
+        index_z.num_entries,
+    )
+    .context("Failed to write indexZ section")?;
+
     writer
         .write_all(&predicate_index.bitmap)
         .context("Failed to write predicateIndex bitmap section")?;
 
-    // Section 4: predicateIndex.sequence (small, from memory)
     writer
         .write_all(&predicate_index.sequence)
         .context("Failed to write predicateIndex sequence section")?;
 
-    // Section 5: predicateCount (small, from memory)
     writer
         .write_all(predicate_count)
         .context("Failed to write predicateCount section")?;
