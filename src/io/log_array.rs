@@ -39,11 +39,13 @@ fn bytes_needed(count: u64, bits: u8) -> u64 {
 }
 
 /// Writer for building a LogArray incrementally.
+#[allow(dead_code)]
 pub struct LogArrayWriter {
     entries: Vec<u64>,
     bits_per_entry: u8,
 }
 
+#[allow(dead_code)]
 impl LogArrayWriter {
     /// Create a new LogArrayWriter with the specified bits per entry.
     /// A bits_per_entry of 0 is allowed (all entries are implicitly 0).
@@ -231,13 +233,227 @@ impl<W: Write> StreamingLogArrayEncoder<W> {
     }
 }
 
+/// Streaming log array decoder that reads entries sequentially from a `Read` source
+/// using O(1) memory, without loading the entire array into RAM.
+///
+/// Reads the preamble during construction, then lazily reads data words on demand.
+/// CRC32C is verified when `finish()` is called.
+pub struct StreamingLogArrayDecoder<R: Read> {
+    reader: R,
+    bits_per_entry: u8,
+    num_entries: u64,
+    entries_read: u64,
+    /// Current 64-bit word being decoded from.
+    current_word: u64,
+    /// Next word (needed when entries span word boundaries).
+    next_word: u64,
+    /// Global bit position within the data stream.
+    bit_position: u64,
+    /// Index of the word currently in `current_word`.
+    current_word_index: u64,
+    /// Whether next_word has been loaded.
+    has_next_word: bool,
+    /// Total number of data words.
+    total_words: u64,
+    /// Words loaded so far (into current_word or next_word).
+    words_loaded: u64,
+    /// Mask for extracting an entry: (1 << bits_per_entry) - 1.
+    mask: u64,
+    /// Total data bytes in the section.
+    total_data_bytes: u64,
+    /// Data bytes read so far.
+    data_bytes_read: u64,
+    crc_digest: crc::Digest<'static, u32>,
+}
+
+impl<R: Read> StreamingLogArrayDecoder<R> {
+    /// Create a streaming decoder by reading the log array preamble.
+    pub fn new(mut reader: R) -> io::Result<Self> {
+        let mut preamble_buf = Vec::new();
+
+        // Type byte
+        let mut type_byte = [0u8; 1];
+        reader.read_exact(&mut type_byte)?;
+        if type_byte[0] != TYPE_LOG {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Expected LogArray type byte {TYPE_LOG}, got {}", type_byte[0]),
+            ));
+        }
+        preamble_buf.push(type_byte[0]);
+
+        // bits_per_entry (raw byte)
+        let mut bits_byte = [0u8; 1];
+        reader.read_exact(&mut bits_byte)?;
+        let bits_per_entry = bits_byte[0];
+        preamble_buf.push(bits_per_entry);
+
+        // VByte(num_entries)
+        let num_entries = read_vbyte_tracking(&mut reader, &mut preamble_buf)?;
+
+        // CRC8
+        let mut crc_byte = [0u8; 1];
+        reader.read_exact(&mut crc_byte)?;
+        let expected_crc = crc8(&preamble_buf);
+        if crc_byte[0] != expected_crc {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "LogArray preamble CRC8 mismatch",
+            ));
+        }
+
+        let mask = if bits_per_entry == 64 {
+            u64::MAX
+        } else if bits_per_entry == 0 {
+            0
+        } else {
+            (1u64 << bits_per_entry) - 1
+        };
+
+        let total_words = words_needed(num_entries, bits_per_entry);
+        let total_data_bytes = bytes_needed(num_entries, bits_per_entry);
+
+        let mut decoder = Self {
+            reader,
+            bits_per_entry,
+            num_entries,
+            entries_read: 0,
+            current_word: 0,
+            next_word: 0,
+            bit_position: 0,
+            current_word_index: 0,
+            has_next_word: false,
+            total_words,
+            words_loaded: 0,
+            mask,
+            total_data_bytes,
+            data_bytes_read: 0,
+            crc_digest: crate::io::crc_utils::CRC32C_ALGO.digest(),
+        };
+
+        // Pre-load first two words if available
+        if total_words > 0 {
+            decoder.current_word = decoder.read_word()?;
+            decoder.words_loaded = 1;
+            if total_words > 1 {
+                decoder.next_word = decoder.read_word()?;
+                decoder.has_next_word = true;
+                decoder.words_loaded = 2;
+            }
+        }
+
+        Ok(decoder)
+    }
+
+    /// Number of entries in the array.
+    #[allow(dead_code)]
+    pub fn num_entries(&self) -> u64 {
+        self.num_entries
+    }
+
+    /// Bits per entry.
+    #[allow(dead_code)]
+    pub fn bits_per_entry(&self) -> u8 {
+        self.bits_per_entry
+    }
+
+    /// Read the next word from the data stream.
+    fn read_word(&mut self) -> io::Result<u64> {
+        let bytes_remaining = self.total_data_bytes - self.data_bytes_read;
+        let bytes_to_read = bytes_remaining.min(8) as usize;
+        if bytes_to_read == 0 {
+            return Ok(0);
+        }
+        let mut buf = [0u8; 8];
+        self.reader.read_exact(&mut buf[..bytes_to_read])?;
+        self.crc_digest.update(&buf[..bytes_to_read]);
+        self.data_bytes_read += bytes_to_read as u64;
+        Ok(u64::from_le_bytes(buf))
+    }
+
+    /// Read the next entry. Returns `None` when all entries have been read.
+    pub fn next_entry(&mut self) -> io::Result<Option<u64>> {
+        if self.entries_read >= self.num_entries {
+            return Ok(None);
+        }
+
+        if self.bits_per_entry == 0 {
+            self.entries_read += 1;
+            return Ok(Some(0));
+        }
+
+        let bit_offset = (self.bit_position % 64) as u32;
+
+        let mut value = (self.current_word >> bit_offset) & self.mask;
+
+        // Handle entry spanning two words
+        if bit_offset as u8 + self.bits_per_entry > 64 {
+            let remaining_bits = bit_offset as u8 + self.bits_per_entry - 64;
+            let upper_mask = (1u64 << remaining_bits) - 1;
+            value |= (self.next_word & upper_mask) << (64 - bit_offset);
+        }
+
+        self.bit_position += self.bits_per_entry as u64;
+        self.entries_read += 1;
+
+        // Check if we've moved to the next word
+        let new_word_index = self.bit_position / 64;
+        if new_word_index > self.current_word_index {
+            self.current_word = self.next_word;
+            self.current_word_index = new_word_index;
+            // Load the next word if available
+            if self.words_loaded < self.total_words {
+                self.next_word = self.read_word()?;
+                self.words_loaded += 1;
+                self.has_next_word = true;
+            } else {
+                self.next_word = 0;
+                self.has_next_word = false;
+            }
+        }
+
+        Ok(Some(value))
+    }
+
+    /// Verify CRC32C after all entries have been read.
+    pub fn finish(mut self) -> io::Result<R> {
+        // Read any remaining data bytes
+        while self.data_bytes_read < self.total_data_bytes {
+            let bytes_remaining = self.total_data_bytes - self.data_bytes_read;
+            let bytes_to_read = bytes_remaining.min(8192) as usize;
+            let mut buf = vec![0u8; bytes_to_read];
+            self.reader.read_exact(&mut buf)?;
+            self.crc_digest.update(&buf);
+            self.data_bytes_read += bytes_to_read as u64;
+        }
+
+        // Read and verify CRC32C
+        let mut crc_buf = [0u8; 4];
+        self.reader.read_exact(&mut crc_buf)?;
+        let stored_crc = u32::from_le_bytes(crc_buf);
+        let computed_crc = self.crc_digest.finalize();
+        if stored_crc != computed_crc {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "LogArray data CRC32C mismatch: expected {computed_crc:#010x}, got {stored_crc:#010x}"
+                ),
+            ));
+        }
+
+        Ok(self.reader)
+    }
+}
+
 /// Reader for decoding a LogArray from bytes.
+#[allow(dead_code)]
 pub struct LogArrayReader {
     words: Vec<u64>,
     num_entries: u64,
     bits_per_entry: u8,
 }
 
+#[allow(dead_code)]
 impl LogArrayReader {
     /// Read a LogArray from a reader.
     pub fn read_from<R: Read>(reader: &mut R) -> io::Result<Self> {
@@ -626,6 +842,243 @@ mod tests {
         let assembled = assemble_log_array(num_entries, bits, &data_buf, data_crc);
 
         assert_eq!(assembled, expected);
+    }
+
+    #[test]
+    fn test_streaming_decoder_matches_reader() {
+        let mut writer = LogArrayWriter::for_max_value(100);
+        let values = [0, 1, 50, 99, 100];
+        for &v in &values {
+            writer.push(v);
+        }
+        let mut buf = Vec::new();
+        writer.write_to(&mut buf).unwrap();
+
+        let reader = LogArrayReader::read_from(&mut Cursor::new(&buf)).unwrap();
+        let mut decoder = StreamingLogArrayDecoder::new(Cursor::new(&buf)).unwrap();
+        assert_eq!(decoder.num_entries(), values.len() as u64);
+
+        for (i, &expected) in values.iter().enumerate() {
+            let val = decoder.next_entry().unwrap().unwrap();
+            assert_eq!(val, expected, "decoder mismatch at index {i}");
+            assert_eq!(val, reader.get(i as u64), "decoder vs reader mismatch at {i}");
+        }
+
+        assert!(decoder.next_entry().unwrap().is_none());
+        decoder.finish().unwrap();
+    }
+
+    #[test]
+    fn test_streaming_decoder_word_boundary() {
+        // 13-bit entries frequently cross word boundaries
+        let mut writer = LogArrayWriter::new(13);
+        let values: Vec<u64> = (0..20).map(|i| i * 400).collect();
+        for &v in &values {
+            writer.push(v);
+        }
+        let mut buf = Vec::new();
+        writer.write_to(&mut buf).unwrap();
+
+        let reader = LogArrayReader::read_from(&mut Cursor::new(&buf)).unwrap();
+        let mut decoder = StreamingLogArrayDecoder::new(Cursor::new(&buf)).unwrap();
+
+        for (i, &expected) in values.iter().enumerate() {
+            let val = decoder.next_entry().unwrap().unwrap();
+            assert_eq!(val, expected, "decoder mismatch at index {i}");
+            assert_eq!(val, reader.get(i as u64), "decoder vs reader at {i}");
+        }
+        decoder.finish().unwrap();
+    }
+
+    #[test]
+    fn test_streaming_decoder_64bit() {
+        let mut writer = LogArrayWriter::new(64);
+        let values = [0, 1, u64::MAX / 2, u64::MAX - 1, u64::MAX];
+        for &v in &values {
+            writer.push(v);
+        }
+        let mut buf = Vec::new();
+        writer.write_to(&mut buf).unwrap();
+
+        let mut decoder = StreamingLogArrayDecoder::new(Cursor::new(&buf)).unwrap();
+        for (i, &expected) in values.iter().enumerate() {
+            let val = decoder.next_entry().unwrap().unwrap();
+            assert_eq!(val, expected, "mismatch at index {i}");
+        }
+        decoder.finish().unwrap();
+    }
+
+    #[test]
+    fn test_streaming_decoder_many_entries() {
+        let max_val = (1u64 << 20) - 1;
+        let mut writer = LogArrayWriter::for_max_value(max_val);
+        let values: Vec<u64> = (0..1000).map(|i| i * 1049 % (max_val + 1)).collect();
+        for &v in &values {
+            writer.push(v);
+        }
+        let mut buf = Vec::new();
+        writer.write_to(&mut buf).unwrap();
+
+        let reader = LogArrayReader::read_from(&mut Cursor::new(&buf)).unwrap();
+        let mut decoder = StreamingLogArrayDecoder::new(Cursor::new(&buf)).unwrap();
+
+        for (i, &expected) in values.iter().enumerate() {
+            let val = decoder.next_entry().unwrap().unwrap();
+            assert_eq!(val, expected, "mismatch at index {i}");
+            assert_eq!(val, reader.get(i as u64));
+        }
+        decoder.finish().unwrap();
+    }
+
+    #[test]
+    fn test_streaming_decoder_empty() {
+        let writer = LogArrayWriter::new(8);
+        let mut buf = Vec::new();
+        writer.write_to(&mut buf).unwrap();
+
+        let mut decoder = StreamingLogArrayDecoder::new(Cursor::new(&buf)).unwrap();
+        assert_eq!(decoder.num_entries(), 0);
+        assert!(decoder.next_entry().unwrap().is_none());
+        decoder.finish().unwrap();
+    }
+
+    #[test]
+    fn test_streaming_decoder_1bit() {
+        let mut writer = LogArrayWriter::new(1);
+        let values = [0, 1, 1, 0, 1, 0, 0, 1, 1, 1];
+        for &v in &values {
+            writer.push(v);
+        }
+        let mut buf = Vec::new();
+        writer.write_to(&mut buf).unwrap();
+
+        let mut decoder = StreamingLogArrayDecoder::new(Cursor::new(&buf)).unwrap();
+        for (i, &expected) in values.iter().enumerate() {
+            let val = decoder.next_entry().unwrap().unwrap();
+            assert_eq!(val, expected, "mismatch at index {i}");
+        }
+        decoder.finish().unwrap();
+    }
+
+    /// Test streaming decoder with bpe=33 (typical for large HDT object IDs) at scale.
+    /// Exercises all 64 possible bit offsets within a word multiple times.
+    /// Uses both LogArrayWriter→Decoder and StreamingEncoder→Decoder paths.
+    #[test]
+    fn test_streaming_decoder_bpe33_large() {
+        let bpe: u8 = 33;
+        let max_val = (1u64 << bpe) - 1;
+        let n = 10_000u64; // enough for ~156 full 64-entry cycles
+
+        // Generate diverse values including edge cases
+        let values: Vec<u64> = (0..n)
+            .map(|i| match i % 7 {
+                0 => 0,                           // zero
+                1 => max_val,                      // max
+                2 => 1,                            // min nonzero
+                3 => i * 839_471 % (max_val + 1),  // pseudo-random
+                4 => max_val - (i % 100),          // near-max
+                5 => (i * i) % (max_val + 1),      // quadratic
+                _ => (max_val / 2) + (i % 1000),   // mid-range
+            })
+            .collect();
+
+        // Path A: LogArrayWriter → StreamingLogArrayDecoder
+        {
+            let mut writer = LogArrayWriter::new(bpe);
+            for &v in &values {
+                writer.push(v);
+            }
+            let mut buf = Vec::new();
+            writer.write_to(&mut buf).unwrap();
+
+            let reader = LogArrayReader::read_from(&mut Cursor::new(&buf)).unwrap();
+            let mut decoder = StreamingLogArrayDecoder::new(Cursor::new(&buf)).unwrap();
+            assert_eq!(decoder.num_entries(), n);
+            assert_eq!(decoder.bits_per_entry(), bpe);
+
+            for (i, &expected) in values.iter().enumerate() {
+                let val = decoder.next_entry().unwrap().unwrap();
+                assert_eq!(
+                    val, expected,
+                    "LogArrayWriter→Decoder mismatch at index {i}: got {val}, expected {expected}"
+                );
+                assert_eq!(val, reader.get(i as u64), "Reader mismatch at index {i}");
+            }
+            assert!(decoder.next_entry().unwrap().is_none());
+            decoder.finish().unwrap();
+        }
+
+        // Path B: StreamingLogArrayEncoder → StreamingLogArrayDecoder
+        {
+            use crate::io::crc_utils::Crc32cWriter;
+            use std::io::BufWriter;
+
+            let data_buf: Vec<u8> = Vec::new();
+            let crc_writer = Crc32cWriter::new(BufWriter::new(data_buf));
+            let mut encoder = StreamingLogArrayEncoder::new(bpe, crc_writer);
+
+            for &v in &values {
+                encoder.push(v).unwrap();
+            }
+            let (num_entries, bpe_out, crc_writer) = encoder.finish().unwrap();
+            assert_eq!(num_entries, n);
+            assert_eq!(bpe_out, bpe);
+
+            let (data_crc, buf_writer) = crc_writer.finalize();
+            let data: Vec<u8> = buf_writer.into_inner().unwrap();
+
+            // Build complete serialized form: preamble + CRC8 + data + CRC32C
+            let mut buf = Vec::new();
+            let mut preamble = Vec::new();
+            preamble.push(TYPE_LOG);
+            preamble.push(bpe);
+            preamble.extend_from_slice(&encode_vbyte(n));
+            buf.extend_from_slice(&preamble);
+            buf.push(crc8(&preamble));
+            buf.extend_from_slice(&data);
+            buf.extend_from_slice(&data_crc.to_le_bytes());
+
+            let mut decoder = StreamingLogArrayDecoder::new(Cursor::new(&buf)).unwrap();
+            for (i, &expected) in values.iter().enumerate() {
+                let val = decoder.next_entry().unwrap().unwrap();
+                assert_eq!(
+                    val, expected,
+                    "StreamingEncoder→Decoder mismatch at index {i}: got {val}, expected {expected}"
+                );
+            }
+            assert!(decoder.next_entry().unwrap().is_none());
+            decoder.finish().unwrap();
+        }
+    }
+
+    /// Test streaming decoder with every bpe from 1 to 64 over multiple word boundaries.
+    /// Catches bit-extraction bugs specific to certain alignment patterns.
+    #[test]
+    fn test_streaming_decoder_all_bpe_values() {
+        for bpe in 1..=64u8 {
+            let max_val = if bpe == 64 { u64::MAX } else { (1u64 << bpe) - 1 };
+            // 200 entries exercises ~3 full 64-entry cycles for any bpe
+            let values: Vec<u64> = (0..200u64)
+                .map(|i| (i * 7919 + 1) % (max_val.min(1_000_000) + 1))
+                .collect();
+
+            let mut writer = LogArrayWriter::new(bpe);
+            for &v in &values {
+                writer.push(v);
+            }
+            let mut buf = Vec::new();
+            writer.write_to(&mut buf).unwrap();
+
+            let mut decoder = StreamingLogArrayDecoder::new(Cursor::new(&buf)).unwrap();
+            for (i, &expected) in values.iter().enumerate() {
+                let val = decoder.next_entry().unwrap().unwrap();
+                assert_eq!(
+                    val, expected,
+                    "bpe={bpe} mismatch at index {i}: got {val}, expected {expected}"
+                );
+            }
+            decoder.finish().unwrap();
+        }
     }
 
     #[test]

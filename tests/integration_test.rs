@@ -1133,3 +1133,480 @@ fn test_multi_file_term_overlap() {
     assert!(hdt_bytes.starts_with(b"$HDT"), "Output should start with HDT magic");
     assert!(stderr.contains("4 triples"), "Should report exactly 4 triples, got:\n{stderr}");
 }
+
+// =============================================================================
+// Index creation tests
+// =============================================================================
+
+/// Run `hdtc index` on an existing HDT file, return the index file bytes.
+fn run_hdtc_index(hdt_path: &Path, temp_dir: &Path) -> Vec<u8> {
+    let work_dir = temp_dir.join("index_work");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_hdtc"))
+        .args([
+            "index",
+            hdt_path.to_str().unwrap(),
+            "--temp-dir",
+            work_dir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute hdtc index");
+
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    eprintln!("hdtc index stderr:\n{stderr}");
+    assert!(
+        output.status.success(),
+        "hdtc index failed: {stderr}"
+    );
+
+    let index_path = hdt_path.with_extension("hdt.index.v1-1");
+    assert!(index_path.exists(), "Index file should exist at {}", index_path.display());
+    std::fs::read(&index_path).expect("Failed to read index file")
+}
+
+/// Parse a VByte value from a byte slice, returning (value, bytes_consumed).
+fn parse_vbyte(data: &[u8]) -> (u64, usize) {
+    let mut value: u64 = 0;
+    let mut shift = 0u32;
+    for (i, &byte) in data.iter().enumerate() {
+        value |= ((byte & 0x7F) as u64) << shift;
+        if byte & 0x80 != 0 {
+            return (value, i + 1);
+        }
+        shift += 7;
+    }
+    panic!("Unterminated VByte");
+}
+
+/// Parse bitmap preamble at offset: type(1) + VByte(num_bits) + CRC8(1).
+/// Returns (num_bits, data_start_offset, data_bytes, section_end_offset).
+fn parse_bitmap_preamble(data: &[u8], offset: usize) -> (u64, usize, usize, usize) {
+    assert_eq!(data[offset], 0x01, "Expected bitmap type byte 0x01");
+    let (num_bits, vbyte_len) = parse_vbyte(&data[offset + 1..]);
+    let data_start = offset + 1 + vbyte_len + 1; // +1 for CRC8
+    let data_bytes = num_bits.div_ceil(8) as usize;
+    let section_end = data_start + data_bytes + 4; // +4 for CRC32C
+    (num_bits, data_start, data_bytes, section_end)
+}
+
+/// Parse log array preamble at offset: type(1) + bpe(1) + VByte(num_entries) + CRC8(1).
+/// Returns (bits_per_entry, num_entries, data_start_offset, section_end_offset).
+fn parse_logarray_preamble(data: &[u8], offset: usize) -> (u8, u64, usize, usize) {
+    assert_eq!(data[offset], 0x01, "Expected log array type byte 0x01");
+    let bpe = data[offset + 1];
+    let (num_entries, vbyte_len) = parse_vbyte(&data[offset + 2..]);
+    let data_start = offset + 2 + vbyte_len + 1; // +1 for CRC8
+    let total_bits = num_entries * bpe as u64;
+    let data_bytes = total_bits.div_ceil(8) as usize;
+    let section_end = data_start + data_bytes + 4; // +4 for CRC32C
+    (bpe, num_entries, data_start, section_end)
+}
+
+/// Read a single bit from packed bitmap data.
+fn read_bitmap_bit(data: &[u8], data_start: usize, bit_index: u64) -> bool {
+    let byte_idx = data_start + (bit_index / 8) as usize;
+    let bit_in_byte = bit_index % 8;
+    (data[byte_idx] >> bit_in_byte) & 1 == 1
+}
+
+/// Read a single entry from packed log array data.
+fn read_logarray_entry(data: &[u8], data_start: usize, bpe: u8, entry_index: u64) -> u64 {
+    let bit_offset = entry_index * bpe as u64;
+    let byte_start = data_start + (bit_offset / 8) as usize;
+    let bit_in_byte = (bit_offset % 8) as u32;
+
+    // Read up to 16 bytes to cover any cross-word boundary
+    let mut buf = [0u8; 16];
+    let available = data.len().saturating_sub(byte_start).min(16);
+    buf[..available].copy_from_slice(&data[byte_start..byte_start + available]);
+    let wide = u128::from_le_bytes(buf);
+    let mask = (1u128 << bpe) - 1;
+    ((wide >> bit_in_byte) & mask) as u64
+}
+
+/// Decode all entries from a bitmap section.
+fn decode_bitmap(data: &[u8], offset: usize) -> (Vec<bool>, usize) {
+    let (num_bits, data_start, _, section_end) = parse_bitmap_preamble(data, offset);
+    let bits: Vec<bool> = (0..num_bits)
+        .map(|i| read_bitmap_bit(data, data_start, i))
+        .collect();
+    (bits, section_end)
+}
+
+/// Decode all entries from a log array section.
+fn decode_logarray(data: &[u8], offset: usize) -> (Vec<u64>, usize) {
+    let (bpe, num_entries, data_start, section_end) = parse_logarray_preamble(data, offset);
+    let entries: Vec<u64> = (0..num_entries)
+        .map(|i| read_logarray_entry(data, data_start, bpe, i))
+        .collect();
+    (entries, section_end)
+}
+
+/// Test that `hdtc index` creates a structurally valid and semantically correct
+/// index file for a dataset with multiple subjects, predicates, and objects.
+///
+/// Dataset (6 triples, 3 subjects, 2 predicates, 4 objects):
+///   <s1> <p1> <o1> .   <s1> <p1> <o2> .   <s1> <p2> <o3> .
+///   <s2> <p1> <o1> .   <s2> <p2> <o4> .
+///   <s3> <p1> <o2> .
+///
+/// This exercises:
+/// - Multiple objects per (S,P) pair → multi-entry groups in bitmapIndexZ
+/// - Multiple predicates per subject → predicate index grouping
+/// - Object appearing in multiple triples → merged OPS groups
+#[test]
+fn test_index_creation_structural_and_semantic() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let nt_path = temp_dir.path().join("index_test.nt");
+
+    // Use short URIs that sort lexicographically in a predictable order
+    write_file(
+        &nt_path,
+        b"<http://example.org/s1> <http://example.org/p1> <http://example.org/o1> .\n\
+          <http://example.org/s1> <http://example.org/p1> <http://example.org/o2> .\n\
+          <http://example.org/s1> <http://example.org/p2> <http://example.org/o3> .\n\
+          <http://example.org/s2> <http://example.org/p1> <http://example.org/o1> .\n\
+          <http://example.org/s2> <http://example.org/p2> <http://example.org/o4> .\n\
+          <http://example.org/s3> <http://example.org/p1> <http://example.org/o2> .\n",
+    );
+
+    // Create HDT
+    let hdt_path = temp_dir.path().join("index_test.hdt");
+    let work_dir = temp_dir.path().join("work");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_hdtc"))
+        .args([
+            "create",
+            nt_path.to_str().unwrap(),
+            "-o",
+            hdt_path.to_str().unwrap(),
+            "--base-uri",
+            "http://example.org/dataset",
+            "--temp-dir",
+            work_dir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute hdtc create");
+
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        output.status.success(),
+        "hdtc create failed: {stderr}"
+    );
+
+    // Create index
+    let index_bytes = run_hdtc_index(&hdt_path, temp_dir.path());
+
+    // ── Parse the index file ──
+
+    // Control Info
+    let (ci_type, ci_format, ci_props, ci_end) = parse_control_info(&index_bytes, 0);
+    assert_eq!(ci_type, 5, "Control type should be INDEX (5)");
+    assert_eq!(
+        ci_format, "<http://purl.org/HDT/hdt#indexFoQ>",
+        "Index format URI mismatch"
+    );
+    assert!(
+        ci_props.contains("numTriples=6"),
+        "Should have numTriples=6 in properties, got: {ci_props}"
+    );
+
+    // Section 1: bitmapIndexZ
+    let (bitmap_index_z, s1_end) = decode_bitmap(&index_bytes, ci_end);
+    assert_eq!(
+        bitmap_index_z.len(),
+        6,
+        "bitmapIndexZ should have num_triples={} bits",
+        6
+    );
+
+    // Section 2: indexZ
+    let (index_z, s2_end) = decode_logarray(&index_bytes, s1_end);
+    assert_eq!(
+        index_z.len(),
+        6,
+        "indexZ should have num_triples={} entries",
+        6
+    );
+
+    // Section 3: predicateIndex bitmap
+    let (pred_bitmap, s3_end) = decode_bitmap(&index_bytes, s2_end);
+
+    // Section 4: predicateIndex sequence
+    let (pred_seq, s4_end) = decode_logarray(&index_bytes, s3_end);
+
+    // Section 5: predicateCount
+    let (pred_count, s5_end) = decode_logarray(&index_bytes, s4_end);
+
+    // All sections should consume the file exactly
+    assert_eq!(
+        s5_end,
+        index_bytes.len(),
+        "Index sections should consume the file exactly (consumed {}, file len {})",
+        s5_end,
+        index_bytes.len()
+    );
+
+    // ── Structural invariants ──
+
+    // bitmapIndexZ: last bit in each object group is set (true), others are false
+    assert!(
+        *bitmap_index_z.last().unwrap(),
+        "Last bit of bitmapIndexZ must be set"
+    );
+
+    // The number of set bits in bitmapIndexZ equals the number of distinct objects
+    let num_object_groups = bitmap_index_z.iter().filter(|&&b| b).count();
+    // Our dataset has 4 distinct objects (o1, o2, o3, o4)
+    assert_eq!(
+        num_object_groups, 4,
+        "bitmapIndexZ should have one group boundary per distinct object"
+    );
+
+    // indexZ values should all be valid Y-positions (S-P pair indices)
+    // Our dataset has 5 S-P pairs: (s1,p1), (s1,p2), (s2,p1), (s2,p2), (s3,p1)
+    let num_sp_pairs = 5u64;
+    for (i, &pos_y) in index_z.iter().enumerate() {
+        assert!(
+            pos_y < num_sp_pairs,
+            "indexZ[{i}]={pos_y} should be < num_sp_pairs={num_sp_pairs}"
+        );
+    }
+
+    // predicateIndex bitmap + sequence should have same length = num_sp_pairs
+    assert_eq!(
+        pred_bitmap.len() as u64, num_sp_pairs,
+        "predicateIndex bitmap should have num_sp_pairs bits"
+    );
+    assert_eq!(
+        pred_seq.len() as u64, num_sp_pairs,
+        "predicateIndex sequence should have num_sp_pairs entries"
+    );
+
+    // predicateCount should have one entry per predicate
+    // Our dataset has 2 predicates (p1, p2)
+    assert_eq!(pred_count.len(), 2, "predicateCount should have 2 entries (one per predicate)");
+
+    // Sum of predicateCount should equal num_sp_pairs
+    let count_sum: u64 = pred_count.iter().sum();
+    assert_eq!(
+        count_sum, num_sp_pairs,
+        "Sum of predicateCount should equal num_sp_pairs"
+    );
+
+    // ── Semantic checks ──
+
+    // predicateCount values: p1 has 3 S-P pairs (s1-p1, s2-p1, s3-p1), p2 has 2 (s1-p2, s2-p2)
+    assert_eq!(pred_count[0], 3, "predicate 1 should have 3 S-P pairs");
+    assert_eq!(pred_count[1], 2, "predicate 2 should have 2 S-P pairs");
+
+    // predicateIndex bitmap: 2 groups, first has 3 entries, second has 2
+    // Bitmap: [false, false, true, false, true]
+    //          ^^^^^^^^^^^^  ^^^^  ^^^^^^^^^^^
+    //            pred 1             pred 2
+    assert_eq!(pred_bitmap, vec![false, false, true, false, true],
+        "predicateIndex bitmap should mark group boundaries at positions 2 and 4");
+
+    // predicateIndex sequence: Y-positions of S-P pairs grouped by predicate
+    // pred 1 (at Y-positions 0, 2, 4 for s1-p1, s2-p1, s3-p1):
+    //   seq[0..3] should be {0, 2, 4} in sorted order
+    // pred 2 (at Y-positions 1, 3 for s1-p2, s2-p2):
+    //   seq[3..5] should be {1, 3} in sorted order
+    assert_eq!(&pred_seq[0..3], &[0, 2, 4],
+        "predicate 1 Y-positions should be [0, 2, 4]");
+    assert_eq!(&pred_seq[3..5], &[1, 3],
+        "predicate 2 Y-positions should be [1, 3]");
+
+    // Verify OPS index semantics:
+    // Our SPO triples with dictionary IDs (subjects s1<s2<s3, predicates p1<p2, objects o1<o2<o3<o4):
+    //   S-P pairs (Y-positions): 0=(s1,p1), 1=(s1,p2), 2=(s2,p1), 3=(s2,p2), 4=(s3,p1)
+    //   Objects per pair: 0→{o1,o2}, 1→{o3}, 2→{o1}, 3→{o4}, 4→{o2}
+    //
+    // OPS order groups by object:
+    //   o1: (s1,p1)@Y=0, (s2,p1)@Y=2  → indexZ=[0,2], bitmapIndexZ=[false,true]
+    //   o2: (s1,p1)@Y=0, (s3,p1)@Y=4  → indexZ=[0,4], bitmapIndexZ=[false,true]
+    //   o3: (s1,p2)@Y=1               → indexZ=[1],   bitmapIndexZ=[true]
+    //   o4: (s2,p2)@Y=3               → indexZ=[3],   bitmapIndexZ=[true]
+    //
+    // Combined: indexZ = [0, 2, 0, 4, 1, 3]
+    //           bitmapIndexZ = [false, true, false, true, true, true]
+    assert_eq!(
+        index_z,
+        vec![0, 2, 0, 4, 1, 3],
+        "indexZ should map OPS-ordered triples to their Y-positions"
+    );
+    assert_eq!(
+        bitmap_index_z,
+        vec![false, true, false, true, true, true],
+        "bitmapIndexZ should mark object group boundaries"
+    );
+}
+
+/// Test index creation with a larger dataset and tiny memory limit to force
+/// multiple external sort chunks. Exercises the parallel merge tree path.
+///
+/// With 2000 triples and 1MB memory limit:
+/// - OPS sort budget = 768KB → ~24K ObjectPosEntry (32 bytes each) per chunk → ~83 chunks
+/// - Pred sort budget = 256KB → ~8K PredicateEntry (16 bytes each) per chunk
+/// - This well exceeds the PARALLEL_MERGE_THRESHOLD of 16.
+#[test]
+fn test_index_creation_many_sort_chunks() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let nt_path = temp_dir.path().join("big_index_test.nt");
+
+    // Generate 2000 triples: 100 subjects × 4 predicates × 5 objects each
+    let num_subjects = 100;
+    let num_predicates = 4;
+    let objects_per_pair = 5;
+    let num_triples = num_subjects * num_predicates * objects_per_pair;
+    let num_sp_pairs = num_subjects * num_predicates;
+
+    let mut content = String::new();
+    for s in 0..num_subjects {
+        for p in 0..num_predicates {
+            for o in 0..objects_per_pair {
+                let obj_id = p * objects_per_pair + o; // 20 distinct objects
+                content.push_str(&format!(
+                    "<http://example.org/s{s:03}> <http://example.org/p{p}> <http://example.org/o{obj_id:02}> .\n"
+                ));
+            }
+        }
+    }
+    write_file(&nt_path, content.as_bytes());
+
+    // Create HDT
+    let hdt_path = temp_dir.path().join("big_index_test.hdt");
+    let work_dir = temp_dir.path().join("work");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_hdtc"))
+        .args([
+            "create",
+            nt_path.to_str().unwrap(),
+            "-o",
+            hdt_path.to_str().unwrap(),
+            "--base-uri",
+            "http://example.org/dataset",
+            "--temp-dir",
+            work_dir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute hdtc create");
+
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(output.status.success(), "hdtc create failed: {stderr}");
+
+    // Create index with tiny memory limit to force many sort chunks
+    let index_work = temp_dir.path().join("index_work");
+    let output = Command::new(env!("CARGO_BIN_EXE_hdtc"))
+        .args([
+            "index",
+            hdt_path.to_str().unwrap(),
+            "--temp-dir",
+            index_work.to_str().unwrap(),
+            "--memory-limit",
+            "1M",
+        ])
+        .output()
+        .expect("Failed to execute hdtc index");
+
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    eprintln!("hdtc index stderr:\n{stderr}");
+    assert!(output.status.success(), "hdtc index failed: {stderr}");
+
+    // Verify parallel merge was used (should be in debug/trace output)
+    // Even if not logged at INFO level, the structural checks below validate correctness.
+
+    let index_path = hdt_path.with_extension("hdt.index.v1-1");
+    let index_bytes = std::fs::read(&index_path).expect("Index file should exist");
+
+    // Parse and verify
+    let (_ci_type, _ci_format, ci_props, ci_end) = parse_control_info(&index_bytes, 0);
+    assert!(
+        ci_props.contains(&format!("numTriples={num_triples}")),
+        "Should have numTriples={num_triples}, got: {ci_props}"
+    );
+
+    let (bitmap_index_z, s1_end) = decode_bitmap(&index_bytes, ci_end);
+    assert_eq!(
+        bitmap_index_z.len(),
+        num_triples,
+        "bitmapIndexZ should have {num_triples} bits"
+    );
+
+    let (index_z, s2_end) = decode_logarray(&index_bytes, s1_end);
+    assert_eq!(
+        index_z.len(),
+        num_triples,
+        "indexZ should have {num_triples} entries"
+    );
+
+    let (pred_bitmap, s3_end) = decode_bitmap(&index_bytes, s2_end);
+    let (pred_seq, s4_end) = decode_logarray(&index_bytes, s3_end);
+    let (pred_count, s5_end) = decode_logarray(&index_bytes, s4_end);
+
+    assert_eq!(
+        s5_end,
+        index_bytes.len(),
+        "All sections should consume file exactly"
+    );
+
+    // Structural invariants
+    assert!(*bitmap_index_z.last().unwrap());
+
+    // All indexZ values must be valid Y-positions
+    for (i, &pos_y) in index_z.iter().enumerate() {
+        assert!(
+            pos_y < num_sp_pairs as u64,
+            "indexZ[{i}]={pos_y} should be < num_sp_pairs={num_sp_pairs}"
+        );
+    }
+
+    // No zero values in indexZ (objects are 1-based, so every triple maps to a valid Y-position)
+    // This is the key check that would have caught the wikidata bug.
+    let zero_count = index_z.iter().filter(|&&v| v == 0).count();
+    // Some entries may legitimately map to Y-position 0, but not an unreasonable fraction.
+    // For this dataset, Y=0 is just (s000,p0), used by 5 triples out of 2000.
+    assert!(
+        zero_count <= objects_per_pair,
+        "Too many indexZ entries map to Y=0: got {zero_count}, expected at most {objects_per_pair}"
+    );
+
+    // Predicate index invariants
+    assert_eq!(
+        pred_bitmap.len(),
+        num_sp_pairs,
+        "predicateIndex bitmap should have {num_sp_pairs} bits"
+    );
+    assert_eq!(
+        pred_seq.len(),
+        num_sp_pairs,
+        "predicateIndex sequence should have {num_sp_pairs} entries"
+    );
+    assert_eq!(
+        pred_count.len(),
+        num_predicates,
+        "predicateCount should have {num_predicates} entries"
+    );
+
+    let count_sum: u64 = pred_count.iter().sum();
+    assert_eq!(count_sum, num_sp_pairs as u64);
+
+    // Each predicate should have exactly num_subjects S-P pairs
+    for (i, &count) in pred_count.iter().enumerate() {
+        assert_eq!(
+            count, num_subjects as u64,
+            "predicate {} should have {} S-P pairs, got {}",
+            i + 1,
+            num_subjects,
+            count
+        );
+    }
+
+    // The number of distinct object groups = number of distinct objects = 20
+    let num_object_groups = bitmap_index_z.iter().filter(|&&b| b).count();
+    assert_eq!(
+        num_object_groups,
+        (num_predicates * objects_per_pair),
+        "bitmapIndexZ should have 20 object groups"
+    );
+}

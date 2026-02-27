@@ -7,15 +7,17 @@ use std::collections::BinaryHeap;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use zstd::{Decoder, Encoder};
 
 use super::parallel_merge::{
-    build_merge_tree, DedupIterator, MergeSource, MergeTreeConfig, MergeTreeIterator,
+    DedupIterator, MergeSource, MergeTreeConfig, MergeTreeIterator, build_merge_tree,
 };
 
 /// Threshold: use parallel merge tree when chunk count exceeds this.
 /// Below this, the single-threaded BinaryHeap merge is faster (no thread overhead).
 const PARALLEL_MERGE_THRESHOLD: usize = 16;
+static NEXT_SORTER_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Trait for items that can be externally sorted.
 /// Items must be serializable to/from bytes for disk storage.
@@ -34,6 +36,7 @@ pub trait Sortable: Ord + Sized + Send + Clone {
 pub struct ExternalSorter {
     temp_dir: PathBuf,
     memory_budget: usize,
+    sorter_id: u64,
     chunk_files: Vec<PathBuf>,
     chunk_counter: usize,
 }
@@ -47,6 +50,7 @@ impl ExternalSorter {
         Self {
             temp_dir: temp_dir.as_ref().to_path_buf(),
             memory_budget,
+            sorter_id: NEXT_SORTER_ID.fetch_add(1, AtomicOrdering::Relaxed),
             chunk_files: Vec::new(),
             chunk_counter: 0,
         }
@@ -98,7 +102,10 @@ impl ExternalSorter {
     }
 
     /// Flush remaining buffer and create the merge iterator.
-    pub fn finish<T: Sortable + PartialEq + 'static>(&mut self, buffer: &mut Vec<T>) -> Result<MergeIterator<T>> {
+    pub fn finish<T: Sortable + PartialEq + 'static>(
+        &mut self,
+        buffer: &mut Vec<T>,
+    ) -> Result<MergeIterator<T>> {
         if !buffer.is_empty() {
             self.flush_chunk(buffer)?;
         }
@@ -109,9 +116,10 @@ impl ExternalSorter {
     fn flush_chunk<T: Sortable>(&mut self, buffer: &mut Vec<T>) -> Result<()> {
         buffer.par_sort_unstable();
 
-        let chunk_path = self
-            .temp_dir
-            .join(format!("sort_chunk_{:06}.tmp.zst", self.chunk_counter));
+        let chunk_path = self.temp_dir.join(format!(
+            "sort_{}_chunk_{:06}.tmp.zst",
+            self.sorter_id, self.chunk_counter
+        ));
         self.chunk_counter += 1;
 
         let file = File::create(&chunk_path)
@@ -157,8 +165,8 @@ impl ExternalSorter {
                 .map(|p| MergeSource::File(p.clone()))
                 .collect();
             let channel_capacity = calculate_merge_channel_capacity(self.memory_budget);
-            let config = MergeTreeConfig::new(&self.temp_dir)
-                .with_channel_capacity(channel_capacity);
+            let config =
+                MergeTreeConfig::new(&self.temp_dir).with_channel_capacity(channel_capacity);
             let handle = build_merge_tree(sources, &config)?;
             MergeIterator::from_tree(handle)
         }
@@ -172,7 +180,9 @@ impl ExternalSorter {
     /// Clean up temporary chunk files.
     pub fn cleanup(&self) {
         for path in &self.chunk_files {
-            if let Err(e) = std::fs::remove_file(path) {
+            if let Err(e) = std::fs::remove_file(path)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
                 tracing::warn!("Failed to remove temp file {}: {}", path.display(), e);
             }
         }
@@ -457,14 +467,7 @@ mod tests {
             .unwrap();
 
         // Duplicates are automatically deduplicated
-        assert_eq!(
-            merged,
-            vec![
-                TestItem(1),
-                TestItem(2),
-                TestItem(3)
-            ]
-        );
+        assert_eq!(merged, vec![TestItem(1), TestItem(2), TestItem(3)]);
     }
 
     #[test]
@@ -489,5 +492,47 @@ mod tests {
 
         let expected: Vec<TestItem> = (0..10).map(TestItem).collect();
         assert_eq!(merged, expected);
+    }
+
+    #[test]
+    fn test_two_sorters_same_temp_dir_do_not_clobber_chunks() {
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        // Tiny budget to force multiple chunk flushes for both sorters.
+        let mut sorter_a = ExternalSorter::new(temp_dir.path(), 24);
+        let mut sorter_b = ExternalSorter::new(temp_dir.path(), 24);
+
+        let mut buffer_a = Vec::new();
+        let mut mem_a = 0usize;
+        let mut buffer_b = Vec::new();
+        let mut mem_b = 0usize;
+
+        // Interleave pushes so chunk files from both sorters are created
+        // in the same directory over the same timeline.
+        for i in 0..100u64 {
+            sorter_a
+                .push(TestItem(10_000 + (99 - i)), &mut buffer_a, &mut mem_a)
+                .unwrap();
+            sorter_b
+                .push(TestItem(20_000 + (99 - i)), &mut buffer_b, &mut mem_b)
+                .unwrap();
+        }
+
+        let out_a: Vec<TestItem> = sorter_a
+            .finish(&mut buffer_a)
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        let out_b: Vec<TestItem> = sorter_b
+            .finish(&mut buffer_b)
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+
+        let expected_a: Vec<TestItem> = (0..100).map(|i| TestItem(10_000 + i)).collect();
+        let expected_b: Vec<TestItem> = (0..100).map(|i| TestItem(20_000 + i)).collect();
+
+        assert_eq!(out_a, expected_a);
+        assert_eq!(out_b, expected_b);
     }
 }

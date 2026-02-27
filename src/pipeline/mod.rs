@@ -111,7 +111,8 @@ pub struct ParserParallelismConfig {
 /// Result of pipeline execution.
 pub struct PipelineResult {
     pub counts: DictCounts,
-    pub dict_sections: Vec<Vec<u8>>, // PFC-encoded sections
+    pub dict_section_paths: Vec<PathBuf>, // PFC section temp files
+    pub dict_section_sizes: Vec<u64>,     // Corresponding file sizes
     pub bitmap_triples: crate::triples::BitmapTriplesFiles,
     pub ntriples_size: u64, // N-Triples serialization size of parsed data
 }
@@ -256,6 +257,61 @@ fn process_peak_rss_bytes() -> Option<u64> {
         return None;
     }
     Some(usage.ru_maxrss as u64)
+}
+
+/// Get current (not peak) resident set size.
+#[cfg(target_os = "macos")]
+#[allow(dead_code, deprecated)] // diagnostic utility; mach_task_self deprecated in libc
+fn current_rss_bytes() -> Option<u64> {
+    use std::mem::MaybeUninit;
+    // mach_task_basic_info gives current resident_size
+    const MACH_TASK_BASIC_INFO: u32 = 20;
+    #[repr(C)]
+    struct MachTaskBasicInfo {
+        virtual_size: u64,
+        resident_size: u64,
+        resident_size_max: u64,
+        user_time: [u32; 2],   // time_value_t
+        system_time: [u32; 2], // time_value_t
+        policy: i32,
+        suspend_count: i32,
+    }
+    unsafe {
+        let mut info = MaybeUninit::<MachTaskBasicInfo>::uninit();
+        let mut count = (std::mem::size_of::<MachTaskBasicInfo>() / std::mem::size_of::<u32>()) as u32;
+        let kr = libc::task_info(
+            libc::mach_task_self(),
+            MACH_TASK_BASIC_INFO,
+            info.as_mut_ptr() as *mut i32,
+            &mut count,
+        );
+        if kr != 0 {
+            return None;
+        }
+        Some(info.assume_init().resident_size)
+    }
+}
+
+/// Get current (not peak) resident set size.
+#[cfg(target_os = "linux")]
+#[allow(dead_code)]
+fn current_rss_bytes() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            let kb_str = rest.trim().strip_suffix("kB")?.trim();
+            let kb: u64 = kb_str.parse().ok()?;
+            return Some(kb * 1024);
+        }
+    }
+    None
+}
+
+/// Get current (not peak) resident set size — fallback for other platforms.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[allow(dead_code)]
+fn current_rss_bytes() -> Option<u64> {
+    None
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -646,6 +702,7 @@ fn vocab_builder_stage(
     include_graphs: bool,
 ) -> Result<()> {
     let mut batch_id = 0;
+    let mut cumulative_triples: u64 = 0;
 
     for quads_batch in batch_rx {
         // ~100 bytes per triple for unique term storage after dedup, floor 10MB
@@ -674,12 +731,14 @@ fn vocab_builder_stage(
         }
 
         let stats = builder.stats();
+        cumulative_triples += stats.num_triples as u64;
         tracing::info!(
-            "Batch {}: {} {}, {} unique terms",
+            "Batch {}: {} {}, {} unique terms (cumulative: {})",
             batch_id,
             stats.num_triples,
             if include_graphs { "quads" } else { "triples" },
-            stats.num_terms
+            stats.num_terms,
+            cumulative_triples,
         );
 
         // Finish and get sorted vocab + triples
@@ -773,42 +832,19 @@ fn vocab_writer_stage(
     Ok(())
 }
 
-/// Clean up temporary files created during pipeline execution.
-fn cleanup_temp_files(batches: &[BatchComplete], mapping_paths: &[PathBuf]) {
-    // Delete partial vocabulary files
+/// Clean up batch temp files on error (vocab + triples only).
+///
+/// Used for early-abort error paths in Stages 1-3 before ID mappings exist.
+/// During normal execution, files are cleaned up eagerly:
+/// - `.pvoc.zst` — deleted per-file during Stage 4 merge (DeleteOnDrop)
+/// - `.ltr.zst` — deleted per-batch during Stage 5 (id_remapper)
+/// - `.map.zst` — deleted per-batch during Stage 5 (id_remapper)
+fn cleanup_batch_files(batches: &[BatchComplete]) {
     for batch in batches {
-        if let Err(e) = std::fs::remove_file(&batch.vocab_path) {
-            tracing::warn!(
-                "Failed to delete partial vocab file {}: {}",
-                batch.vocab_path.display(),
-                e
-            );
-        }
+        let _ = std::fs::remove_file(&batch.vocab_path);
+        let _ = std::fs::remove_file(&batch.triples_path);
     }
-
-    // Delete local triples files
-    for batch in batches {
-        if let Err(e) = std::fs::remove_file(&batch.triples_path) {
-            tracing::warn!(
-                "Failed to delete local triples file {}: {}",
-                batch.triples_path.display(),
-                e
-            );
-        }
-    }
-
-    // Delete ID mapping files
-    for path in mapping_paths {
-        if let Err(e) = std::fs::remove_file(path) {
-            tracing::warn!(
-                "Failed to delete ID mapping file {}: {}",
-                path.display(),
-                e
-            );
-        }
-    }
-
-    tracing::debug!("Temporary files cleaned up");
+    tracing::debug!("Cleaned up {} batch temp files", batches.len());
 }
 
 /// Run the complete pipeline: RDF → HDT.
@@ -915,22 +951,22 @@ pub fn run_pipeline(
     let ntriples_size = match parser_handle.join() {
         Ok(Ok(size)) => size,
         Ok(Err(e)) => {
-            cleanup_temp_files(&batches, &[]);
+            cleanup_batch_files(&batches);
             return Err(e);
         }
         Err(_) => {
-            cleanup_temp_files(&batches, &[]);
+            cleanup_batch_files(&batches);
             return Err(anyhow::anyhow!("Parser thread panicked"));
         }
     };
 
     match builder_handle.join() {
         Ok(Err(e)) => {
-            cleanup_temp_files(&batches, &[]);
+            cleanup_batch_files(&batches);
             return Err(e);
         }
         Err(_) => {
-            cleanup_temp_files(&batches, &[]);
+            cleanup_batch_files(&batches);
             return Err(anyhow::anyhow!("Builder thread panicked"));
         }
         Ok(Ok(())) => {}
@@ -938,11 +974,11 @@ pub fn run_pipeline(
 
     match writer_handle.join() {
         Ok(Err(e)) => {
-            cleanup_temp_files(&batches, &[]);
+            cleanup_batch_files(&batches);
             return Err(e);
         }
         Err(_) => {
-            cleanup_temp_files(&batches, &[]);
+            cleanup_batch_files(&batches);
             return Err(anyhow::anyhow!("Writer thread panicked"));
         }
         Ok(Ok(())) => {}
@@ -998,12 +1034,10 @@ pub fn run_pipeline(
     let (global_triple_tx, global_triple_rx) =
         bounded::<Vec<IdTriple>>(stage56_budget.remap_to_sort_channel_capacity);
 
-    // Prepare batch remap info and track mapping paths for cleanup
+    // Prepare batch remap info (files are cleaned up per-batch by the remapper)
     let (remap_tx, remap_rx) = bounded(batches.len());
-    let mut mapping_paths: Vec<PathBuf> = Vec::new();
     for batch in &batches {
         let mapping_path = temp_dir.join(format!("id_mapping_{:06}.map.zst", batch.batch_id));
-        mapping_paths.push(mapping_path.clone());
         remap_tx
             .send(id_remapper::BatchRemapInfo {
                 batch_id: batch.batch_id,
@@ -1109,14 +1143,12 @@ pub fn run_pipeline(
         sort_start.elapsed().as_secs_f64()
     );
 
-    // Clean up temporary files
-    cleanup_temp_files(&batches, &mapping_paths);
-
     log_benchmark_summary(&stage_metrics, benchmark);
 
     Ok(PipelineResult {
         counts: merge_result.counts,
-        dict_sections: merge_result.dict_sections,
+        dict_section_paths: merge_result.dict_section_paths,
+        dict_section_sizes: merge_result.dict_section_sizes,
         bitmap_triples,
         ntriples_size,
     })

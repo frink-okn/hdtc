@@ -34,7 +34,7 @@ const CRC16_ALGO: Crc<u16> = Crc::<u16>::new(&crc::Algorithm {
 
 // CRC32C (Castagnoli): polynomial 0x1EDC6F41
 // This is the same as CRC_32_ISCSI in the crc crate
-const CRC32C_ALGO: Crc<u32> = Crc::<u32>::new(&CRC_32_ISCSI);
+pub(crate) const CRC32C_ALGO: Crc<u32> = Crc::<u32>::new(&CRC_32_ISCSI);
 
 /// Compute CRC8-CCITT over the given data.
 pub fn crc8(data: &[u8]) -> u8 {

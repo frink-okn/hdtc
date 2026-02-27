@@ -359,6 +359,34 @@ same deterministic ordering and ID assignment as current single-threaded merge.
 - [x] Existing `pipeline::vocab_merger` tests remain green
 - [x] End-to-end `cargo test` remains green
 
+### 4.5 Parallelize Shard Finalization in Stage 4
+
+**Impact:** Low-moderate — estimated 10-15% of Stage 4 time (700-1000s at 21B scale)
+**Files:** `src/pipeline/vocab_merger.rs` (`ShardedMappingWriter::finish`)
+
+**Context (21B Wikidata benchmark, 2026-02-25):**
+Stage 4 took 7,080s for 3,342 batches and ~4B unique terms. The dominant cost (~85-90%)
+is the serial merge tree + PFC encoding, which must process terms in sorted order. The
+shard finalization — reading 128+128 shard files, grouping entries by batch, and writing
+3,342 per-batch mapping files — accounts for the remaining ~10-15%.
+
+The 128 SO shards and 128 P shards are independent of each other and can be processed
+in parallel using rayon. The per-batch mapping file writes within each shard group are
+also independent.
+
+**Steps:**
+
+- [ ] Run 21B (or large dataset) with `RUST_LOG=hdtc=debug` to capture exact timing from the `Stage 4 timing:` log line (confirms the 10-15% estimate)
+- [ ] Use `rayon::par_iter` over the 128 SO shards (each shard reads its entries, groups by batch, writes per-batch dense SO maps)
+- [ ] Same for the 128 P shards (update existing per-batch files with P maps)
+- [ ] Verify no contention on per-batch mapping files (each batch maps to exactly one SO shard and one P shard, so no cross-shard writes to the same file)
+
+**Expected gain:** ~5-10% Stage 4 reduction at 21B scale (modest because finalization is the minority of work).
+
+**Note:** The much larger lever for Stage 4 at scale is reducing the number of batches
+(larger `--memory-limit` → larger batch size → fewer partial vocabs → less merge tree work).
+Going from 3,342 to ~1,700 batches would roughly halve the merge tree's intermediate I/O.
+
 ---
 
 ## Phase 5: Test Coverage Gaps
@@ -478,6 +506,15 @@ The index can be created:
   - [x] If set, call `index::create_index(&hdt_path, memory_budget, &temp_dir)`
   - [x] ExternalSorter auto-cleans temp files
 - [x] Test index creation with sample RDF data and verify file format
+- [x] Streaming rewrite: `StreamingBitmapDecoder` + `StreamingLogArrayDecoder` for O(1) memory
+- [x] Integration test with full semantic verification (`test_index_creation_structural_and_semantic`)
+- [x] Remove old in-memory index code (kept temporarily for writer.rs unit tests):
+  - `PredicateIndex` struct in `predicate_index.rs`
+  - `build_predicate_index()` in `predicate_index.rs`
+  - `build_predicate_count()` in `predicate_index.rs`
+  - `write_index()` in `writer.rs` (non-streaming variant)
+  - Associated `#[allow(dead_code)]` / `#[allow(unused_imports)]` annotations
+  - Writer unit tests should be migrated to use streaming equivalents first
 
 **Index File Format (confirmed by hdt-java source):**
 

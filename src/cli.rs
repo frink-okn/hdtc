@@ -40,7 +40,7 @@ impl std::str::FromStr for MemorySize {
 impl std::fmt::Display for MemorySize {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let bytes = self.0;
-        if bytes % (1024 * 1024 * 1024) == 0 {
+        if bytes.is_multiple_of(1024 * 1024 * 1024) {
             write!(f, "{}G", bytes / (1024 * 1024 * 1024))
         } else {
             write!(f, "{}M", bytes / (1024 * 1024))
@@ -86,6 +86,9 @@ pub enum Commands {
 
     /// Create index file for an existing HDT file
     Index(IndexArgs),
+
+    /// Validate HDT triples structures (ArrayY/ArrayZ/BitmapZ) for indexing
+    Validate(ValidateArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -155,4 +158,10 @@ pub struct IndexArgs {
     /// Soft memory limit for sorting operations (e.g. 4G, 2000M)
     #[arg(long, value_name = "SIZE", default_value = "4G")]
     pub memory_limit: MemorySize,
+}
+
+#[derive(Debug, Parser)]
+pub struct ValidateArgs {
+    /// Path to existing HDT file
+    pub hdt_file: PathBuf,
 }

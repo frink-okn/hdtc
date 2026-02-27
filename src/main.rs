@@ -32,7 +32,7 @@ fn raise_fd_limit() -> Option<(u64, u64)> {
                 let old = rlim.rlim_cur;
                 rlim.rlim_cur = target;
                 if libc::setrlimit(libc::RLIMIT_NOFILE, &rlim) == 0 {
-                    return Some((old as u64, target as u64));
+                    return Some((old, target));
                 }
             }
         }
@@ -70,6 +70,7 @@ fn main() -> Result<()> {
     match cli.command {
         cli::Commands::Create(args) => create_hdt(args, benchmark),
         cli::Commands::Index(args) => create_index_from_hdt(args, benchmark),
+        cli::Commands::Validate(args) => validate_hdt_file(args, benchmark),
     }
 }
 
@@ -138,19 +139,25 @@ fn create_hdt(args: cli::CreateArgs, benchmark: bool) -> Result<()> {
         benchmark,
     )?;
 
-    // Write HDT file (streaming: reads triples from temp files, O(1) triples memory)
+    // Write HDT file (streaming: reads dict sections and triples from temp files)
     hdt::write_hdt_streaming(
         &args.output,
         &base_uri,
         &pipeline_result.counts,
-        &pipeline_result.dict_sections,
+        &pipeline_result.dict_section_paths,
+        &pipeline_result.dict_section_sizes,
         &pipeline_result.bitmap_triples,
         pipeline_result.ntriples_size,
     )?;
 
     let num_triples = pipeline_result.bitmap_triples.num_triples;
 
-    // Clean up triples temp files
+    // Clean up dict section and triples temp files
+    for path in &pipeline_result.dict_section_paths {
+        if let Err(e) = std::fs::remove_file(path) {
+            tracing::debug!("Failed to remove dict section temp file: {e}");
+        }
+    }
     pipeline_result.bitmap_triples.cleanup();
 
     // Optionally create index file
@@ -221,6 +228,36 @@ fn create_index_from_hdt(args: cli::IndexArgs, benchmark: bool) -> Result<()> {
         }
         Err(e) => {
             tracing::error!("Failed to create index: {}", e);
+            Err(e)
+        }
+    }
+}
+
+/// Validate an existing HDT file's triples structures for indexing.
+fn validate_hdt_file(args: cli::ValidateArgs, benchmark: bool) -> Result<()> {
+    if !args.hdt_file.exists() {
+        anyhow::bail!("HDT file not found: {}", args.hdt_file.display());
+    }
+
+    tracing::info!(
+        "Validating HDT triples structures: {}",
+        args.hdt_file.display()
+    );
+
+    let start = std::time::Instant::now();
+    match index::validate_hdt_triples(&args.hdt_file) {
+        Ok(()) => {
+            if benchmark {
+                tracing::info!(
+                    "Benchmark summary (validate): total {:.3}s",
+                    start.elapsed().as_secs_f64()
+                );
+            }
+            tracing::info!("Validation passed");
+            Ok(())
+        }
+        Err(e) => {
+            tracing::error!("Validation failed: {}", e);
             Err(e)
         }
     }

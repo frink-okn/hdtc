@@ -8,10 +8,14 @@
 //! type_byte(0x02) + VByte(string_count) + VByte(buffer_length) + VByte(block_size) + CRC8
 //! + LogArray(block_offsets) + Buffer(encoded_strings) + CRC32C
 
-use crate::io::crc_utils::{crc8, crc32c};
-use crate::io::log_array::LogArrayWriter;
+use crate::io::crc_utils::{crc8, Crc32cWriter, CRC32C_ALGO};
+#[cfg(test)]
+use crate::io::crc_utils::crc32c;
+use crate::io::log_array::{LogArrayWriter, StreamingLogArrayEncoder};
 use crate::io::vbyte::encode_vbyte;
-use std::io::{self, Write};
+use std::fs::File;
+use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::path::{Path, PathBuf};
 
 /// PFC dictionary section type byte, written before each section.
 const PFC_SECTION_TYPE: u8 = 0x02;
@@ -19,12 +23,14 @@ const PFC_SECTION_TYPE: u8 = 0x02;
 /// Default number of strings per block.
 const DEFAULT_BLOCK_SIZE: usize = 16;
 
-/// Encoder for building a PFC dictionary section.
+/// Encoder for building a PFC dictionary section (used in tests).
+#[cfg(test)]
 pub struct PfcEncoder {
     block_size: usize,
     strings: Vec<String>,
 }
 
+#[cfg(test)]
 impl PfcEncoder {
     pub fn new() -> Self {
         Self {
@@ -114,9 +120,241 @@ impl PfcEncoder {
     }
 }
 
+#[cfg(test)]
 impl Default for PfcEncoder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Result of finishing a streaming PFC encoder.
+pub struct PfcSectionFile {
+    /// Path to the complete PFC section file (preamble + LogArray + buffer + CRC32C).
+    pub path: PathBuf,
+    /// Total size of the section file in bytes.
+    pub size: u64,
+}
+
+/// Streaming PFC encoder that writes blocks to temp files as they fill.
+///
+/// Unlike `PfcEncoder` which holds all strings in memory, this encoder uses O(block_size)
+/// memory regardless of dictionary size. Encoded string data and block offsets are written
+/// to temp files incrementally. On `finish()`, the complete PFC section is assembled.
+pub struct StreamingPfcEncoder {
+    block_size: usize,
+    string_count: u64,
+    total_buffer_bytes: u64,
+
+    /// Current block of strings (at most block_size entries).
+    current_block: Vec<String>,
+    /// Last string pushed (for sort-order validation across blocks).
+    last_string: Option<String>,
+
+    /// Writer for encoded string data (zstd-compressed).
+    string_buf_writer: zstd::Encoder<'static, BufWriter<File>>,
+    /// Writer for block offsets (zstd-compressed, raw u64 LE).
+    offsets_writer: zstd::Encoder<'static, BufWriter<File>>,
+    /// Number of block offsets written.
+    num_offsets: u64,
+
+    /// Incremental CRC32C over the string buffer.
+    string_buf_crc: crc::Digest<'static, u32>,
+
+    /// Paths for intermediate temp files.
+    string_buf_path: PathBuf,
+    offsets_path: PathBuf,
+    /// Directory for the final output file.
+    output_dir: PathBuf,
+    /// Section name for temp file naming.
+    section_name: String,
+}
+
+impl StreamingPfcEncoder {
+    /// Create a new streaming PFC encoder that writes to temp files in `temp_dir`.
+    ///
+    /// `section_name` is used for temp file naming (e.g., "shared", "subjects").
+    pub fn new(temp_dir: &Path, section_name: &str) -> io::Result<Self> {
+        let string_buf_path = temp_dir.join(format!("pfc_{section_name}_strings.tmp"));
+        let offsets_path = temp_dir.join(format!("pfc_{section_name}_offsets.tmp"));
+
+        let string_buf_file = File::create(&string_buf_path)?;
+        let offsets_file = File::create(&offsets_path)?;
+
+        let string_buf_encoder = zstd::Encoder::new(BufWriter::new(string_buf_file), 3)?;
+        let offsets_encoder = zstd::Encoder::new(BufWriter::new(offsets_file), 3)?;
+
+        Ok(Self {
+            block_size: DEFAULT_BLOCK_SIZE,
+            string_count: 0,
+            total_buffer_bytes: 0,
+            current_block: Vec::with_capacity(DEFAULT_BLOCK_SIZE),
+            last_string: None,
+            string_buf_writer: string_buf_encoder,
+            offsets_writer: offsets_encoder,
+            num_offsets: 0,
+            string_buf_crc: CRC32C_ALGO.digest(),
+            string_buf_path,
+            offsets_path,
+            output_dir: temp_dir.to_path_buf(),
+            section_name: section_name.to_string(),
+        })
+    }
+
+    /// Add a string to the dictionary section.
+    ///
+    /// Strings MUST be added in sorted order.
+    pub fn push(&mut self, s: &str) -> io::Result<()> {
+        debug_assert!(
+            self.last_string.as_ref().is_none_or(|prev| prev.as_str() < s),
+            "Strings must be added in sorted order"
+        );
+
+        self.current_block.push(s.to_string());
+
+        if self.current_block.len() == self.block_size {
+            self.flush_block()?;
+        }
+
+        Ok(())
+    }
+
+    /// Flush the current block to the string buffer temp file.
+    fn flush_block(&mut self) -> io::Result<()> {
+        if self.current_block.is_empty() {
+            return Ok(());
+        }
+
+        // Record block offset
+        self.offsets_writer
+            .write_all(&self.total_buffer_bytes.to_le_bytes())?;
+        self.num_offsets += 1;
+
+        // Encode block
+        for (i, s) in self.current_block.iter().enumerate() {
+            if i == 0 {
+                // First string in block: written verbatim + null terminator
+                let bytes = s.as_bytes();
+                self.string_buf_writer.write_all(bytes)?;
+                self.string_buf_writer.write_all(&[0x00])?;
+                self.string_buf_crc.update(bytes);
+                self.string_buf_crc.update(&[0x00]);
+                self.total_buffer_bytes += bytes.len() as u64 + 1;
+            } else {
+                // Within block: VByte(shared_prefix_len) + suffix + null
+                let prev = &self.current_block[i - 1];
+                let shared = common_prefix_len(prev, s);
+                let vbyte = encode_vbyte(shared as u64);
+                let suffix = &s.as_bytes()[shared..];
+
+                self.string_buf_writer.write_all(&vbyte)?;
+                self.string_buf_writer.write_all(suffix)?;
+                self.string_buf_writer.write_all(&[0x00])?;
+                self.string_buf_crc.update(&vbyte);
+                self.string_buf_crc.update(suffix);
+                self.string_buf_crc.update(&[0x00]);
+                self.total_buffer_bytes += vbyte.len() as u64 + suffix.len() as u64 + 1;
+            }
+        }
+
+        self.string_count += self.current_block.len() as u64;
+        self.last_string = self.current_block.last().cloned();
+        self.current_block.clear();
+
+        Ok(())
+    }
+
+    /// Finish encoding and assemble the complete PFC section file.
+    ///
+    /// Returns the path and size of the output file. Cleans up intermediate temp files.
+    pub fn finish(mut self) -> io::Result<PfcSectionFile> {
+        // Flush any remaining partial block
+        self.flush_block()?;
+
+        // Finalize zstd encoders (flush + write end frame)
+        self.string_buf_writer.finish()?;
+        self.offsets_writer.finish()?;
+
+        // Finalize string buffer CRC
+        let string_buf_crc = self.string_buf_crc.finalize();
+
+        // Create output file for the complete PFC section
+        let output_path = self
+            .output_dir
+            .join(format!("pfc_{}_section.tmp", self.section_name));
+        let output_file = File::create(&output_path)?;
+        let mut writer = BufWriter::new(output_file);
+
+        // 1. Write preamble + CRC8
+        let mut preamble = Vec::new();
+        preamble.push(PFC_SECTION_TYPE);
+        preamble.extend_from_slice(&encode_vbyte(self.string_count));
+        preamble.extend_from_slice(&encode_vbyte(self.total_buffer_bytes));
+        preamble.extend_from_slice(&encode_vbyte(self.block_size as u64));
+        writer.write_all(&preamble)?;
+        writer.write_all(&[crc8(&preamble)])?;
+
+        // 2. Write block offsets as LogArray (with sentinel)
+        if self.num_offsets > 0 {
+            let sentinel = self.total_buffer_bytes;
+            let max_offset = sentinel.max(1);
+            let num_entries = self.num_offsets + 1; // offsets + sentinel
+
+            // Write LogArray preamble
+            let bits_per_entry = crate::io::log_array::bits_for(max_offset);
+            let mut la_preamble = Vec::new();
+            la_preamble.push(1u8); // TYPE_LOG
+            la_preamble.push(bits_per_entry);
+            la_preamble.extend_from_slice(&encode_vbyte(num_entries));
+            writer.write_all(&la_preamble)?;
+            writer.write_all(&[crc8(&la_preamble)])?;
+
+            // Stream offsets through StreamingLogArrayEncoder wrapped in Crc32cWriter
+            let crc_writer = Crc32cWriter::new(&mut writer);
+            let mut la_encoder = StreamingLogArrayEncoder::new(bits_per_entry, crc_writer);
+
+            // Read offsets back from zstd-compressed temp file
+            let offsets_file = File::open(&self.offsets_path)?;
+            let mut offsets_reader = zstd::Decoder::new(BufReader::new(offsets_file))?;
+            let mut offset_buf = [0u8; 8];
+            for _ in 0..self.num_offsets {
+                offsets_reader.read_exact(&mut offset_buf)?;
+                let offset = u64::from_le_bytes(offset_buf);
+                la_encoder.push(offset)?;
+            }
+            // Push sentinel
+            la_encoder.push(sentinel)?;
+
+            let (_num_entries, _bits, crc_writer) = la_encoder.finish()?;
+            crc_writer.finalize_and_write()?;
+        } else {
+            // Empty section: LogArray with sentinel entry (0) using 0 bits per entry
+            let mut log_array = LogArrayWriter::new(0);
+            log_array.push(0);
+            log_array.write_to(&mut writer)?;
+        }
+
+        // 3. Decompress string buffer from temp file and copy to output + CRC32C
+        {
+            let string_buf_file = File::open(&self.string_buf_path)?;
+            let mut reader = zstd::Decoder::new(BufReader::new(string_buf_file))?;
+            io::copy(&mut reader, &mut writer)?;
+        }
+        writer.write_all(&string_buf_crc.to_le_bytes())?;
+
+        writer.flush()?;
+        drop(writer);
+
+        // Get output file size
+        let size = std::fs::metadata(&output_path)?.len();
+
+        // Clean up intermediate temp files
+        let _ = std::fs::remove_file(&self.string_buf_path);
+        let _ = std::fs::remove_file(&self.offsets_path);
+
+        Ok(PfcSectionFile {
+            path: output_path,
+            size,
+        })
     }
 }
 
@@ -416,5 +654,121 @@ mod tests {
 
         let mut cursor = Cursor::new(&buf);
         assert!(PfcDecoder::read_from(&mut cursor).is_err());
+    }
+
+    // --- StreamingPfcEncoder tests ---
+
+    /// Helper: compare streaming encoder output against in-memory PfcEncoder (bit-exact).
+    fn assert_streaming_matches_inmemory(strings: &[&str]) {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+
+        // In-memory encoder
+        let mut inmem = PfcEncoder::new();
+        for &s in strings {
+            inmem.push(s);
+        }
+        let mut inmem_buf = Vec::new();
+        inmem.write_to(&mut inmem_buf).unwrap();
+
+        // Streaming encoder
+        let mut streaming = StreamingPfcEncoder::new(temp_dir.path(), "test").unwrap();
+        for &s in strings {
+            streaming.push(s).unwrap();
+        }
+        let section_file = streaming.finish().unwrap();
+
+        // Read the streaming output
+        let streaming_buf = std::fs::read(&section_file.path).unwrap();
+
+        assert_eq!(
+            inmem_buf, streaming_buf,
+            "Streaming encoder output differs from in-memory encoder (len {} vs {})",
+            inmem_buf.len(),
+            streaming_buf.len()
+        );
+        assert_eq!(section_file.size, streaming_buf.len() as u64);
+
+        // Also verify the streaming output is decodable
+        let mut cursor = Cursor::new(&streaming_buf);
+        let decoder = PfcDecoder::read_from(&mut cursor).unwrap();
+        assert_eq!(decoder.len(), strings.len());
+        for (i, &s) in strings.iter().enumerate() {
+            assert_eq!(decoder.get(i), Some(s), "mismatch at index {i}");
+        }
+    }
+
+    #[test]
+    fn test_streaming_empty() {
+        assert_streaming_matches_inmemory(&[]);
+    }
+
+    #[test]
+    fn test_streaming_single_string() {
+        assert_streaming_matches_inmemory(&["http://example.org/resource1"]);
+    }
+
+    #[test]
+    fn test_streaming_within_one_block() {
+        assert_streaming_matches_inmemory(&[
+            "http://example.org/a",
+            "http://example.org/b",
+            "http://example.org/c",
+        ]);
+    }
+
+    #[test]
+    fn test_streaming_exactly_one_block() {
+        // Exactly 16 strings = one full block
+        let strings: Vec<String> = (0..16)
+            .map(|i| format!("http://example.org/r{i:04}"))
+            .collect();
+        let refs: Vec<&str> = strings.iter().map(|s| s.as_str()).collect();
+        assert_streaming_matches_inmemory(&refs);
+    }
+
+    #[test]
+    fn test_streaming_multiple_blocks() {
+        // 40 strings = 2 full blocks + 8 remaining
+        let strings: Vec<String> = (0..40)
+            .map(|i| format!("http://example.org/resource{i:04}"))
+            .collect();
+        let refs: Vec<&str> = strings.iter().map(|s| s.as_str()).collect();
+        assert_streaming_matches_inmemory(&refs);
+    }
+
+    #[test]
+    fn test_streaming_block_plus_one() {
+        // 17 strings = 1 full block + 1 remaining
+        let strings: Vec<String> = (0..17)
+            .map(|i| format!("http://example.org/r{i:04}"))
+            .collect();
+        let refs: Vec<&str> = strings.iter().map(|s| s.as_str()).collect();
+        assert_streaming_matches_inmemory(&refs);
+    }
+
+    #[test]
+    fn test_streaming_diverse_strings() {
+        let mut strings = vec![
+            "\"literal value\"",
+            "\"literal with lang\"@en",
+            "\"typed literal\"^^<http://www.w3.org/2001/XMLSchema#date>",
+            "http://example.org/resource1",
+            "http://example.org/resource2",
+            "http://example.org/resource3",
+            "_:blank1",
+            "_:blank2",
+        ];
+        strings.sort();
+        assert_streaming_matches_inmemory(&strings);
+    }
+
+    #[test]
+    fn test_streaming_many_blocks() {
+        // 200 strings across many blocks
+        let strings: Vec<String> = (0..200)
+            .map(|i| format!("http://example.org/term{i:06}"))
+            .collect();
+        let refs: Vec<&str> = strings.iter().map(|s| s.as_str()).collect();
+        assert_streaming_matches_inmemory(&refs);
     }
 }

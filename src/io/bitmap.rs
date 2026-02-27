@@ -17,11 +17,13 @@ use std::io::{self, Read, Write};
 const TYPE_BITMAP: u8 = 1;
 
 /// Writer for building a Bitmap incrementally.
+#[allow(dead_code)]
 pub struct BitmapWriter {
     bits: Vec<u64>,
     num_bits: u64,
 }
 
+#[allow(dead_code)]
 impl BitmapWriter {
     pub fn new() -> Self {
         Self {
@@ -199,13 +201,145 @@ impl<W: Write> StreamingBitmapEncoder<W> {
     }
 }
 
+/// Streaming bitmap decoder that reads bits sequentially from a `Read` source
+/// using O(1) memory, without loading the entire bitmap into RAM.
+///
+/// Reads the preamble (type byte, VByte num_bits, CRC8) during construction,
+/// then lazily reads data words on demand. CRC32C is verified when `finish()` is called.
+pub struct StreamingBitmapDecoder<R: Read> {
+    reader: R,
+    current_word: u64,
+    /// Number of unread bits remaining in current_word (0 means need to load next word).
+    bits_remaining_in_word: u8,
+    num_bits: u64,
+    bits_read: u64,
+    /// Total number of complete data bytes to read.
+    total_data_bytes: u64,
+    /// Data bytes read so far.
+    data_bytes_read: u64,
+    crc_digest: crc::Digest<'static, u32>,
+}
+
+impl<R: Read> StreamingBitmapDecoder<R> {
+    /// Create a streaming decoder by reading the bitmap preamble.
+    /// The reader should be positioned at the start of a bitmap section.
+    pub fn new(mut reader: R) -> io::Result<Self> {
+        let mut preamble_buf = Vec::new();
+
+        // Type byte
+        let mut type_byte = [0u8; 1];
+        reader.read_exact(&mut type_byte)?;
+        if type_byte[0] != TYPE_BITMAP {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Expected Bitmap type byte {TYPE_BITMAP}, got {}", type_byte[0]),
+            ));
+        }
+        preamble_buf.push(type_byte[0]);
+
+        // VByte(num_bits)
+        let num_bits = read_vbyte_tracking(&mut reader, &mut preamble_buf)?;
+
+        // CRC8
+        let mut crc_byte = [0u8; 1];
+        reader.read_exact(&mut crc_byte)?;
+        let expected_crc = crc8(&preamble_buf);
+        if crc_byte[0] != expected_crc {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Bitmap preamble CRC8 mismatch",
+            ));
+        }
+
+        let total_data_bytes = num_bits.div_ceil(8);
+
+        Ok(Self {
+            reader,
+            current_word: 0,
+            bits_remaining_in_word: 0,
+            num_bits,
+            bits_read: 0,
+            total_data_bytes,
+            data_bytes_read: 0,
+            crc_digest: crate::io::crc_utils::CRC32C_ALGO.digest(),
+        })
+    }
+
+    /// Total number of bits in the bitmap.
+    #[allow(dead_code)]
+    pub fn num_bits(&self) -> u64 {
+        self.num_bits
+    }
+
+    /// Read the next bit. Returns `None` when all bits have been read.
+    pub fn next_bit(&mut self) -> io::Result<Option<bool>> {
+        if self.bits_read >= self.num_bits {
+            return Ok(None);
+        }
+
+        // Load next word if needed
+        if self.bits_remaining_in_word == 0 {
+            let bytes_remaining = self.total_data_bytes - self.data_bytes_read;
+            let bytes_to_read = bytes_remaining.min(8) as usize;
+            let mut buf = [0u8; 8];
+            self.reader.read_exact(&mut buf[..bytes_to_read])?;
+            self.crc_digest.update(&buf[..bytes_to_read]);
+            self.data_bytes_read += bytes_to_read as u64;
+            self.current_word = u64::from_le_bytes(buf);
+            // Number of valid bits in this word
+            let bits_in_word = ((self.num_bits - self.bits_read).min(64)) as u8;
+            self.bits_remaining_in_word = bits_in_word;
+        }
+
+        let bit = self.current_word & 1 != 0;
+        self.current_word >>= 1;
+        self.bits_remaining_in_word -= 1;
+        self.bits_read += 1;
+
+        Ok(Some(bit))
+    }
+
+    /// Verify CRC32C after all bits have been read.
+    /// Must be called after consuming all bits.
+    pub fn finish(mut self) -> io::Result<R> {
+        // Read any remaining data bytes we haven't consumed
+        // (shouldn't happen if all bits were read, but be safe)
+        while self.data_bytes_read < self.total_data_bytes {
+            let bytes_remaining = self.total_data_bytes - self.data_bytes_read;
+            let bytes_to_read = bytes_remaining.min(8192) as usize;
+            let mut buf = vec![0u8; bytes_to_read];
+            self.reader.read_exact(&mut buf)?;
+            self.crc_digest.update(&buf);
+            self.data_bytes_read += bytes_to_read as u64;
+        }
+
+        // Read and verify CRC32C
+        let mut crc_buf = [0u8; 4];
+        self.reader.read_exact(&mut crc_buf)?;
+        let stored_crc = u32::from_le_bytes(crc_buf);
+        let computed_crc = self.crc_digest.finalize();
+        if stored_crc != computed_crc {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Bitmap data CRC32C mismatch: expected {computed_crc:#010x}, got {stored_crc:#010x}"
+                ),
+            ));
+        }
+
+        Ok(self.reader)
+    }
+}
+
 /// Reader for decoding a Bitmap from bytes.
+#[allow(dead_code)]
 pub struct BitmapReader {
     words: Vec<u64>,
     num_bits: u64,
     rank_prefix: Vec<u64>,
 }
 
+#[allow(dead_code)]
 impl BitmapReader {
     /// Read a Bitmap from a reader.
     pub fn read_from<R: Read>(reader: &mut R) -> io::Result<Self> {
@@ -614,6 +748,70 @@ mod tests {
         assembled.extend_from_slice(&data_crc.to_le_bytes());
 
         assert_eq!(assembled, expected);
+    }
+
+    #[test]
+    fn test_streaming_decoder_matches_reader() {
+        // Verify StreamingBitmapDecoder produces the same bits as BitmapReader
+        let pattern = [true, false, true, true, false, false, true, false, true, true];
+        let mut writer = BitmapWriter::new();
+        for &b in &pattern {
+            writer.push(b);
+        }
+        let mut buf = Vec::new();
+        writer.write_to(&mut buf).unwrap();
+
+        // Read with BitmapReader
+        let reader = BitmapReader::read_from(&mut Cursor::new(&buf)).unwrap();
+
+        // Read with StreamingBitmapDecoder
+        let mut decoder = StreamingBitmapDecoder::new(Cursor::new(&buf)).unwrap();
+        assert_eq!(decoder.num_bits(), pattern.len() as u64);
+
+        for (i, &expected) in pattern.iter().enumerate() {
+            let bit = decoder.next_bit().unwrap().unwrap();
+            assert_eq!(bit, expected, "decoder mismatch at index {i}");
+            assert_eq!(bit, reader.get(i as u64), "decoder vs reader mismatch at {i}");
+        }
+
+        // Should return None after all bits
+        assert!(decoder.next_bit().unwrap().is_none());
+
+        // CRC should verify
+        decoder.finish().unwrap();
+    }
+
+    #[test]
+    fn test_streaming_decoder_cross_word() {
+        // 200 bits crossing multiple word boundaries
+        let mut writer = BitmapWriter::new();
+        for i in 0..200u64 {
+            writer.push(i % 5 == 0);
+        }
+        let mut buf = Vec::new();
+        writer.write_to(&mut buf).unwrap();
+
+        let reader = BitmapReader::read_from(&mut Cursor::new(&buf)).unwrap();
+        let mut decoder = StreamingBitmapDecoder::new(Cursor::new(&buf)).unwrap();
+
+        for i in 0..200u64 {
+            let bit = decoder.next_bit().unwrap().unwrap();
+            assert_eq!(bit, reader.get(i), "mismatch at index {i}");
+        }
+        assert!(decoder.next_bit().unwrap().is_none());
+        decoder.finish().unwrap();
+    }
+
+    #[test]
+    fn test_streaming_decoder_empty() {
+        let writer = BitmapWriter::new();
+        let mut buf = Vec::new();
+        writer.write_to(&mut buf).unwrap();
+
+        let mut decoder = StreamingBitmapDecoder::new(Cursor::new(&buf)).unwrap();
+        assert_eq!(decoder.num_bits(), 0);
+        assert!(decoder.next_bit().unwrap().is_none());
+        decoder.finish().unwrap();
     }
 
     #[test]
