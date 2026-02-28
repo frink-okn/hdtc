@@ -30,8 +30,11 @@ pub struct HdtInputAdapter {
     pub num_triples: u64,
     /// Original N-Triples size from the HDT header (0 if not present).
     pub original_size: u64,
-    /// File offset where the dictionary ControlInfo starts.
-    dict_ci_offset: u64,
+    /// File offsets where each PFC dictionary section starts.
+    shared_section_offset: u64,
+    subjects_section_offset: u64,
+    predicates_section_offset: u64,
+    objects_section_offset: u64,
     /// File offset where the triples BitmapY starts.
     triples_data_offset: u64,
     /// Number of (subject, predicate) pairs (= ArrayY/BitmapY entries).
@@ -76,7 +79,6 @@ impl HdtInputAdapter {
         let (num_triples, original_size) = parse_header_metadata(&header_text)?;
 
         // Dictionary control info
-        let dict_ci_offset = reader.stream_position()?;
         let dict_ci =
             ControlInfo::read_from(&mut reader).context("Failed to read dictionary control info")?;
         if dict_ci.control_type != ControlType::Dictionary {
@@ -90,10 +92,14 @@ impl HdtInputAdapter {
             );
         }
 
-        // Read PFC section headers to get counts, then skip the data
+        // Record each PFC section's file offset, then skip past it
+        let shared_section_offset = reader.stream_position()?;
         let shared_count = skip_pfc_section(&mut reader, "shared")?;
+        let subjects_section_offset = reader.stream_position()?;
         let subjects_count = skip_pfc_section(&mut reader, "subjects")?;
+        let predicates_section_offset = reader.stream_position()?;
         let predicates_count = skip_pfc_section(&mut reader, "predicates")?;
+        let objects_section_offset = reader.stream_position()?;
         let objects_count = skip_pfc_section(&mut reader, "objects")?;
 
         // Triples control info
@@ -138,7 +144,10 @@ impl HdtInputAdapter {
             predicates_count,
             num_triples,
             original_size,
-            dict_ci_offset,
+            shared_section_offset,
+            subjects_section_offset,
+            predicates_section_offset,
+            objects_section_offset,
             triples_data_offset,
             num_sp_pairs,
         })
@@ -166,12 +175,15 @@ impl HdtInputAdapter {
 
     /// Create a factory closure that produces a sorted vocabulary stream.
     ///
-    /// The stream is a 4-way merge of all PFC sections (shared, subjects,
+    /// The stream is a streaming 4-way merge of PFC sections (shared, subjects,
     /// objects, predicates) yielding `StreamEntry` items in lexicographic order.
+    /// Only O(block_size) memory per section — no full materialization.
     ///
     /// When `file_index` is `Some(i)`, blank node terms are disambiguated by
     /// prefixing them with `f{i}_` (e.g. `_:b1` → `_:f2_b1`), matching the
-    /// parser's per-file blank node disambiguation.
+    /// parser's per-file blank node disambiguation. This prefix is applied
+    /// inline and preserves sort order because it inserts a common string
+    /// after the `_:` marker shared by all blank nodes.
     pub fn vocab_factory(
         &self,
         batch_id: usize,
@@ -179,42 +191,27 @@ impl HdtInputAdapter {
     ) -> crate::pipeline::vocab_merger::VocabFactory
     {
         let path = self.path.clone();
-        let dict_ci_offset = self.dict_ci_offset;
+        let shared_section_offset = self.shared_section_offset;
+        let subjects_section_offset = self.subjects_section_offset;
+        let predicates_section_offset = self.predicates_section_offset;
+        let objects_section_offset = self.objects_section_offset;
         let shared_count = self.shared_count;
         let subjects_count = self.subjects_count;
 
         Box::new(move || {
-            let file = File::open(&path)?;
-            let mut reader = BufReader::with_capacity(256 * 1024, file);
-            reader.seek(SeekFrom::Start(dict_ci_offset))?;
-            let _dict_ci = ControlInfo::read_from(&mut reader)?;
+            let bnode_prefix = file_index.map(|idx| format!("f{idx}_"));
 
-            // Read each PFC section sequentially into memory for the 4-way merge
-            let mut shared_terms = read_pfc_section_terms(&mut reader, "shared")?;
-            let mut subjects_terms = read_pfc_section_terms(&mut reader, "subjects")?;
-            let predicates_terms = read_pfc_section_terms(&mut reader, "predicates")?;
-            let mut objects_terms = read_pfc_section_terms(&mut reader, "objects")?;
-
-            // Disambiguate blank nodes by prefixing with a file-specific identifier.
-            // This must happen before the merge so sort order reflects the prefixed terms.
-            // Predicates are never blank nodes so they are skipped.
-            if let Some(idx) = file_index {
-                let prefix = format!("f{idx}_");
-                disambiguate_blank_nodes(&mut shared_terms, &prefix);
-                disambiguate_blank_nodes(&mut subjects_terms, &prefix);
-                disambiguate_blank_nodes(&mut objects_terms, &prefix);
-            }
-
-            // Build a 4-way merge iterator
-            let iter = FourWayMerge::new(
-                shared_terms,
-                subjects_terms,
-                objects_terms,
-                predicates_terms,
+            let iter = StreamingFourWayMerge::open(
+                &path,
+                shared_section_offset,
+                subjects_section_offset,
+                predicates_section_offset,
+                objects_section_offset,
                 shared_count,
                 subjects_count,
                 batch_id,
-            );
+                bnode_prefix,
+            )?;
 
             Ok(Box::new(iter) as Box<dyn Iterator<Item = Result<StreamEntry>> + Send>)
         })
@@ -222,59 +219,14 @@ impl HdtInputAdapter {
 
 }
 
-/// Prefix blank node terms in-place for disambiguation.
-///
-/// Blank nodes in HDT dictionaries are stored as `_:label`. This function
-/// transforms them to `_:{prefix}label` so that blank nodes from different
-/// input files don't collide during the vocabulary merge.
-///
-/// The terms vector must be re-sorted after prefixing since the prefix changes
-/// the lexicographic order.
-fn disambiguate_blank_nodes(terms: &mut [Vec<u8>], prefix: &str) {
-    let bnode_marker = b"_:";
-    let mut any_changed = false;
-    for term in terms.iter_mut() {
-        if term.starts_with(bnode_marker) {
-            let mut new_term = Vec::with_capacity(2 + prefix.len() + term.len() - 2);
-            new_term.extend_from_slice(bnode_marker);
-            new_term.extend_from_slice(prefix.as_bytes());
-            new_term.extend_from_slice(&term[2..]);
-            *term = new_term;
-            any_changed = true;
-        }
-    }
-    if any_changed {
-        terms.sort();
-    }
-}
-
-/// Read all terms from a PFC section into a Vec.
-fn read_pfc_section_terms<R: Read>(reader: &mut R, section_name: &str) -> Result<Vec<Vec<u8>>> {
-    let header = PfcSectionHeader::read_from(reader, section_name)?;
-    let count = header.string_count as usize;
-    let mut terms = Vec::with_capacity(count);
-
-    let mut iter = PfcSectionIterator::new(&mut *reader, &header, section_name);
-    for term_result in &mut iter {
-        terms.push(term_result?);
-    }
-
-    // Skip past CRC — the iterator consumed the string data but the CRC is still pending.
-    let mut crc = [0u8; 4];
-    reader.read_exact(&mut crc)?;
-
-    Ok(terms)
-}
-
 // ---------------------------------------------------------------------------
-// 4-way merge iterator
+// Streaming 4-way merge iterator
 // ---------------------------------------------------------------------------
 
 /// Entry in the merge heap, tagged with which section it came from.
 struct HeapEntry {
     term: Vec<u8>,
     section: SectionKind,
-    index: usize, // position within its section's term list
 }
 
 impl Eq for HeapEntry {}
@@ -303,119 +255,158 @@ enum SectionKind {
     Predicates,
 }
 
-/// Merges 4 sorted PFC sections into a single lexicographically sorted stream.
-struct FourWayMerge {
-    shared: Vec<Vec<u8>>,
-    subjects: Vec<Vec<u8>>,
-    objects: Vec<Vec<u8>>,
-    predicates: Vec<Vec<u8>>,
+/// Streaming 4-way merge of PFC dictionary sections.
+///
+/// Holds 4 `PfcSectionIterator`s (each with its own file handle) and a
+/// 4-entry BinaryHeap. Memory is O(block_size) per section — no full
+/// materialization of dictionary terms.
+struct StreamingFourWayMerge {
+    shared_iter: PfcSectionIterator<BufReader<File>>,
+    subjects_iter: PfcSectionIterator<BufReader<File>>,
+    objects_iter: PfcSectionIterator<BufReader<File>>,
+    predicates_iter: PfcSectionIterator<BufReader<File>>,
     heap: BinaryHeap<HeapEntry>,
     shared_count: u64,
     subjects_count: u64,
     batch_id: usize,
-    // Cursors for next index to push from each section
-    shared_cursor: usize,
-    subjects_cursor: usize,
-    objects_cursor: usize,
-    predicates_cursor: usize,
+    bnode_prefix: Option<String>,
+    // Per-section counters (0-based index of next term to yield)
+    shared_index: u64,
+    subjects_index: u64,
+    objects_index: u64,
+    predicates_index: u64,
 }
 
-impl FourWayMerge {
-    fn new(
-        shared: Vec<Vec<u8>>,
-        subjects: Vec<Vec<u8>>,
-        objects: Vec<Vec<u8>>,
-        predicates: Vec<Vec<u8>>,
+impl StreamingFourWayMerge {
+    #[allow(clippy::too_many_arguments)]
+    fn open(
+        path: &Path,
+        shared_offset: u64,
+        subjects_offset: u64,
+        predicates_offset: u64,
+        objects_offset: u64,
         shared_count: u64,
         subjects_count: u64,
         batch_id: usize,
-    ) -> Self {
+        bnode_prefix: Option<String>,
+    ) -> Result<Self> {
+        let open_section = |offset: u64, name: &str| -> Result<PfcSectionIterator<BufReader<File>>> {
+            let mut f = File::open(path)?;
+            f.seek(SeekFrom::Start(offset))?;
+            let mut reader = BufReader::with_capacity(256 * 1024, f);
+            let header = PfcSectionHeader::read_from(&mut reader, name)?;
+            Ok(PfcSectionIterator::new(reader, &header, name))
+        };
+
+        let mut shared_iter = open_section(shared_offset, "shared")?;
+        let mut subjects_iter = open_section(subjects_offset, "subjects")?;
+        let mut predicates_iter = open_section(predicates_offset, "predicates")?;
+        let mut objects_iter = open_section(objects_offset, "objects")?;
+
         let mut heap = BinaryHeap::with_capacity(4);
 
-        // Seed the heap with the first entry from each non-empty section
-        if !shared.is_empty() {
-            heap.push(HeapEntry {
-                term: shared[0].clone(),
-                section: SectionKind::Shared,
-                index: 0,
-            });
+        // Seed the heap with the first term from each non-empty section
+        if let Some(term) = Self::next_from(&mut shared_iter)? {
+            heap.push(HeapEntry { term, section: SectionKind::Shared });
         }
-        if !subjects.is_empty() {
-            heap.push(HeapEntry {
-                term: subjects[0].clone(),
-                section: SectionKind::Subjects,
-                index: 0,
-            });
+        if let Some(term) = Self::next_from(&mut subjects_iter)? {
+            heap.push(HeapEntry { term, section: SectionKind::Subjects });
         }
-        if !objects.is_empty() {
-            heap.push(HeapEntry {
-                term: objects[0].clone(),
-                section: SectionKind::Objects,
-                index: 0,
-            });
+        if let Some(term) = Self::next_from(&mut predicates_iter)? {
+            heap.push(HeapEntry { term, section: SectionKind::Predicates });
         }
-        if !predicates.is_empty() {
-            heap.push(HeapEntry {
-                term: predicates[0].clone(),
-                section: SectionKind::Predicates,
-                index: 0,
-            });
+        if let Some(term) = Self::next_from(&mut objects_iter)? {
+            heap.push(HeapEntry { term, section: SectionKind::Objects });
         }
 
-        Self {
-            shared,
-            subjects,
-            objects,
-            predicates,
+        Ok(Self {
+            shared_iter,
+            subjects_iter,
+            objects_iter,
+            predicates_iter,
             heap,
             shared_count,
             subjects_count,
             batch_id,
-            shared_cursor: 1,
-            subjects_cursor: 1,
-            objects_cursor: 1,
-            predicates_cursor: 1,
+            bnode_prefix,
+            shared_index: 0,
+            subjects_index: 0,
+            objects_index: 0,
+            predicates_index: 0,
+        })
+    }
+
+    /// Pull the next term from a PFC iterator, transposing the Result.
+    fn next_from(iter: &mut PfcSectionIterator<BufReader<File>>) -> Result<Option<Vec<u8>>> {
+        match iter.next() {
+            Some(Ok(term)) => Ok(Some(term)),
+            Some(Err(e)) => Err(e),
+            None => Ok(None),
         }
     }
 
-    fn advance_section(&mut self, section: SectionKind) {
-        let (terms, cursor) = match section {
-            SectionKind::Shared => (&self.shared, &mut self.shared_cursor),
-            SectionKind::Subjects => (&self.subjects, &mut self.subjects_cursor),
-            SectionKind::Objects => (&self.objects, &mut self.objects_cursor),
-            SectionKind::Predicates => (&self.predicates, &mut self.predicates_cursor),
+    /// Get the iterator for a section and advance it, pushing the next term onto the heap.
+    fn advance_section(&mut self, section: SectionKind) -> Result<()> {
+        let iter = match section {
+            SectionKind::Shared => &mut self.shared_iter,
+            SectionKind::Subjects => &mut self.subjects_iter,
+            SectionKind::Objects => &mut self.objects_iter,
+            SectionKind::Predicates => &mut self.predicates_iter,
         };
-        if *cursor < terms.len() {
-            self.heap.push(HeapEntry {
-                term: terms[*cursor].clone(),
-                section,
-                index: *cursor,
-            });
-            *cursor += 1;
+        if let Some(term) = Self::next_from(iter)? {
+            self.heap.push(HeapEntry { term, section });
         }
+        Ok(())
     }
 
-    fn make_entry(&self, term: Vec<u8>, section: SectionKind, index: usize) -> StreamEntry {
-        // Compute roles and local IDs based on which section the term came from
+    /// Consume the current index for a section and return it, then increment.
+    fn take_index(&mut self, section: SectionKind) -> u64 {
+        let counter = match section {
+            SectionKind::Shared => &mut self.shared_index,
+            SectionKind::Subjects => &mut self.subjects_index,
+            SectionKind::Objects => &mut self.objects_index,
+            SectionKind::Predicates => &mut self.predicates_index,
+        };
+        let idx = *counter;
+        *counter += 1;
+        idx
+    }
+
+    /// Apply blank node prefix if needed. Preserves sort order because the
+    /// prefix is inserted after the common `_:` marker.
+    fn disambiguate(&self, mut term: Vec<u8>) -> Vec<u8> {
+        if let Some(ref prefix) = self.bnode_prefix
+            && term.starts_with(b"_:")
+        {
+            let mut new_term = Vec::with_capacity(2 + prefix.len() + term.len() - 2);
+            new_term.extend_from_slice(b"_:");
+            new_term.extend_from_slice(prefix.as_bytes());
+            new_term.extend_from_slice(&term[2..]);
+            term = new_term;
+        }
+        term
+    }
+
+    fn make_entry(&self, term: Vec<u8>, section: SectionKind, index: u64) -> StreamEntry {
         match section {
             SectionKind::Shared => StreamEntry {
                 term,
                 roles: Roles::SUBJECT | Roles::OBJECT,
-                so_local_id: Some(index as u32), // 0-based
+                so_local_id: Some(index as u32),
                 p_local_id: None,
                 source_batch: self.batch_id,
             },
             SectionKind::Subjects => StreamEntry {
                 term,
                 roles: Roles::SUBJECT,
-                so_local_id: Some((self.shared_count as usize + index) as u32),
+                so_local_id: Some((self.shared_count + index) as u32),
                 p_local_id: None,
                 source_batch: self.batch_id,
             },
             SectionKind::Objects => StreamEntry {
                 term,
                 roles: Roles::OBJECT,
-                so_local_id: Some((self.shared_count as usize + self.subjects_count as usize + index) as u32),
+                so_local_id: Some((self.shared_count + self.subjects_count + index) as u32),
                 p_local_id: None,
                 source_batch: self.batch_id,
             },
@@ -423,35 +414,34 @@ impl FourWayMerge {
                 term,
                 roles: Roles::PREDICATE,
                 so_local_id: None,
-                p_local_id: Some(index as u32), // 0-based
+                p_local_id: Some(index as u32),
                 source_batch: self.batch_id,
             },
         }
     }
 }
 
-impl Iterator for FourWayMerge {
+impl Iterator for StreamingFourWayMerge {
     type Item = Result<StreamEntry>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let entry = self.heap.pop()?;
         let section = entry.section;
-        let index = entry.index;
         let term = entry.term;
 
-        // Check if the next entry from a different section has the same term.
-        // If so, we need to merge roles. For example, a term that's both a
-        // predicate and a subject/object in the HDT.
-        // In practice this is rare but we handle it correctly.
-        let mut merged = self.make_entry(term.clone(), section, index);
+        let index = self.take_index(section);
+        let disambiguated = self.disambiguate(term.clone());
+        let mut merged = self.make_entry(disambiguated, section, index);
 
-        // Peek at and consume entries with the same term from other sections
+        // Consume entries with the same term from other sections (role merging)
         while let Some(peek) = self.heap.peek() {
             if peek.term != term {
                 break;
             }
             let dup = self.heap.pop().unwrap();
-            let dup_entry = self.make_entry(dup.term, dup.section, dup.index);
+            let dup_index = self.take_index(dup.section);
+            let dup_term = self.disambiguate(dup.term);
+            let dup_entry = self.make_entry(dup_term, dup.section, dup_index);
             merged.roles |= dup_entry.roles;
             if merged.so_local_id.is_none() {
                 merged.so_local_id = dup_entry.so_local_id;
@@ -459,11 +449,15 @@ impl Iterator for FourWayMerge {
             if merged.p_local_id.is_none() {
                 merged.p_local_id = dup_entry.p_local_id;
             }
-            self.advance_section(dup.section);
+            if let Err(e) = self.advance_section(dup.section) {
+                return Some(Err(e));
+            }
         }
 
         // Advance the section we just popped from
-        self.advance_section(section);
+        if let Err(e) = self.advance_section(section) {
+            return Some(Err(e));
+        }
 
         Some(Ok(merged))
     }
@@ -731,70 +725,8 @@ mod tests {
         assert_eq!(remap_predicate(3), 2);
     }
 
-    #[test]
-    fn test_four_way_merge_order() {
-        // Simulate 4 sorted sections and verify merge produces globally sorted output
-        let shared = vec![b"alice".to_vec(), b"bob".to_vec()];
-        let subjects = vec![b"charlie".to_vec()];
-        let objects = vec![b"dave".to_vec()];
-        let predicates = vec![b"knows".to_vec(), b"likes".to_vec()];
-
-        let merge = FourWayMerge::new(
-            shared,
-            subjects,
-            objects,
-            predicates,
-            2, // shared_count
-            1, // subjects_count
-            0, // batch_id
-        );
-
-        let entries: Vec<StreamEntry> = merge.map(|r| r.unwrap()).collect();
-        assert_eq!(entries.len(), 6);
-
-        // Verify sorted order
-        for i in 1..entries.len() {
-            assert!(entries[i - 1].term <= entries[i].term,
-                "Terms not in order: {:?} > {:?}",
-                String::from_utf8_lossy(&entries[i - 1].term),
-                String::from_utf8_lossy(&entries[i].term));
-        }
-
-        // Verify roles
-        let alice = &entries[0];
-        assert_eq!(alice.term, b"alice");
-        assert!(alice.roles.contains(Roles::SUBJECT | Roles::OBJECT));
-        assert_eq!(alice.so_local_id, Some(0)); // shared[0]
-
-        let charlie = entries.iter().find(|e| e.term == b"charlie").unwrap();
-        assert!(charlie.roles.contains(Roles::SUBJECT));
-        assert_eq!(charlie.so_local_id, Some(2)); // shared_count + 0
-
-        let dave = entries.iter().find(|e| e.term == b"dave").unwrap();
-        assert!(dave.roles.contains(Roles::OBJECT));
-        assert_eq!(dave.so_local_id, Some(3)); // shared_count + subjects_count + 0
-
-        let knows = entries.iter().find(|e| e.term == b"knows").unwrap();
-        assert!(knows.roles.contains(Roles::PREDICATE));
-        assert_eq!(knows.p_local_id, Some(0));
-    }
-
-    #[test]
-    fn test_four_way_merge_duplicate_term() {
-        // A term appears in both shared and predicates sections
-        let shared = vec![b"http://example.org/x".to_vec()];
-        let subjects = vec![];
-        let objects = vec![];
-        let predicates = vec![b"http://example.org/x".to_vec()];
-
-        let merge = FourWayMerge::new(shared, subjects, objects, predicates, 1, 0, 0);
-        let entries: Vec<StreamEntry> = merge.map(|r| r.unwrap()).collect();
-
-        // Should be merged into a single entry with both roles
-        assert_eq!(entries.len(), 1);
-        let entry = &entries[0];
-        assert!(entry.roles.contains(Roles::SUBJECT | Roles::OBJECT | Roles::PREDICATE));
-        assert_eq!(entry.so_local_id, Some(0));
-        assert_eq!(entry.p_local_id, Some(0));
-    }
+    // Streaming 4-way merge is tested end-to-end via the integration test
+    // `test_hdt_input_merged_with_ntriples` which exercises vocab_factory on
+    // real HDT files, verifying sorted order, role assignment, and blank node
+    // disambiguation through the full pipeline.
 }
