@@ -7,9 +7,10 @@ HDT files produced by hdtc are fully compatible with [hdt-java](https://github.c
 ## Features
 
 - **All standard RDF formats** — N-Triples, N-Quads, Turtle, TriG, RDF/XML, JSON-LD, N3
+- **HDT inputs** — existing HDT files can be used as inputs, enabling merging of HDT files with each other or with RDF files
 - **Transparent decompression** — `.gz`, `.bz2`, `.xz` inputs handled automatically
 - **Scalable** — streaming, disk-backed pipeline with configurable memory limit (default 4 GB)
-- **Multiple inputs** — accepts any mix of files and directories; recursively discovers RDF files
+- **Multiple inputs** — accepts any mix of RDF files, HDT files, and directories; recursively discovers RDF files
 - **Parallel NT/NQ parsing** — newline-safe chunk parsing for N-Triples/N-Quads (including `.gz`, `.bz2`, `.xz`) with bounded in-flight memory
 - **Quads support** — HDTQ format (ESWC 2018) with graph dictionary and membership bitmaps
 - **Index generation** — optional `.hdt.index.v1-1` for OPS-order queries
@@ -76,6 +77,20 @@ Generate an HDT index alongside the output:
 
 ```sh
 hdtc create data.nt -o data.hdt --index
+```
+
+### Create: Merging HDT files
+
+Merge two existing HDT files into one:
+
+```sh
+hdtc create part1.hdt part2.hdt -o merged.hdt
+```
+
+Combine an existing HDT file with new RDF data:
+
+```sh
+hdtc create existing.hdt updates.nt.gz -o combined.hdt
 ```
 
 ### Create: Quads mode
@@ -169,14 +184,14 @@ Auto parser tuning is derived from `--memory-limit` (accepts `G`/`M` suffixes, e
 
 ### Dump: All options
 
-| Option                | Default      | Description                                                            |
-| --------------------- | ------------ | ---------------------------------------------------------------------- |
-| `<HDT_FILE>`          | _(required)_ | Path to existing HDT file                                              |
-| `-o, --output`        | _(required)_ | Output N-Triples file path                                             |
-| `--memory-limit SIZE` | `4G`         | Soft memory limit for dictionary cache (e.g. `4G`, `2000M`)           |
-| `--benchmark`         | off          | Emit stage timing and RSS high-water summary                           |
-| `-v, --verbose`       | —            | Increase log verbosity (`-v` debug, `-vv` trace)                       |
-| `-q, --quiet`         | —            | Suppress all output except errors                                      |
+| Option                | Default      | Description                                                 |
+| --------------------- | ------------ | ----------------------------------------------------------- |
+| `<HDT_FILE>`          | _(required)_ | Path to existing HDT file                                   |
+| `-o, --output`        | _(required)_ | Output N-Triples file path                                  |
+| `--memory-limit SIZE` | `4G`         | Soft memory limit for dictionary cache (e.g. `4G`, `2000M`) |
+| `--benchmark`         | off          | Emit stage timing and RSS high-water summary                |
+| `-v, --verbose`       | —            | Increase log verbosity (`-v` debug, `-vv` trace)            |
+| `-q, --quiet`         | —            | Suppress all output except errors                           |
 
 ## Resource requirements
 
