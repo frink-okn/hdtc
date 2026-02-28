@@ -9,3 +9,4 @@ pub use log_array::{LogArrayWriter, LogArrayReader, StreamingLogArrayEncoder, St
 #[allow(unused_imports)]
 pub use bitmap::{BitmapWriter, BitmapReader, StreamingBitmapEncoder, StreamingBitmapDecoder};
 pub use control::{ControlInfo, ControlType};
+pub use vbyte::{decode_vbyte, encode_vbyte, read_vbyte};

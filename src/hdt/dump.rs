@@ -1,6 +1,7 @@
 use crate::io::crc_utils::crc8;
 use crate::io::{
     ControlInfo, ControlType, LogArrayReader, StreamingBitmapDecoder, StreamingLogArrayDecoder,
+    decode_vbyte, encode_vbyte, read_vbyte,
 };
 use anyhow::{Context, Result, bail};
 use oxrdfio::{RdfFormat, RdfParser};
@@ -138,16 +139,18 @@ pub fn dump_hdt_to_ntriples_streaming(
     } else {
         0
     };
-    let mut current_subject_text = if num_triples > 0 {
-        dictionary.subject_term(current_subject)?
-    } else {
-        String::new()
-    };
-    let mut current_predicate_text = if num_sp_pairs > 0 {
-        dictionary.predicate_term(current_predicate)?
-    } else {
-        String::new()
-    };
+
+    // Reusable buffers for term bytes — avoids per-triple allocation.
+    let mut subject_buf = Vec::new();
+    let mut predicate_buf = Vec::new();
+    let mut object_buf = Vec::new();
+
+    if num_triples > 0 {
+        dictionary.subject_term(current_subject, &mut subject_buf)?;
+    }
+    if num_sp_pairs > 0 {
+        dictionary.predicate_term(current_predicate, &mut predicate_buf)?;
+    }
 
     let mut triples_written = 0u64;
 
@@ -163,17 +166,17 @@ pub fn dump_hdt_to_ntriples_streaming(
             bail!("Invalid object ID 0 at triple position {pos_z}");
         }
 
-        let object_text = dictionary.object_term(object)?;
+        dictionary.object_term(object, &mut object_buf)?;
 
         // Write subject (IRI or blank node)
-        write_ntriples_subject(&mut writer, current_subject_text.as_bytes())?;
+        write_ntriples_subject(&mut writer, &subject_buf)?;
         writer.write_all(b" ")?;
         // Write predicate (always an IRI)
         writer.write_all(b"<")?;
-        writer.write_all(current_predicate_text.as_bytes())?;
+        writer.write_all(&predicate_buf)?;
         writer.write_all(b"> ")?;
         // Write object (IRI, blank node, or literal)
-        write_ntriples_object(&mut writer, object_text.as_bytes())?;
+        write_ntriples_object(&mut writer, &object_buf)?;
         writer.write_all(b" .\n")?;
         triples_written += 1;
 
@@ -189,7 +192,7 @@ pub fn dump_hdt_to_ntriples_streaming(
             if by_bit {
                 current_subject += 1;
                 if pos_z + 1 < num_triples {
-                    current_subject_text = dictionary.subject_term(current_subject)?;
+                    dictionary.subject_term(current_subject, &mut subject_buf)?;
                 }
             }
 
@@ -198,7 +201,7 @@ pub fn dump_hdt_to_ntriples_streaming(
                 current_predicate = array_y_dec
                     .next_entry()?
                     .with_context(|| format!("ArrayY ended early at pos_y {pos_y}"))?;
-                current_predicate_text = dictionary.predicate_term(current_predicate)?;
+                dictionary.predicate_term(current_predicate, &mut predicate_buf)?;
             }
         }
     }
@@ -277,36 +280,55 @@ fn write_ntriples_literal(w: &mut impl Write, term: &[u8]) -> std::io::Result<()
 /// Returns `(value_end, suffix_start)` where:
 /// - `value` is `term[1..value_end]` (between opening `"` and closing `"`)
 /// - `suffix` is `term[suffix_start..]` (e.g. `^^<datatype>` or `@lang`, empty for simple literals)
+///
+/// HDT stores literal values unescaped, so embedded `"` in the value are
+/// indistinguishable from the structural closing `"` in pathological cases.
+/// This parser handles the three suffix forms by dispatching on the last byte:
+/// - `>` → typed literal: scan backwards for `"^^<` (robust because IRIs cannot contain `<`)
+/// - valid BCP-47 char → language tag: scan backwards for `[a-zA-Z0-9-]+` then verify `@"`
+/// - `"` → simple literal
 fn find_literal_boundary(term: &[u8]) -> (usize, usize) {
     let len = term.len();
+    if len < 2 {
+        return (len, len);
+    }
 
-    // Typed literal: ends with `>`, look for `"^^<` scanning backwards
-    if len > 4 && term[len - 1] == b'>' {
-        // Scan backwards for "^^<
-        let mut i = len - 2;
-        while i >= 4 {
-            if term[i] == b'<' && term[i - 1] == b'^' && term[i - 2] == b'^' && term[i - 3] == b'"'
+    match term[len - 1] {
+        // Typed literal: ends with `>`, look for `"^^<` scanning backwards.
+        // IRIs cannot contain `<`, so the first `<` from the right with `"^^` before it
+        // is unambiguous.
+        b'>' => {
+            let mut i = len - 2;
+            while i >= 4 {
+                if term[i] == b'<'
+                    && term[i - 1] == b'^'
+                    && term[i - 2] == b'^'
+                    && term[i - 3] == b'"'
+                {
+                    return (i - 3, i - 2);
+                }
+                i -= 1;
+            }
+        }
+        // Simple literal: closing `"` is the last character.
+        b'"' => return (len - 1, len),
+        // Possibly language-tagged: scan backwards for valid BCP-47 tag characters,
+        // then verify `@"` delimiter. This is more robust than scanning for `"@`
+        // because language tags are restricted to [a-zA-Z0-9-], so we won't match
+        // an `@` embedded in the value unless everything after it also looks like
+        // a valid tag.
+        b if b.is_ascii_alphanumeric() || b == b'-' => {
+            let mut tag_start = len - 1;
+            while tag_start > 0
+                && (term[tag_start - 1].is_ascii_alphanumeric() || term[tag_start - 1] == b'-')
             {
-                return (i - 3, i - 2);
+                tag_start -= 1;
             }
-            i -= 1;
-        }
-    }
-
-    // Language-tagged literal: look for `"@` scanning backwards
-    if len > 3 {
-        let mut i = len - 1;
-        while i >= 2 {
-            if term[i - 1] == b'"' && term[i] == b'@' {
-                return (i - 1, i);
+            if tag_start >= 2 && term[tag_start - 1] == b'@' && term[tag_start - 2] == b'"' {
+                return (tag_start - 2, tag_start - 1);
             }
-            i -= 1;
         }
-    }
-
-    // Simple literal: last character is `"`
-    if len >= 2 && term[len - 1] == b'"' {
-        return (len - 1, len);
+        _ => {}
     }
 
     // Fallback (shouldn't happen with valid HDT data)
@@ -407,7 +429,7 @@ fn skip_bitmap_section<R: Read + Seek>(reader: &mut R) -> Result<(u64, u64)> {
     let mut type_byte = [0u8; 1];
     reader.read_exact(&mut type_byte)?;
 
-    let num_bits = read_vbyte_from_reader(reader)?;
+    let num_bits = read_vbyte(reader)?;
 
     let mut crc8 = [0u8; 1];
     reader.read_exact(&mut crc8)?;
@@ -428,7 +450,7 @@ fn skip_log_array_section<R: Read + Seek>(reader: &mut R) -> Result<(u64, u64, u
     reader.read_exact(&mut bits_byte)?;
     let bits_per_entry = bits_byte[0];
 
-    let num_entries = read_vbyte_from_reader(reader)?;
+    let num_entries = read_vbyte(reader)?;
 
     let mut crc8 = [0u8; 1];
     reader.read_exact(&mut crc8)?;
@@ -440,62 +462,6 @@ fn skip_log_array_section<R: Read + Seek>(reader: &mut R) -> Result<(u64, u64, u
     Ok((section_start, num_entries, bits_per_entry))
 }
 
-fn read_vbyte_from_reader<R: Read>(reader: &mut R) -> Result<u64> {
-    let mut value: u64 = 0;
-    let mut shift = 0u32;
-    let mut byte_buf = [0u8; 1];
-
-    loop {
-        reader.read_exact(&mut byte_buf)?;
-        let byte = byte_buf[0];
-        value |= ((byte & 0x7F) as u64) << shift;
-        if byte & 0x80 != 0 {
-            return Ok(value);
-        }
-        shift += 7;
-        if shift >= 64 {
-            bail!("Invalid VByte: value exceeds u64 range");
-        }
-    }
-}
-
-fn read_vbyte_tracking<R: Read>(reader: &mut R, tracking: &mut Vec<u8>) -> Result<u64> {
-    let mut value: u64 = 0;
-    let mut shift = 0u32;
-    let mut byte_buf = [0u8; 1];
-
-    loop {
-        reader.read_exact(&mut byte_buf)?;
-        let byte = byte_buf[0];
-        tracking.push(byte);
-        value |= ((byte & 0x7F) as u64) << shift;
-        if byte & 0x80 != 0 {
-            return Ok(value);
-        }
-        shift += 7;
-        if shift >= 64 {
-            bail!("Invalid VByte: value exceeds u64 range");
-        }
-    }
-}
-
-fn decode_vbyte_slice(data: &[u8]) -> Result<(u64, usize)> {
-    let mut value: u64 = 0;
-    let mut shift = 0u32;
-
-    for (i, byte) in data.iter().enumerate() {
-        value |= ((byte & 0x7F) as u64) << shift;
-        if byte & 0x80 != 0 {
-            return Ok((value, i + 1));
-        }
-        shift += 7;
-        if shift >= 64 {
-            bail!("Invalid VByte in PFC block: value exceeds u64 range");
-        }
-    }
-
-    bail!("Unexpected end of block while decoding VByte");
-}
 
 struct DictionaryResolver {
     shared: PfcSectionIndex,
@@ -505,32 +471,32 @@ struct DictionaryResolver {
 }
 
 impl DictionaryResolver {
-    fn subject_term(&mut self, subject_id: u64) -> Result<String> {
+    fn subject_term(&mut self, subject_id: u64, buf: &mut Vec<u8>) -> Result<()> {
         let shared_count = self.shared.string_count;
         if subject_id == 0 {
             bail!("Invalid subject ID 0");
         }
         if subject_id <= shared_count {
-            return self.shared.get(subject_id);
+            return self.shared.get_bytes(subject_id, buf);
         }
         let local = subject_id - shared_count;
-        self.subjects.get(local)
+        self.subjects.get_bytes(local, buf)
     }
 
-    fn predicate_term(&mut self, predicate_id: u64) -> Result<String> {
-        self.predicates.get(predicate_id)
+    fn predicate_term(&mut self, predicate_id: u64, buf: &mut Vec<u8>) -> Result<()> {
+        self.predicates.get_bytes(predicate_id, buf)
     }
 
-    fn object_term(&mut self, object_id: u64) -> Result<String> {
+    fn object_term(&mut self, object_id: u64, buf: &mut Vec<u8>) -> Result<()> {
         let shared_count = self.shared.string_count;
         if object_id == 0 {
             bail!("Invalid object ID 0");
         }
         if object_id <= shared_count {
-            return self.shared.get(object_id);
+            return self.shared.get_bytes(object_id, buf);
         }
         let local = object_id - shared_count;
-        self.objects.get(local)
+        self.objects.get_bytes(local, buf)
     }
 }
 
@@ -541,7 +507,7 @@ struct PfcSectionIndex {
     offsets: Vec<u64>,
     string_buf_start: u64,
     reader: BufReader<File>,
-    block_cache: HashMap<u64, Vec<String>>,
+    block_cache: HashMap<u64, Vec<Vec<u8>>>,
     cache_order: VecDeque<u64>,
     cache_capacity: usize,
 }
@@ -565,12 +531,15 @@ impl PfcSectionIndex {
         }
         preamble.push(section_type[0]);
 
-        let string_count = read_vbyte_tracking(reader, &mut preamble)
+        let string_count = read_vbyte(reader)
             .with_context(|| format!("Invalid string count VByte for {section_name}"))?;
-        let buffer_length = read_vbyte_tracking(reader, &mut preamble)
+        preamble.extend_from_slice(&encode_vbyte(string_count));
+        let buffer_length = read_vbyte(reader)
             .with_context(|| format!("Invalid buffer length VByte for {section_name}"))?;
-        let block_size = read_vbyte_tracking(reader, &mut preamble)
+        preamble.extend_from_slice(&encode_vbyte(buffer_length));
+        let block_size = read_vbyte(reader)
             .with_context(|| format!("Invalid block size VByte for {section_name}"))?;
+        preamble.extend_from_slice(&encode_vbyte(block_size));
         if block_size == 0 {
             bail!("Invalid block size 0 in {section_name} section");
         }
@@ -641,7 +610,7 @@ impl PfcSectionIndex {
         })
     }
 
-    fn get(&mut self, id: u64) -> Result<String> {
+    fn get_bytes(&mut self, id: u64, buf: &mut Vec<u8>) -> Result<()> {
         if id == 0 || id > self.string_count {
             bail!(
                 "{} ID out of range: {id} (valid range: 1..={})",
@@ -665,19 +634,22 @@ impl PfcSectionIndex {
             }
         }
 
-        self.block_cache
+        let entry = self
+            .block_cache
             .get(&block_index)
             .and_then(|v| v.get(entry_in_block))
-            .cloned()
             .with_context(|| {
                 format!(
                     "Decoded block too short in {} at block {}, entry {}",
                     self.section_name, block_index, entry_in_block
                 )
-            })
+            })?;
+        buf.clear();
+        buf.extend_from_slice(entry);
+        Ok(())
     }
 
-    fn decode_block(&mut self, block_index: u64) -> Result<Vec<String>> {
+    fn decode_block(&mut self, block_index: u64) -> Result<Vec<Vec<u8>>> {
         let start = self
             .offsets
             .get(block_index as usize)
@@ -739,21 +711,13 @@ impl PfcSectionIndex {
                 })?;
                 let end_pos = pos + rel_end;
                 let term_bytes = data[pos..end_pos].to_vec();
-                let value = std::str::from_utf8(&term_bytes)
-                    .with_context(|| {
-                        format!(
-                            "Non-UTF8 term in {} block {}",
-                            self.section_name, block_index
-                        )
-                    })?
-                    .to_string();
                 pos = end_pos + 1;
-                prev_bytes = term_bytes;
-                entries.push(value);
+                prev_bytes = term_bytes.clone();
+                entries.push(term_bytes);
                 continue;
             }
 
-            let (shared, consumed) = decode_vbyte_slice(&data[pos..])?;
+            let (shared, consumed) = decode_vbyte(&data[pos..])?;
             pos += consumed;
             let rel_end = data[pos..].iter().position(|&b| b == 0).with_context(|| {
                 format!(
@@ -779,14 +743,8 @@ impl PfcSectionIndex {
             let mut value_bytes = Vec::with_capacity(shared + suffix.len());
             value_bytes.extend_from_slice(&prev_bytes[..shared]);
             value_bytes.extend_from_slice(suffix);
-            let value = String::from_utf8(value_bytes.clone()).with_context(|| {
-                format!(
-                    "Non-UTF8 reconstructed term in {} block {}",
-                    self.section_name, block_index
-                )
-            })?;
-            prev_bytes = value_bytes;
-            entries.push(value);
+            prev_bytes = value_bytes.clone();
+            entries.push(value_bytes);
         }
 
         Ok(entries)
@@ -947,5 +905,36 @@ mod tests {
         let (ve, ss) = find_literal_boundary(term);
         assert_eq!(&term[1..ve], b"email@host");
         assert_eq!(&term[ss..], b"@en");
+    }
+
+    #[test]
+    fn test_find_boundary_value_ending_with_at_no_lang_tag() {
+        // Simple literal whose value ends with "@" — not a language tag because
+        // there are no BCP-47 characters after the "@".
+        let term = b"\"user@\"";
+        let (ve, ss) = find_literal_boundary(term);
+        assert_eq!(&term[1..ve], b"user@");
+        assert_eq!(ss, term.len()); // simple literal, no suffix
+    }
+
+    #[test]
+    fn test_find_boundary_value_with_at_non_tag_suffix() {
+        // Value contains "@" followed by characters that include non-BCP-47 chars
+        // (dots, underscores). The last byte is '.', which is not alphanumeric or '-',
+        // so this is treated as a simple literal ending with '"'.
+        // HDT wouldn't normally produce this, but it tests the robustness of the parser.
+        let term = b"\"user@host.com\"";
+        let (ve, ss) = find_literal_boundary(term);
+        assert_eq!(&term[1..ve], b"user@host.com");
+        assert_eq!(ss, term.len()); // simple literal
+    }
+
+    #[test]
+    fn test_find_boundary_multiple_at_signs() {
+        // Value has multiple "@" signs; only the last valid "@ + BCP-47 tag should match.
+        let term = b"\"a@fake\"@de";
+        let (ve, ss) = find_literal_boundary(term);
+        assert_eq!(&term[1..ve], b"a@fake");
+        assert_eq!(&term[ss..], b"@de");
     }
 }

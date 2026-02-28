@@ -169,13 +169,14 @@ Auto parser tuning is derived from `--memory-limit` (accepts `G`/`M` suffixes, e
 
 ### Dump: All options
 
-| Option          | Default      | Description                                      |
-| --------------- | ------------ | ------------------------------------------------ |
-| `<HDT_FILE>`    | _(required)_ | Path to existing HDT file                        |
-| `-o, --output`  | _(required)_ | Output N-Triples file path                       |
-| `--benchmark`   | off          | Emit stage timing and RSS high-water summary     |
-| `-v, --verbose` | —            | Increase log verbosity (`-v` debug, `-vv` trace) |
-| `-q, --quiet`   | —            | Suppress all output except errors                |
+| Option                | Default      | Description                                                            |
+| --------------------- | ------------ | ---------------------------------------------------------------------- |
+| `<HDT_FILE>`          | _(required)_ | Path to existing HDT file                                              |
+| `-o, --output`        | _(required)_ | Output N-Triples file path                                             |
+| `--memory-limit SIZE` | `4G`         | Soft memory limit for dictionary cache (e.g. `4G`, `2000M`)           |
+| `--benchmark`         | off          | Emit stage timing and RSS high-water summary                           |
+| `-v, --verbose`       | —            | Increase log verbosity (`-v` debug, `-vv` trace)                       |
+| `-q, --quiet`         | —            | Suppress all output except errors                                      |
 
 ## Resource requirements
 
