@@ -3,10 +3,10 @@
 //! Each byte uses 7 data bits (little-endian order). The MSB is a termination
 //! bit: 1 means this is the last byte, 0 means more bytes follow.
 
-#[cfg(test)]
 use std::io;
+use std::io::Read;
 #[cfg(test)]
-use std::io::{Read, Write};
+use std::io::Write;
 
 /// Encode a u64 value as VByte, returning the bytes.
 pub fn encode_vbyte(mut value: u64) -> Vec<u8> {
@@ -26,7 +26,6 @@ pub fn encode_vbyte(mut value: u64) -> Vec<u8> {
 
 /// Decode a VByte-encoded value from a byte slice.
 /// Returns (value, bytes_consumed).
-#[cfg(test)]
 pub fn decode_vbyte(data: &[u8]) -> io::Result<(u64, usize)> {
     let mut value: u64 = 0;
     let mut shift = 0u32;
@@ -60,7 +59,6 @@ pub fn write_vbyte<W: Write>(writer: &mut W, value: u64) -> io::Result<usize> {
 }
 
 /// Read a VByte-encoded value from a reader.
-#[cfg(test)]
 pub fn read_vbyte<R: Read>(reader: &mut R) -> io::Result<u64> {
     let mut value: u64 = 0;
     let mut shift = 0u32;
