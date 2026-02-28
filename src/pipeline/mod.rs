@@ -535,6 +535,7 @@ fn build_memory_plan(memory_budget: usize) -> PipelineMemoryPlan {
 }
 
 /// Stage 1: Parse RDF and batch quads.
+#[allow(clippy::too_many_arguments)]
 fn parser_stage(
     inputs: Vec<RdfInput>,
     batch_size: usize,
@@ -543,9 +544,10 @@ fn parser_stage(
     base_uri: String,
     parser_parallelism: ParserParallelismConfig,
     batch_tx: Sender<BatchedQuads>,
+    total_input_count: usize,
 ) -> Result<u64> {
     let expected_files = inputs.len();
-    let disambiguate_blank_nodes = inputs.len() > 1;
+    let disambiguate_blank_nodes = total_input_count > 1;
     let available_cpus = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)
@@ -912,6 +914,7 @@ pub fn run_pipeline(
     let base_uri_owned = base_uri.to_string();
     let parser_parallelism_owned = parser_parallelism.clone();
     let parser_budget = memory_plan.parser_budget_bytes;
+    let total_input_count = inputs.len() + hdt_inputs.len();
     let parser_handle = std::thread::spawn(move || {
         parser_stage(
             inputs_owned,
@@ -921,6 +924,7 @@ pub fn run_pipeline(
             base_uri_owned,
             parser_parallelism_owned,
             batch_tx,
+            total_input_count,
         )
     });
 

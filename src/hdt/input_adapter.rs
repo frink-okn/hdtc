@@ -5,14 +5,15 @@
 //! 2. A streaming triple reader (for the ID remapper in Stage 5)
 
 use crate::hdt::pfc_reader::{PfcSectionHeader, PfcSectionIterator};
-use crate::io::{ControlInfo, ControlType, StreamingBitmapDecoder, StreamingLogArrayDecoder, read_vbyte};
+use crate::io::{ControlInfo, ControlType, StreamingBitmapDecoder, StreamingLogArrayDecoder, skip_bitmap_section, skip_log_array_section};
 use crate::pipeline::batch_vocab::Roles;
 use crate::pipeline::vocab_merger::StreamEntry;
 use anyhow::{Context, Result, bail};
+use oxrdfio::{RdfFormat, RdfParser};
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::fs::File;
-use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::io::{BufReader, Cursor, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 const DICTIONARY_FOUR_FORMAT: &str = "<http://purl.org/HDT/hdt#dictionaryFour>";
@@ -72,8 +73,7 @@ impl HdtInputAdapter {
 
         // Parse triple count and original size from header
         let header_text = String::from_utf8(header_buf).context("Header not valid UTF-8")?;
-        let num_triples = parse_num_triples_from_header(&header_text)?;
-        let original_size = parse_original_size_from_header(&header_text);
+        let (num_triples, original_size) = parse_header_metadata(&header_text)?;
 
         // Dictionary control info
         let dict_ci_offset = reader.stream_position()?;
@@ -187,34 +187,9 @@ impl HdtInputAdapter {
             let file = File::open(&path)?;
             let mut reader = BufReader::with_capacity(256 * 1024, file);
             reader.seek(SeekFrom::Start(dict_ci_offset))?;
-
-            // Skip the dictionary ControlInfo
             let _dict_ci = ControlInfo::read_from(&mut reader)?;
 
-            // Read all 4 PFC section headers and create iterators
-            let shared_header = PfcSectionHeader::read_from(&mut reader, "shared")?;
-            let shared_iter = PfcSectionIterator::new(&mut reader as &mut dyn Read, &shared_header, "shared");
-
-            // Wait — we can't use &mut reader for multiple iterators simultaneously.
-            // Instead, we need to read sections sequentially: collect each section's
-            // terms, then merge. But that defeats the streaming purpose.
-            //
-            // Better approach: read all 4 sections into memory (just the terms),
-            // then do a 4-way merge. The terms are already stored in the HDT file
-            // and we need them for the merge anyway.
-            //
-            // Actually, PFC sections are read sequentially in the file, so we need
-            // to read them one at a time. Let's collect them into sorted Vec<Vec<u8>>,
-            // then do a streaming 4-way merge from the Vecs.
-            drop(shared_iter);
-
-            // Re-open and seek to dictionary start
-            let file = File::open(&path)?;
-            let mut reader = BufReader::with_capacity(256 * 1024, file);
-            reader.seek(SeekFrom::Start(dict_ci_offset))?;
-            let _dict_ci = ControlInfo::read_from(&mut reader)?;
-
-            // Read each PFC section sequentially
+            // Read each PFC section sequentially into memory for the 4-way merge
             let mut shared_terms = read_pfc_section_terms(&mut reader, "shared")?;
             let mut subjects_terms = read_pfc_section_terms(&mut reader, "subjects")?;
             let predicates_terms = read_pfc_section_terms(&mut reader, "predicates")?;
@@ -498,6 +473,28 @@ impl Iterator for FourWayMerge {
 // Streaming triple reader
 // ---------------------------------------------------------------------------
 
+/// Remap an HDT subject ID (1-based) to the flat local SO space (0-based).
+fn remap_subject(s: u64) -> u32 {
+    (s - 1) as u32
+}
+
+/// Remap an HDT object ID to the flat local SO space.
+///
+/// Shared objects (ID <= shared_count) map to [0..shared_count-1].
+/// Object-only terms (ID > shared_count) are placed after all subjects.
+fn remap_object(o: u64, shared_count: u64, subjects_count: u64) -> u32 {
+    if o <= shared_count {
+        (o - 1) as u32
+    } else {
+        (subjects_count + o - 1) as u32
+    }
+}
+
+/// Remap an HDT predicate ID (1-based) to the flat local P space (0-based).
+fn remap_predicate(p: u64) -> u32 {
+    (p - 1) as u32
+}
+
 /// Streaming reader that decodes BitmapTriples from an HDT file,
 /// yielding triples with IDs remapped to a flat local SO/P space.
 pub struct HdtTripleReader {
@@ -573,27 +570,16 @@ impl HdtTripleReader {
         })
     }
 
-    /// Remap an HDT subject ID to the flat local SO space.
     fn remap_subject(&self, s: u64) -> u32 {
-        // Subjects in HDT: [1..shared+subjects], contiguous
-        // Flat local: [0..shared+subjects-1]
-        (s - 1) as u32
+        remap_subject(s)
     }
 
-    /// Remap an HDT object ID to the flat local SO space.
     fn remap_object(&self, o: u64) -> u32 {
-        if o <= self.shared_count {
-            // Shared term: same as subject mapping
-            (o - 1) as u32
-        } else {
-            // Object-only term: placed after all subjects in the flat space
-            (self.subjects_count + o - 1) as u32
-        }
+        remap_object(o, self.shared_count, self.subjects_count)
     }
 
-    /// Remap an HDT predicate ID to the flat local P space.
     fn remap_predicate(&self, p: u64) -> u32 {
-        (p - 1) as u32
+        remap_predicate(p)
     }
 
     /// Read the next triple, returning (flat_subject, flat_predicate, flat_object).
@@ -642,87 +628,62 @@ impl HdtTripleReader {
     }
 }
 
-// ---------------------------------------------------------------------------
-// HDT section scanning helpers (duplicated from dump.rs — could be shared)
-// ---------------------------------------------------------------------------
-
-fn skip_bitmap_section<R: Read + Seek>(reader: &mut R) -> Result<(u64, u64)> {
-    let section_start = reader.stream_position()?;
-
-    let mut type_byte = [0u8; 1];
-    reader.read_exact(&mut type_byte)?;
-
-    let num_bits = read_vbyte(reader)?;
-
-    let mut crc8 = [0u8; 1];
-    reader.read_exact(&mut crc8)?;
-
-    let data_bytes = num_bits.div_ceil(8);
-    reader.seek(SeekFrom::Current(data_bytes as i64 + 4))?;
-
-    Ok((section_start, num_bits))
-}
-
-fn skip_log_array_section<R: Read + Seek>(reader: &mut R) -> Result<(u64, u64, u8)> {
-    let section_start = reader.stream_position()?;
-
-    let mut type_byte = [0u8; 1];
-    reader.read_exact(&mut type_byte)?;
-
-    let mut bits_byte = [0u8; 1];
-    reader.read_exact(&mut bits_byte)?;
-    let bits_per_entry = bits_byte[0];
-
-    let num_entries = read_vbyte(reader)?;
-
-    let mut crc8 = [0u8; 1];
-    reader.read_exact(&mut crc8)?;
-
-    let total_bits = num_entries * bits_per_entry as u64;
-    let data_bytes = total_bits.div_ceil(8);
-    reader.seek(SeekFrom::Current(data_bytes as i64 + 4))?;
-
-    Ok((section_start, num_entries, bits_per_entry))
-}
-
-fn skip_pfc_section<R: Read>(reader: &mut R, section_name: &str) -> Result<u64> {
+fn skip_pfc_section<R: Read + Seek>(reader: &mut R, section_name: &str) -> Result<u64> {
     crate::hdt::pfc_reader::skip_pfc_section(reader, section_name)
 }
 
-/// Extract `originalSize` from the HDT header, returning 0 if not found.
-fn parse_original_size_from_header(header_text: &str) -> u64 {
-    for line in header_text.lines() {
-        if line.contains("originalSize")
-            && let Some(start) = line.find('"')
-        {
-            let rest = &line[start + 1..];
-            if let Some(end) = rest.find('"')
-                && let Ok(size) = rest[..end].parse::<u64>()
-            {
-                return size;
-            }
-        }
-    }
-    0
-}
+/// Parse header metadata from the HDT header RDF.
+///
+/// Returns `(num_triples, original_size)`. The triple count is required;
+/// original size defaults to 0 if not present.
+fn parse_header_metadata(header_text: &str) -> Result<(u64, u64)> {
+    const VOID_TRIPLES: &str = "http://rdfs.org/ns/void#triples";
+    const HDT_TRIPLES_NUM: &str = "http://purl.org/HDT/hdt#triplesnumTriples";
+    const ORIGINAL_SIZE: &str = "http://purl.org/HDT/hdt#originalSize";
 
-fn parse_num_triples_from_header(header_text: &str) -> Result<u64> {
-    // Parse the header RDF to find the triple count
-    // The header contains lines like: <...> <http://rdfs.org/ns/void#triples> "12345" .
-    for line in header_text.lines() {
-        if line.contains("void#triples") {
-            // Extract the number from the quoted value
-            if let Some(start) = line.find('"') {
-                let rest = &line[start + 1..];
-                if let Some(end) = rest.find('"')
-                    && let Ok(count) = rest[..end].parse::<u64>()
-                {
-                    return Ok(count);
-                }
-            }
+    let mut triples_from_void: Option<u64> = None;
+    let mut triples_from_hdt: Option<u64> = None;
+    let mut original_size: u64 = 0;
+
+    let parser =
+        RdfParser::from_format(RdfFormat::NTriples).for_reader(Cursor::new(header_text.as_bytes()));
+
+    for quad_result in parser {
+        let quad = quad_result.context("Invalid N-Triples in HDT header metadata")?;
+        let predicate = quad.predicate.as_str();
+
+        let oxrdf::Term::Literal(literal) = quad.object else {
+            continue;
+        };
+
+        if predicate == VOID_TRIPLES {
+            triples_from_void = Some(literal.value().parse::<u64>().with_context(|| {
+                format!("Invalid numeric triple-count literal: {}", literal.value())
+            })?);
+        } else if predicate == HDT_TRIPLES_NUM {
+            triples_from_hdt = Some(literal.value().parse::<u64>().with_context(|| {
+                format!("Invalid numeric triple-count literal: {}", literal.value())
+            })?);
+        } else if predicate == ORIGINAL_SIZE
+            && let Ok(size) = literal.value().parse::<u64>()
+        {
+            original_size = size;
         }
     }
-    bail!("Could not find triple count in HDT header");
+
+    let num_triples = match (triples_from_void, triples_from_hdt) {
+        (Some(v), Some(h)) if v != h => {
+            bail!(
+                "Header triple-count mismatch between void:triples ({v}) and hdt:triplesnumTriples ({h})"
+            )
+        }
+        (Some(v), Some(_)) => v,
+        (Some(v), None) => v,
+        (None, Some(h)) => h,
+        (None, None) => bail!("Header metadata missing triple-count predicate"),
+    };
+
+    Ok((num_triples, original_size))
 }
 
 #[cfg(test)]
@@ -731,29 +692,25 @@ mod tests {
 
     #[test]
     fn test_remap_ids() {
-        // shared=10, subjects=5
-        let _shared_count = 10u64;
+        let shared_count = 10u64;
         let subjects_count = 5u64;
 
-        // Subject remapping: s -> s-1
-        assert_eq!((1u64 - 1) as u32, 0);
-        assert_eq!((10u64 - 1) as u32, 9);
-        assert_eq!((15u64 - 1) as u32, 14);
+        // Subject remapping: 1-based HDT ID → 0-based flat ID
+        assert_eq!(remap_subject(1), 0);
+        assert_eq!(remap_subject(10), 9);
+        assert_eq!(remap_subject(15), 14);
 
-        // Object remapping
-        // Shared object (o <= shared_count): o -> o-1
-        assert_eq!((1u64 - 1) as u32, 0);
-        assert_eq!((10u64 - 1) as u32, 9);
+        // Object remapping: shared objects (o <= shared_count) → o-1
+        assert_eq!(remap_object(1, shared_count, subjects_count), 0);
+        assert_eq!(remap_object(10, shared_count, subjects_count), 9);
 
-        // Object-only (o > shared_count): o -> subjects_count + o - 1
-        let o = 11u64;
-        assert_eq!((subjects_count + o - 1) as u32, 15);
-        let o = 13u64;
-        assert_eq!((subjects_count + o - 1) as u32, 17);
+        // Object-only (o > shared_count) → subjects_count + o - 1
+        assert_eq!(remap_object(11, shared_count, subjects_count), 15);
+        assert_eq!(remap_object(13, shared_count, subjects_count), 17);
 
-        // Predicate remapping: p -> p-1
-        assert_eq!((1u64 - 1) as u32, 0);
-        assert_eq!((3u64 - 1) as u32, 2);
+        // Predicate remapping: 1-based → 0-based
+        assert_eq!(remap_predicate(1), 0);
+        assert_eq!(remap_predicate(3), 2);
     }
 
     #[test]

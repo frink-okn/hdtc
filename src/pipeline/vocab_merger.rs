@@ -536,7 +536,6 @@ pub fn merge_vocabularies(
     let mut so_map_finalize_time = Duration::ZERO;
     let mut pfc_serialize_time = Duration::ZERO;
     let mut mapping_write_time = Duration::ZERO;
-    let stream_bytes_read = 0u64;
 
     // Separate metadata from factories
     let mut batch_max_so: Vec<u32> = Vec::with_capacity(sources.len());
@@ -707,10 +706,9 @@ pub fn merge_vocabularies(
     mapping_write_time += mapping_write_start.elapsed();
 
     tracing::debug!(
-        "Stage 4 timing: stream init {:.3}s/read {:.3}s ({} MB), assign {:.3}s, finalize SO-map {:.3}s, dict serialize {:.3}s, mapping writes {:.3}s",
+        "Stage 4 timing: stream init {:.3}s/read {:.3}s, assign {:.3}s, finalize SO-map {:.3}s, dict serialize {:.3}s, mapping writes {:.3}s",
         stream_reader_init_time.as_secs_f64(),
         stream_read_time.as_secs_f64(),
-        stream_bytes_read / (1024 * 1024),
         id_assignment_time.as_secs_f64(),
         so_map_finalize_time.as_secs_f64(),
         pfc_serialize_time.as_secs_f64(),

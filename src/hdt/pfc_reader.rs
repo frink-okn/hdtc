@@ -278,14 +278,16 @@ impl<R: Read> Iterator for PfcSectionIterator<R> {
 /// Read and skip a PFC section, returning its string count.
 ///
 /// Useful when you need to skip past a section without decoding all terms.
-pub fn skip_pfc_section<R: Read>(reader: &mut R, section_name: &str) -> Result<u64> {
+/// Uses `Seek` to skip the string buffer efficiently without allocation.
+pub fn skip_pfc_section<R: Read + std::io::Seek>(
+    reader: &mut R,
+    section_name: &str,
+) -> Result<u64> {
     let header = PfcSectionHeader::read_from(reader, section_name)?;
     let string_count = header.string_count;
 
     // Skip the string buffer + CRC32C
-    let buf_len = header.buffer_length as usize + 4;
-    let mut skip = vec![0u8; buf_len];
-    reader.read_exact(&mut skip)?;
+    reader.seek(std::io::SeekFrom::Current(header.buffer_length as i64 + 4))?;
 
     Ok(string_count)
 }
