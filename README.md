@@ -12,7 +12,7 @@ HDT files produced by hdtc are fully compatible with [hdt-java](https://github.c
 - **Scalable** — streaming, disk-backed pipeline with configurable memory limit (default 4 GB)
 - **Multiple inputs** — accepts any mix of RDF files, HDT files, and directories; recursively discovers RDF files
 - **Parallel NT/NQ parsing** — newline-safe chunk parsing for N-Triples/N-Quads (including `.gz`, `.bz2`, `.xz`) with bounded in-flight memory
-- **Quads support** — HDTQ format (ESWC 2018) with graph dictionary and membership bitmaps
+- **Quad inputs** — N-Quads and TriG inputs are accepted; the graph component is dropped and triples are indexed normally
 - **Index generation** — optional `.hdt.index.v1-1` for OPS-order queries
 - **Resilient parsing** — skips malformed triples with warnings, reports total skipped at the end
 
@@ -93,22 +93,6 @@ Combine an existing HDT file with new RDF data:
 hdtc create existing.hdt updates.nt.gz -o combined.hdt
 ```
 
-### Create: Quads mode
-
-Produce an HDTQ file from N-Quads input:
-
-```sh
-hdtc create data.nq -o data.hdt -m quads
-```
-
-Map input files to named graphs:
-
-```sh
-hdtc create people.nt places.nt -o data.hdt -m quads \
-  --graph-map people.nt=http://example.org/people \
-  --graph-map places.nt=http://example.org/places
-```
-
 ### Create: Tuning for large datasets
 
 Set a higher memory limit for better throughput:
@@ -154,12 +138,9 @@ If the output file already exists, it is overwritten.
 | ---------------------------------- | ---------------------------- | ----------------------------------------------------------- |
 | `<INPUTS>...`                      | _(required)_                 | Input RDF files or directories                              |
 | `-o, --output`                     | _(required)_                 | Output HDT file path                                        |
-| `-m, --mode`                       | `triples`                    | Output mode: `triples` or `quads`                           |
 | `--temp-dir`                       | system temp                  | Directory for temporary working files                       |
 | `--index`                          | off                          | Generate `.hdt.index.v1-1` index file                       |
 | `--base-uri`                       | `http://example.org/dataset` | Base URI for the HDT header                                 |
-| `--graph-map PATH=URI`             | —                            | Map input paths to named graph URIs (quads mode)            |
-| `--default-graph URI`              | —                            | Default graph for triples without an explicit graph         |
 | `--memory-limit SIZE`              | `4G`                         | Soft memory limit for internal buffers (e.g. `4G`, `2000M`) |
 | `--parse-file-workers N`           | auto                         | Number of files parsed concurrently                         |
 | `--parse-chunk-workers N`          | auto (capped)                | Parser workers per active NT/NQ file                        |
@@ -250,7 +231,6 @@ src/
   index/             HDT index generation (.hdt.index.v1-1)
   io/                VByte, LogArray, Bitmap, CRC, Control Information
   pipeline/          6-stage pipelined architecture
-  quads/             HDTQ quad support
   sort/              External merge sort
 tests/
   integration_test.rs   End-to-end pipeline tests
