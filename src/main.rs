@@ -244,7 +244,10 @@ fn dump_hdt_to_ntriples(args: cli::DumpArgs, benchmark: bool) -> Result<()> {
     tracing::info!("Output: {}", args.output.display());
 
     let start = std::time::Instant::now();
-    let count = hdt::dump_hdt_to_ntriples_streaming(&args.hdt_file, &args.output)?;
+    let memory_limit = args.memory_limit.as_bytes();
+    tracing::info!("Memory limit: {} bytes", memory_limit);
+    let count =
+        hdt::dump_hdt_to_ntriples_streaming(&args.hdt_file, &args.output, memory_limit)?;
 
     if benchmark {
         tracing::info!(

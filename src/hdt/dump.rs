@@ -3,8 +3,7 @@ use crate::io::{
     ControlInfo, ControlType, LogArrayReader, StreamingBitmapDecoder, StreamingLogArrayDecoder,
 };
 use anyhow::{Context, Result, bail};
-use oxrdf::{BlankNode, Literal, NamedNode, NamedOrBlankNode, Term, Triple};
-use oxrdfio::{RdfFormat, RdfParser, RdfSerializer};
+use oxrdfio::{RdfFormat, RdfParser};
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
@@ -14,7 +13,11 @@ const PFC_SECTION_TYPE: u8 = 0x02;
 const DICTIONARY_FOUR_FORMAT: &str = "<http://purl.org/HDT/hdt#dictionaryFour>";
 const TRIPLES_BITMAP_FORMAT: &str = "<http://purl.org/HDT/hdt#triplesBitmap>";
 
-pub fn dump_hdt_to_ntriples_streaming(hdt_path: &Path, output_path: &Path) -> Result<u64> {
+pub fn dump_hdt_to_ntriples_streaming(
+    hdt_path: &Path,
+    output_path: &Path,
+    memory_limit: usize,
+) -> Result<u64> {
     let file = File::open(hdt_path)
         .with_context(|| format!("Failed to open HDT file {}", hdt_path.display()))?;
     let mut reader = BufReader::with_capacity(256 * 1024, file);
@@ -56,11 +59,17 @@ pub fn dump_hdt_to_ntriples_streaming(hdt_path: &Path, output_path: &Path) -> Re
         );
     }
 
+    // Dump's memory is almost entirely the PFC block cache — the only other
+    // allocations are block-offset vectors (tens of MB) and I/O buffers (~1 MB).
+    // Reserve a fixed 64 MB for those, then split the rest across 4 sections.
+    const RESERVED_BYTES: usize = 64 * 1024 * 1024;
+    let cache_budget_per_section = memory_limit.saturating_sub(RESERVED_BYTES) / 4;
+
     let mut dictionary = DictionaryResolver {
-        shared: PfcSectionIndex::read_from(&mut reader, hdt_path, "shared")?,
-        subjects: PfcSectionIndex::read_from(&mut reader, hdt_path, "subjects")?,
-        predicates: PfcSectionIndex::read_from(&mut reader, hdt_path, "predicates")?,
-        objects: PfcSectionIndex::read_from(&mut reader, hdt_path, "objects")?,
+        shared: PfcSectionIndex::read_from(&mut reader, hdt_path, "shared", cache_budget_per_section)?,
+        subjects: PfcSectionIndex::read_from(&mut reader, hdt_path, "subjects", cache_budget_per_section)?,
+        predicates: PfcSectionIndex::read_from(&mut reader, hdt_path, "predicates", cache_budget_per_section)?,
+        objects: PfcSectionIndex::read_from(&mut reader, hdt_path, "objects", cache_budget_per_section)?,
     };
 
     let triples_ci =
@@ -117,8 +126,7 @@ pub fn dump_hdt_to_ntriples_streaming(hdt_path: &Path, output_path: &Path) -> Re
 
     let output_file = File::create(output_path)
         .with_context(|| format!("Failed to create output file {}", output_path.display()))?;
-    let output_writer = BufWriter::with_capacity(256 * 1024, output_file);
-    let mut serializer = RdfSerializer::from_format(RdfFormat::NTriples).for_writer(output_writer);
+    let mut writer = BufWriter::with_capacity(256 * 1024, output_file);
 
     let num_sp_pairs = ay_entries;
     let mut current_subject = 1u64;
@@ -157,15 +165,16 @@ pub fn dump_hdt_to_ntriples_streaming(hdt_path: &Path, output_path: &Path) -> Re
 
         let object_text = dictionary.object_term(object)?;
 
-        let triple = Triple::new(
-            parse_subject(&current_subject_text)
-                .with_context(|| format!("Invalid subject term for ID {current_subject}"))?,
-            NamedNode::new(current_predicate_text.as_str())
-                .with_context(|| format!("Invalid predicate IRI for ID {current_predicate}"))?,
-            parse_object(&object_text)
-                .with_context(|| format!("Invalid object term for ID {object}"))?,
-        );
-        serializer.serialize_triple(&triple)?;
+        // Write subject (IRI or blank node)
+        write_ntriples_subject(&mut writer, current_subject_text.as_bytes())?;
+        writer.write_all(b" ")?;
+        // Write predicate (always an IRI)
+        writer.write_all(b"<")?;
+        writer.write_all(current_predicate_text.as_bytes())?;
+        writer.write_all(b"> ")?;
+        // Write object (IRI, blank node, or literal)
+        write_ntriples_object(&mut writer, object_text.as_bytes())?;
+        writer.write_all(b" .\n")?;
         triples_written += 1;
 
         let bz_bit = bitmap_z_dec
@@ -211,58 +220,138 @@ pub fn dump_hdt_to_ntriples_streaming(hdt_path: &Path, output_path: &Path) -> Re
         .finish()
         .context("ArrayZ CRC verification failed")?;
 
-    let mut writer = serializer.finish()?;
     writer.flush()?;
 
     Ok(triples_written)
 }
 
-fn parse_subject(term: &str) -> Result<NamedOrBlankNode> {
-    if let Some(id) = term.strip_prefix("_:") {
-        Ok(BlankNode::new(id)?.into())
+/// Write a subject term (IRI or blank node) in N-Triples format.
+fn write_ntriples_subject(w: &mut impl Write, term: &[u8]) -> std::io::Result<()> {
+    if term.starts_with(b"_:") {
+        w.write_all(term)
     } else {
-        Ok(NamedNode::new(term)?.into())
+        w.write_all(b"<")?;
+        w.write_all(term)?;
+        w.write_all(b">")
     }
 }
 
-fn parse_object(term: &str) -> Result<Term> {
-    if let Some(id) = term.strip_prefix("_:") {
-        Ok(Term::from(BlankNode::new(id)?))
-    } else if term.starts_with('"') {
-        Ok(Term::from(parse_hdt_literal(term)?))
+/// Write an object term (IRI, blank node, or literal) in N-Triples format.
+/// Literal values are escaped for N-Triples (HDT stores raw unescaped UTF-8).
+fn write_ntriples_object(w: &mut impl Write, term: &[u8]) -> std::io::Result<()> {
+    if term.starts_with(b"\"") {
+        write_ntriples_literal(w, term)
+    } else if term.starts_with(b"_:") {
+        w.write_all(term)
     } else {
-        Ok(Term::from(NamedNode::new(term)?))
+        w.write_all(b"<")?;
+        w.write_all(term)?;
+        w.write_all(b">")
     }
 }
 
-fn parse_hdt_literal(term: &str) -> Result<Literal> {
-    if !term.starts_with('"') {
-        bail!("Invalid literal serialization");
+/// Write a literal in N-Triples format with proper escaping of the value portion.
+///
+/// HDT stores literals as: `"raw value"`, `"raw value"@lang`, or `"raw value"^^<datatype>`.
+/// The value portion may contain raw `"`, `\`, newlines, etc. that must be escaped for N-Triples.
+/// The datatype IRI and language tag are written verbatim (they don't need escaping).
+fn write_ntriples_literal(w: &mut impl Write, term: &[u8]) -> std::io::Result<()> {
+    debug_assert!(term.first() == Some(&b'"'));
+
+    // Find where the raw value ends and the suffix begins.
+    // Scan backwards for the boundary marker: "^^< (typed), "@ (lang-tagged), or final " (simple).
+    let (value_end, suffix_start) = find_literal_boundary(term);
+    let value = &term[1..value_end];
+
+    w.write_all(b"\"")?;
+    write_escaped_literal_value(w, value)?;
+    w.write_all(b"\"")?;
+    if suffix_start < term.len() {
+        w.write_all(&term[suffix_start..])?;
+    }
+    Ok(())
+}
+
+/// Find the boundary between the raw value and the suffix in an HDT literal.
+///
+/// Returns `(value_end, suffix_start)` where:
+/// - `value` is `term[1..value_end]` (between opening `"` and closing `"`)
+/// - `suffix` is `term[suffix_start..]` (e.g. `^^<datatype>` or `@lang`, empty for simple literals)
+fn find_literal_boundary(term: &[u8]) -> (usize, usize) {
+    let len = term.len();
+
+    // Typed literal: ends with `>`, look for `"^^<` scanning backwards
+    if len > 4 && term[len - 1] == b'>' {
+        // Scan backwards for "^^<
+        let mut i = len - 2;
+        while i >= 4 {
+            if term[i] == b'<' && term[i - 1] == b'^' && term[i - 2] == b'^' && term[i - 3] == b'"'
+            {
+                return (i - 3, i - 2);
+            }
+            i -= 1;
+        }
     }
 
-    if term.ends_with('>')
-        && let Some(marker_pos) = term.rfind("\"^^<")
-    {
-        let value = &term[1..marker_pos];
-        let datatype = &term[marker_pos + 4..term.len() - 1];
-        let datatype_node = NamedNode::new(datatype)
-            .with_context(|| format!("Invalid datatype IRI in literal: {datatype}"))?;
-        return Ok(Literal::new_typed_literal(value, datatype_node));
+    // Language-tagged literal: look for `"@` scanning backwards
+    if len > 3 {
+        let mut i = len - 1;
+        while i >= 2 {
+            if term[i - 1] == b'"' && term[i] == b'@' {
+                return (i - 1, i);
+            }
+            i -= 1;
+        }
     }
 
-    if let Some(marker_pos) = term.rfind("\"@") {
-        let value = &term[1..marker_pos];
-        let language = &term[marker_pos + 2..];
-        return Literal::new_language_tagged_literal(value, language)
-            .context("Invalid language-tagged literal");
+    // Simple literal: last character is `"`
+    if len >= 2 && term[len - 1] == b'"' {
+        return (len - 1, len);
     }
 
-    if term.len() >= 2 && term.ends_with('"') {
-        let value = &term[1..term.len() - 1];
-        return Ok(Literal::new_simple_literal(value));
-    }
+    // Fallback (shouldn't happen with valid HDT data)
+    (len, len)
+}
 
-    bail!("Invalid literal serialization")
+/// Write a literal value with N-Triples escaping.
+///
+/// Per the W3C N-Triples spec, STRING_LITERAL_QUOTE only allows characters in
+/// `[#x20-#x21] | [#x23-#x5B] | [#x5D-#x10FFFF]` plus ECHAR/UCHAR escapes.
+/// This means all bytes below 0x20 (control characters), `"` (0x22), and `\` (0x5C)
+/// must be escaped. In the common case where no escaping is needed, this is a
+/// single `write_all` call.
+fn write_escaped_literal_value(w: &mut impl Write, value: &[u8]) -> std::io::Result<()> {
+    let mut start = 0;
+    for (i, &b) in value.iter().enumerate() {
+        let escape: &[u8] = match b {
+            b'\\' => b"\\\\",
+            b'"' => b"\\\"",
+            b'\n' => b"\\n",
+            b'\r' => b"\\r",
+            b'\t' => b"\\t",
+            0x08 => b"\\b",
+            0x0C => b"\\f",
+            // Other control characters (0x00-0x07, 0x0B, 0x0E-0x1F) need \uXXXX
+            0x00..=0x1F => {
+                if start < i {
+                    w.write_all(&value[start..i])?;
+                }
+                write!(w, "\\u{b:04X}")?;
+                start = i + 1;
+                continue;
+            }
+            _ => continue,
+        };
+        if start < i {
+            w.write_all(&value[start..i])?;
+        }
+        w.write_all(escape)?;
+        start = i + 1;
+    }
+    if start < value.len() {
+        w.write_all(&value[start..])?;
+    }
+    Ok(())
 }
 
 fn parse_num_triples_from_header(header: &str) -> Result<u64> {
@@ -283,7 +372,7 @@ fn parse_num_triples_from_header(header: &str) -> Result<u64> {
             continue;
         }
 
-        let Term::Literal(literal) = quad.object else {
+        let oxrdf::Term::Literal(literal) = quad.object else {
             continue;
         };
 
@@ -454,6 +543,7 @@ struct PfcSectionIndex {
     reader: BufReader<File>,
     block_cache: HashMap<u64, Vec<String>>,
     cache_order: VecDeque<u64>,
+    cache_capacity: usize,
 }
 
 impl PfcSectionIndex {
@@ -461,6 +551,7 @@ impl PfcSectionIndex {
         reader: &mut R,
         hdt_path: &Path,
         section_name: &'static str,
+        cache_budget: usize,
     ) -> Result<Self> {
         let mut preamble = Vec::new();
 
@@ -527,6 +618,15 @@ impl PfcSectionIndex {
             .seek(SeekFrom::Current(buffer_length as i64 + 4))
             .with_context(|| format!("Failed to skip string buffer for {section_name}"))?;
 
+        // Estimate ~2KB per decoded block (block_size strings × ~128 bytes avg).
+        // Clamp to at least 64 blocks so small budgets still function.
+        const ESTIMATED_BLOCK_BYTES: usize = 2048;
+        let cache_capacity = (cache_budget / ESTIMATED_BLOCK_BYTES).max(64);
+
+        tracing::debug!(
+            "{section_name}: cache_capacity={cache_capacity} blocks (budget={cache_budget} bytes)"
+        );
+
         let file = File::open(hdt_path)?;
         Ok(Self {
             section_name,
@@ -537,6 +637,7 @@ impl PfcSectionIndex {
             reader: BufReader::with_capacity(64 * 1024, file),
             block_cache: HashMap::new(),
             cache_order: VecDeque::new(),
+            cache_capacity,
         })
     }
 
@@ -557,8 +658,7 @@ impl PfcSectionIndex {
             let block = self.decode_block(block_index)?;
             self.block_cache.insert(block_index, block);
             self.cache_order.push_back(block_index);
-            const CACHE_CAPACITY: usize = 4096;
-            while self.cache_order.len() > CACHE_CAPACITY {
+            while self.cache_order.len() > self.cache_capacity {
                 if let Some(evicted) = self.cache_order.pop_front() {
                     self.block_cache.remove(&evicted);
                 }
@@ -695,40 +795,157 @@ impl PfcSectionIndex {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_hdt_literal;
+    use super::*;
+
+    fn write_to_string(f: impl Fn(&mut Vec<u8>) -> std::io::Result<()>) -> String {
+        let mut buf = Vec::new();
+        f(&mut buf).unwrap();
+        String::from_utf8(buf).unwrap()
+    }
 
     #[test]
-    fn test_parse_hdt_literal_simple() {
-        let lit = parse_hdt_literal("\"hello\"").unwrap();
-        assert_eq!(lit.value(), "hello");
+    fn test_write_subject_iri() {
+        let result = write_to_string(|w| write_ntriples_subject(w, b"http://example.org/s"));
+        assert_eq!(result, "<http://example.org/s>");
+    }
+
+    #[test]
+    fn test_write_subject_blank_node() {
+        let result = write_to_string(|w| write_ntriples_subject(w, b"_:b0"));
+        assert_eq!(result, "_:b0");
+    }
+
+    #[test]
+    fn test_write_object_iri() {
+        let result = write_to_string(|w| write_ntriples_object(w, b"http://example.org/o"));
+        assert_eq!(result, "<http://example.org/o>");
+    }
+
+    #[test]
+    fn test_write_object_blank_node() {
+        let result = write_to_string(|w| write_ntriples_object(w, b"_:b1"));
+        assert_eq!(result, "_:b1");
+    }
+
+    #[test]
+    fn test_write_literal_simple() {
+        let result = write_to_string(|w| write_ntriples_object(w, b"\"hello\""));
+        assert_eq!(result, "\"hello\"");
+    }
+
+    #[test]
+    fn test_write_literal_typed() {
+        let result = write_to_string(|w| {
+            write_ntriples_object(w, b"\"30\"^^<http://www.w3.org/2001/XMLSchema#integer>")
+        });
         assert_eq!(
-            lit.datatype().as_str(),
-            "http://www.w3.org/2001/XMLSchema#string"
+            result,
+            "\"30\"^^<http://www.w3.org/2001/XMLSchema#integer>"
         );
-        assert!(lit.language().is_none());
     }
 
     #[test]
-    fn test_parse_hdt_literal_typed() {
-        let lit = parse_hdt_literal("\"30\"^^<http://www.w3.org/2001/XMLSchema#integer>").unwrap();
-        assert_eq!(lit.value(), "30");
+    fn test_write_literal_language() {
+        let result = write_to_string(|w| write_ntriples_object(w, b"\"bonjour\"@fr"));
+        assert_eq!(result, "\"bonjour\"@fr");
+    }
+
+    #[test]
+    fn test_write_literal_embedded_quote() {
+        // HDT stores: "he said "hi"" (raw quotes inside)
+        // N-Triples output must escape: "he said \"hi\""
+        let result = write_to_string(|w| write_ntriples_object(w, b"\"he said \"hi\"\""));
+        assert_eq!(result, r#""he said \"hi\"""#);
+    }
+
+    #[test]
+    fn test_write_literal_with_newline() {
+        // HDT stores raw newline byte
+        let result = write_to_string(|w| write_ntriples_object(w, b"\"line1\nline2\""));
+        assert_eq!(result, "\"line1\\nline2\"");
+    }
+
+    #[test]
+    fn test_write_literal_with_backslash() {
+        let result = write_to_string(|w| write_ntriples_object(w, b"\"path\\to\\file\""));
+        assert_eq!(result, "\"path\\\\to\\\\file\"");
+    }
+
+    #[test]
+    fn test_write_literal_with_cr_and_tab() {
+        let result = write_to_string(|w| write_ntriples_object(w, b"\"a\rb\tc\""));
+        assert_eq!(result, "\"a\\rb\\tc\"");
+    }
+
+    #[test]
+    fn test_write_literal_with_backspace_and_formfeed() {
+        let result = write_to_string(|w| write_ntriples_object(w, b"\"a\x08b\x0Cc\""));
+        assert_eq!(result, "\"a\\bb\\fc\"");
+    }
+
+    #[test]
+    fn test_write_literal_with_other_control_chars() {
+        // NUL (0x00), BEL (0x07), vertical tab (0x0B) need \uXXXX escaping
+        let result = write_to_string(|w| write_ntriples_object(w, b"\"a\x00b\x07c\x0Bd\""));
+        assert_eq!(result, "\"a\\u0000b\\u0007c\\u000Bd\"");
+    }
+
+    #[test]
+    fn test_write_literal_typed_with_escapes() {
+        // Value contains a newline, typed literal
+        let input = b"\"line1\nline2\"^^<http://www.w3.org/2001/XMLSchema#string>";
+        let result = write_to_string(|w| write_ntriples_object(w, input));
         assert_eq!(
-            lit.datatype().as_str(),
-            "http://www.w3.org/2001/XMLSchema#integer"
+            result,
+            "\"line1\\nline2\"^^<http://www.w3.org/2001/XMLSchema#string>"
         );
-        assert!(lit.language().is_none());
     }
 
     #[test]
-    fn test_parse_hdt_literal_language() {
-        let lit = parse_hdt_literal("\"bonjour\"@fr").unwrap();
-        assert_eq!(lit.value(), "bonjour");
-        assert_eq!(lit.language(), Some("fr"));
+    fn test_write_literal_language_with_escapes() {
+        let input = b"\"line1\nline2\"@en";
+        let result = write_to_string(|w| write_ntriples_object(w, input));
+        assert_eq!(result, "\"line1\\nline2\"@en");
     }
 
     #[test]
-    fn test_parse_hdt_literal_embedded_quote() {
-        let lit = parse_hdt_literal("\"he said \"hi\"\"").unwrap();
-        assert_eq!(lit.value(), "he said \"hi\"");
+    fn test_write_literal_unicode() {
+        // UTF-8 characters pass through unchanged
+        let result =
+            write_to_string(|w| write_ntriples_object(w, "\"èpsilon\"".as_bytes()));
+        assert_eq!(result, "\"èpsilon\"");
+    }
+
+    #[test]
+    fn test_find_boundary_typed() {
+        let term = b"\"value\"^^<http://example.org/type>";
+        let (ve, ss) = find_literal_boundary(term);
+        assert_eq!(&term[1..ve], b"value");
+        assert_eq!(&term[ss..], b"^^<http://example.org/type>");
+    }
+
+    #[test]
+    fn test_find_boundary_language() {
+        let term = b"\"value\"@en";
+        let (ve, ss) = find_literal_boundary(term);
+        assert_eq!(&term[1..ve], b"value");
+        assert_eq!(&term[ss..], b"@en");
+    }
+
+    #[test]
+    fn test_find_boundary_simple() {
+        let term = b"\"value\"";
+        let (ve, ss) = find_literal_boundary(term);
+        assert_eq!(&term[1..ve], b"value");
+        assert_eq!(ss, term.len());
+    }
+
+    #[test]
+    fn test_find_boundary_value_containing_at() {
+        // Value contains "@" but the real language tag is at the end
+        let term = b"\"email@host\"@en";
+        let (ve, ss) = find_literal_boundary(term);
+        assert_eq!(&term[1..ve], b"email@host");
+        assert_eq!(&term[ss..], b"@en");
     }
 }

@@ -177,4 +177,8 @@ pub struct DumpArgs {
     /// Output N-Triples file path (overwritten if it exists)
     #[arg(short, long)]
     pub output: PathBuf,
+
+    /// Soft memory limit for dictionary cache (e.g. 4G, 2000M)
+    #[arg(long, value_name = "SIZE", default_value = "4G")]
+    pub memory_limit: MemorySize,
 }
