@@ -1,5 +1,6 @@
 //! Parallel ID remapping from local to global IDs.
 
+use crate::hdt::input_adapter::HdtTripleReader;
 use crate::pipeline::batch_vocab::LocalIdTriple;
 use crate::pipeline::vocab_merger::IdMapping;
 use crate::triples::id_triple::IdTriple;
@@ -9,10 +10,25 @@ use std::fs::File;
 use std::io::BufReader;
 use std::path::PathBuf;
 
+/// Source of local-ID triples for remapping.
+pub enum TripleSource {
+    /// Standard local-ID triples file (zstd-compressed `.ltr.zst`).
+    LtrFile(PathBuf),
+    /// HDT BitmapTriples — read streaming from the HDT file.
+    HdtFile {
+        path: PathBuf,
+        triples_data_offset: u64,
+        num_triples: u64,
+        num_sp_pairs: u64,
+        shared_count: u64,
+        subjects_count: u64,
+    },
+}
+
 /// Information about a batch for remapping.
 pub struct BatchRemapInfo {
     pub batch_id: usize,
-    pub triples_path: PathBuf,
+    pub triple_source: TripleSource,
     pub mapping_path: PathBuf,
 }
 
@@ -26,59 +42,102 @@ fn remap_batch(
     let mapping = IdMapping::read_from_file(&batch_info.mapping_path)
         .with_context(|| format!("Failed to load ID mapping for batch {}", batch_info.batch_id))?;
 
-    // Open local-ID triples file
-    let file = File::open(&batch_info.triples_path)
-        .with_context(|| format!("Failed to open triples file for batch {}", batch_info.batch_id))?;
-    let buf_reader = BufReader::new(file);
-    let mut decoder = zstd::Decoder::with_buffer(buf_reader)?;
-
     let mut count = 0;
     let mut chunk: Vec<IdTriple> = Vec::with_capacity(chunk_size);
 
-    // Read and remap each triple
-    loop {
-        match LocalIdTriple::read_from(&mut decoder) {
-            Ok(Some(local_triple)) => {
-                // Look up global IDs from mappings
-                let global_subject = *mapping.so_map.get(local_triple.subject as usize)
-                    .ok_or_else(|| anyhow::anyhow!(
-                        "SO mapping missing for local subject ID {} in batch {} (map size: {})",
-                        local_triple.subject, batch_info.batch_id, mapping.so_map.len()
-                    ))?;
-                let global_predicate = *mapping.p_map.get(local_triple.predicate as usize)
-                    .ok_or_else(|| anyhow::anyhow!(
-                        "P mapping missing for local predicate ID {} in batch {} (map size: {})",
-                        local_triple.predicate, batch_info.batch_id, mapping.p_map.len()
-                    ))?;
-                let global_object = *mapping.so_map.get(local_triple.object as usize)
-                    .ok_or_else(|| anyhow::anyhow!(
-                        "SO mapping missing for local object ID {} in batch {} (map size: {})",
-                        local_triple.object, batch_info.batch_id, mapping.so_map.len()
-                    ))?;
+    let mut remap_and_send = |s: u32, p: u32, o: u32| -> Result<()> {
+        let global_subject = *mapping.so_map.get(s as usize).ok_or_else(|| {
+            anyhow::anyhow!(
+                "SO mapping missing for local subject ID {} in batch {} (map size: {})",
+                s,
+                batch_info.batch_id,
+                mapping.so_map.len()
+            )
+        })?;
+        let global_predicate = *mapping.p_map.get(p as usize).ok_or_else(|| {
+            anyhow::anyhow!(
+                "P mapping missing for local predicate ID {} in batch {} (map size: {})",
+                p,
+                batch_info.batch_id,
+                mapping.p_map.len()
+            )
+        })?;
+        let global_object = *mapping.so_map.get(o as usize).ok_or_else(|| {
+            anyhow::anyhow!(
+                "SO mapping missing for local object ID {} in batch {} (map size: {})",
+                o,
+                batch_info.batch_id,
+                mapping.so_map.len()
+            )
+        })?;
 
-                let global_triple = IdTriple {
-                    subject: global_subject,
-                    predicate: global_predicate,
-                    object: global_object,
-                };
-
-                // Send to next stage in chunks to reduce channel overhead
-                chunk.push(global_triple);
-                if chunk.len() >= chunk_size {
-                    let chunk_to_send = std::mem::take(&mut chunk);
-                    if global_triple_tx.send(chunk_to_send).is_err() {
-                        anyhow::bail!("Global triple receiver disconnected");
-                    }
-                    chunk = Vec::with_capacity(chunk_size);
-                }
-
-                count += 1;
+        chunk.push(IdTriple {
+            subject: global_subject,
+            predicate: global_predicate,
+            object: global_object,
+        });
+        if chunk.len() >= chunk_size {
+            let chunk_to_send = std::mem::take(&mut chunk);
+            if global_triple_tx.send(chunk_to_send).is_err() {
+                anyhow::bail!("Global triple receiver disconnected");
             }
-            Ok(None) => break, // End of file
-            Err(e) => {
-                return Err(e).with_context(|| {
-                    format!("Failed to read local triple from batch {}", batch_info.batch_id)
-                });
+            chunk = Vec::with_capacity(chunk_size);
+        }
+        count += 1;
+        Ok(())
+    };
+
+    match &batch_info.triple_source {
+        TripleSource::LtrFile(triples_path) => {
+            let file = File::open(triples_path).with_context(|| {
+                format!(
+                    "Failed to open triples file for batch {}",
+                    batch_info.batch_id
+                )
+            })?;
+            let buf_reader = BufReader::new(file);
+            let mut decoder = zstd::Decoder::with_buffer(buf_reader)?;
+
+            loop {
+                match LocalIdTriple::read_from(&mut decoder) {
+                    Ok(Some(t)) => remap_and_send(t.subject, t.predicate, t.object)?,
+                    Ok(None) => break,
+                    Err(e) => {
+                        return Err(e).with_context(|| {
+                            format!(
+                                "Failed to read local triple from batch {}",
+                                batch_info.batch_id
+                            )
+                        });
+                    }
+                }
+            }
+        }
+        TripleSource::HdtFile {
+            path,
+            triples_data_offset,
+            num_triples,
+            num_sp_pairs,
+            shared_count,
+            subjects_count,
+        } => {
+            let mut reader = HdtTripleReader::open(
+                path,
+                *triples_data_offset,
+                *num_triples,
+                *num_sp_pairs,
+                *shared_count,
+                *subjects_count,
+            )
+            .with_context(|| {
+                format!(
+                    "Failed to open HDT triples for batch {}",
+                    batch_info.batch_id
+                )
+            })?;
+
+            while let Some((s, p, o)) = reader.next_triple()? {
+                remap_and_send(s, p, o)?;
             }
         }
     }
@@ -114,11 +173,16 @@ pub fn id_remapper_stage(
                 .map(|batch_info| {
                     match remap_batch(batch_info, &global_triple_tx, chunk_size) {
                         Ok(count) => {
-                            // Files fully consumed — delete immediately to free disk space
-                            if let Err(e) = std::fs::remove_file(&batch_info.triples_path) {
+                            // Files fully consumed — delete temp files to free disk space.
+                            // HDT source files are not owned by us, so skip deletion.
+                            if let TripleSource::LtrFile(ref triples_path) =
+                                batch_info.triple_source
+                                && let Err(e) = std::fs::remove_file(triples_path)
+                            {
                                 tracing::warn!(
                                     "Failed to delete {}: {}",
-                                    batch_info.triples_path.display(), e
+                                    triples_path.display(),
+                                    e
                                 );
                             }
                             if let Err(e) = std::fs::remove_file(&batch_info.mapping_path) {
@@ -230,7 +294,7 @@ mod tests {
 
         let batch_info = BatchRemapInfo {
             batch_id: 0,
-            triples_path,
+            triple_source: TripleSource::LtrFile(triples_path),
             mapping_path,
         };
 
@@ -282,7 +346,7 @@ mod tests {
 
         let batch_info = BatchRemapInfo {
             batch_id: 0,
-            triples_path,
+            triple_source: TripleSource::LtrFile(triples_path),
             mapping_path,
         };
 
@@ -332,7 +396,7 @@ mod tests {
 
         let batch_info = BatchRemapInfo {
             batch_id: 0,
-            triples_path,
+            triple_source: TripleSource::LtrFile(triples_path),
             mapping_path,
         };
 
@@ -370,7 +434,7 @@ mod tests {
 
         let batch_info = BatchRemapInfo {
             batch_id: 0,
-            triples_path,
+            triple_source: TripleSource::LtrFile(triples_path),
             mapping_path,
         };
 

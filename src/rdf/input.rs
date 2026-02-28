@@ -76,12 +76,20 @@ fn detect_format(path: &Path) -> Option<RdfFormat> {
     }
 }
 
-/// Discover all RDF input files from a list of paths (files and/or directories).
+/// Result of input discovery, partitioned by type.
+pub struct DiscoveredInputs {
+    pub rdf_inputs: Vec<RdfInput>,
+    pub hdt_inputs: Vec<PathBuf>,
+}
+
+/// Discover all input files from a list of paths (files and/or directories).
 ///
 /// Directories are walked recursively. Files with unrecognized extensions are
-/// skipped with a warning logged via `tracing`.
-pub fn discover_inputs(paths: &[PathBuf]) -> Result<Vec<RdfInput>> {
-    let mut inputs = Vec::new();
+/// skipped with a warning logged via `tracing`. HDT files (`.hdt` extension)
+/// are returned separately from RDF text files.
+pub fn discover_inputs(paths: &[PathBuf]) -> Result<DiscoveredInputs> {
+    let mut rdf_inputs = Vec::new();
+    let mut hdt_inputs = Vec::new();
 
     for path in paths {
         if !path.exists() {
@@ -89,24 +97,16 @@ pub fn discover_inputs(paths: &[PathBuf]) -> Result<Vec<RdfInput>> {
         }
 
         if path.is_file() {
-            match classify_file(path) {
-                Some(input) => inputs.push(input),
-                None => {
-                    tracing::warn!("Skipping file with unrecognized extension: {}", path.display());
-                }
-            }
+            classify_and_route(path, &mut rdf_inputs, &mut hdt_inputs, true);
         } else if path.is_dir() {
             for entry in WalkDir::new(path)
                 .follow_links(true)
                 .into_iter()
                 .filter_map(|e| e.ok())
             {
-                if entry.file_type().is_file()
-                    && let Some(input) = classify_file(entry.path())
-                {
-                    inputs.push(input);
+                if entry.file_type().is_file() {
+                    classify_and_route(entry.path(), &mut rdf_inputs, &mut hdt_inputs, false);
                 }
-                // Silently skip unrecognized files in directories
             }
         } else {
             bail!(
@@ -116,15 +116,52 @@ pub fn discover_inputs(paths: &[PathBuf]) -> Result<Vec<RdfInput>> {
         }
     }
 
-    if inputs.is_empty() {
-        bail!("No RDF input files found");
+    if rdf_inputs.is_empty() && hdt_inputs.is_empty() {
+        bail!("No input files found");
     }
 
     // Sort for deterministic processing order (important for blank node disambiguation)
-    inputs.sort_by(|a, b| a.path.cmp(&b.path));
+    rdf_inputs.sort_by(|a, b| a.path.cmp(&b.path));
+    hdt_inputs.sort();
 
-    tracing::info!("Discovered {} RDF input files", inputs.len());
-    Ok(inputs)
+    if !rdf_inputs.is_empty() {
+        tracing::info!("Discovered {} RDF input files", rdf_inputs.len());
+    }
+    if !hdt_inputs.is_empty() {
+        tracing::info!("Discovered {} HDT input files", hdt_inputs.len());
+    }
+
+    Ok(DiscoveredInputs {
+        rdf_inputs,
+        hdt_inputs,
+    })
+}
+
+/// Check if a file has an `.hdt` extension.
+fn is_hdt_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("hdt"))
+}
+
+/// Classify a file and route it to the appropriate list.
+/// `warn_unrecognized` controls whether unknown extensions produce a warning.
+fn classify_and_route(
+    path: &Path,
+    rdf_inputs: &mut Vec<RdfInput>,
+    hdt_inputs: &mut Vec<PathBuf>,
+    warn_unrecognized: bool,
+) {
+    if is_hdt_file(path) {
+        hdt_inputs.push(path.to_path_buf());
+    } else if let Some(input) = classify_file(path) {
+        rdf_inputs.push(input);
+    } else if warn_unrecognized {
+        tracing::warn!(
+            "Skipping file with unrecognized extension: {}",
+            path.display()
+        );
+    }
 }
 
 /// Try to classify a file path as an RDF input.

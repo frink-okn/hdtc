@@ -78,7 +78,9 @@ fn main() -> Result<()> {
 /// Create HDT file from RDF input(s)
 fn create_hdt(args: cli::CreateArgs, benchmark: bool) -> Result<()> {
     // Discover input files
-    let inputs = rdf::discover_inputs(&args.inputs)?;
+    let discovered = rdf::discover_inputs(&args.inputs)?;
+    let inputs = discovered.rdf_inputs;
+    let hdt_inputs = discovered.hdt_inputs;
     for input in &inputs {
         tracing::debug!(
             "  {} ({:?}, {:?})",
@@ -86,6 +88,9 @@ fn create_hdt(args: cli::CreateArgs, benchmark: bool) -> Result<()> {
             input.format,
             input.compression
         );
+    }
+    for hdt_path in &hdt_inputs {
+        tracing::debug!("  {} (HDT)", hdt_path.display());
     }
 
     tracing::info!("Output: {}", args.output.display());
@@ -122,9 +127,13 @@ fn create_hdt(args: cli::CreateArgs, benchmark: bool) -> Result<()> {
         Some(uri) => uri.clone(),
         None => {
             // Use file:// URI of first input file (must be absolute path)
-            let first_input = &inputs[0];
-            let abs_path = std::fs::canonicalize(&first_input.path)
-                .unwrap_or_else(|_| first_input.path.clone());
+            let first_path = inputs
+                .first()
+                .map(|i| &i.path)
+                .or(hdt_inputs.first())
+                .expect("at least one input file");
+            let abs_path =
+                std::fs::canonicalize(first_path).unwrap_or_else(|_| first_path.clone());
             format!("file://{}", abs_path.display())
         }
     };
@@ -132,6 +141,7 @@ fn create_hdt(args: cli::CreateArgs, benchmark: bool) -> Result<()> {
     // Run the pipelined HDT construction
     let pipeline_result = pipeline::run_pipeline(
         &inputs,
+        &hdt_inputs,
         &temp_dir,
         memory_budget,
         include_graphs,
