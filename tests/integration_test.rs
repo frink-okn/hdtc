@@ -1820,3 +1820,258 @@ fn test_index_creation_many_sort_chunks() {
         "bitmapIndexZ should have 20 object groups"
     );
 }
+
+// =============================================================================
+// HDT input tests
+// =============================================================================
+
+/// Helper: create an HDT file from N-Triples content, return the HDT path.
+fn create_hdt_from_ntriples(temp_dir: &Path, nt_content: &[u8], name: &str) -> std::path::PathBuf {
+    let nt_path = temp_dir.join(format!("{name}.nt"));
+    write_file(&nt_path, nt_content);
+    let hdt_path = temp_dir.join(format!("{name}.hdt"));
+    let work_dir = temp_dir.join(format!("{name}_work"));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_hdtc"))
+        .args([
+            "create",
+            nt_path.to_str().unwrap(),
+            "-o", hdt_path.to_str().unwrap(),
+            "--base-uri", "http://example.org/dataset",
+            "--temp-dir", work_dir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute hdtc");
+
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(output.status.success(), "hdtc create failed for {name}: {stderr}");
+    hdt_path
+}
+
+/// Helper: read all triples from an HDT file using the `hdt` crate.
+fn read_hdt_triples(hdt_path: &Path) -> HashSet<(String, String, String)> {
+    let file = std::fs::File::open(hdt_path).expect("open HDT file");
+    let hdt = hdt::Hdt::read(std::io::BufReader::new(file)).expect("read HDT");
+    hdt.triples_with_pattern(None, None, None)
+        .map(|[s, p, o]| (s.to_string(), p.to_string(), o.to_string()))
+        .collect()
+}
+
+/// Test using an HDT file as sole input to create a new HDT file.
+/// The output should contain all the same triples.
+#[test]
+fn test_hdt_input_sole_source() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let nt_content = b"\
+<http://example.org/alice> <http://example.org/knows> <http://example.org/bob> .
+<http://example.org/bob> <http://example.org/name> \"Bob\" .
+<http://example.org/alice> <http://example.org/age> \"30\"^^<http://www.w3.org/2001/XMLSchema#integer> .
+";
+
+    // Create source HDT
+    let source_hdt = create_hdt_from_ntriples(temp_dir.path(), nt_content, "source");
+
+    // Use it as input to create a new HDT
+    let output_hdt = temp_dir.path().join("output.hdt");
+    let work_dir = temp_dir.path().join("output_work");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_hdtc"))
+        .args([
+            "create",
+            source_hdt.to_str().unwrap(),
+            "-o", output_hdt.to_str().unwrap(),
+            "--base-uri", "http://example.org/dataset",
+            "--temp-dir", work_dir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute hdtc");
+
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(output.status.success(), "hdtc failed with HDT input: {stderr}");
+    assert!(stderr.contains("HDT input"), "Should log HDT input scanning");
+
+    // Verify output has the same triples
+    let source_triples = read_hdt_triples(&source_hdt);
+    let output_triples = read_hdt_triples(&output_hdt);
+    assert_eq!(source_triples, output_triples, "HDT round-trip should preserve all triples");
+    assert_eq!(output_triples.len(), 3);
+}
+
+/// Test merging an HDT file with additional N-Triples.
+/// The output should contain triples from both sources.
+#[test]
+fn test_hdt_input_merged_with_ntriples() {
+    let temp_dir = tempfile::tempdir().unwrap();
+
+    // Create an HDT with triples about alice
+    let alice_nt = b"\
+<http://example.org/alice> <http://example.org/knows> <http://example.org/bob> .
+<http://example.org/alice> <http://example.org/name> \"Alice\" .
+";
+    let alice_hdt = create_hdt_from_ntriples(temp_dir.path(), alice_nt, "alice");
+
+    // Additional N-Triples about bob (with overlapping term: bob)
+    let bob_nt_path = temp_dir.path().join("bob.nt");
+    write_file(
+        &bob_nt_path,
+        b"<http://example.org/bob> <http://example.org/name> \"Bob\" .\n\
+          <http://example.org/bob> <http://example.org/age> \"25\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n",
+    );
+
+    // Merge HDT + N-Triples
+    let output_hdt = temp_dir.path().join("merged.hdt");
+    let work_dir = temp_dir.path().join("merge_work");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_hdtc"))
+        .args([
+            "create",
+            alice_hdt.to_str().unwrap(),
+            bob_nt_path.to_str().unwrap(),
+            "-o", output_hdt.to_str().unwrap(),
+            "--base-uri", "http://example.org/dataset",
+            "--temp-dir", work_dir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute hdtc");
+
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(output.status.success(), "hdtc failed merging HDT + NT: {stderr}");
+
+    // Verify merged output
+    let triples = read_hdt_triples(&output_hdt);
+    assert_eq!(triples.len(), 4, "Merged output should have 4 triples");
+
+    // Check specific triples exist from both sources
+    assert!(triples.iter().any(|(s, p, _)| s.contains("alice") && p.contains("knows")),
+        "Should contain alice-knows-bob from HDT");
+    assert!(triples.iter().any(|(s, p, _)| s.contains("bob") && p.contains("age")),
+        "Should contain bob-age from N-Triples");
+}
+
+/// Test merging two HDT files together.
+#[test]
+fn test_hdt_input_two_hdt_files() {
+    let temp_dir = tempfile::tempdir().unwrap();
+
+    let hdt1 = create_hdt_from_ntriples(
+        temp_dir.path(),
+        b"<http://example.org/a> <http://example.org/p> <http://example.org/b> .\n",
+        "hdt1",
+    );
+
+    let hdt2 = create_hdt_from_ntriples(
+        temp_dir.path(),
+        b"<http://example.org/c> <http://example.org/p> <http://example.org/d> .\n",
+        "hdt2",
+    );
+
+    let output_hdt = temp_dir.path().join("merged2.hdt");
+    let work_dir = temp_dir.path().join("merge2_work");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_hdtc"))
+        .args([
+            "create",
+            hdt1.to_str().unwrap(),
+            hdt2.to_str().unwrap(),
+            "-o", output_hdt.to_str().unwrap(),
+            "--base-uri", "http://example.org/dataset",
+            "--temp-dir", work_dir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute hdtc");
+
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(output.status.success(), "hdtc failed merging two HDTs: {stderr}");
+
+    let triples = read_hdt_triples(&output_hdt);
+    assert_eq!(triples.len(), 2, "Merged output should have 2 triples");
+}
+
+/// Test that duplicate triples across HDT and N-Triples are deduplicated.
+#[test]
+fn test_hdt_input_deduplication() {
+    let temp_dir = tempfile::tempdir().unwrap();
+
+    let shared_triple = b"<http://example.org/s> <http://example.org/p> <http://example.org/o> .\n";
+
+    // Create HDT with the triple
+    let hdt_path = create_hdt_from_ntriples(temp_dir.path(), shared_triple, "dup");
+
+    // N-Triples file with the same triple plus one more
+    let nt_path = temp_dir.path().join("dup.nt");
+    write_file(
+        &nt_path,
+        b"<http://example.org/s> <http://example.org/p> <http://example.org/o> .\n\
+          <http://example.org/s> <http://example.org/p> <http://example.org/o2> .\n",
+    );
+
+    let output_hdt = temp_dir.path().join("dedup.hdt");
+    let work_dir = temp_dir.path().join("dedup_work");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_hdtc"))
+        .args([
+            "create",
+            hdt_path.to_str().unwrap(),
+            nt_path.to_str().unwrap(),
+            "-o", output_hdt.to_str().unwrap(),
+            "--base-uri", "http://example.org/dataset",
+            "--temp-dir", work_dir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute hdtc");
+
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(output.status.success(), "hdtc failed with dedup: {stderr}");
+
+    let triples = read_hdt_triples(&output_hdt);
+    assert_eq!(triples.len(), 2, "Duplicate triple should be deduplicated, expected 2 unique triples");
+}
+
+/// Test blank node disambiguation across two HDT inputs.
+/// Two HDT files each contain `_:b1` — these should be treated as distinct blank nodes.
+#[test]
+fn test_hdt_input_blank_node_disambiguation() {
+    let temp_dir = tempfile::tempdir().unwrap();
+
+    // Both files use blank node `_:b1` but they should be disambiguated
+    let hdt1 = create_hdt_from_ntriples(
+        temp_dir.path(),
+        b"_:b1 <http://example.org/name> \"Alice\" .\n",
+        "bnode1",
+    );
+    let hdt2 = create_hdt_from_ntriples(
+        temp_dir.path(),
+        b"_:b1 <http://example.org/name> \"Bob\" .\n",
+        "bnode2",
+    );
+
+    let output_hdt = temp_dir.path().join("bnode_merged.hdt");
+    let work_dir = temp_dir.path().join("bnode_work");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_hdtc"))
+        .args([
+            "create",
+            hdt1.to_str().unwrap(),
+            hdt2.to_str().unwrap(),
+            "-o", output_hdt.to_str().unwrap(),
+            "--base-uri", "http://example.org/dataset",
+            "--temp-dir", work_dir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute hdtc");
+
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(output.status.success(), "hdtc failed merging HDTs with blank nodes: {stderr}");
+
+    let triples = read_hdt_triples(&output_hdt);
+    // The two _:b1 nodes should be disambiguated into two distinct blank nodes,
+    // resulting in 2 triples (not 1 if they were incorrectly merged).
+    assert_eq!(triples.len(), 2,
+        "Blank nodes from different HDT files should be disambiguated, expected 2 triples but got: {:?}",
+        triples);
+
+    // Verify the two subjects are different blank nodes
+    let subjects: HashSet<_> = triples.iter().map(|(s, _, _)| s.clone()).collect();
+    assert_eq!(subjects.len(), 2,
+        "Should have 2 distinct blank node subjects, got: {:?}", subjects);
+}

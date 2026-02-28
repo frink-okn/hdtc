@@ -10,15 +10,16 @@
 //!
 //! Stages are connected by bounded crossbeam channels for automatic backpressure.
 
-mod batch_vocab;
+pub(crate) mod batch_vocab;
 mod partial_vocab;
-mod vocab_merger;
-mod id_remapper;
+pub(crate) mod vocab_merger;
+pub(crate) mod id_remapper;
 
 pub use batch_vocab::BatchVocabBuilder;
 pub use partial_vocab::{PartialVocabEntry, PartialVocabReader, PartialVocabWriter};
 
 use crate::dictionary::DictCounts;
+use crate::hdt::input_adapter::HdtInputAdapter;
 use crate::rdf::{stream_quads_with_options, ExtractedQuad, ParseOptions, RdfInput};
 use crate::sort::ExternalSorter;
 use crate::triples::id_triple::IdTriple;
@@ -534,6 +535,7 @@ fn build_memory_plan(memory_budget: usize) -> PipelineMemoryPlan {
 }
 
 /// Stage 1: Parse RDF and batch quads.
+#[allow(clippy::too_many_arguments)]
 fn parser_stage(
     inputs: Vec<RdfInput>,
     batch_size: usize,
@@ -542,9 +544,10 @@ fn parser_stage(
     base_uri: String,
     parser_parallelism: ParserParallelismConfig,
     batch_tx: Sender<BatchedQuads>,
+    total_input_count: usize,
 ) -> Result<u64> {
     let expected_files = inputs.len();
-    let disambiguate_blank_nodes = inputs.len() > 1;
+    let disambiguate_blank_nodes = total_input_count > 1;
     let available_cpus = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)
@@ -848,8 +851,13 @@ fn cleanup_batch_files(batches: &[BatchComplete]) {
 }
 
 /// Run the complete pipeline: RDF → HDT.
+///
+/// Accepts both RDF text inputs (parsed via stages 1-3) and HDT inputs
+/// (injected directly into the vocabulary merge at stage 4).
+#[allow(clippy::too_many_arguments)]
 pub fn run_pipeline(
     inputs: &[RdfInput],
+    hdt_inputs: &[PathBuf],
     temp_dir: &Path,
     memory_budget: usize,
     include_graphs: bool,
@@ -906,6 +914,7 @@ pub fn run_pipeline(
     let base_uri_owned = base_uri.to_string();
     let parser_parallelism_owned = parser_parallelism.clone();
     let parser_budget = memory_plan.parser_budget_bytes;
+    let total_input_count = inputs.len() + hdt_inputs.len();
     let parser_handle = std::thread::spawn(move || {
         parser_stage(
             inputs_owned,
@@ -915,6 +924,7 @@ pub fn run_pipeline(
             base_uri_owned,
             parser_parallelism_owned,
             batch_tx,
+            total_input_count,
         )
     });
 
@@ -948,7 +958,7 @@ pub fn run_pipeline(
     );
 
     // Wait for all stages to complete
-    let ntriples_size = match parser_handle.join() {
+    let mut ntriples_size = match parser_handle.join() {
         Ok(Ok(size)) => size,
         Ok(Err(e)) => {
             cleanup_batch_files(&batches);
@@ -992,19 +1002,50 @@ pub fn run_pipeline(
         benchmark,
     );
 
+    // Pre-process HDT inputs: scan headers, create adapters
+    let mut hdt_adapters: Vec<(usize, HdtInputAdapter)> = Vec::new();
+    if !hdt_inputs.is_empty() {
+        tracing::info!("Scanning {} HDT input file(s)", hdt_inputs.len());
+        let rdf_batch_count = batches.len();
+        for (i, hdt_path) in hdt_inputs.iter().enumerate() {
+            let batch_id = rdf_batch_count + i;
+            let adapter = HdtInputAdapter::scan(hdt_path)
+                .with_context(|| format!("Failed to scan HDT input {}", hdt_path.display()))?;
+            ntriples_size += adapter.original_size;
+            hdt_adapters.push((batch_id, adapter));
+        }
+    }
+
     // Stage 4: Merge vocabularies and build global dictionary
-    tracing::info!("Stage 4: Merging {} partial vocabularies", batches.len());
+    let total_sources = batches.len() + hdt_adapters.len();
+    tracing::info!("Stage 4: Merging {} vocabulary sources ({} RDF batches + {} HDT inputs)",
+        total_sources, batches.len(), hdt_adapters.len());
     let stage4_start = Instant::now();
     let stage4_rss_before = if benchmark { process_peak_rss_bytes() } else { None };
-    let batch_infos: Vec<(usize, PathBuf)> = batches
-        .iter()
-        .map(|b| (b.batch_id, b.vocab_path.clone()))
-        .collect();
+    let mut vocab_sources: Vec<vocab_merger::VocabSource> = Vec::with_capacity(total_sources);
+    for batch in &batches {
+        let source =
+            vocab_merger::vocab_source_from_pvoc(batch.batch_id, batch.vocab_path.clone())?;
+        vocab_sources.push(source);
+    }
+    // Disambiguate blank nodes when there are multiple total input files
+    let total_input_files = inputs.len() + hdt_inputs.len();
+    let disambiguate = total_input_files > 1;
+    for (i, (batch_id, adapter)) in hdt_adapters.iter().enumerate() {
+        let file_index = if disambiguate { Some(inputs.len() + i) } else { None };
+        vocab_sources.push(vocab_merger::VocabSource {
+            batch_id: *batch_id,
+            max_so_id: adapter.max_so_id(),
+            max_p_id: adapter.max_p_id(),
+            factory: adapter.vocab_factory(*batch_id, file_index),
+        });
+    }
+
     let stage4_budget = memory_plan.stage4_budget_bytes;
     tracing::debug!("Stage 4 merge budget: {} MiB", stage4_budget / MIB);
 
     let merge_result =
-        vocab_merger::merge_vocabularies(batch_infos, temp_dir, stage4_budget)?;
+        vocab_merger::merge_vocabularies(vocab_sources, temp_dir, stage4_budget)?;
 
     tracing::info!(
         "Stage 4 complete: {} shared, {} subjects, {} predicates, {} objects (elapsed: {:.1}s)",
@@ -1035,13 +1076,31 @@ pub fn run_pipeline(
         bounded::<Vec<IdTriple>>(stage56_budget.remap_to_sort_channel_capacity);
 
     // Prepare batch remap info (files are cleaned up per-batch by the remapper)
-    let (remap_tx, remap_rx) = bounded(batches.len());
+    let total_remap_batches = batches.len() + hdt_adapters.len();
+    let (remap_tx, remap_rx) = bounded(total_remap_batches);
     for batch in &batches {
         let mapping_path = temp_dir.join(format!("id_mapping_{:06}.map.zst", batch.batch_id));
         remap_tx
             .send(id_remapper::BatchRemapInfo {
                 batch_id: batch.batch_id,
-                triples_path: batch.triples_path.clone(),
+                triple_source: id_remapper::TripleSource::LtrFile(batch.triples_path.clone()),
+                mapping_path,
+            })
+            .ok();
+    }
+    for (batch_id, adapter) in &hdt_adapters {
+        let mapping_path = temp_dir.join(format!("id_mapping_{:06}.map.zst", batch_id));
+        remap_tx
+            .send(id_remapper::BatchRemapInfo {
+                batch_id: *batch_id,
+                triple_source: id_remapper::TripleSource::HdtFile {
+                    path: adapter.path.clone(),
+                    triples_data_offset: adapter.triples_data_offset(),
+                    num_triples: adapter.num_triples,
+                    num_sp_pairs: adapter.num_sp_pairs(),
+                    shared_count: adapter.shared_count,
+                    subjects_count: adapter.subjects_count,
+                },
                 mapping_path,
             })
             .ok();

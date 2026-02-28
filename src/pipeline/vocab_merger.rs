@@ -372,12 +372,12 @@ impl ShardedMappingWriter {
 }
 
 #[derive(Debug)]
-struct StreamEntry {
-    term: Vec<u8>,
-    roles: Roles,
-    so_local_id: Option<u32>,
-    p_local_id: Option<u32>,
-    source_batch: usize,
+pub struct StreamEntry {
+    pub term: Vec<u8>,
+    pub roles: Roles,
+    pub so_local_id: Option<u32>,
+    pub p_local_id: Option<u32>,
+    pub source_batch: usize,
 }
 
 impl Mergeable for StreamEntry {
@@ -474,13 +474,61 @@ pub struct VocabMergeResult {
     pub predicate_ids: HashMap<String, u64>,
 }
 
-/// Merge partial vocabularies into global dictionary.
+/// Factory type that lazily produces a sorted iterator of `StreamEntry` items.
+pub type VocabFactory =
+    Box<dyn FnOnce() -> Result<Box<dyn Iterator<Item = Result<StreamEntry>> + Send>> + Send>;
+
+/// A vocabulary source for the k-way merge. Abstracts over partial vocab
+/// files (from RDF parsing) and HDT dictionary sections.
+pub struct VocabSource {
+    pub batch_id: usize,
+    pub max_so_id: u32,
+    pub max_p_id: u32,
+    pub factory: VocabFactory,
+}
+
+/// Create a `VocabSource` from a partial vocab file (the standard RDF path).
+pub fn vocab_source_from_pvoc(batch_id: usize, vocab_path: PathBuf) -> Result<VocabSource> {
+    let reader = PartialVocabReader::open(&vocab_path)
+        .with_context(|| format!("Failed to open partial vocab for batch {}", batch_id))?;
+    let max_so_id = reader.max_so_id();
+    let max_p_id = reader.max_p_id();
+    drop(reader);
+
+    let factory: VocabFactory = Box::new(move || {
+        let delete_path = vocab_path.clone();
+        let reader = PartialVocabReader::open(&vocab_path).with_context(|| {
+            format!("Failed to open partial vocab for batch {}", batch_id)
+        })?;
+        let iter = reader.map(move |entry_result| {
+            entry_result.map(|entry| StreamEntry {
+                term: entry.term,
+                roles: entry.roles,
+                so_local_id: entry.so_local_id,
+                p_local_id: entry.p_local_id,
+                source_batch: batch_id,
+            })
+        });
+        Ok(Box::new(DeleteOnDrop {
+            inner: iter,
+            path: delete_path,
+        }) as Box<dyn Iterator<Item = Result<StreamEntry>> + Send>)
+    });
+
+    Ok(VocabSource {
+        batch_id,
+        max_so_id,
+        max_p_id,
+        factory,
+    })
+}
+
 pub fn merge_vocabularies(
-    batch_infos: Vec<(usize, PathBuf)>, // (batch_id, vocab_path)
+    sources: Vec<VocabSource>,
     temp_dir: &Path,
     memory_budget: usize,
 ) -> Result<VocabMergeResult> {
-    tracing::debug!("Merging {} partial vocabularies", batch_infos.len());
+    tracing::debug!("Merging {} vocabulary sources", sources.len());
 
     let mut stream_reader_init_time = Duration::ZERO;
     let mut stream_read_time = Duration::ZERO;
@@ -488,28 +536,16 @@ pub fn merge_vocabularies(
     let mut so_map_finalize_time = Duration::ZERO;
     let mut pfc_serialize_time = Duration::ZERO;
     let mut mapping_write_time = Duration::ZERO;
-    let mut stream_bytes_read = 0u64;
 
-    let mut batch_max_so: Vec<u32> = Vec::with_capacity(batch_infos.len());
-    let mut batch_max_p: Vec<u32> = Vec::with_capacity(batch_infos.len());
+    // Separate metadata from factories
+    let mut batch_max_so: Vec<u32> = Vec::with_capacity(sources.len());
+    let mut batch_max_p: Vec<u32> = Vec::with_capacity(sources.len());
+    let mut factories: Vec<(usize, VocabFactory)> = Vec::with_capacity(sources.len());
 
-    for (batch_id, vocab_path) in &batch_infos {
-        let init_start = Instant::now();
-        tracing::debug!(
-            "Opening partial vocab header for batch {}: {:?}",
-            batch_id,
-            vocab_path
-        );
-        stream_bytes_read += std::fs::metadata(vocab_path)
-            .with_context(|| format!("Failed to stat partial vocab for batch {}", batch_id))?
-            .len();
-        let reader = PartialVocabReader::open(vocab_path)
-            .with_context(|| format!("Failed to open partial vocab for batch {}", batch_id))?;
-
-        // Record max IDs from header (used to size dense mapping arrays later)
-        batch_max_so.push(reader.max_so_id());
-        batch_max_p.push(reader.max_p_id());
-        stream_reader_init_time += init_start.elapsed();
+    for source in sources {
+        batch_max_so.push(source.max_so_id);
+        batch_max_p.push(source.max_p_id);
+        factories.push((source.batch_id, source.factory));
     }
 
     let mut shard_writer = ShardedMappingWriter::new(temp_dir, batch_max_so, batch_max_p)
@@ -541,7 +577,7 @@ pub fn merge_vocabularies(
         stream_channel_capacity,
         memory_budget / 1024 / 1024
     );
-    let merge_handle = build_vocab_merge_tree(&batch_infos, stream_channel_capacity, temp_dir)?;
+    let merge_handle = build_vocab_merge_tree(factories, stream_channel_capacity, temp_dir)?;
     let stream_rx = &merge_handle.rx;
     stream_reader_init_time += stream_init_start.elapsed();
 
@@ -670,10 +706,9 @@ pub fn merge_vocabularies(
     mapping_write_time += mapping_write_start.elapsed();
 
     tracing::debug!(
-        "Stage 4 timing: stream init {:.3}s/read {:.3}s ({} MB), assign {:.3}s, finalize SO-map {:.3}s, dict serialize {:.3}s, mapping writes {:.3}s",
+        "Stage 4 timing: stream init {:.3}s/read {:.3}s, assign {:.3}s, finalize SO-map {:.3}s, dict serialize {:.3}s, mapping writes {:.3}s",
         stream_reader_init_time.as_secs_f64(),
         stream_read_time.as_secs_f64(),
-        stream_bytes_read / (1024 * 1024),
         id_assignment_time.as_secs_f64(),
         so_map_finalize_time.as_secs_f64(),
         pfc_serialize_time.as_secs_f64(),
@@ -726,46 +761,19 @@ impl<I> Drop for DeleteOnDrop<I> {
     }
 }
 
-/// Build a parallel merge tree over partial vocabulary files.
+/// Build a parallel merge tree from vocab source factories.
 ///
-/// Each leaf thread opens a `PartialVocabReader` and maps entries to
-/// `StreamEntry` with the correct `source_batch`. When the number of
-/// batches exceeds the merge tree's max fan-in, multi-round merging
+/// Each factory produces a sorted iterator of `StreamEntry`. When the number
+/// of sources exceeds the merge tree's max fan-in, multi-round merging
 /// with intermediate temp files is used automatically.
-///
-/// Each partial vocab file is deleted as soon as its leaf thread finishes
-/// reading it (via `DeleteOnDrop`), freeing disk space during the merge.
 fn build_vocab_merge_tree(
-    batch_infos: &[(usize, PathBuf)],
+    factories: Vec<(usize, VocabFactory)>,
     channel_capacity: usize,
     temp_dir: &Path,
 ) -> Result<MergeTreeHandle<StreamEntry>> {
-    let sources: Vec<MergeSource<StreamEntry>> = batch_infos
-        .iter()
-        .map(|(batch_id, vocab_path)| {
-            let batch_id = *batch_id;
-            let vocab_path = vocab_path.clone();
-            MergeSource::Factory(Box::new(move || {
-                let delete_path = vocab_path.clone();
-                let reader = PartialVocabReader::open(&vocab_path).with_context(|| {
-                    format!("Failed to open partial vocab for batch {}", batch_id)
-                })?;
-                let iter = reader.map(move |entry_result| {
-                    entry_result.map(|entry| StreamEntry {
-                        term: entry.term,
-                        roles: entry.roles,
-                        so_local_id: entry.so_local_id,
-                        p_local_id: entry.p_local_id,
-                        source_batch: batch_id,
-                    })
-                });
-                Ok(Box::new(DeleteOnDrop {
-                    inner: iter,
-                    path: delete_path,
-                })
-                    as Box<dyn Iterator<Item = Result<StreamEntry>> + Send>)
-            }))
-        })
+    let sources: Vec<MergeSource<StreamEntry>> = factories
+        .into_iter()
+        .map(|(_batch_id, factory)| MergeSource::Factory(factory))
         .collect();
 
     let config = MergeTreeConfig::new(temp_dir).with_channel_capacity(channel_capacity);
@@ -847,6 +855,39 @@ mod tests {
 
     const TEST_MEMORY_BUDGET: usize = 512 * 1024 * 1024;
 
+    /// Convert batch_infos to VocabSource vec for tests.
+    fn to_vocab_sources(batch_infos: Vec<(usize, PathBuf)>) -> Result<Vec<VocabSource>> {
+        batch_infos
+            .into_iter()
+            .map(|(id, path)| vocab_source_from_pvoc(id, path))
+            .collect()
+    }
+
+    /// Convert batch_infos to factory tuples for build_vocab_merge_tree tests.
+    fn to_factories(
+        batch_infos: Vec<(usize, PathBuf)>,
+    ) -> Vec<(usize, VocabFactory)> {
+        batch_infos
+            .into_iter()
+            .map(|(batch_id, vocab_path)| {
+                let factory: VocabFactory = Box::new(move || {
+                        let reader = PartialVocabReader::open(&vocab_path)?;
+                        let iter = reader.map(move |entry_result| {
+                            entry_result.map(|entry| StreamEntry {
+                                term: entry.term,
+                                roles: entry.roles,
+                                so_local_id: entry.so_local_id,
+                                p_local_id: entry.p_local_id,
+                                source_batch: batch_id,
+                            })
+                        });
+                        Ok(Box::new(iter) as Box<dyn Iterator<Item = Result<StreamEntry>> + Send>)
+                    });
+                (batch_id, factory)
+            })
+            .collect()
+    }
+
     fn read_mapping_from_temp(temp_path: &Path, batch_id: usize) -> Result<IdMapping> {
         let mapping_path = temp_path.join(format!("id_mapping_{:06}.map.zst", batch_id));
         IdMapping::read_from_file(&mapping_path)
@@ -909,7 +950,7 @@ mod tests {
         )?;
 
         let batch_infos = vec![(0, batch0_path), (1, batch1_path)];
-        let result = merge_vocabularies(batch_infos, temp_path, TEST_MEMORY_BUDGET)?;
+        let result = merge_vocabularies(to_vocab_sources(batch_infos)?, temp_path, TEST_MEMORY_BUDGET)?;
 
         // Verify counts
         assert_eq!(result.counts.shared, 0);
@@ -961,7 +1002,7 @@ mod tests {
         )?;
 
         let batch_infos = vec![(0, batch0_path), (1, batch1_path)];
-        let result = merge_vocabularies(batch_infos, temp_path, TEST_MEMORY_BUDGET)?;
+        let result = merge_vocabularies(to_vocab_sources(batch_infos)?, temp_path, TEST_MEMORY_BUDGET)?;
 
         // "x" should be shared (appears as both subject and object)
         // "p1" should be a predicate
@@ -1006,7 +1047,7 @@ mod tests {
         create_test_partial_vocab(&batch2_path, vec![("multi", Roles::OBJECT, Some(0), None)])?;
 
         let batch_infos = vec![(0, batch0_path), (1, batch1_path), (2, batch2_path)];
-        let result = merge_vocabularies(batch_infos, temp_path, TEST_MEMORY_BUDGET)?;
+        let result = merge_vocabularies(to_vocab_sources(batch_infos)?, temp_path, TEST_MEMORY_BUDGET)?;
 
         // "multi" should be shared (appears as both subject and object)
         // and also as predicate
@@ -1066,7 +1107,7 @@ mod tests {
         )?;
 
         let batch_infos = vec![(0, batch0_path), (1, batch1_path), (2, batch2_path)];
-        let result = merge_vocabularies(batch_infos, temp_path, TEST_MEMORY_BUDGET)?;
+        let result = merge_vocabularies(to_vocab_sources(batch_infos)?, temp_path, TEST_MEMORY_BUDGET)?;
 
         // "a" shared (subject + object), "b" shared (subject + object) + predicate, "c" predicate, "d" subject
         assert_eq!(result.counts.shared, 2); // a, b
@@ -1117,7 +1158,7 @@ mod tests {
         create_test_partial_vocab(&batch1_path, vec![])?;
 
         let batch_infos = vec![(0, batch0_path), (1, batch1_path)];
-        let result = merge_vocabularies(batch_infos, temp_path, TEST_MEMORY_BUDGET)?;
+        let result = merge_vocabularies(to_vocab_sources(batch_infos)?, temp_path, TEST_MEMORY_BUDGET)?;
 
         // Should only count terms from batch 0
         assert_eq!(result.counts.shared, 0);
@@ -1160,7 +1201,8 @@ mod tests {
         )?;
 
         let batch_infos = vec![(0usize, batch0_path), (1usize, batch1_path)];
-        let handle = build_vocab_merge_tree(&batch_infos, 1, temp_path)?;
+        let factories = to_factories(batch_infos);
+        let handle = build_vocab_merge_tree(factories, 1, temp_path)?;
 
         let mut observed_terms: Vec<String> = Vec::new();
         let mut observed_batches: Vec<usize> = Vec::new();
@@ -1184,8 +1226,9 @@ mod tests {
         let temp_dir = TempDir::new()?;
         let missing_path = temp_dir.path().join("does_not_exist.vocab.zst");
         let batch_infos = vec![(42usize, missing_path)];
+        let factories = to_factories(batch_infos);
 
-        let handle = build_vocab_merge_tree(&batch_infos, 2, temp_dir.path())?;
+        let handle = build_vocab_merge_tree(factories, 2, temp_dir.path())?;
 
         let first = handle
             .rx
@@ -1193,8 +1236,8 @@ mod tests {
             .expect("expected an error item from missing-file source");
         let err = first.expect_err("expected error result for missing partial vocab file");
         assert!(
-            err.to_string()
-                .contains("Failed to open partial vocab for batch 42"),
+            err.to_string().contains("Failed to open partial vocab")
+                || err.to_string().contains("does_not_exist"),
             "unexpected error: {err}"
         );
 
