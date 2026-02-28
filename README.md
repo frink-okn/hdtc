@@ -285,3 +285,7 @@ cargo build --release
 ## License
 
 MIT — see [LICENSE](LICENSE) for details.
+
+## Funding
+
+Development supported by [NSF award 2535091](https://www.nsf.gov/awardsearch/show-award?AWD_ID=2535091).
