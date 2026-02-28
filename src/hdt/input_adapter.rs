@@ -9,10 +9,11 @@ use crate::io::{ControlInfo, ControlType, StreamingBitmapDecoder, StreamingLogAr
 use crate::pipeline::batch_vocab::Roles;
 use crate::pipeline::vocab_merger::StreamEntry;
 use anyhow::{Context, Result, bail};
+use oxrdfio::{RdfFormat, RdfParser};
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::fs::File;
-use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::io::{BufReader, Cursor, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 const DICTIONARY_FOUR_FORMAT: &str = "<http://purl.org/HDT/hdt#dictionaryFour>";
@@ -707,22 +708,50 @@ fn parse_original_size_from_header(header_text: &str) -> u64 {
 }
 
 fn parse_num_triples_from_header(header_text: &str) -> Result<u64> {
-    // Parse the header RDF to find the triple count
-    // The header contains lines like: <...> <http://rdfs.org/ns/void#triples> "12345" .
-    for line in header_text.lines() {
-        if line.contains("void#triples") {
-            // Extract the number from the quoted value
-            if let Some(start) = line.find('"') {
-                let rest = &line[start + 1..];
-                if let Some(end) = rest.find('"')
-                    && let Ok(count) = rest[..end].parse::<u64>()
-                {
-                    return Ok(count);
-                }
-            }
+    const VOID_TRIPLES: &str = "http://rdfs.org/ns/void#triples";
+    const HDT_TRIPLES_NUM: &str = "http://purl.org/HDT/hdt#triplesnumTriples";
+
+    let mut value_from_void: Option<u64> = None;
+    let mut value_from_hdt: Option<u64> = None;
+
+    let parser = RdfParser::from_format(RdfFormat::NTriples)
+        .for_reader(Cursor::new(header_text.as_bytes()));
+
+    for quad_result in parser {
+        let quad = quad_result.context("Invalid N-Triples in HDT header metadata")?;
+        let predicate = quad.predicate.as_str();
+
+        if predicate != VOID_TRIPLES && predicate != HDT_TRIPLES_NUM {
+            continue;
+        }
+
+        let oxrdf::Term::Literal(literal) = quad.object else {
+            continue;
+        };
+
+        let parsed = literal.value().parse::<u64>().with_context(|| {
+            format!("Invalid numeric triple-count literal: {}", literal.value())
+        })?;
+
+        if predicate == VOID_TRIPLES {
+            value_from_void = Some(parsed);
+        }
+        if predicate == HDT_TRIPLES_NUM {
+            value_from_hdt = Some(parsed);
         }
     }
-    bail!("Could not find triple count in HDT header");
+
+    match (value_from_void, value_from_hdt) {
+        (Some(v), Some(h)) if v != h => {
+            bail!(
+                "Header triple-count mismatch between void:triples ({v}) and hdt:triplesnumTriples ({h})"
+            )
+        }
+        (Some(v), Some(_)) => Ok(v),
+        (Some(v), None) => Ok(v),
+        (None, Some(h)) => Ok(h),
+        (None, None) => bail!("Header metadata missing triple-count predicate"),
+    }
 }
 
 #[cfg(test)]
