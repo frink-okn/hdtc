@@ -139,6 +139,12 @@ fn remap_batch(
             while let Some((s, p, o)) = reader.next_triple()? {
                 remap_and_send(s, p, o)?;
             }
+            reader.finalize().with_context(|| {
+                format!(
+                    "HDT triples CRC verification failed for batch {}",
+                    batch_info.batch_id
+                )
+            })?;
         }
     }
 

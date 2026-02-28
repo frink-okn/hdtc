@@ -626,6 +626,24 @@ impl HdtTripleReader {
 
         Ok(Some((flat_s, flat_p, flat_o)))
     }
+
+    /// Verify CRC32C checksums on all four BitmapTriples sections.
+    /// Must be called after all triples have been consumed.
+    pub fn finalize(self) -> Result<()> {
+        self.bitmap_y
+            .finish()
+            .context("BitmapY CRC32C verification failed")?;
+        self.bitmap_z
+            .finish()
+            .context("BitmapZ CRC32C verification failed")?;
+        self.array_y
+            .finish()
+            .context("ArrayY CRC32C verification failed")?;
+        self.array_z
+            .finish()
+            .context("ArrayZ CRC32C verification failed")?;
+        Ok(())
+    }
 }
 
 fn skip_pfc_section<R: Read + Seek>(reader: &mut R, section_name: &str) -> Result<u64> {
