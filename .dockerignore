@@ -1,0 +1,6 @@
+target/
+*.hdt
+*.hdt.index.v1-1
+*.log
+temp/
+java-temp/
