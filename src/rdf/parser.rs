@@ -113,9 +113,9 @@ fn open_input(input: &RdfInput) -> Result<Box<dyn Read>> {
 
     let reader: Box<dyn Read> = match input.compression {
         Compression::None => Box::new(buf_reader),
-        Compression::Gzip => Box::new(flate2::read::GzDecoder::new(buf_reader)),
-        Compression::Bzip2 => Box::new(bzip2::read::BzDecoder::new(buf_reader)),
-        Compression::Xz => Box::new(xz2::read::XzDecoder::new(buf_reader)),
+        Compression::Gzip => Box::new(flate2::read::MultiGzDecoder::new(buf_reader)),
+        Compression::Bzip2 => Box::new(bzip2::read::MultiBzDecoder::new(buf_reader)),
+        Compression::Xz => Box::new(xz2::read::XzDecoder::new_multi_decoder(buf_reader)),
     };
 
     Ok(reader)
