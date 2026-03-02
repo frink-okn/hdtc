@@ -71,6 +71,7 @@ fn main() -> Result<()> {
         cli::Commands::Create(args) => create_hdt(args, benchmark),
         cli::Commands::Index(args) => create_index_from_hdt(args, benchmark),
         cli::Commands::Dump(args) => dump_hdt_to_ntriples(args, benchmark),
+        cli::Commands::Search(args) => search_hdt(args, benchmark),
         cli::Commands::Validate(args) => validate_hdt_file(args, benchmark),
     }
 }
@@ -251,13 +252,16 @@ fn dump_hdt_to_ntriples(args: cli::DumpArgs, benchmark: bool) -> Result<()> {
     }
 
     tracing::info!("Dumping HDT to N-Triples: {}", args.hdt_file.display());
-    tracing::info!("Output: {}", args.output.display());
+    match &args.output {
+        Some(p) => tracing::info!("Output: {}", p.display()),
+        None => tracing::info!("Output: stdout"),
+    }
 
     let start = std::time::Instant::now();
     let memory_limit = args.memory_limit.as_bytes();
     tracing::info!("Memory limit: {} bytes", memory_limit);
     let count =
-        hdt::dump_hdt_to_ntriples_streaming(&args.hdt_file, &args.output, memory_limit)?;
+        hdt::search_hdt_streaming(&args.hdt_file, "? ? ?", args.output.as_deref(), false, None, memory_limit)?;
 
     if benchmark {
         tracing::info!(
@@ -266,11 +270,46 @@ fn dump_hdt_to_ntriples(args: cli::DumpArgs, benchmark: bool) -> Result<()> {
         );
     }
 
-    tracing::info!(
-        "Done! {} triples written to {}",
-        count,
-        args.output.display()
-    );
+    match &args.output {
+        Some(p) => tracing::info!("Done! {count} triples written to {}", p.display()),
+        None => tracing::info!("Done! {count} triples written"),
+    }
+    Ok(())
+}
+
+/// Search an HDT file with a triple pattern.
+fn search_hdt(args: cli::SearchArgs, benchmark: bool) -> Result<()> {
+    if !args.hdt_file.exists() {
+        anyhow::bail!("HDT file not found: {}", args.hdt_file.display());
+    }
+
+    if args.count && args.limit.is_some() {
+        tracing::warn!("--limit is ignored when combined with --count; counting all matches");
+    }
+
+    tracing::info!("Searching HDT: {}", args.hdt_file.display());
+    tracing::info!("Query: {}", args.query);
+
+    let start = std::time::Instant::now();
+    let memory_limit = args.memory_limit.as_bytes();
+
+    let count = hdt::search_hdt_streaming(
+        &args.hdt_file,
+        &args.query,
+        args.output.as_deref(),
+        args.count,
+        if args.count { None } else { args.limit },
+        memory_limit,
+    )?;
+
+    if benchmark {
+        tracing::info!(
+            "Benchmark summary (search): total {:.3}s",
+            start.elapsed().as_secs_f64()
+        );
+    }
+
+    tracing::info!("Done! {count} matching triple(s)");
     Ok(())
 }
 

@@ -87,8 +87,11 @@ pub enum Commands {
     /// Create index file for an existing HDT file
     Index(IndexArgs),
 
-    /// Dump an HDT file to N-Triples
+    /// Dump an HDT file to N-Triples (tab-delimited: S\tP\tO\t.)
     Dump(DumpArgs),
+
+    /// Search an HDT file with a triple pattern
+    Search(SearchArgs),
 
     /// Validate HDT triples structures (ArrayY/ArrayZ/BitmapZ) for indexing
     Validate(ValidateArgs),
@@ -170,13 +173,44 @@ pub struct ValidateArgs {
 }
 
 #[derive(Debug, Parser)]
+pub struct SearchArgs {
+    /// Path to existing HDT file
+    pub hdt_file: PathBuf,
+
+    /// Triple pattern query (three N-Triples terms; use `?` or `*` as a wildcard).
+    ///
+    /// Examples:
+    ///   "<http://example.org/alice> ? ?"
+    ///   "? <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?"
+    ///   "? ? \"Alice\"@en"
+    #[arg(long, value_name = "PATTERN")]
+    pub query: String,
+
+    /// Write results to file instead of stdout
+    #[arg(short, long, value_name = "PATH")]
+    pub output: Option<PathBuf>,
+
+    /// Print only the count of matching triples, not the triples themselves
+    #[arg(long)]
+    pub count: bool,
+
+    /// Stop after N results (warning: ignored when combined with --count)
+    #[arg(long, value_name = "N")]
+    pub limit: Option<u64>,
+
+    /// Soft memory limit for dictionary caches (e.g. 4G, 2000M)
+    #[arg(short = 'm', long, value_name = "SIZE", default_value = "4G")]
+    pub memory_limit: MemorySize,
+}
+
+#[derive(Debug, Parser)]
 pub struct DumpArgs {
     /// Path to existing HDT file
     pub hdt_file: PathBuf,
 
-    /// Output N-Triples file path (overwritten if it exists)
-    #[arg(short, long)]
-    pub output: PathBuf,
+    /// Write results to file instead of stdout
+    #[arg(short, long, value_name = "PATH")]
+    pub output: Option<PathBuf>,
 
     /// Soft memory limit for dictionary cache (e.g. 4G, 2000M)
     #[arg(long, value_name = "SIZE", default_value = "4G")]

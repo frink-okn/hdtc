@@ -33,7 +33,7 @@ cargo build --release
 
 ## Usage
 
-hdtc supports three main commands:
+hdtc supports four main commands:
 
 ### `hdtc create` — Convert RDF to HDT
 
@@ -50,7 +50,13 @@ hdtc index [OPTIONS] <HDT_FILE>
 ### `hdtc dump` — Convert HDT to N-Triples
 
 ```
-hdtc dump <HDT_FILE> --output <OUTPUT>
+hdtc dump [OPTIONS] <HDT_FILE>
+```
+
+### `hdtc search` — Query an HDT file with a triple pattern
+
+```
+hdtc search [OPTIONS] --query <PATTERN> <HDT_FILE>
 ```
 
 ### Create: Basic examples
@@ -124,13 +130,77 @@ hdtc index existing.hdt --memory-limit 8G --temp-dir /mnt/fast-ssd/tmp
 
 ### Dump: Exporting to N-Triples
 
-Export an HDT file to N-Triples:
+Export an HDT file to N-Triples (writes to stdout if `--output` is omitted):
 
 ```sh
 hdtc dump existing.hdt -o existing.nt
 ```
 
+Stream directly to another tool:
+
+```sh
+hdtc dump existing.hdt | gzip > existing.nt.gz
+```
+
 If the output file already exists, it is overwritten.
+
+### Search: Querying with triple patterns
+
+Search using a triple pattern — three N-Triples terms separated by whitespace, with `?` as a wildcard for any position. Outputs tab-delimited N-Triples (`S\tP\tO\t.`) to stdout or a file.
+
+Count all triples (equivalent to `hdtc dump`):
+
+```sh
+hdtc search existing.hdt --query "? ? ?"
+```
+
+Find all triples about a specific subject:
+
+```sh
+hdtc search existing.hdt --query "<http://example.org/alice> ? ?"
+```
+
+Find triples with a specific subject and predicate:
+
+```sh
+hdtc search existing.hdt --query "<http://example.org/alice> <http://xmlns.com/foaf/0.1/name> ?"
+```
+
+Look up an exact triple:
+
+```sh
+hdtc search existing.hdt --query "<http://example.org/alice> <http://xmlns.com/foaf/0.1/name> \"Alice\"@en"
+```
+
+Count matching triples without outputting them:
+
+```sh
+hdtc search existing.hdt --query "<http://example.org/alice> ? ?" --count
+```
+
+Limit output to the first 10 results:
+
+```sh
+hdtc search existing.hdt --query "<http://example.org/alice> ? ?" --limit 10
+```
+
+Write results to a file:
+
+```sh
+hdtc search existing.hdt --query "<http://example.org/alice> ? ?" -o alice.nt
+```
+
+**Supported patterns** (no index required):
+
+| Pattern | Example |
+| ------- | ------- |
+| `? ? ?` | All triples |
+| `S ? ?` | All triples for a subject |
+| `S P ?` | All objects for a subject–predicate pair |
+| `S ? O` | All predicates linking a subject to an object |
+| `S P O` | Exact triple lookup |
+
+Patterns beginning with `?` (e.g. `? P ?`, `? ? O`) require an OPS index (Phase 2/3, not yet implemented).
 
 ### Create: All options
 
@@ -168,11 +238,24 @@ Auto parser tuning is derived from `--memory-limit` (accepts `G`/`M` suffixes, e
 | Option                | Default      | Description                                                 |
 | --------------------- | ------------ | ----------------------------------------------------------- |
 | `<HDT_FILE>`          | _(required)_ | Path to existing HDT file                                   |
-| `-o, --output`        | _(required)_ | Output N-Triples file path                                  |
+| `-o, --output PATH`   | stdout       | Write N-Triples to file instead of stdout                   |
 | `--memory-limit SIZE` | `4G`         | Soft memory limit for dictionary cache (e.g. `4G`, `2000M`) |
 | `--benchmark`         | off          | Emit stage timing and RSS high-water summary                |
 | `-v, --verbose`       | —            | Increase log verbosity (`-v` debug, `-vv` trace)            |
 | `-q, --quiet`         | —            | Suppress all output except errors                           |
+
+### Search: All options
+
+| Option                | Default      | Description                                                          |
+| --------------------- | ------------ | -------------------------------------------------------------------- |
+| `<HDT_FILE>`          | _(required)_ | Path to existing HDT file                                            |
+| `--query PATTERN`     | _(required)_ | Triple pattern (three N-Triples terms, `?` or `*` as wildcard)       |
+| `-o, --output PATH`   | stdout       | Write results to file instead of stdout                              |
+| `--count`             | off          | Print only the count of matching triples                             |
+| `--limit N`           | unlimited    | Stop after N results (ignored when combined with `--count`)          |
+| `--memory-limit SIZE` | `4G`         | Soft memory limit for dictionary caches (e.g. `4G`, `2000M`)        |
+| `-v, --verbose`       | —            | Increase log verbosity (`-v` debug, `-vv` trace)                     |
+| `-q, --quiet`         | —            | Suppress all output except errors                                    |
 
 ## Resource requirements
 

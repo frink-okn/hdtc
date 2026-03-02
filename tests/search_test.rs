@@ -1,0 +1,435 @@
+//! Integration tests for `hdtc search`.
+//!
+//! Covers Phase 1 patterns: `???`, `S??`, `SP?`, `S?O`, `SPO`.
+
+mod common;
+
+use common::{REPRESENTATIVE_NT, write_file};
+use std::collections::HashSet;
+use std::path::Path;
+use std::process::Command;
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Create an HDT file from `REPRESENTATIVE_NT` in `temp_dir` and return its path.
+fn make_representative_hdt(temp_dir: &Path) -> std::path::PathBuf {
+    let nt_path = temp_dir.join("input.nt");
+    write_file(&nt_path, REPRESENTATIVE_NT.as_bytes());
+
+    let hdt_path = temp_dir.join("data.hdt");
+    let work_dir = temp_dir.join("work");
+
+    let status = Command::new(env!("CARGO_BIN_EXE_hdtc"))
+        .args([
+            "create",
+            nt_path.to_str().unwrap(),
+            "-o",
+            hdt_path.to_str().unwrap(),
+            "--base-uri",
+            "http://example.org/dataset",
+            "--temp-dir",
+            work_dir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute hdtc create");
+
+    assert!(
+        status.status.success(),
+        "hdtc create failed: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+
+    hdt_path
+}
+
+/// Run `hdtc search` and return (success, stdout, stderr).
+fn run_search(hdt_path: &Path, query: &str, extra_args: &[&str]) -> (bool, String, String) {
+    let mut args = vec!["search", hdt_path.to_str().unwrap(), "--query", query];
+    args.extend_from_slice(extra_args);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_hdtc"))
+        .args(&args)
+        .output()
+        .expect("Failed to execute hdtc search");
+
+    (
+        output.status.success(),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+/// Parse tab-delimited N-Triples output from `hdtc search` into a set of triple strings.
+///
+/// Each line has the form: `S\tP\tO\t.\n`. We treat each line as a canonical
+/// triple key: `"S P O"` (using space for easy comparison).
+///
+/// We do NOT use an RDF parser here — we rely on the structural correctness of
+/// the output format (each field is a well-formed N-Triples term).
+fn parse_tab_triples(output: &str) -> HashSet<String> {
+    output
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            // strip trailing \t.
+            let line = line.strip_suffix("\t.").unwrap_or(line);
+            let parts: Vec<&str> = line.splitn(3, '\t').collect();
+            assert_eq!(
+                parts.len(),
+                3,
+                "Expected 3 tab-separated fields in line: {line:?}"
+            );
+            format!("{} {} {}", parts[0], parts[1], parts[2])
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+/// `???` returns all 8 triples from the representative dataset.
+#[test]
+fn test_search_scan_all() {
+    let temp = tempfile::tempdir().unwrap();
+    let hdt = make_representative_hdt(temp.path());
+    let (ok, stdout, stderr) = run_search(&hdt, "? ? ?", &[]);
+    assert!(ok, "hdtc search failed: {stderr}");
+    let triples = parse_tab_triples(&stdout);
+    assert_eq!(
+        triples.len(),
+        8,
+        "Expected 8 triples from ??? scan, got {}: {triples:#?}",
+        triples.len()
+    );
+}
+
+/// `--count` flag prints the count and nothing else to stdout.
+#[test]
+fn test_search_count_all() {
+    let temp = tempfile::tempdir().unwrap();
+    let hdt = make_representative_hdt(temp.path());
+    let (ok, stdout, stderr) = run_search(&hdt, "? ? ?", &["--count"]);
+    assert!(ok, "hdtc search failed: {stderr}");
+    let count: u64 = stdout.trim().parse().expect("Expected a number in stdout");
+    assert_eq!(count, 8, "Expected count=8, got {count}");
+}
+
+/// `--limit 3` stops after 3 results.
+#[test]
+fn test_search_limit() {
+    let temp = tempfile::tempdir().unwrap();
+    let hdt = make_representative_hdt(temp.path());
+    let (ok, stdout, stderr) = run_search(&hdt, "? ? ?", &["--limit", "3"]);
+    assert!(ok, "hdtc search failed: {stderr}");
+    let triples = parse_tab_triples(&stdout);
+    assert_eq!(
+        triples.len(),
+        3,
+        "Expected 3 triples with --limit 3, got {}",
+        triples.len()
+    );
+}
+
+/// `S??` returns all triples with alice as subject (5 triples).
+#[test]
+fn test_search_subject_bound() {
+    let temp = tempfile::tempdir().unwrap();
+    let hdt = make_representative_hdt(temp.path());
+    let (ok, stdout, stderr) =
+        run_search(&hdt, "<http://example.org/alice> ? ?", &[]);
+    assert!(ok, "hdtc search failed: {stderr}");
+    let triples = parse_tab_triples(&stdout);
+    assert_eq!(
+        triples.len(),
+        5,
+        "Expected 5 triples for alice, got {}: {triples:#?}",
+        triples.len()
+    );
+    // All results must have alice as subject
+    for triple in &triples {
+        assert!(
+            triple.starts_with("<http://example.org/alice>"),
+            "Expected alice subject, got: {triple}"
+        );
+    }
+}
+
+/// `SP?` returns triples with alice as subject and `label` as predicate (2 triples).
+#[test]
+fn test_search_subject_predicate_bound() {
+    let temp = tempfile::tempdir().unwrap();
+    let hdt = make_representative_hdt(temp.path());
+    let (ok, stdout, stderr) = run_search(
+        &hdt,
+        "<http://example.org/alice> <http://example.org/label> ?",
+        &[],
+    );
+    assert!(ok, "hdtc search failed: {stderr}");
+    let triples = parse_tab_triples(&stdout);
+    assert_eq!(
+        triples.len(),
+        2,
+        "Expected 2 label triples for alice, got {}: {triples:#?}",
+        triples.len()
+    );
+    for triple in &triples {
+        assert!(triple.contains("<http://example.org/label>"));
+    }
+}
+
+/// `S?O` returns triples where alice knows bob (1 triple).
+#[test]
+fn test_search_subject_object_bound() {
+    let temp = tempfile::tempdir().unwrap();
+    let hdt = make_representative_hdt(temp.path());
+    let (ok, stdout, stderr) = run_search(
+        &hdt,
+        "<http://example.org/alice> ? <http://example.org/bob>",
+        &[],
+    );
+    assert!(ok, "hdtc search failed: {stderr}");
+    let triples = parse_tab_triples(&stdout);
+    assert_eq!(
+        triples.len(),
+        1,
+        "Expected 1 triple (alice ? bob), got {}: {triples:#?}",
+        triples.len()
+    );
+}
+
+/// `SPO` exact match returns exactly 1 triple.
+#[test]
+fn test_search_exact() {
+    let temp = tempfile::tempdir().unwrap();
+    let hdt = make_representative_hdt(temp.path());
+    let (ok, stdout, stderr) = run_search(
+        &hdt,
+        "<http://example.org/alice> <http://example.org/knows> <http://example.org/bob>",
+        &[],
+    );
+    assert!(ok, "hdtc search failed: {stderr}");
+    let triples = parse_tab_triples(&stdout);
+    assert_eq!(
+        triples.len(),
+        1,
+        "Expected 1 triple for SPO exact match, got {}: {triples:#?}",
+        triples.len()
+    );
+}
+
+/// A subject not in the dictionary returns 0 results (not an error).
+#[test]
+fn test_search_subject_not_found() {
+    let temp = tempfile::tempdir().unwrap();
+    let hdt = make_representative_hdt(temp.path());
+    let (ok, stdout, stderr) =
+        run_search(&hdt, "<http://example.org/nobody> ? ?", &[]);
+    assert!(ok, "hdtc search should succeed even with zero results: {stderr}");
+    let triples = parse_tab_triples(&stdout);
+    assert_eq!(
+        triples.len(),
+        0,
+        "Expected 0 results for unknown subject, got {triples:#?}"
+    );
+}
+
+/// A predicate not in the dictionary returns 0 results (not an error).
+#[test]
+fn test_search_predicate_not_found_returns_zero() {
+    let temp = tempfile::tempdir().unwrap();
+    let hdt = make_representative_hdt(temp.path());
+    let (ok, stdout, stderr) = run_search(
+        &hdt,
+        "<http://example.org/alice> <http://example.org/unknown> ?",
+        &[],
+    );
+    assert!(ok, "hdtc search should succeed even with zero results: {stderr}");
+    let triples = parse_tab_triples(&stdout);
+    assert_eq!(
+        triples.len(),
+        0,
+        "Expected 0 results for unknown predicate, got {triples:#?}"
+    );
+}
+
+/// Exact match for a triple that does not exist returns 0 results.
+#[test]
+fn test_search_exact_not_found() {
+    let temp = tempfile::tempdir().unwrap();
+    let hdt = make_representative_hdt(temp.path());
+    let (ok, stdout, stderr) = run_search(
+        &hdt,
+        "<http://example.org/alice> <http://example.org/knows> <http://example.org/alice>",
+        &[],
+    );
+    assert!(ok, "hdtc search should succeed even with zero results: {stderr}");
+    let triples = parse_tab_triples(&stdout);
+    assert_eq!(
+        triples.len(),
+        0,
+        "Expected 0 results for non-existent triple, got {triples:#?}"
+    );
+}
+
+/// `S?O` with a lang-tagged literal object (S?O pattern, Phase 1 scope).
+#[test]
+fn test_search_subject_literal_object() {
+    let temp = tempfile::tempdir().unwrap();
+    let hdt = make_representative_hdt(temp.path());
+    // alice ? "Alice"@en — subject+object bound (S?O)
+    let (ok, stdout, stderr) =
+        run_search(&hdt, "<http://example.org/alice> ? \"Alice\"@en", &[]);
+    assert!(ok, "hdtc search failed: {stderr}");
+    let triples = parse_tab_triples(&stdout);
+    assert_eq!(
+        triples.len(),
+        1,
+        "Expected 1 triple for alice ? \"Alice\"@en, got {}: {triples:#?}",
+        triples.len()
+    );
+}
+
+/// `S?O` with a typed literal object (S?O pattern, Phase 1 scope).
+#[test]
+fn test_search_subject_typed_literal_object() {
+    let temp = tempfile::tempdir().unwrap();
+    let hdt = make_representative_hdt(temp.path());
+    // alice ? "30"^^xsd:integer — subject+object bound (S?O)
+    let (ok, stdout, stderr) = run_search(
+        &hdt,
+        "<http://example.org/alice> ? \"30\"^^<http://www.w3.org/2001/XMLSchema#integer>",
+        &[],
+    );
+    assert!(ok, "hdtc search failed: {stderr}");
+    let triples = parse_tab_triples(&stdout);
+    assert_eq!(
+        triples.len(),
+        1,
+        "Expected 1 triple for alice ? \"30\"^^xsd:integer, got {}: {triples:#?}",
+        triples.len()
+    );
+}
+
+/// `??O` (object-bound only) returns an error because the index is required (Phase 3).
+#[test]
+fn test_search_object_bound_requires_index() {
+    let temp = tempfile::tempdir().unwrap();
+    let hdt = make_representative_hdt(temp.path());
+    let (ok, _stdout, stderr) = run_search(&hdt, "? ? \"Alice\"@en", &[]);
+    assert!(!ok, "Expected hdtc search to fail for ??O without index");
+    assert!(
+        stderr.contains("index") || stderr.contains("Phase"),
+        "Error message should mention index requirement: {stderr}"
+    );
+}
+
+/// `?P?` (predicate-bound only) returns an error because the index is required.
+#[test]
+fn test_search_predicate_bound_requires_index() {
+    let temp = tempfile::tempdir().unwrap();
+    let hdt = make_representative_hdt(temp.path());
+    let (ok, _stdout, stderr) = run_search(&hdt, "? <http://example.org/knows> ?", &[]);
+    assert!(!ok, "Expected hdtc search to fail for ?P? without index");
+    assert!(
+        stderr.contains("index") || stderr.contains("Phase"),
+        "Error message should mention index requirement: {stderr}"
+    );
+}
+
+/// `--count` with `--limit` warns on stderr and counts all.
+#[test]
+fn test_search_count_with_limit_warns() {
+    let temp = tempfile::tempdir().unwrap();
+    let hdt = make_representative_hdt(temp.path());
+    let (ok, stdout, stderr) = run_search(&hdt, "? ? ?", &["--count", "--limit", "3"]);
+    assert!(ok, "hdtc search failed: {stderr}");
+    let count: u64 = stdout.trim().parse().expect("Expected a number");
+    // count should be total (8), not limited
+    assert_eq!(count, 8, "Expected count=8 regardless of --limit when --count is set");
+    assert!(
+        stderr.contains("ignored") || stderr.contains("warn") || stderr.to_lowercase().contains("limit"),
+        "Expected warning about --limit being ignored with --count: {stderr}"
+    );
+}
+
+/// `--output` writes triples to a file; stdout is empty.
+#[test]
+fn test_search_output_to_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let hdt = make_representative_hdt(temp.path());
+    let out = temp.path().join("results.nt");
+
+    let (ok, stdout, stderr) = run_search(
+        &hdt,
+        "<http://example.org/alice> ? ?",
+        &["--output", out.to_str().unwrap()],
+    );
+    assert!(ok, "hdtc search failed: {stderr}");
+    assert!(stdout.is_empty(), "Expected no stdout output when --output is given");
+
+    let content = std::fs::read_to_string(&out).unwrap();
+    let triples = parse_tab_triples(&content);
+    assert_eq!(triples.len(), 5, "Expected 5 triples in output file, got {triples:#?}");
+}
+
+/// `--count --output` writes the count to the file; stdout is empty.
+#[test]
+fn test_search_count_output_to_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let hdt = make_representative_hdt(temp.path());
+    let out = temp.path().join("count.txt");
+
+    let (ok, stdout, stderr) = run_search(
+        &hdt,
+        "? ? ?",
+        &["--count", "--output", out.to_str().unwrap()],
+    );
+    assert!(ok, "hdtc search failed: {stderr}");
+    assert!(stdout.is_empty(), "Expected no stdout when --count --output is set");
+
+    let content = std::fs::read_to_string(&out).unwrap();
+    let count: u64 = content.trim().parse().expect("Expected a number in output file");
+    assert_eq!(count, 8, "Expected count=8 in output file, got {count}");
+}
+
+/// Dump output is tab-delimited and parseable as N-Triples.
+#[test]
+fn test_dump_tab_delimited() {
+    let temp = tempfile::tempdir().unwrap();
+    let hdt = make_representative_hdt(temp.path());
+    let output_nt = temp.path().join("dumped.nt");
+
+    let status = Command::new(env!("CARGO_BIN_EXE_hdtc"))
+        .args([
+            "dump",
+            hdt.to_str().unwrap(),
+            "-o",
+            output_nt.to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute hdtc dump");
+
+    assert!(
+        status.status.success(),
+        "hdtc dump failed: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+
+    let content = std::fs::read_to_string(&output_nt).unwrap();
+    // Each line should contain tabs (our new format).
+    let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
+    assert_eq!(lines.len(), 8, "Expected 8 triples in dump output");
+    for line in &lines {
+        assert!(
+            line.contains('\t'),
+            "Expected tab-delimited format in dump output, got: {line:?}"
+        );
+        assert!(
+            line.ends_with("\t."),
+            "Expected line to end with '\\t.' in dump output, got: {line:?}"
+        );
+    }
+}
