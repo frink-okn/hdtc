@@ -4,6 +4,8 @@ A Rust command-line tool for converting RDF files to [HDT](https://www.rdfhdt.or
 
 HDT files produced by hdtc are fully compatible with [hdt-java](https://github.com/rdfhdt/hdt-java) and [hdt-cpp](https://github.com/rdfhdt/hdt-cpp).
 
+Development of hdtc is done primarily through Claude Code.
+
 ## Features
 
 - **All standard RDF formats** — N-Triples, N-Quads, Turtle, TriG, RDF/XML, JSON-LD, N3
