@@ -133,6 +133,33 @@ fn test_search_limit() {
     );
 }
 
+/// `--offset 2 --limit 3` skips first 2 matches, then returns next 3.
+#[test]
+fn test_search_offset_with_limit() {
+    let temp = tempfile::tempdir().unwrap();
+    let hdt = make_representative_hdt(temp.path());
+    let (ok, stdout, stderr) = run_search(&hdt, "? ? ?", &["--offset", "2", "--limit", "3"]);
+    assert!(ok, "hdtc search failed: {stderr}");
+    let triples = parse_tab_triples(&stdout);
+    assert_eq!(
+        triples.len(),
+        3,
+        "Expected 3 triples with --offset 2 --limit 3, got {}",
+        triples.len()
+    );
+}
+
+/// `--offset` past the end returns no rows.
+#[test]
+fn test_search_offset_past_end() {
+    let temp = tempfile::tempdir().unwrap();
+    let hdt = make_representative_hdt(temp.path());
+    let (ok, stdout, stderr) = run_search(&hdt, "? ? ?", &["--offset", "100"]);
+    assert!(ok, "hdtc search failed: {stderr}");
+    let triples = parse_tab_triples(&stdout);
+    assert_eq!(triples.len(), 0, "Expected 0 triples with large offset");
+}
+
 /// `S??` returns all triples with alice as subject (5 triples).
 #[test]
 fn test_search_subject_bound() {
@@ -326,19 +353,6 @@ fn test_search_object_bound_requires_index() {
     );
 }
 
-/// `?P?` (predicate-bound only) returns an error because the index is required.
-#[test]
-fn test_search_predicate_bound_requires_index() {
-    let temp = tempfile::tempdir().unwrap();
-    let hdt = make_representative_hdt(temp.path());
-    let (ok, _stdout, stderr) = run_search(&hdt, "? <http://example.org/knows> ?", &[]);
-    assert!(!ok, "Expected hdtc search to fail for ?P? without index");
-    assert!(
-        stderr.contains("index") || stderr.contains("Phase"),
-        "Error message should mention index requirement: {stderr}"
-    );
-}
-
 /// `--count` with `--limit` warns on stderr and counts all.
 #[test]
 fn test_search_count_with_limit_warns() {
@@ -352,6 +366,21 @@ fn test_search_count_with_limit_warns() {
     assert!(
         stderr.contains("ignored") || stderr.contains("warn") || stderr.to_lowercase().contains("limit"),
         "Expected warning about --limit being ignored with --count: {stderr}"
+    );
+}
+
+/// `--count` with `--offset` warns on stderr and counts all.
+#[test]
+fn test_search_count_with_offset_warns() {
+    let temp = tempfile::tempdir().unwrap();
+    let hdt = make_representative_hdt(temp.path());
+    let (ok, stdout, stderr) = run_search(&hdt, "? ? ?", &["--count", "--offset", "3"]);
+    assert!(ok, "hdtc search failed: {stderr}");
+    let count: u64 = stdout.trim().parse().expect("Expected a number");
+    assert_eq!(count, 8, "Expected count=8 regardless of --offset when --count is set");
+    assert!(
+        stderr.contains("ignored") || stderr.contains("warn") || stderr.to_lowercase().contains("offset"),
+        "Expected warning about --offset being ignored with --count: {stderr}"
     );
 }
 
@@ -393,6 +422,194 @@ fn test_search_count_output_to_file() {
     let content = std::fs::read_to_string(&out).unwrap();
     let count: u64 = content.trim().parse().expect("Expected a number in output file");
     assert_eq!(count, 8, "Expected count=8 in output file, got {count}");
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2 helpers and tests: `?P?` via predicate index
+// ---------------------------------------------------------------------------
+
+/// Create an HDT file AND its index in `temp_dir`.
+fn make_representative_hdt_with_index(temp_dir: &Path) -> std::path::PathBuf {
+    let hdt = make_representative_hdt(temp_dir);
+
+    let status = Command::new(env!("CARGO_BIN_EXE_hdtc"))
+        .args(["index", hdt.to_str().unwrap()])
+        .output()
+        .expect("Failed to execute hdtc index");
+
+    assert!(
+        status.status.success(),
+        "hdtc index failed: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+
+    hdt
+}
+
+/// `?P?` with the `knows` predicate returns exactly 2 triples (alice→bob, bob→alice).
+#[test]
+fn test_search_predicate_bound_knows() {
+    let temp = tempfile::tempdir().unwrap();
+    let hdt = make_representative_hdt_with_index(temp.path());
+    let (ok, stdout, stderr) = run_search(&hdt, "? <http://example.org/knows> ?", &[]);
+    assert!(ok, "hdtc search ?P? failed: {stderr}");
+    let triples = parse_tab_triples(&stdout);
+    assert_eq!(
+        triples.len(),
+        2,
+        "Expected 2 triples for ?-knows-?, got {}: {triples:#?}",
+        triples.len()
+    );
+    for triple in &triples {
+        assert!(
+            triple.contains("<http://example.org/knows>"),
+            "Expected knows predicate in: {triple}"
+        );
+    }
+}
+
+/// `?P?` with the `age` predicate returns exactly 1 triple.
+#[test]
+fn test_search_predicate_bound_age() {
+    let temp = tempfile::tempdir().unwrap();
+    let hdt = make_representative_hdt_with_index(temp.path());
+    let (ok, stdout, stderr) = run_search(&hdt, "? <http://example.org/age> ?", &[]);
+    assert!(ok, "hdtc search ?P? failed: {stderr}");
+    let triples = parse_tab_triples(&stdout);
+    assert_eq!(
+        triples.len(),
+        1,
+        "Expected 1 triple for ?-age-?, got {}: {triples:#?}",
+        triples.len()
+    );
+}
+
+/// `?P?` with the `label` predicate returns exactly 2 triples (two language tags).
+#[test]
+fn test_search_predicate_bound_label() {
+    let temp = tempfile::tempdir().unwrap();
+    let hdt = make_representative_hdt_with_index(temp.path());
+    let (ok, stdout, stderr) = run_search(&hdt, "? <http://example.org/label> ?", &[]);
+    assert!(ok, "hdtc search ?P? failed: {stderr}");
+    let triples = parse_tab_triples(&stdout);
+    assert_eq!(
+        triples.len(),
+        2,
+        "Expected 2 label triples, got {}: {triples:#?}",
+        triples.len()
+    );
+    for triple in &triples {
+        assert!(triple.contains("<http://example.org/label>"));
+    }
+}
+
+/// `?P?` with the `name` predicate returns exactly 2 triples.
+#[test]
+fn test_search_predicate_bound_name() {
+    let temp = tempfile::tempdir().unwrap();
+    let hdt = make_representative_hdt_with_index(temp.path());
+    let (ok, stdout, stderr) = run_search(&hdt, "? <http://example.org/name> ?", &[]);
+    assert!(ok, "hdtc search ?P? failed: {stderr}");
+    let triples = parse_tab_triples(&stdout);
+    assert_eq!(
+        triples.len(),
+        2,
+        "Expected 2 name triples, got {}: {triples:#?}",
+        triples.len()
+    );
+}
+
+/// `?P?` with a predicate not in the dictionary returns 0 results (not an error).
+#[test]
+fn test_search_predicate_bound_unknown() {
+    let temp = tempfile::tempdir().unwrap();
+    let hdt = make_representative_hdt_with_index(temp.path());
+    let (ok, stdout, stderr) =
+        run_search(&hdt, "? <http://example.org/nonexistent> ?", &[]);
+    assert!(ok, "hdtc search should succeed with 0 results: {stderr}");
+    let triples = parse_tab_triples(&stdout);
+    assert_eq!(
+        triples.len(),
+        0,
+        "Expected 0 results for unknown predicate, got {triples:#?}"
+    );
+}
+
+/// `?P?` with `--count` emits only the count.
+#[test]
+fn test_search_predicate_bound_count() {
+    let temp = tempfile::tempdir().unwrap();
+    let hdt = make_representative_hdt_with_index(temp.path());
+    let (ok, stdout, stderr) =
+        run_search(&hdt, "? <http://example.org/knows> ?", &["--count"]);
+    assert!(ok, "hdtc search ?P? --count failed: {stderr}");
+    let count: u64 = stdout.trim().parse().expect("Expected a number in stdout");
+    assert_eq!(count, 2, "Expected count=2 for ?-knows-?, got {count}");
+}
+
+/// `?P?` with `--limit 1` stops after 1 result.
+#[test]
+fn test_search_predicate_bound_limit() {
+    let temp = tempfile::tempdir().unwrap();
+    let hdt = make_representative_hdt_with_index(temp.path());
+    let (ok, stdout, stderr) =
+        run_search(&hdt, "? <http://example.org/knows> ?", &["--limit", "1"]);
+    assert!(ok, "hdtc search ?P? --limit failed: {stderr}");
+    let triples = parse_tab_triples(&stdout);
+    assert_eq!(
+        triples.len(),
+        1,
+        "Expected 1 triple with --limit 1, got {}: {triples:#?}",
+        triples.len()
+    );
+}
+
+/// `?P?` with `--offset 1` skips the first match and returns one remaining row.
+#[test]
+fn test_search_predicate_bound_offset() {
+    let temp = tempfile::tempdir().unwrap();
+    let hdt = make_representative_hdt_with_index(temp.path());
+    let (ok, stdout, stderr) =
+        run_search(&hdt, "? <http://example.org/knows> ?", &["--offset", "1"]);
+    assert!(ok, "hdtc search ?P? --offset failed: {stderr}");
+    let triples = parse_tab_triples(&stdout);
+    assert_eq!(
+        triples.len(),
+        1,
+        "Expected 1 triple for ?-knows-? with --offset 1, got {}: {triples:#?}",
+        triples.len()
+    );
+}
+
+/// `?P?` with `--no-index` falls back to sequential scan and still returns correct results.
+#[test]
+fn test_search_predicate_bound_no_index_fallback() {
+    let temp = tempfile::tempdir().unwrap();
+    // Note: no index created here — --no-index forces sequential fallback.
+    let hdt = make_representative_hdt(temp.path());
+    let (ok, stdout, stderr) =
+        run_search(&hdt, "? <http://example.org/knows> ?", &["--no-index"]);
+    assert!(ok, "hdtc search ?P? --no-index failed: {stderr}");
+    let triples = parse_tab_triples(&stdout);
+    assert_eq!(
+        triples.len(),
+        2,
+        "Expected 2 triples with --no-index fallback, got {}: {triples:#?}",
+        triples.len()
+    );
+}
+
+/// `?P?` without an index and without `--no-index` returns an error.
+#[test]
+fn test_search_predicate_bound_requires_index() {
+    let temp = tempfile::tempdir().unwrap();
+    let hdt = make_representative_hdt(temp.path());
+    let (ok, _stdout, stderr) = run_search(&hdt, "? <http://example.org/knows> ?", &[]);
+    assert!(!ok, "Expected hdtc search to fail for ?P? without index");
+    assert!(
+        stderr.contains("index"),
+        "Error message should mention index requirement: {stderr}"
+    );
 }
 
 /// Dump output is tab-delimited and parseable as N-Triples.

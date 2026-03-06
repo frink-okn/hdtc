@@ -11,6 +11,7 @@ mod triples;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tracing_subscriber::EnvFilter;
 
 /// Raise the soft file descriptor limit toward the hard limit.
@@ -41,7 +42,28 @@ fn raise_fd_limit() -> Option<(u64, u64)> {
     None
 }
 
+fn make_default_temp_dir() -> Result<std::path::PathBuf> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("hdtc_work_{}_{}", std::process::id(), now));
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("Failed to create temp dir {}", dir.display()))?;
+    Ok(dir)
+}
+
 fn main() -> Result<()> {
+    // Restore SIGPIPE to its default disposition so that piping to tools like
+    // `head` or `grep` terminates the process silently (exit 141) rather than
+    // propagating EPIPE as an error.  Rust sets SIGPIPE to SIG_IGN at startup,
+    // which causes broken-pipe writes to return an error instead of killing
+    // the process, resulting in a spurious "Broken pipe" message on stderr.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
     let raised_fd_limit = raise_fd_limit();
 
     let cli = cli::Cli::parse();
@@ -104,11 +126,7 @@ fn create_hdt(args: cli::CreateArgs, benchmark: bool) -> Result<()> {
                 .with_context(|| format!("Failed to create temp dir {}", dir.display()))?;
             dir.clone()
         }
-        None => {
-            let dir = std::env::temp_dir().join("hdtc_work");
-            std::fs::create_dir_all(&dir)?;
-            dir
-        }
+        None => make_default_temp_dir()?,
     };
     tracing::info!("Temp directory: {}", temp_dir.display());
 
@@ -210,11 +228,7 @@ fn create_index_from_hdt(args: cli::IndexArgs, benchmark: bool) -> Result<()> {
                 .with_context(|| format!("Failed to create temp dir {}", dir.display()))?;
             dir.clone()
         }
-        None => {
-            let dir = std::env::temp_dir().join("hdtc_work");
-            std::fs::create_dir_all(&dir)?;
-            dir
-        }
+        None => make_default_temp_dir()?,
     };
 
     let memory_budget = args.memory_limit.as_bytes();
@@ -261,7 +275,17 @@ fn dump_hdt_to_ntriples(args: cli::DumpArgs, benchmark: bool) -> Result<()> {
     let memory_limit = args.memory_limit.as_bytes();
     tracing::info!("Memory limit: {} bytes", memory_limit);
     let count =
-        hdt::search_hdt_streaming(&args.hdt_file, "? ? ?", args.output.as_deref(), false, None, memory_limit)?;
+        hdt::search_hdt_streaming(
+            &args.hdt_file,
+            "? ? ?",
+            args.output.as_deref(),
+            false,
+            None,
+            None,
+            memory_limit,
+            None,
+            false,
+        )?;
 
     if benchmark {
         tracing::info!(
@@ -286,6 +310,9 @@ fn search_hdt(args: cli::SearchArgs, benchmark: bool) -> Result<()> {
     if args.count && args.limit.is_some() {
         tracing::warn!("--limit is ignored when combined with --count; counting all matches");
     }
+    if args.count && args.offset.is_some() {
+        tracing::warn!("--offset is ignored when combined with --count; counting all matches");
+    }
 
     tracing::info!("Searching HDT: {}", args.hdt_file.display());
     tracing::info!("Query: {}", args.query);
@@ -299,7 +326,10 @@ fn search_hdt(args: cli::SearchArgs, benchmark: bool) -> Result<()> {
         args.output.as_deref(),
         args.count,
         if args.count { None } else { args.limit },
+        if args.count { None } else { args.offset },
         memory_limit,
+        args.index.as_deref(),
+        args.no_index,
     )?;
 
     if benchmark {

@@ -198,6 +198,18 @@ pub struct SearchArgs {
     #[arg(long, value_name = "N")]
     pub limit: Option<u64>,
 
+    /// Skip the first N matching results
+    #[arg(long, value_name = "N")]
+    pub offset: Option<u64>,
+
+    /// Index file path (default: <HDT_FILE>.hdt.index.v1-1)
+    #[arg(long, value_name = "PATH")]
+    pub index: Option<PathBuf>,
+
+    /// Disable index use; fall back to sequential scan for all patterns
+    #[arg(long)]
+    pub no_index: bool,
+
     /// Soft memory limit for dictionary caches (e.g. 4G, 2000M)
     #[arg(short = 'm', long, value_name = "SIZE", default_value = "4G")]
     pub memory_limit: MemorySize,

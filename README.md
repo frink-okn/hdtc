@@ -13,7 +13,7 @@ HDT files produced by hdtc are fully compatible with [hdt-java](https://github.c
 - **Multiple inputs** — accepts any mix of RDF files, HDT files, and directories; recursively discovers RDF files
 - **Parallel NT/NQ parsing** — newline-safe chunk parsing for N-Triples/N-Quads (including `.gz`, `.bz2`, `.xz`) with bounded in-flight memory
 - **Quad inputs** — N-Quads and TriG inputs are accepted; the graph component is dropped and triples are indexed normally
-- **Index generation** — optional `.hdt.index.v1-1` for OPS-order queries
+- **Index generation** — optional `.hdt.index.v1-1` enables efficient predicate-bound (`? P ?`) queries
 - **Resilient parsing** — skips malformed triples with warnings, reports total skipped at the end
 
 ## Installation
@@ -184,23 +184,48 @@ Limit output to the first 10 results:
 hdtc search existing.hdt --query "<http://example.org/alice> ? ?" --limit 10
 ```
 
+Skip the first 20 matches, then return up to 10 results:
+
+```sh
+hdtc search existing.hdt --query "? ? ?" --offset 20 --limit 10
+```
+
 Write results to a file:
 
 ```sh
 hdtc search existing.hdt --query "<http://example.org/alice> ? ?" -o alice.nt
 ```
 
-**Supported patterns** (no index required):
+Find all triples with a given predicate (requires index):
 
-| Pattern | Example |
-| ------- | ------- |
-| `? ? ?` | All triples |
-| `S ? ?` | All triples for a subject |
-| `S P ?` | All objects for a subject–predicate pair |
-| `S ? O` | All predicates linking a subject to an object |
-| `S P O` | Exact triple lookup |
+```sh
+hdtc search data.hdt --query "? <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?"
+```
 
-Patterns beginning with `?` (e.g. `? P ?`, `? ? O`) require an OPS index (Phase 2/3, not yet implemented).
+Same query using a sequential scan fallback (no index needed):
+
+```sh
+hdtc search data.hdt --query "? <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?" --no-index
+```
+
+Use an index file at a non-default path:
+
+```sh
+hdtc search data.hdt --query "? <http://xmlns.com/foaf/0.1/knows> ?" --index /path/to/data.hdt.index.v1-1
+```
+
+**Supported patterns:**
+
+| Pattern | Index required?       | Description                                   |
+| ------- | --------------------- | --------------------------------------------- |
+| `? ? ?` | No                    | All triples                                   |
+| `S ? ?` | No                    | All triples for a subject                     |
+| `S P ?` | No                    | All objects for a subject–predicate pair      |
+| `S ? O` | No                    | All predicates linking a subject to an object |
+| `S P O` | No                    | Exact triple lookup                           |
+| `? P ?` | Yes (or `--no-index`) | All triples with a given predicate            |
+
+For `? P ?`, hdtc uses the `.hdt.index.v1-1` sidecar file (auto-detected next to the HDT file, or specified with `--index`). Pass `--no-index` to fall back to a sequential full scan instead. Patterns `? ? O` and `? P O` are planned for a future release.
 
 ### Create: All options
 
@@ -246,16 +271,19 @@ Auto parser tuning is derived from `--memory-limit` (accepts `G`/`M` suffixes, e
 
 ### Search: All options
 
-| Option                | Default      | Description                                                          |
-| --------------------- | ------------ | -------------------------------------------------------------------- |
-| `<HDT_FILE>`          | _(required)_ | Path to existing HDT file                                            |
-| `--query PATTERN`     | _(required)_ | Triple pattern (three N-Triples terms, `?` or `*` as wildcard)       |
-| `-o, --output PATH`   | stdout       | Write results to file instead of stdout                              |
-| `--count`             | off          | Print only the count of matching triples                             |
-| `--limit N`           | unlimited    | Stop after N results (ignored when combined with `--count`)          |
-| `--memory-limit SIZE` | `4G`         | Soft memory limit for dictionary caches (e.g. `4G`, `2000M`)        |
-| `-v, --verbose`       | —            | Increase log verbosity (`-v` debug, `-vv` trace)                     |
-| `-q, --quiet`         | —            | Suppress all output except errors                                    |
+| Option                | Default                     | Description                                                              |
+| --------------------- | --------------------------- | ------------------------------------------------------------------------ |
+| `<HDT_FILE>`          | _(required)_                | Path to existing HDT file                                                |
+| `--query PATTERN`     | _(required)_                | Triple pattern (three N-Triples terms, `?` or `*` as wildcard)           |
+| `-o, --output PATH`   | stdout                      | Write results to file instead of stdout                                  |
+| `--count`             | off                         | Print only the count of matching triples                                 |
+| `--limit N`           | unlimited                   | Stop after N results (ignored when combined with `--count`)              |
+| `--offset N`          | 0                           | Skip the first N matching results (ignored when combined with `--count`) |
+| `--index PATH`        | `<HDT_FILE>.hdt.index.v1-1` | Index file path (used for `? P ?` queries)                               |
+| `--no-index`          | off                         | Disable index use; fall back to sequential scan for all patterns         |
+| `--memory-limit SIZE` | `4G`                        | Soft memory limit for dictionary caches (e.g. `4G`, `2000M`)             |
+| `-v, --verbose`       | —                           | Increase log verbosity (`-v` debug, `-vv` trace)                         |
+| `-q, --quiet`         | —                           | Suppress all output except errors                                        |
 
 ## Resource requirements
 

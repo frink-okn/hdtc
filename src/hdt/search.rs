@@ -1,4 +1,4 @@
-//! HDT triple-pattern search engine (Phase 1).
+//! HDT triple-pattern search engine (Phase 1 + Phase 2).
 //!
 //! Supports the following query patterns without an index file:
 //!
@@ -8,13 +8,20 @@
 //! - `S?O`  — subject + object bound
 //! - `SPO`  — exact triple lookup
 //!
-//! Patterns requiring the index file (`?P?`, `??O`, `?PO`) are planned for
-//! Phase 2 and Phase 3 and will return a clear error for now.
+//! Supports with a `.hdt.index.v1-1` sidecar index (Phase 2):
+//!
+//! - `?P?`  — predicate bound, uses predicateIndex for efficient lookup
+//!
+//! Patterns `??O` and `?PO` are planned for Phase 3.
 
-use crate::hdt::reader::{BitmapTriplesScanner, open_hdt, write_triple_tab};
+use crate::hdt::index_reader::{open_index, open_index_section};
+use crate::hdt::reader::{BitmapTriplesScanner, DictionaryResolver, HdtSectionOffsets, open_hdt, write_triple_tab};
+use crate::io::{StreamingBitmapDecoder, StreamingLogArrayDecoder};
 use anyhow::{Context, Result, bail};
-use std::io::Write;
-use std::path::Path;
+use std::fs::File;
+use std::io::{BufReader, SeekFrom, Write};
+use std::io::Seek;
+use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
 // Query term and pattern
@@ -46,7 +53,7 @@ pub enum PatternKind {
     SubjectObjectBound,
     /// `SPO` — exact triple.
     Exact,
-    /// `?P?` — predicate bound only (requires index — Phase 2).
+    /// `?P?` — predicate bound only (requires index).
     PredicateBound,
     /// `??O` — object bound only (requires index — Phase 3).
     ObjectBound,
@@ -299,6 +306,198 @@ fn push_codepoint(buf: &mut Vec<u8>, codepoint: u32) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Index path resolution
+// ---------------------------------------------------------------------------
+
+fn resolve_index_path(hdt_path: &Path, explicit: Option<&Path>) -> PathBuf {
+    if let Some(p) = explicit {
+        p.to_path_buf()
+    } else {
+        hdt_path.with_extension("hdt.index.v1-1")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ?P? search using predicate index
+// ---------------------------------------------------------------------------
+
+/// Search for all triples matching `? <pred_id> ?` using the predicate index.
+///
+/// Opens five streaming decoders simultaneously — `predicateIndex.bitmap`,
+/// `predicateIndex.seq`, `BitmapY`, `BitmapZ`, and `ArrayZ` — and interleaves
+/// their reads in a single forward pass.  No intermediate buffer proportional
+/// to the predicate's frequency is allocated; memory is O(1).
+///
+/// The predIndex group for `pred_id` is scanned entry by entry.  Each `pos_y`
+/// value obtained from `predicateIndex.seq` is used immediately to advance
+/// BitmapY/BitmapZ/ArrayZ and emit the matching object triples before
+/// moving on to the next predIndex entry.
+///
+/// Writes triples to `writer` unless `count_only` is true. Returns the triple count.
+#[allow(clippy::too_many_arguments)]
+fn search_predicate_bound(
+    hdt_path: &Path,
+    index_path: &Path,
+    pred_id: u64,
+    offsets: &HdtSectionOffsets,
+    dictionary: &mut DictionaryResolver,
+    writer: &mut crate::hdt::reader::OutputWriter,
+    count_only: bool,
+    offset: Option<u64>,
+    limit: Option<u64>,
+) -> Result<u64> {
+    let idx = open_index(index_path)
+        .with_context(|| format!("Failed to read index file {}", index_path.display()))?;
+
+    let mut p_buf = Vec::new();
+    let mut predicate_resolved = false;
+
+    let open_at = |section_offset: u64| -> Result<BufReader<File>> {
+        let mut f = File::open(hdt_path)
+            .with_context(|| format!("Failed to open {}", hdt_path.display()))?;
+        f.seek(SeekFrom::Start(section_offset))?;
+        Ok(BufReader::with_capacity(256 * 1024, f))
+    };
+
+    // Open all five streaming decoders. ArrayY is not needed — we already know
+    // the predicate ID. predicateIndex.bitmap/seq guide the BitmapY/BitmapZ/ArrayZ scan.
+    let mut pred_bitmap = StreamingBitmapDecoder::new(
+        open_index_section(index_path, idx.pred_bitmap_start)?,
+    )
+    .context("Failed to open predicateIndex.bitmap decoder")?;
+
+    let mut pred_seq = StreamingLogArrayDecoder::new(
+        open_index_section(index_path, idx.pred_seq_start)?,
+    )
+    .context("Failed to open predicateIndex.seq decoder")?;
+
+    let mut bitmap_y = StreamingBitmapDecoder::new(open_at(offsets.by_start)?)
+        .context("Failed to open BitmapY decoder")?;
+    let mut bitmap_z = StreamingBitmapDecoder::new(open_at(offsets.bz_start)?)
+        .context("Failed to open BitmapZ decoder")?;
+    let mut array_z = StreamingLogArrayDecoder::new(open_at(offsets.az_start)?)
+        .context("Failed to open ArrayZ decoder")?;
+
+    // Predicate groups in predicateIndex are 1-based and delimited by 1-bits.
+    // Scan forward through groups 1..(pred_id-1), then process group pred_id.
+    let mut groups_passed = 0u64;
+    let mut in_target = pred_id == 1;
+    let mut by_pos = 0u64; // (S,P) pairs consumed so far in BitmapY
+    let mut subject = 1u64;
+    let mut count = 0u64;
+    let mut remaining_offset = offset.unwrap_or(0);
+    let mut s_buf = Vec::new();
+    let mut o_buf = Vec::new();
+    let mut prev_s = 0u64;
+
+    'scan: loop {
+        let Some(pred_bit) = pred_bitmap.next_bit()? else {
+            break;
+        };
+        let Some(pos_y) = pred_seq.next_entry()? else {
+            break;
+        };
+
+        if !in_target {
+            // Still scanning pre-target groups; a 1-bit marks the end of a group.
+            if pred_bit {
+                groups_passed += 1;
+                if groups_passed == pred_id - 1 {
+                    in_target = true;
+                }
+            }
+            continue;
+        }
+
+        // We're in predicate P's group.  Advance BitmapY + BitmapZ from
+        // `by_pos` to `pos_y`, skipping all objects for intervening (S,P) pairs.
+        while by_pos < pos_y {
+            loop {
+                let bz_bit = bitmap_z.next_bit()?.with_context(|| {
+                    format!("BitmapZ ended early skipping to pos_y {pos_y} (at {by_pos})")
+                })?;
+                array_z.next_entry()?.with_context(|| {
+                    format!("ArrayZ ended early skipping to pos_y {pos_y} (at {by_pos})")
+                })?;
+                if bz_bit {
+                    break;
+                }
+            }
+            let by_bit = bitmap_y.next_bit()?.with_context(|| {
+                format!("BitmapY ended early skipping to pos_y {pos_y} (at {by_pos})")
+            })?;
+            if by_bit {
+                subject += 1;
+            }
+            by_pos += 1;
+        }
+
+        // Emit all objects for the (S,P) pair at `pos_y`.
+        loop {
+            let object = array_z
+                .next_entry()?
+                .with_context(|| format!("ArrayZ ended early at target pos_y {pos_y}"))?;
+            let bz_bit = bitmap_z
+                .next_bit()?
+                .with_context(|| format!("BitmapZ ended early at target pos_y {pos_y}"))?;
+
+            if remaining_offset > 0 {
+                remaining_offset -= 1;
+                if bz_bit {
+                    break;
+                }
+                continue;
+            }
+
+            count += 1;
+            if !count_only {
+                if !predicate_resolved {
+                    dictionary
+                        .predicate_term(pred_id, &mut p_buf)
+                        .with_context(|| format!("Failed to resolve predicate ID {pred_id}"))?;
+                    predicate_resolved = true;
+                }
+                if subject != prev_s {
+                    dictionary
+                        .subject_term(subject, &mut s_buf)
+                        .with_context(|| format!("Failed to resolve subject ID {subject}"))?;
+                    prev_s = subject;
+                }
+                dictionary
+                    .object_term(object, &mut o_buf)
+                    .with_context(|| format!("Failed to resolve object ID {object}"))?;
+                write_triple_tab(writer, &s_buf, &p_buf, &o_buf)?;
+            }
+
+            if let Some(lim) = limit
+                && count >= lim
+            {
+                break 'scan;
+            }
+
+            if bz_bit {
+                break;
+            }
+        }
+
+        // Consume the BitmapY bit for `pos_y` to keep the subject counter current.
+        let by_bit = bitmap_y.next_bit()?.with_context(|| {
+            format!("BitmapY ended early after emitting pos_y {pos_y}")
+        })?;
+        if by_bit {
+            subject += 1;
+        }
+        by_pos += 1;
+
+        if pred_bit {
+            break 'scan; // end of predicate P's group
+        }
+    }
+
+    Ok(count)
+}
+
+// ---------------------------------------------------------------------------
 // Main search function
 // ---------------------------------------------------------------------------
 
@@ -307,29 +506,36 @@ fn push_codepoint(buf: &mut Vec<u8>, codepoint: u32) -> Result<()> {
 /// - `query`: space-separated triple pattern in N-Triples syntax (`?` as wildcard)
 /// - `output`: `None` = stdout, `Some(path)` = write to file
 /// - `count_only`: if true, emit only the count (nothing to stdout except the number)
-/// - `limit`: stop after this many results (`None` = no limit)
+/// - `limit`: stop after this many results (`None` = no limit; ignored when `count_only`)
+/// - `offset`: skip this many matching results before emitting/counting
 /// - `memory_limit`: budget for the PFC block caches
+/// - `index_path`: explicit index file path; `None` = auto-derive as `<hdt>.hdt.index.v1-1`
+/// - `no_index`: if true, skip the index and fall back to sequential scan for all patterns
 ///
 /// Returns the count of matching triples.
+#[allow(clippy::too_many_arguments)]
 pub fn search_hdt_streaming(
     hdt_path: &Path,
     query: &str,
     output: Option<&Path>,
     count_only: bool,
     limit: Option<u64>,
+    offset: Option<u64>,
     memory_limit: usize,
+    index_path: Option<&Path>,
+    no_index: bool,
 ) -> Result<u64> {
     let (s_term, p_term, o_term) =
         parse_query(query).with_context(|| format!("Invalid query: {query:?}"))?;
 
     let kind = PatternKind::from_terms(&s_term, &p_term, &o_term);
 
-    // Phase 1 only covers patterns that don't need an index.
+    // Phase 3 patterns are not yet supported.
     match kind {
-        PatternKind::PredicateBound | PatternKind::ObjectBound | PatternKind::PredicateObjectBound => {
+        PatternKind::ObjectBound | PatternKind::PredicateObjectBound => {
             bail!(
-                "Pattern {:?} requires an index file. Run `hdtc index <HDT_FILE>` first, \
-                 then retry (index-based queries are coming in Phase 2/3).",
+                "Pattern {:?} requires an object index file. \
+                 Object-index queries are coming in Phase 3.",
                 kind
             );
         }
@@ -365,6 +571,44 @@ pub fn search_hdt_streaming(
         },
     };
 
+    // Phase 2: predicate-bound query — use the predicate index when available.
+    if kind == PatternKind::PredicateBound && !no_index {
+        let pred_id = p_id.expect("p_id must be set for PredicateBound");
+        let eff_index = resolve_index_path(hdt_path, index_path);
+
+        if !eff_index.exists() {
+            bail!(
+                "Pattern ?P? requires an index file.\n\
+                 Expected: {}\n\
+                 Run `hdtc index {}` to create one, \
+                 or pass `--no-index` to fall back to a sequential scan.",
+                eff_index.display(),
+                hdt_path.display()
+            );
+        }
+
+        let mut writer = crate::hdt::reader::make_writer(output)?;
+        let count = search_predicate_bound(
+            hdt_path,
+            &eff_index,
+            pred_id,
+            &offsets,
+            &mut dictionary,
+            &mut writer,
+            count_only,
+            offset,
+            limit,
+        )?;
+        if count_only {
+            writeln!(writer, "{count}")?;
+        }
+        writer.flush()?;
+        return Ok(count);
+    }
+
+    // For PredicateBound with --no-index, or all other patterns:
+    // fall through to the sequential scan below.
+
     let mut scanner = BitmapTriplesScanner::new(&offsets, hdt_path)
         .context("Failed to create BitmapTriples scanner")?;
 
@@ -372,6 +616,7 @@ pub fn search_hdt_streaming(
     let mut writer = crate::hdt::reader::make_writer(output)?;
 
     let mut count = 0u64;
+    let mut remaining_offset = offset.unwrap_or(0);
     let mut subject_buf = Vec::new();
     let mut predicate_buf = Vec::new();
     let mut object_buf = Vec::new();
@@ -402,6 +647,11 @@ pub fn search_hdt_streaming(
         if let Some(target_o) = o_id
             && o != target_o
         {
+            continue;
+        }
+
+        if remaining_offset > 0 {
+            remaining_offset -= 1;
             continue;
         }
 

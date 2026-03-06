@@ -1,4 +1,5 @@
 pub(crate) mod dump;
+pub(crate) mod index_reader;
 pub(crate) mod input_adapter;
 pub(crate) mod pfc_reader;
 pub(crate) mod reader;
