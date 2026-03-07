@@ -150,7 +150,7 @@ If the output file already exists, it is overwritten.
 
 Search using a triple pattern — three N-Triples terms separated by whitespace, with `?` as a wildcard for any position. Outputs tab-delimited N-Triples (`S\tP\tO\t.`) to stdout or a file.
 
-Count all triples (equivalent to `hdtc dump`):
+Output all triples (equivalent to `hdtc dump`):
 
 ```sh
 hdtc search existing.hdt --query "? ? ?"
