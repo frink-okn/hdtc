@@ -464,28 +464,31 @@ impl BitmapReader {
 
     /// Find the position of the nth 1-bit (1-indexed).
     /// select1(1) returns the position of the first 1-bit.
-    #[cfg(test)]
+    ///
+    /// Uses binary search on the rank prefix array for O(log(n_words)) lookup.
     pub fn select1(&self, n: u64) -> Option<u64> {
         if n == 0 {
             return None;
         }
-        let mut remaining = n;
-        for (word_idx, &word) in self.words.iter().enumerate() {
-            let ones = word.count_ones() as u64;
-            if remaining <= ones {
-                // The answer is in this word
-                let mut w = word;
-                for bit_pos in 0..64 {
-                    if w & 1 == 1 {
-                        remaining -= 1;
-                        if remaining == 0 {
-                            return Some(word_idx as u64 * 64 + bit_pos);
-                        }
-                    }
-                    w >>= 1;
+        let total = *self.rank_prefix.last().unwrap_or(&0);
+        if n > total {
+            return None;
+        }
+        // Binary search: rank_prefix[i] = popcount(words[0..i)).
+        // Find the word w where rank_prefix[w] < n <= rank_prefix[w+1].
+        let w = self.rank_prefix.partition_point(|&r| r < n) - 1;
+        let remaining = n - self.rank_prefix[w];
+        // Linear scan within the word to find the remaining-th set bit
+        let mut word = self.words[w];
+        let mut count = 0u64;
+        for bit_pos in 0..64u64 {
+            if word & 1 == 1 {
+                count += 1;
+                if count == remaining {
+                    return Some(w as u64 * 64 + bit_pos);
                 }
             }
-            remaining -= ones;
+            word >>= 1;
         }
         None
     }

@@ -1,6 +1,7 @@
 //! Integration tests for `hdtc search`.
 //!
-//! Covers Phase 1 patterns: `???`, `S??`, `SP?`, `S?O`, `SPO`.
+//! Covers all triple-pattern query types: `???`, `S??`, `SP?`, `S?O`, `SPO`,
+//! `?P?`, `??O`, `?PO`.
 
 mod common;
 
@@ -263,6 +264,24 @@ fn test_search_subject_not_found() {
     );
 }
 
+/// Subject not found with `--count` prints `0`.
+#[test]
+fn test_search_subject_not_found_count_outputs_zero() {
+    let temp = tempfile::tempdir().unwrap();
+    let hdt = make_representative_hdt(temp.path());
+    let (ok, stdout, stderr) = run_search(
+        &hdt,
+        "<http://example.org/nobody> ? ?",
+        &["--count"],
+    );
+    assert!(ok, "hdtc search should succeed even with zero results: {stderr}");
+    assert_eq!(
+        stdout.trim(),
+        "0",
+        "Expected --count to print 0 for non-existent subject"
+    );
+}
+
 /// A predicate not in the dictionary returns 0 results (not an error).
 #[test]
 fn test_search_predicate_not_found_returns_zero() {
@@ -340,7 +359,7 @@ fn test_search_subject_typed_literal_object() {
     );
 }
 
-/// `??O` (object-bound only) returns an error because the index is required (Phase 3).
+/// `??O` without an index and without `--no-index` returns an error.
 #[test]
 fn test_search_object_bound_requires_index() {
     let temp = tempfile::tempdir().unwrap();
@@ -348,7 +367,7 @@ fn test_search_object_bound_requires_index() {
     let (ok, _stdout, stderr) = run_search(&hdt, "? ? \"Alice\"@en", &[]);
     assert!(!ok, "Expected hdtc search to fail for ??O without index");
     assert!(
-        stderr.contains("index") || stderr.contains("Phase"),
+        stderr.contains("index"),
         "Error message should mention index requirement: {stderr}"
     );
 }
@@ -444,6 +463,85 @@ fn make_representative_hdt_with_index(temp_dir: &Path) -> std::path::PathBuf {
     );
 
     hdt
+}
+
+/// Create a skewed HDT+index where one object has a very large group.
+///
+/// Returns `(hdt_path, common_object_term, hot_predicate_term, expected_hot_count_on_common)`.
+fn make_skewed_hdt_with_index(temp_dir: &Path) -> (std::path::PathBuf, String, String, u64) {
+    let common_object = "<http://example.org/commonObject>".to_string();
+    let hot_predicate = "<http://example.org/pHot>".to_string();
+
+    // Ensure object-group size > 4096 so search_object_bound chunking is exercised.
+    let common_group_size = 10_000u64;
+    let mut expected_hot_on_common = 0u64;
+
+    let mut nt = String::new();
+
+    // Large group for one object, with mixed predicates.
+    for i in 0..common_group_size {
+        let subj = format!("<http://example.org/s{i}>");
+        let pred = if i % 64 == 0 {
+            expected_hot_on_common += 1;
+            hot_predicate.clone()
+        } else {
+            format!("<http://example.org/p{}>", i % 31)
+        };
+        nt.push_str(&format!("{subj} {pred} {common_object} .\n"));
+    }
+
+    // Make hot predicate globally very frequent across many other objects so
+    // `count(P)` is much larger than count(commonObject), encouraging ?PO
+    // routing to the object-index path.
+    for i in 0..50_000u64 {
+        let subj = format!("<http://example.org/h{i}>");
+        let obj = format!("<http://example.org/o{}>", i % 20_000);
+        nt.push_str(&format!("{subj} {hot_predicate} {obj} .\n"));
+    }
+
+    let nt_path = temp_dir.join("skewed.nt");
+    write_file(&nt_path, nt.as_bytes());
+
+    let hdt_path = temp_dir.join("skewed.hdt");
+    let work_dir = temp_dir.join("work-skewed");
+
+    let create = Command::new(env!("CARGO_BIN_EXE_hdtc"))
+        .args([
+            "create",
+            nt_path.to_str().unwrap(),
+            "-o",
+            hdt_path.to_str().unwrap(),
+            "--base-uri",
+            "http://example.org/dataset",
+            "--temp-dir",
+            work_dir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute hdtc create for skewed dataset");
+
+    assert!(
+        create.status.success(),
+        "hdtc create failed for skewed dataset: {}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+
+    let index = Command::new(env!("CARGO_BIN_EXE_hdtc"))
+        .args(["index", hdt_path.to_str().unwrap()])
+        .output()
+        .expect("Failed to execute hdtc index for skewed dataset");
+
+    assert!(
+        index.status.success(),
+        "hdtc index failed for skewed dataset: {}",
+        String::from_utf8_lossy(&index.stderr)
+    );
+
+    (
+        hdt_path,
+        common_object,
+        hot_predicate,
+        expected_hot_on_common,
+    )
 }
 
 /// `?P?` with the `knows` predicate returns exactly 2 triples (alice→bob, bob→alice).
@@ -609,6 +707,305 @@ fn test_search_predicate_bound_requires_index() {
     assert!(
         stderr.contains("index"),
         "Error message should mention index requirement: {stderr}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3 tests: `??O` via object index
+// ---------------------------------------------------------------------------
+
+/// `??O` with a shared URI object returns correct results.
+#[test]
+fn test_search_object_bound_shared_uri() {
+    let temp = tempfile::tempdir().unwrap();
+    let hdt = make_representative_hdt_with_index(temp.path());
+    let (ok, stdout, stderr) =
+        run_search(&hdt, "? ? <http://example.org/alice>", &[]);
+    assert!(ok, "hdtc search ??O failed: {stderr}");
+    let triples = parse_tab_triples(&stdout);
+    assert_eq!(
+        triples.len(),
+        1,
+        "Expected 1 triple for ??-alice, got {}: {triples:#?}",
+        triples.len()
+    );
+    for triple in &triples {
+        assert!(
+            triple.contains("<http://example.org/alice>"),
+            "Expected alice as object in: {triple}"
+        );
+    }
+}
+
+/// `??O` with an object-only URI returns correct results.
+#[test]
+fn test_search_object_bound_uri_only() {
+    let temp = tempfile::tempdir().unwrap();
+    let hdt = make_representative_hdt_with_index(temp.path());
+    let (ok, stdout, stderr) =
+        run_search(&hdt, "? ? <http://example.org/Thing>", &[]);
+    assert!(ok, "hdtc search ??O failed: {stderr}");
+    let triples = parse_tab_triples(&stdout);
+    assert_eq!(
+        triples.len(),
+        1,
+        "Expected 1 triple for ??-Thing, got {}: {triples:#?}",
+        triples.len()
+    );
+}
+
+/// `??O` with a language-tagged literal returns correct results.
+#[test]
+fn test_search_object_bound_lang_literal() {
+    let temp = tempfile::tempdir().unwrap();
+    let hdt = make_representative_hdt_with_index(temp.path());
+    let (ok, stdout, stderr) = run_search(&hdt, "? ? \"Alice\"@en", &[]);
+    assert!(ok, "hdtc search ??O failed: {stderr}");
+    let triples = parse_tab_triples(&stdout);
+    assert_eq!(
+        triples.len(),
+        1,
+        "Expected 1 triple for ??-\"Alice\"@en, got {}: {triples:#?}",
+        triples.len()
+    );
+}
+
+/// `??O` with a typed literal returns correct results.
+#[test]
+fn test_search_object_bound_typed_literal() {
+    let temp = tempfile::tempdir().unwrap();
+    let hdt = make_representative_hdt_with_index(temp.path());
+    let (ok, stdout, stderr) = run_search(
+        &hdt,
+        "? ? \"30\"^^<http://www.w3.org/2001/XMLSchema#integer>",
+        &[],
+    );
+    assert!(ok, "hdtc search ??O failed: {stderr}");
+    let triples = parse_tab_triples(&stdout);
+    assert_eq!(
+        triples.len(),
+        1,
+        "Expected 1 triple for ??-\"30\"^^xsd:integer, got {}: {triples:#?}",
+        triples.len()
+    );
+}
+
+/// `??O` with unknown object returns 0 results (not an error).
+#[test]
+fn test_search_object_bound_unknown() {
+    let temp = tempfile::tempdir().unwrap();
+    let hdt = make_representative_hdt_with_index(temp.path());
+    let (ok, stdout, stderr) =
+        run_search(&hdt, "? ? <http://example.org/nonexistent>", &[]);
+    assert!(ok, "hdtc search should succeed with 0 results: {stderr}");
+    let triples = parse_tab_triples(&stdout);
+    assert_eq!(
+        triples.len(),
+        0,
+        "Expected 0 results for unknown object, got {triples:#?}"
+    );
+}
+
+/// `??O` with `--count`.
+#[test]
+fn test_search_object_bound_count() {
+    let temp = tempfile::tempdir().unwrap();
+    let hdt = make_representative_hdt_with_index(temp.path());
+    let (ok, stdout, stderr) =
+        run_search(&hdt, "? ? <http://example.org/alice>", &["--count"]);
+    assert!(ok, "hdtc search ??O --count failed: {stderr}");
+    let count: u64 = stdout.trim().parse().expect("Expected a number in stdout");
+    assert_eq!(count, 1, "Expected count=1 for ??-alice, got {count}");
+}
+
+/// `??O` with `--no-index` falls back to sequential scan.
+#[test]
+fn test_search_object_bound_no_index_fallback() {
+    let temp = tempfile::tempdir().unwrap();
+    let hdt = make_representative_hdt(temp.path());
+    let (ok, stdout, stderr) =
+        run_search(&hdt, "? ? <http://example.org/alice>", &["--no-index"]);
+    assert!(ok, "hdtc search ??O --no-index failed: {stderr}");
+    let triples = parse_tab_triples(&stdout);
+    assert_eq!(
+        triples.len(),
+        1,
+        "Expected 1 triple with --no-index fallback, got {}: {triples:#?}",
+        triples.len()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3+4 tests: `?PO` via selectivity routing
+// ---------------------------------------------------------------------------
+
+/// `?PO` returns correct results.
+#[test]
+fn test_search_predicate_object_bound() {
+    let temp = tempfile::tempdir().unwrap();
+    let hdt = make_representative_hdt_with_index(temp.path());
+    let (ok, stdout, stderr) = run_search(
+        &hdt,
+        "? <http://example.org/knows> <http://example.org/alice>",
+        &[],
+    );
+    assert!(ok, "hdtc search ?PO failed: {stderr}");
+    let triples = parse_tab_triples(&stdout);
+    assert_eq!(
+        triples.len(),
+        1,
+        "Expected 1 triple for ?-knows-alice, got {}: {triples:#?}",
+        triples.len()
+    );
+}
+
+/// `?PO` with a literal object returns correct results.
+#[test]
+fn test_search_predicate_object_bound_literal() {
+    let temp = tempfile::tempdir().unwrap();
+    let hdt = make_representative_hdt_with_index(temp.path());
+    let (ok, stdout, stderr) = run_search(
+        &hdt,
+        "? <http://example.org/name> \"Alice\"",
+        &[],
+    );
+    assert!(ok, "hdtc search ?PO failed: {stderr}");
+    let triples = parse_tab_triples(&stdout);
+    assert_eq!(
+        triples.len(),
+        1,
+        "Expected 1 triple for ?-name-\"Alice\", got {}: {triples:#?}",
+        triples.len()
+    );
+}
+
+/// `?PO` with unknown predicate returns 0 results.
+#[test]
+fn test_search_predicate_object_bound_unknown_pred() {
+    let temp = tempfile::tempdir().unwrap();
+    let hdt = make_representative_hdt_with_index(temp.path());
+    let (ok, stdout, stderr) = run_search(
+        &hdt,
+        "? <http://example.org/nonexistent> <http://example.org/alice>",
+        &[],
+    );
+    assert!(ok, "hdtc search should succeed with 0 results: {stderr}");
+    let triples = parse_tab_triples(&stdout);
+    assert_eq!(triples.len(), 0, "Expected 0 results for unknown predicate");
+}
+
+/// `?PO` with unknown object returns 0 results.
+#[test]
+fn test_search_predicate_object_bound_unknown_obj() {
+    let temp = tempfile::tempdir().unwrap();
+    let hdt = make_representative_hdt_with_index(temp.path());
+    let (ok, stdout, stderr) = run_search(
+        &hdt,
+        "? <http://example.org/knows> <http://example.org/nonexistent>",
+        &[],
+    );
+    assert!(ok, "hdtc search should succeed with 0 results: {stderr}");
+    let triples = parse_tab_triples(&stdout);
+    assert_eq!(triples.len(), 0, "Expected 0 results for unknown object");
+}
+
+/// `?PO` with `--count`.
+#[test]
+fn test_search_predicate_object_bound_count() {
+    let temp = tempfile::tempdir().unwrap();
+    let hdt = make_representative_hdt_with_index(temp.path());
+    let (ok, stdout, stderr) = run_search(
+        &hdt,
+        "? <http://example.org/knows> <http://example.org/alice>",
+        &["--count"],
+    );
+    assert!(ok, "hdtc search ?PO --count failed: {stderr}");
+    let count: u64 = stdout.trim().parse().expect("Expected a number in stdout");
+    assert_eq!(count, 1, "Expected count=1 for ?-knows-alice, got {count}");
+}
+
+/// `?PO` with `--no-index` falls back to sequential scan.
+#[test]
+fn test_search_predicate_object_bound_no_index_fallback() {
+    let temp = tempfile::tempdir().unwrap();
+    let hdt = make_representative_hdt(temp.path());
+    let (ok, stdout, stderr) = run_search(
+        &hdt,
+        "? <http://example.org/knows> <http://example.org/alice>",
+        &["--no-index"],
+    );
+    assert!(ok, "hdtc search ?PO --no-index failed: {stderr}");
+    let triples = parse_tab_triples(&stdout);
+    assert_eq!(
+        triples.len(),
+        1,
+        "Expected 1 triple with --no-index fallback, got {}: {triples:#?}",
+        triples.len()
+    );
+}
+
+/// `?PO` without an index and without `--no-index` returns an error.
+#[test]
+fn test_search_predicate_object_bound_requires_index() {
+    let temp = tempfile::tempdir().unwrap();
+    let hdt = make_representative_hdt(temp.path());
+    let (ok, _stdout, stderr) = run_search(
+        &hdt,
+        "? <http://example.org/knows> <http://example.org/alice>",
+        &[],
+    );
+    assert!(!ok, "Expected hdtc search to fail for ?PO without index");
+    assert!(
+        stderr.contains("index"),
+        "Error message should mention index requirement: {stderr}"
+    );
+}
+
+/// Stress-style regression: large object group is processed correctly with
+/// chunked ??O streaming (group size > 4096) without full in-memory group load.
+#[test]
+fn test_search_object_bound_large_group_chunked() {
+    let temp = tempfile::tempdir().unwrap();
+    let (hdt, common_object, _hot_predicate, _expected_hot_on_common) =
+        make_skewed_hdt_with_index(temp.path());
+
+    let query = format!("? ? {common_object}");
+    let (ok, stdout, stderr) = run_search(&hdt, &query, &["--count"]);
+    assert!(ok, "hdtc search ??O --count failed on skewed data: {stderr}");
+
+    let count: u64 = stdout.trim().parse().expect("Expected numeric count");
+    assert_eq!(
+        count, 10_000,
+        "Expected full object-group count for common object"
+    );
+
+    // Also verify limit path on same large group.
+    let (ok, stdout, stderr) = run_search(&hdt, &query, &["--limit", "25"]);
+    assert!(ok, "hdtc search ??O --limit failed on skewed data: {stderr}");
+    let triples = parse_tab_triples(&stdout);
+    assert_eq!(
+        triples.len(),
+        25,
+        "Expected limited results from large ??O group"
+    );
+}
+
+/// Stress-style regression: `?PO` stays correct under skewed selectivity where
+/// the predicate is globally hot but only sparsely matches the queried object.
+#[test]
+fn test_search_predicate_object_bound_skewed_selectivity() {
+    let temp = tempfile::tempdir().unwrap();
+    let (hdt, common_object, hot_predicate, expected_hot_on_common) =
+        make_skewed_hdt_with_index(temp.path());
+
+    let query = format!("? {hot_predicate} {common_object}");
+    let (ok, stdout, stderr) = run_search(&hdt, &query, &["--count"]);
+    assert!(ok, "hdtc search ?PO --count failed on skewed data: {stderr}");
+
+    let count: u64 = stdout.trim().parse().expect("Expected numeric count");
+    assert_eq!(
+        count, expected_hot_on_common,
+        "Expected ?PO count on skewed selectivity dataset"
     );
 }
 

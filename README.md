@@ -13,7 +13,7 @@ HDT files produced by hdtc are fully compatible with [hdt-java](https://github.c
 - **Multiple inputs** — accepts any mix of RDF files, HDT files, and directories; recursively discovers RDF files
 - **Parallel NT/NQ parsing** — newline-safe chunk parsing for N-Triples/N-Quads (including `.gz`, `.bz2`, `.xz`) with bounded in-flight memory
 - **Quad inputs** — N-Quads and TriG inputs are accepted; the graph component is dropped and triples are indexed normally
-- **Index generation** — optional `.hdt.index.v1-1` enables efficient predicate-bound (`? P ?`) queries
+- **Index generation** — optional `.hdt.index.v1-1` enables efficient `? P ?`, `? ? O`, and `? P O` queries
 - **Resilient parsing** — skips malformed triples with warnings, reports total skipped at the end
 
 ## Installation
@@ -214,18 +214,32 @@ Use an index file at a non-default path:
 hdtc search data.hdt --query "? <http://xmlns.com/foaf/0.1/knows> ?" --index /path/to/data.hdt.index.v1-1
 ```
 
+Find all triples with a given object (requires index):
+
+```sh
+hdtc search data.hdt --query "? ? <http://example.org/Person>"
+```
+
+Find triples with a specific predicate and object:
+
+```sh
+hdtc search data.hdt --query "? <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/Person>"
+```
+
 **Supported patterns:**
 
-| Pattern | Index required?       | Description                                   |
-| ------- | --------------------- | --------------------------------------------- |
-| `? ? ?` | No                    | All triples                                   |
-| `S ? ?` | No                    | All triples for a subject                     |
-| `S P ?` | No                    | All objects for a subject–predicate pair      |
-| `S ? O` | No                    | All predicates linking a subject to an object |
-| `S P O` | No                    | Exact triple lookup                           |
-| `? P ?` | Yes (or `--no-index`) | All triples with a given predicate            |
+| Pattern | Index required?       | Description                                        |
+| ------- | --------------------- | -------------------------------------------------- |
+| `? ? ?` | No                    | All triples                                        |
+| `S ? ?` | No                    | All triples for a subject                          |
+| `S P ?` | No                    | All objects for a subject–predicate pair           |
+| `S ? O` | No                    | All predicates linking a subject to an object      |
+| `S P O` | No                    | Exact triple lookup                                |
+| `? P ?` | Yes (or `--no-index`) | All triples with a given predicate                 |
+| `? ? O` | Yes (or `--no-index`) | All triples with a given object                    |
+| `? P O` | Yes (or `--no-index`) | All triples with a given predicate and object      |
 
-For `? P ?`, hdtc uses the `.hdt.index.v1-1` sidecar file (auto-detected next to the HDT file, or specified with `--index`). Pass `--no-index` to fall back to a sequential full scan instead. Patterns `? ? O` and `? P O` are planned for a future release.
+For `? P ?`, `? ? O`, and `? P O`, hdtc uses the `.hdt.index.v1-1` sidecar file (auto-detected next to the HDT file, or specified with `--index`). Pass `--no-index` to fall back to a sequential full scan instead. For `? P O`, hdtc automatically chooses the most efficient query path based on predicate selectivity.
 
 ### Create: All options
 
@@ -279,7 +293,7 @@ Auto parser tuning is derived from `--memory-limit` (accepts `G`/`M` suffixes, e
 | `--count`             | off                         | Print only the count of matching triples                                 |
 | `--limit N`           | unlimited                   | Stop after N results (ignored when combined with `--count`)              |
 | `--offset N`          | 0                           | Skip the first N matching results (ignored when combined with `--count`) |
-| `--index PATH`        | `<HDT_FILE>.hdt.index.v1-1` | Index file path (used for `? P ?` queries)                               |
+| `--index PATH`        | `<HDT_FILE>.hdt.index.v1-1` | Index file path (used for `? P ?`, `? ? O`, and `? P O` queries)        |
 | `--no-index`          | off                         | Disable index use; fall back to sequential scan for all patterns         |
 | `--memory-limit SIZE` | `4G`                        | Soft memory limit for dictionary caches (e.g. `4G`, `2000M`)             |
 | `-v, --verbose`       | —                           | Increase log verbosity (`-v` debug, `-vv` trace)                         |
