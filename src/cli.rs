@@ -95,6 +95,9 @@ pub enum Commands {
 
     /// Validate HDT triples structures (ArrayY/ArrayZ/BitmapZ) for indexing
     Validate(ValidateArgs),
+
+    /// Compute VoID statistics for an HDT file and output as N-Triples
+    Void(VoidArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -211,6 +214,33 @@ pub struct SearchArgs {
     pub no_index: bool,
 
     /// Soft memory limit for dictionary caches (e.g. 4G, 2000M)
+    #[arg(short = 'm', long, value_name = "SIZE", default_value = "4G")]
+    pub memory_limit: MemorySize,
+}
+
+#[derive(Debug, Parser)]
+pub struct VoidArgs {
+    /// Path to existing HDT file
+    pub hdt_file: PathBuf,
+
+    /// URI identifying the dataset being described
+    #[arg(long, default_value = "http://example.org/dataset")]
+    pub dataset_uri: String,
+
+    /// Write results to file instead of stdout
+    #[arg(short, long, value_name = "PATH")]
+    pub output: Option<PathBuf>,
+
+    /// Use blank nodes for partition identifiers instead of URI references
+    #[arg(long)]
+    pub use_blank_nodes: bool,
+
+    /// Soft memory limit for dictionary caches (e.g. 4G, 2000M)
+    ///
+    /// Controls the PFC block cache used for term resolution during serialization.
+    /// The analysis data structures (subject→class index, partition statistics) use
+    /// additional memory proportional to the number of typed subjects and class/property
+    /// combinations in the dataset.
     #[arg(short = 'm', long, value_name = "SIZE", default_value = "4G")]
     pub memory_limit: MemorySize,
 }

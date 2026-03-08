@@ -26,6 +26,7 @@ hashbrown = "0.15"
 bumpalo = "3"
 bitflags = "2"
 libc = "0.2"
+md5 = "0.8"
 
 [dev-dependencies]
 hdt = "0.4"

@@ -16,6 +16,7 @@ Development of hdtc is done primarily through Claude Code.
 - **Parallel NT/NQ parsing** — newline-safe chunk parsing for N-Triples/N-Quads (including `.gz`, `.bz2`, `.xz`) with bounded in-flight memory
 - **Quad inputs** — N-Quads and TriG inputs are accepted; the graph component is dropped and triples are indexed normally
 - **Index generation** — optional `.hdt.index.v1-1` enables efficient `? P ?`, `? ? O`, and `? P O` queries
+- **VoID statistics** — compute dataset-level, property, and class partition statistics as N-Triples
 - **Resilient parsing** — skips malformed triples with warnings, reports total skipped at the end
 
 ## Installation
@@ -35,7 +36,7 @@ cargo build --release
 
 ## Usage
 
-hdtc supports four main commands:
+hdtc supports five main commands:
 
 ### `hdtc create` — Convert RDF to HDT
 
@@ -59,6 +60,12 @@ hdtc dump [OPTIONS] <HDT_FILE>
 
 ```
 hdtc search [OPTIONS] --query <PATTERN> <HDT_FILE>
+```
+
+### `hdtc void` — Compute VoID statistics
+
+```
+hdtc void [OPTIONS] <HDT_FILE>
 ```
 
 ### Create: Basic examples
@@ -230,18 +237,54 @@ hdtc search data.hdt --query "? <http://www.w3.org/1999/02/22-rdf-syntax-ns#type
 
 **Supported patterns:**
 
-| Pattern | Index required?       | Description                                        |
-| ------- | --------------------- | -------------------------------------------------- |
-| `? ? ?` | No                    | All triples                                        |
-| `S ? ?` | No                    | All triples for a subject                          |
-| `S P ?` | No                    | All objects for a subject–predicate pair           |
-| `S ? O` | No                    | All predicates linking a subject to an object      |
-| `S P O` | No                    | Exact triple lookup                                |
-| `? P ?` | Yes (or `--no-index`) | All triples with a given predicate                 |
-| `? ? O` | Yes (or `--no-index`) | All triples with a given object                    |
-| `? P O` | Yes (or `--no-index`) | All triples with a given predicate and object      |
+| Pattern | Index required?       | Description                                   |
+| ------- | --------------------- | --------------------------------------------- |
+| `? ? ?` | No                    | All triples                                   |
+| `S ? ?` | No                    | All triples for a subject                     |
+| `S P ?` | No                    | All objects for a subject–predicate pair      |
+| `S ? O` | No                    | All predicates linking a subject to an object |
+| `S P O` | No                    | Exact triple lookup                           |
+| `? P ?` | Yes (or `--no-index`) | All triples with a given predicate            |
+| `? ? O` | Yes (or `--no-index`) | All triples with a given object               |
+| `? P O` | Yes (or `--no-index`) | All triples with a given predicate and object |
 
 For `? P ?`, `? ? O`, and `? P O`, hdtc uses the `.hdt.index.v1-1` sidecar file (auto-detected next to the HDT file, or specified with `--index`). Pass `--no-index` to fall back to a sequential full scan instead. For `? P O`, hdtc automatically chooses the most efficient query path based on predicate selectivity.
+
+### Void: Computing VoID statistics
+
+Compute [VoID](https://www.w3.org/TR/void/) (Vocabulary of Interlinked Datasets) statistics for an HDT file and output the results as N-Triples. This is useful for generating dataset metadata describing the structure and content of an RDF dataset.
+
+The output includes:
+
+- **Dataset-level statistics** — total triples, distinct subjects, distinct objects, number of properties
+- **Property partitions** — triple count per predicate
+- **Class partitions** — entity count and triple count per `rdf:type` class, with nested property partitions
+- **Object class partitions** — target class breakdown for each property within a class partition (using the [void-ext](http://ldf.fi/void-ext) `objectClassPartition` extension)
+
+Generate VoID statistics to stdout:
+
+```sh
+hdtc void data.hdt --dataset-uri http://example.org/mydataset
+```
+
+Write VoID output to a file:
+
+```sh
+hdtc void data.hdt --dataset-uri http://example.org/mydataset -o void.nt
+```
+
+Use blank nodes instead of URI references for partition identifiers:
+
+```sh
+hdtc void data.hdt --dataset-uri http://example.org/mydataset --use-blank-nodes
+```
+
+The algorithm uses two sequential passes over the HDT triples (no index required):
+
+1. **Pass 1** scans all triples to identify `rdf:type` relationships, building a subject-to-class index.
+2. **Pass 2** scans all triples again to accumulate per-property and per-class statistics using the index from Pass 1.
+
+Partition URIs are generated using MD5 hashes of the corresponding class or property IRI. Blank-node classes (common in OWL ontologies) are automatically filtered out and do not produce class partitions.
 
 ### Create: All options
 
@@ -295,11 +338,23 @@ Auto parser tuning is derived from `--memory-limit` (accepts `G`/`M` suffixes, e
 | `--count`             | off                         | Print only the count of matching triples                                 |
 | `--limit N`           | unlimited                   | Stop after N results (ignored when combined with `--count`)              |
 | `--offset N`          | 0                           | Skip the first N matching results (ignored when combined with `--count`) |
-| `--index PATH`        | `<HDT_FILE>.hdt.index.v1-1` | Index file path (used for `? P ?`, `? ? O`, and `? P O` queries)        |
+| `--index PATH`        | `<HDT_FILE>.hdt.index.v1-1` | Index file path (used for `? P ?`, `? ? O`, and `? P O` queries)         |
 | `--no-index`          | off                         | Disable index use; fall back to sequential scan for all patterns         |
 | `--memory-limit SIZE` | `4G`                        | Soft memory limit for dictionary caches (e.g. `4G`, `2000M`)             |
 | `-v, --verbose`       | —                           | Increase log verbosity (`-v` debug, `-vv` trace)                         |
 | `-q, --quiet`         | —                           | Suppress all output except errors                                        |
+
+### Void: All options
+
+| Option                    | Default                      | Description                                                         |
+| ------------------------- | ---------------------------- | ------------------------------------------------------------------- |
+| `<HDT_FILE>`              | _(required)_                 | Path to existing HDT file                                           |
+| `--dataset-uri URI`       | `http://example.org/dataset` | URI identifying the dataset being described                         |
+| `-o, --output PATH`       | stdout                       | Write VoID N-Triples to file instead of stdout                      |
+| `--use-blank-nodes`       | off                          | Use blank nodes for partition identifiers instead of URI references |
+| `-m, --memory-limit SIZE` | `4G`                         | Soft memory limit for dictionary caches (e.g. `4G`, `2000M`)        |
+| `-v, --verbose`           | —                            | Increase log verbosity (`-v` debug, `-vv` trace)                    |
+| `-q, --quiet`             | —                            | Suppress all output except errors                                   |
 
 ## Resource requirements
 
