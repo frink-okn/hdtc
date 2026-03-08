@@ -95,6 +95,7 @@ fn main() -> Result<()> {
         cli::Commands::Dump(args) => dump_hdt_to_ntriples(args, benchmark),
         cli::Commands::Search(args) => search_hdt(args, benchmark),
         cli::Commands::Validate(args) => validate_hdt_file(args, benchmark),
+        cli::Commands::Void(args) => compute_void(args, benchmark),
     }
 }
 
@@ -340,6 +341,44 @@ fn search_hdt(args: cli::SearchArgs, benchmark: bool) -> Result<()> {
     }
 
     tracing::info!("Done! {count} matching triple(s)");
+    Ok(())
+}
+
+/// Compute VoID statistics for an HDT file.
+fn compute_void(args: cli::VoidArgs, benchmark: bool) -> Result<()> {
+    if !args.hdt_file.exists() {
+        anyhow::bail!("HDT file not found: {}", args.hdt_file.display());
+    }
+
+    tracing::info!("Computing VoID statistics: {}", args.hdt_file.display());
+    tracing::info!("Dataset URI: {}", args.dataset_uri);
+    match &args.output {
+        Some(p) => tracing::info!("Output: {}", p.display()),
+        None => tracing::info!("Output: stdout"),
+    }
+
+    let start = std::time::Instant::now();
+    let memory_limit = args.memory_limit.as_bytes();
+
+    let count = hdt::compute_void(
+        &args.hdt_file,
+        &args.dataset_uri,
+        args.output.as_deref(),
+        args.use_blank_nodes,
+        memory_limit,
+    )?;
+
+    if benchmark {
+        tracing::info!(
+            "Benchmark summary (void): total {:.3}s",
+            start.elapsed().as_secs_f64()
+        );
+    }
+
+    match &args.output {
+        Some(p) => tracing::info!("Done! {count} VoID triples written to {}", p.display()),
+        None => tracing::info!("Done! {count} VoID triples written"),
+    }
     Ok(())
 }
 
