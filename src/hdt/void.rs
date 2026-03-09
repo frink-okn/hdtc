@@ -1,8 +1,8 @@
 //! VoID (Vocabulary of Interlinked Datasets) statistics computation.
 //!
 //! Implements a two-pass, ID-based algorithm:
-//! - Pass 1: Scan all triples to find `rdf:type` triples; build a subject→class index
-//!   and a typed-subject bitmap.
+//! - Pass 1: Scan all triples to find `rdf:type` triples; build a `ClassComboIndex` that
+//!   maps each subject to its deduplicated class combination (4 bytes per subject).
 //! - Pass 2: Full sequential scan to accumulate dataset-level and class-level statistics.
 //! - Serialize results as N-Triples.
 //!
@@ -20,8 +20,57 @@ use super::reader::{
     BitmapTriplesScanner, DictionaryResolver, HdtSectionOffsets, make_writer, open_hdt,
 };
 
-/// Subject-to-classes index built in Pass 1: maps each typed subject ID to its class IDs.
-type SubjectClassIndex = HashMap<u64, Vec<u64>>;
+// ---------------------------------------------------------------------------
+// ClassComboIndex: compact subject→classes mapping via combo deduplication
+// ---------------------------------------------------------------------------
+
+/// Compact index mapping each subject ID to its class combination.
+///
+/// Instead of `HashMap<u64, Vec<u64>>` (~96 bytes per typed subject), this uses
+/// 4 bytes per subject (typed or not) via class-combination deduplication.
+/// Subjects sharing the same set of `rdf:type` classes (e.g., all `wikibase:Statement`
+/// nodes) map to the same combo ID.
+///
+/// Memory: `4 × nb_subjects` bytes + `O(distinct_combos × avg_classes)` for the lookup table.
+struct ClassComboIndex {
+    /// Combo ID for each subject, indexed by subject_id (1-based; index 0 unused).
+    /// 0 = untyped.
+    subject_combos: Vec<u32>,
+    /// Sorted class IDs for each combo. `combo_to_classes[combo_id - 1]` gives the
+    /// class IDs for `combo_id > 0`.
+    combo_to_classes: Vec<Vec<u64>>,
+}
+
+impl ClassComboIndex {
+    /// Look up the classes for a subject ID.
+    #[inline]
+    fn classes(&self, subject_id: u64) -> &[u64] {
+        let idx = subject_id as usize;
+        if idx < self.subject_combos.len() {
+            let combo_id = self.subject_combos[idx];
+            if combo_id > 0 {
+                return &self.combo_to_classes[combo_id as usize - 1];
+            }
+        }
+        &[]
+    }
+
+    /// Check if a subject is typed (has any `rdf:type`).
+    #[inline]
+    fn is_typed(&self, subject_id: u64) -> bool {
+        let idx = subject_id as usize;
+        idx < self.subject_combos.len() && self.subject_combos[idx] > 0
+    }
+
+    /// Distinct class IDs across all combos.
+    fn distinct_class_ids(&self) -> std::collections::HashSet<u64> {
+        let mut set = std::collections::HashSet::new();
+        for classes in &self.combo_to_classes {
+            set.extend(classes.iter().copied());
+        }
+        set
+    }
+}
 
 // ---------------------------------------------------------------------------
 // VoID vocabulary constants (raw IRIs, without angle-bracket delimiters)
@@ -78,29 +127,6 @@ impl ClassPartitionData {
 }
 
 // ---------------------------------------------------------------------------
-// Bitmap helpers (1-indexed, matching HDT subject IDs)
-// ---------------------------------------------------------------------------
-
-/// Check whether bit for `id` (1-indexed) is set in a byte-packed bitmap.
-#[inline]
-fn bitmap_check(bitmap: &[u8], id: u64) -> bool {
-    debug_assert!(id > 0, "bitmap IDs are 1-indexed; got 0");
-    let idx = (id / 8) as usize;
-    idx < bitmap.len() && (bitmap[idx] >> (id % 8)) & 1 == 1
-}
-
-/// Set bit for `id` (1-indexed) in a byte-packed bitmap.
-#[inline]
-fn bitmap_set(bitmap: &mut [u8], id: u64) {
-    debug_assert!(id > 0, "bitmap IDs are 1-indexed; got 0");
-    let idx = (id / 8) as usize;
-    debug_assert!(idx < bitmap.len(), "bitmap_set: id {id} out of bounds (len={})", bitmap.len());
-    if idx < bitmap.len() {
-        bitmap[idx] |= 1 << (id % 8);
-    }
-}
-
-// ---------------------------------------------------------------------------
 // N-Triples output helpers
 // ---------------------------------------------------------------------------
 
@@ -141,79 +167,121 @@ fn nt(w: &mut impl Write, s: &str, p: &str, o: &str) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Pass 1: Build subject→class index from rdf:type triples
+// Pass 1: Build ClassComboIndex from rdf:type triples
 // ---------------------------------------------------------------------------
 
-/// Scan all triples; collect `rdf:type` triples to build:
-/// - `typed_bitmap`: one bit per subject ID (1-indexed), set if subject has any `rdf:type`.
-/// - `id_to_classes`: maps each typed subject ID to its list of class IDs (object IDs
-///   from `rdf:type` triples).
-fn build_type_index(
+/// Scan all triples; collect `rdf:type` triples to build a [`ClassComboIndex`].
+///
+/// Exploits SPO ordering: all triples for a subject are contiguous, so we buffer
+/// each subject's class IDs with O(1) memory per subject, then deduplicate via
+/// a combo map.
+fn build_class_combo_index(
     hdt_path: &Path,
     offsets: &HdtSectionOffsets,
     rdf_type_pred_id: u64,
     nb_subjects: u64,
-) -> Result<(Vec<u8>, SubjectClassIndex)> {
-    // Bitmap covers IDs 1..=nb_subjects (1-indexed). Byte i covers bits i*8..i*8+7.
-    // Max bit index = nb_subjects, so we need (nb_subjects / 8 + 1) bytes.
-    let bitmap_len = (nb_subjects / 8 + 1) as usize;
-    let mut typed_bitmap = vec![0u8; bitmap_len];
-    let mut id_to_classes: HashMap<u64, Vec<u64>> = HashMap::new();
+) -> Result<ClassComboIndex> {
+    let alloc_bytes = (nb_subjects as usize + 1) * std::mem::size_of::<u32>();
+    tracing::info!(
+        "  Allocating class combo index: {:.1} GB for {} subjects",
+        alloc_bytes as f64 / 1_073_741_824.0,
+        nb_subjects
+    );
+
+    let mut subject_combos = vec![0u32; nb_subjects as usize + 1];
+    let mut combo_map: HashMap<Vec<u64>, u32> = HashMap::new();
+    let mut combo_to_classes: Vec<Vec<u64>> = Vec::new();
 
     let mut scanner =
         BitmapTriplesScanner::new(offsets, hdt_path).context("open scanner for Pass 1")?;
 
-    let mut scanned = 0u64;
+    let mut current_subject: u64 = 0;
+    let mut current_classes: Vec<u64> = Vec::new();
+    let mut scanned: u64 = 0;
+    let mut typed_subjects: u64 = 0;
+
+    // Closure-like helper: finalize a subject's collected class IDs into the combo index.
+    // Defined inline because closures can't borrow multiple fields mutably.
+    macro_rules! finalize_subject {
+        () => {
+            if !current_classes.is_empty() {
+                current_classes.sort_unstable();
+                current_classes.dedup();
+                let combo_id = if let Some(&id) = combo_map.get(&current_classes) {
+                    id
+                } else {
+                    anyhow::ensure!(
+                        combo_to_classes.len() < u32::MAX as usize,
+                        "More than {} unique class combinations; dataset too complex for VoID analysis",
+                        u32::MAX
+                    );
+                    let id = combo_to_classes.len() as u32 + 1;
+                    let classes = current_classes.clone();
+                    combo_map.insert(classes.clone(), id);
+                    combo_to_classes.push(classes);
+                    id
+                };
+                subject_combos[current_subject as usize] = combo_id;
+                typed_subjects += 1;
+                current_classes.clear();
+            }
+        };
+    }
+
     while let Some((s_id, p_id, o_id)) = scanner.next_triple()? {
+        if s_id != current_subject {
+            finalize_subject!();
+            current_subject = s_id;
+        }
         if p_id == rdf_type_pred_id {
-            bitmap_set(&mut typed_bitmap, s_id);
-            id_to_classes.entry(s_id).or_default().push(o_id);
+            current_classes.push(o_id);
         }
         scanned += 1;
         if scanned.is_multiple_of(10_000_000) {
             tracing::info!("  Pass 1: {scanned} triples scanned...");
         }
     }
+    // Finalize last subject.
+    finalize_subject!();
 
-    let typed_count = id_to_classes.len();
     let class_count = {
         let mut seen = std::collections::HashSet::new();
-        for classes in id_to_classes.values() {
+        for classes in &combo_to_classes {
             seen.extend(classes.iter().copied());
         }
         seen.len()
     };
     tracing::info!(
-        "  Pass 1 complete: {scanned} triples scanned, {typed_count} typed subjects, {class_count} distinct classes"
+        "  Pass 1 complete: {scanned} triples scanned, {typed_subjects} typed subjects, \
+         {class_count} distinct classes, {} unique class combinations",
+        combo_to_classes.len()
     );
 
-    Ok((typed_bitmap, id_to_classes))
+    Ok(ClassComboIndex {
+        subject_combos,
+        combo_to_classes,
+    })
 }
 
 // ---------------------------------------------------------------------------
 // Post–Pass 1: filter non-IRI classes
 // ---------------------------------------------------------------------------
 
-/// Remove non-IRI class IDs (blank nodes, literals) from the subject→class index
-/// and update the typed bitmap accordingly.
+/// Remove non-IRI class IDs (blank nodes, literals) from the class combo index.
 ///
 /// The Python `void-hdt` tool only treats `URIRef` objects of `rdf:type` triples as
 /// valid classes.  Blank nodes used as `rdf:type` objects are common in OWL ontologies
 /// (anonymous class expressions) and should not produce class partitions or affect
 /// type-based counting.
 ///
-/// After filtering, subjects whose class lists become empty have their bitmap bits
-/// cleared so that Pass 2 treats them as untyped.
+/// After filtering, combos that become empty are mapped to 0 (untyped), and
+/// duplicate filtered combos are merged.
 fn filter_non_iri_classes(
-    typed_bitmap: &mut [u8],
-    id_to_classes: &mut SubjectClassIndex,
+    class_combo_index: &mut ClassComboIndex,
     resolver: &mut DictionaryResolver,
 ) -> Result<()> {
-    // Collect all unique class IDs.
-    let mut all_class_ids = std::collections::HashSet::new();
-    for classes in id_to_classes.values() {
-        all_class_ids.extend(classes.iter().copied());
-    }
+    // Collect all unique class IDs across all combos.
+    let all_class_ids = class_combo_index.distinct_class_ids();
 
     // Resolve each class ID and build set of non-IRI ones.
     let mut non_iri_class_ids = std::collections::HashSet::new();
@@ -235,21 +303,40 @@ fn filter_non_iri_classes(
         non_iri_class_ids.len()
     );
 
-    // Remove non-IRI class IDs from each subject's class list.
-    // If a subject loses all classes, clear its typed bitmap bit.
-    id_to_classes.retain(|&s_id, classes| {
-        classes.retain(|c| !non_iri_class_ids.contains(c));
-        if classes.is_empty() {
-            // Clear bitmap bit — this subject is effectively untyped.
-            let idx = (s_id / 8) as usize;
-            if idx < typed_bitmap.len() {
-                typed_bitmap[idx] &= !(1 << (s_id % 8));
-            }
-            false // remove entry
+    // Build a remapping: old combo_id → new combo_id.
+    let mut new_combo_map: HashMap<Vec<u64>, u32> = HashMap::new();
+    let mut new_combo_to_classes: Vec<Vec<u64>> = Vec::new();
+    // combo_remap[i] = new combo_id for old combo_id (i+1). 0 = became untyped.
+    let mut combo_remap: Vec<u32> =
+        Vec::with_capacity(class_combo_index.combo_to_classes.len());
+
+    for classes in &class_combo_index.combo_to_classes {
+        let filtered: Vec<u64> = classes
+            .iter()
+            .copied()
+            .filter(|c| !non_iri_class_ids.contains(c))
+            .collect();
+
+        if filtered.is_empty() {
+            combo_remap.push(0);
+        } else if let Some(&id) = new_combo_map.get(&filtered) {
+            combo_remap.push(id);
         } else {
-            true
+            let id = new_combo_to_classes.len() as u32 + 1;
+            new_combo_to_classes.push(filtered.clone());
+            new_combo_map.insert(filtered, id);
+            combo_remap.push(id);
         }
-    });
+    }
+
+    // Remap all subject entries.
+    for combo_id in class_combo_index.subject_combos.iter_mut() {
+        if *combo_id > 0 {
+            *combo_id = combo_remap[*combo_id as usize - 1];
+        }
+    }
+
+    class_combo_index.combo_to_classes = new_combo_to_classes;
 
     Ok(())
 }
@@ -265,8 +352,7 @@ fn run_stats_pass(
     hdt_path: &Path,
     offsets: &HdtSectionOffsets,
     nb_shared: u64,
-    typed_bitmap: &[u8],
-    id_to_classes: &HashMap<u64, Vec<u64>>,
+    class_combo_index: &ClassComboIndex,
 ) -> Result<(HashMap<u64, u64>, HashMap<u64, ClassPartitionData>)> {
     let mut dataset_prop_counts: HashMap<u64, u64> = HashMap::new();
     let mut class_partitions: HashMap<u64, ClassPartitionData> = HashMap::new();
@@ -288,7 +374,7 @@ fn run_stats_pass(
         // Subject type lookup (update cache on subject change).
         if s_id != prev_subject_id {
             prev_subject_id = s_id;
-            current_subject_classes = id_to_classes.get(&s_id).map_or(&[], Vec::as_slice);
+            current_subject_classes = class_combo_index.classes(s_id);
         }
 
         if current_subject_classes.is_empty() {
@@ -306,10 +392,9 @@ fn run_stats_pass(
         // Objects with ID > nb_shared are in the object-only section (literals or
         // object-only URIs) and can never appear as subjects of rdf:type triples.
         // Objects in the shared section (ID <= nb_shared) may be typed: look them up
-        // in id_to_classes (which was built from subjects' rdf:type triples — shared IDs
-        // appear as both subjects and objects).
-        let obj_classes: &[u64] = if o_id <= nb_shared && bitmap_check(typed_bitmap, o_id) {
-            id_to_classes.get(&o_id).map_or(&[], Vec::as_slice)
+        // in the class combo index (shared IDs appear as both subjects and objects).
+        let obj_classes: &[u64] = if o_id <= nb_shared && class_combo_index.is_typed(o_id) {
+            class_combo_index.classes(o_id)
         } else {
             &[]
         };
@@ -561,35 +646,40 @@ pub fn compute_void(
         .locate_predicate(RDF_TYPE.as_bytes())
         .context("Failed to locate rdf:type predicate")?;
 
-    // Pass 1: build typed-subject bitmap and subject→class index.
-    let (mut typed_bitmap, mut id_to_classes) = if let Some(type_pred_id) = rdf_type_pred_id {
+    // Pass 1: build class combo index from rdf:type triples.
+    let mut class_combo_index = if let Some(type_pred_id) = rdf_type_pred_id {
         tracing::info!("Pass 1: scanning rdf:type triples (pred_id={type_pred_id})...");
-        build_type_index(hdt_path, &offsets, type_pred_id, nb_subjects)?
+        build_class_combo_index(hdt_path, &offsets, type_pred_id, nb_subjects)?
     } else {
         tracing::info!("rdf:type predicate not found; skipping class partition analysis");
-        (vec![], HashMap::new())
+        ClassComboIndex {
+            subject_combos: Vec::new(),
+            combo_to_classes: Vec::new(),
+        }
     };
 
     // Filter out non-IRI class IDs (blank nodes, literals).
     // The Python tool only considers URIRef classes; blank nodes used as rdf:type
     // objects should not create class partitions or affect type-based counting.
-    filter_non_iri_classes(&mut typed_bitmap, &mut id_to_classes, &mut resolver)?;
+    filter_non_iri_classes(&mut class_combo_index, &mut resolver)?;
 
-    // Compute entity counts per class from the subject→class index.
+    // Compute entity counts per class from the class combo index.
     let mut class_entity_counts: HashMap<u64, u64> = HashMap::new();
-    for classes in id_to_classes.values() {
-        for &class_id in classes {
-            *class_entity_counts.entry(class_id).or_insert(0) += 1;
+    for &combo_id in &class_combo_index.subject_combos {
+        if combo_id > 0 {
+            for &class_id in &class_combo_index.combo_to_classes[combo_id as usize - 1] {
+                *class_entity_counts.entry(class_id).or_insert(0) += 1;
+            }
         }
     }
 
     // Pass 2: full triple scan — dataset-level property counts and class partitions.
     tracing::info!("Pass 2: scanning all triples for statistics...");
     let (dataset_prop_counts, mut class_partitions) =
-        run_stats_pass(hdt_path, &offsets, nb_shared, &typed_bitmap, &id_to_classes)?;
+        run_stats_pass(hdt_path, &offsets, nb_shared, &class_combo_index)?;
 
-    // Release the Pass 1 index (no longer needed).
-    drop(id_to_classes);
+    // Release the class combo index (no longer needed).
+    drop(class_combo_index);
 
     // Merge entity counts into class_partitions.
     for (class_id, cp) in class_partitions.iter_mut() {
