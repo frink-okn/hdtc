@@ -259,7 +259,9 @@ The output includes:
 - **Dataset-level statistics** — total triples, distinct subjects, distinct objects, number of properties
 - **Property partitions** — triple count per predicate
 - **Class partitions** — entity count and triple count per `rdf:type` class, with nested property partitions
-- **Object class partitions** — target class breakdown for each property within a class partition (using the [void-ext](http://ldf.fi/void-ext) `objectClassPartition` extension)
+- **Object class partitions** — per-property target class breakdown (using the [void-ext](http://ldf.fi/void-ext) `objectClassPartition` extension), within class-level property partitions
+- **Datatype partitions** — per-property breakdown of literal objects by RDF datatype (e.g., `xsd:integer`, `xsd:string`) using the void-ext `datatypePartition` extension, within class-level property partitions
+- **Language partitions** — for `rdf:langString` literals, further breakdown by language tag (e.g., `en`, `de`), nested inside the corresponding datatype partition using the void-ext `languagePartition` extension
 
 Generate VoID statistics to stdout:
 
@@ -279,12 +281,13 @@ Use blank nodes instead of URI references for partition identifiers:
 hdtc void data.hdt --dataset-uri http://example.org/mydataset --use-blank-nodes
 ```
 
-The algorithm uses two sequential passes over the HDT triples (no index required):
+The algorithm uses two sequential passes over the HDT triples plus a dictionary scan (no index required):
 
 1. **Pass 1** scans all triples to identify `rdf:type` relationships, building a subject-to-class index.
-2. **Pass 2** scans all triples again to accumulate per-property and per-class statistics using the index from Pass 1.
+2. **Datatype index** — a sequential scan of the object-only dictionary section extracts each literal's datatype or language tag, building a compact 2-byte-per-entry index. Shared-section terms are skipped (literals can never be subjects, so shared terms are always URIs or blank nodes).
+3. **Pass 2** scans all triples again to accumulate per-property and per-class statistics, including datatype and language counts, using the indices from the previous steps.
 
-Partition URIs are generated using MD5 hashes of the corresponding class or property IRI. Blank-node classes (common in OWL ontologies) are automatically filtered out and do not produce class partitions.
+Partition URIs are generated using MD5 hashes of the corresponding class, property, datatype, or language tag. Blank-node classes (common in OWL ontologies) are automatically filtered out and do not produce class partitions.
 
 ### Create: All options
 

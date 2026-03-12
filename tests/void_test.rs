@@ -1494,7 +1494,9 @@ fn find_language_partition(
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_void_dataset_datatype_partitions() {
+fn test_void_dataset_no_datatype_partitions() {
+    // Datatype partitions should NOT appear in dataset-level property partitions.
+    // They should only appear in class-level property partitions.
     let temp_dir = tempfile::tempdir().unwrap();
     let hdt_path = make_hdt(temp_dir.path(), DATATYPE_NT, "void_dt_dataset");
     let (ok, stdout, stderr) =
@@ -1505,7 +1507,7 @@ fn test_void_dataset_datatype_partitions() {
     let smap = subject_map(&triples);
     let ds = "<http://example.org/ds>";
 
-    // Find the dataset-level property partition for "age".
+    // Dataset-level property partition for "age" should exist with triple count.
     let age_pp = find_property_partition(
         &triples,
         &smap,
@@ -1513,55 +1515,22 @@ fn test_void_dataset_datatype_partitions() {
         "<http://example.org/age>",
     )
     .expect("Missing dataset-level property partition for ex:age");
-
-    // age has 2 triples, both xsd:integer.
     assert_eq!(
         get_void_triples_count(&smap, &age_pp),
         Some(2),
         "Expected 2 triples for age property partition"
     );
 
-    // Should have a datatype partition for xsd:integer with count 2.
-    let int_dt = find_datatype_partition(
-        &triples,
-        &smap,
-        &age_pp,
-        "http://www.w3.org/2001/XMLSchema#integer",
-    )
-    .expect("Missing xsd:integer datatype partition under age");
+    // But NO datatype partitions should exist under it.
+    let dt_count: usize = triples
+        .iter()
+        .filter(|(s, p, _)| {
+            s == &age_pp && p == "http://ldf.fi/void-ext#datatypePartition"
+        })
+        .count();
     assert_eq!(
-        get_void_triples_count(&smap, &int_dt),
-        Some(2),
-        "Expected 2 triples in xsd:integer datatype partition for age"
-    );
-
-    // Find dataset-level property partition for "name".
-    let name_pp = find_property_partition(
-        &triples,
-        &smap,
-        ds,
-        "<http://example.org/name>",
-    )
-    .expect("Missing dataset-level property partition for ex:name");
-
-    // name has 3 triples, all plain literals → xsd:string.
-    assert_eq!(
-        get_void_triples_count(&smap, &name_pp),
-        Some(3),
-        "Expected 3 triples for name property partition"
-    );
-
-    let str_dt = find_datatype_partition(
-        &triples,
-        &smap,
-        &name_pp,
-        "http://www.w3.org/2001/XMLSchema#string",
-    )
-    .expect("Missing xsd:string datatype partition under name");
-    assert_eq!(
-        get_void_triples_count(&smap, &str_dt),
-        Some(3),
-        "Expected 3 triples in xsd:string datatype partition for name"
+        dt_count, 0,
+        "Dataset-level property partition should have no datatype partitions"
     );
 }
 
@@ -1570,7 +1539,9 @@ fn test_void_dataset_datatype_partitions() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_void_dataset_language_partitions() {
+fn test_void_dataset_no_language_partitions() {
+    // Language partitions (nested under rdf:langString datatype partitions) should NOT
+    // appear in dataset-level property partitions.
     let temp_dir = tempfile::tempdir().unwrap();
     let hdt_path = make_hdt(temp_dir.path(), DATATYPE_NT, "void_lang_dataset");
     let (ok, stdout, stderr) =
@@ -1581,7 +1552,6 @@ fn test_void_dataset_language_partitions() {
     let smap = subject_map(&triples);
     let ds = "<http://example.org/ds>";
 
-    // Find dataset-level property partition for "label".
     let label_pp = find_property_partition(
         &triples,
         &smap,
@@ -1589,43 +1559,22 @@ fn test_void_dataset_language_partitions() {
         "<http://example.org/label>",
     )
     .expect("Missing dataset-level property partition for ex:label");
-
-    // label has 3 triples: "Alice"@en, "Alicia"@es, "Bob"@en.
     assert_eq!(
         get_void_triples_count(&smap, &label_pp),
         Some(3),
         "Expected 3 triples for label property partition"
     );
 
-    // Should have a rdf:langString datatype partition with count 3.
-    let lang_dt = find_datatype_partition(
-        &triples,
-        &smap,
-        &label_pp,
-        "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString",
-    )
-    .expect("Missing rdf:langString datatype partition under label");
+    // No datatype partitions at dataset level.
+    let dt_count: usize = triples
+        .iter()
+        .filter(|(s, p, _)| {
+            s == &label_pp && p == "http://ldf.fi/void-ext#datatypePartition"
+        })
+        .count();
     assert_eq!(
-        get_void_triples_count(&smap, &lang_dt),
-        Some(3),
-        "Expected 3 triples in rdf:langString datatype partition for label"
-    );
-
-    // Nested language partitions: @en (2 triples), @es (1 triple).
-    let en_part = find_language_partition(&triples, &smap, &lang_dt, "en")
-        .expect("Missing @en language partition under label's langString");
-    assert_eq!(
-        get_void_triples_count(&smap, &en_part),
-        Some(2),
-        "Expected 2 triples in @en language partition"
-    );
-
-    let es_part = find_language_partition(&triples, &smap, &lang_dt, "es")
-        .expect("Missing @es language partition under label's langString");
-    assert_eq!(
-        get_void_triples_count(&smap, &es_part),
-        Some(1),
-        "Expected 1 triple in @es language partition"
+        dt_count, 0,
+        "Dataset-level label property partition should have no datatype partitions"
     );
 }
 
@@ -1810,7 +1759,8 @@ fn test_void_datatype_blank_node_mode() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_void_datatype_counts_sum() {
+fn test_void_class_datatype_counts_sum() {
+    // Datatype partition counts at class level should sum to the property partition total.
     let temp_dir = tempfile::tempdir().unwrap();
     let hdt_path = make_hdt(temp_dir.path(), DATATYPE_NT, "void_dt_sum");
     let (ok, stdout, stderr) =
@@ -1821,25 +1771,30 @@ fn test_void_datatype_counts_sum() {
     let smap = subject_map(&triples);
     let ds = "<http://example.org/ds>";
 
-    // For the "name" property partition, datatype partition count should equal total.
-    // All 3 name triples are plain literals (xsd:string), so sum of dt partitions = 3.
-    let name_pp = find_property_partition(
+    // Find Person class partition → name property partition.
+    let person_cp = find_class_partition(
         &triples,
         &smap,
         ds,
+        "<http://example.org/Person>",
+    )
+    .unwrap();
+    let name_pp = find_property_partition(
+        &triples,
+        &smap,
+        &person_cp,
         "<http://example.org/name>",
     )
     .unwrap();
     let total = get_void_triples_count(&smap, &name_pp).unwrap();
 
-    // Sum all datatype partition counts.
+    // Sum all datatype partition counts under the class-level property partition.
     let dt_sum: u64 = triples
         .iter()
         .filter(|(s, p, _)| {
             s == &name_pp && p == "http://ldf.fi/void-ext#datatypePartition"
         })
-        .map(|(_, _, o)| o.clone())
-        .map(|dt_node| get_void_triples_count(&smap, &dt_node).unwrap_or(0))
+        .map(|(_, _, o)| get_void_triples_count(&smap, o).unwrap_or(0))
         .sum();
 
     assert_eq!(
@@ -1847,11 +1802,11 @@ fn test_void_datatype_counts_sum() {
         "Sum of datatype partition counts ({dt_sum}) should equal property partition total ({total})"
     );
 
-    // For "label", langString count = sum of language partition counts.
+    // For "label" under Person, langString count = sum of language partition counts.
     let label_pp = find_property_partition(
         &triples,
         &smap,
-        ds,
+        &person_cp,
         "<http://example.org/label>",
     )
     .unwrap();
@@ -1869,8 +1824,7 @@ fn test_void_datatype_counts_sum() {
         .filter(|(s, p, _)| {
             s == &lang_dt && p == "http://ldf.fi/void-ext#languagePartition"
         })
-        .map(|(_, _, o)| o.clone())
-        .map(|lang_node| get_void_triples_count(&smap, &lang_node).unwrap_or(0))
+        .map(|(_, _, o)| get_void_triples_count(&smap, o).unwrap_or(0))
         .sum();
 
     assert_eq!(
@@ -1884,7 +1838,9 @@ fn test_void_datatype_counts_sum() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_void_dataset_decimal_datatype() {
+fn test_void_dataset_no_decimal_datatype_partition() {
+    // Dataset-level revenue property partition should have no datatype partitions.
+    // (corp has no rdf:type, so revenue won't appear in any class partition either.)
     let temp_dir = tempfile::tempdir().unwrap();
     let hdt_path = make_hdt(temp_dir.path(), DATATYPE_NT, "void_dt_decimal");
     let (ok, stdout, stderr) =
@@ -1902,19 +1858,18 @@ fn test_void_dataset_decimal_datatype() {
         "<http://example.org/revenue>",
     )
     .expect("Missing dataset-level property partition for ex:revenue");
-
-    let decimal_dt = find_datatype_partition(
-        &triples,
-        &smap,
-        &revenue_pp,
-        "http://www.w3.org/2001/XMLSchema#decimal",
-    )
-    .expect("Missing xsd:decimal datatype partition under revenue");
     assert_eq!(
-        get_void_triples_count(&smap, &decimal_dt),
+        get_void_triples_count(&smap, &revenue_pp),
         Some(1),
-        "Expected 1 triple in xsd:decimal datatype partition for revenue"
+        "Expected 1 triple for revenue property partition"
     );
+    let dt_count: usize = triples
+        .iter()
+        .filter(|(s, p, _)| {
+            s == &revenue_pp && p == "http://ldf.fi/void-ext#datatypePartition"
+        })
+        .count();
+    assert_eq!(dt_count, 0, "Dataset-level revenue should have no datatype partitions");
 }
 
 // ---------------------------------------------------------------------------
@@ -1923,9 +1878,8 @@ fn test_void_dataset_decimal_datatype() {
 
 #[test]
 fn test_void_existing_fixture_still_works() {
-    // Ensure the original VOID_NT fixture still produces correct results with
-    // the new datatype partition code. The name property should now have
-    // xsd:string datatype partitions.
+    // Ensure the original VOID_NT fixture still produces correct results.
+    // Dataset-level property partitions should NOT have datatype partitions.
     let temp_dir = tempfile::tempdir().unwrap();
     let hdt_path = make_hdt(temp_dir.path(), VOID_NT, "void_existing");
     let (ok, stdout, stderr) =
@@ -1943,7 +1897,7 @@ fn test_void_existing_fixture_still_works() {
         "Expected 11 triples"
     );
 
-    // The name property (4 plain literals) should have an xsd:string datatype partition.
+    // Dataset-level name property partition should exist but with no datatype partitions.
     let name_pp = find_property_partition(
         &triples,
         &smap,
@@ -1951,18 +1905,15 @@ fn test_void_existing_fixture_still_works() {
         "<http://example.org/name>",
     )
     .expect("Missing name property partition");
-
-    let str_dt = find_datatype_partition(
-        &triples,
-        &smap,
-        &name_pp,
-        "http://www.w3.org/2001/XMLSchema#string",
-    )
-    .expect("Missing xsd:string datatype partition under name in original fixture");
+    let dt_count: usize = triples
+        .iter()
+        .filter(|(s, p, _)| {
+            s == &name_pp && p == "http://ldf.fi/void-ext#datatypePartition"
+        })
+        .count();
     assert_eq!(
-        get_void_triples_count(&smap, &str_dt),
-        Some(4),
-        "Expected 4 triples in xsd:string datatype partition for name (original fixture)"
+        dt_count, 0,
+        "Dataset-level name property partition should have no datatype partitions"
     );
 }
 
@@ -1998,6 +1949,7 @@ const MIXED_DATATYPE_NT: &str = r#"<http://example.org/alice> <http://www.w3.org
 
 #[test]
 fn test_void_mixed_datatypes_single_property() {
+    // Mixed datatypes: datatype partitions should only appear at class level.
     let temp_dir = tempfile::tempdir().unwrap();
     let hdt_path = make_hdt(temp_dir.path(), MIXED_DATATYPE_NT, "void_mixed_dt");
     let (ok, stdout, stderr) =
@@ -2008,7 +1960,7 @@ fn test_void_mixed_datatypes_single_property() {
     let smap = subject_map(&triples);
     let ds = "<http://example.org/ds>";
 
-    // Dataset-level "value" property partition should have 8 triples.
+    // Dataset-level "value" property partition should have 8 triples but no datatype partitions.
     let value_pp = find_property_partition(
         &triples,
         &smap,
@@ -2021,74 +1973,15 @@ fn test_void_mixed_datatypes_single_property() {
         Some(8),
         "Expected 8 triples for value property partition"
     );
-
-    // xsd:integer datatype partition: 2 triples.
-    let int_dt = find_datatype_partition(
-        &triples,
-        &smap,
-        &value_pp,
-        "http://www.w3.org/2001/XMLSchema#integer",
-    )
-    .expect("Missing xsd:integer datatype partition under value");
-    assert_eq!(get_void_triples_count(&smap, &int_dt), Some(2));
-
-    // xsd:string datatype partition: 2 triples (plain literals).
-    let str_dt = find_datatype_partition(
-        &triples,
-        &smap,
-        &value_pp,
-        "http://www.w3.org/2001/XMLSchema#string",
-    )
-    .expect("Missing xsd:string datatype partition under value");
-    assert_eq!(get_void_triples_count(&smap, &str_dt), Some(2));
-
-    // xsd:date datatype partition: 1 triple.
-    let date_dt = find_datatype_partition(
-        &triples,
-        &smap,
-        &value_pp,
-        "http://www.w3.org/2001/XMLSchema#date",
-    )
-    .expect("Missing xsd:date datatype partition under value");
-    assert_eq!(get_void_triples_count(&smap, &date_dt), Some(1));
-
-    // rdf:langString datatype partition: 3 triples total.
-    let lang_dt = find_datatype_partition(
-        &triples,
-        &smap,
-        &value_pp,
-        "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString",
-    )
-    .expect("Missing rdf:langString datatype partition under value");
-    assert_eq!(get_void_triples_count(&smap, &lang_dt), Some(3));
-
-    // Nested language partitions: @en=1, @es=1, @de=1.
-    let en_part = find_language_partition(&triples, &smap, &lang_dt, "en")
-        .expect("Missing @en language partition");
-    assert_eq!(get_void_triples_count(&smap, &en_part), Some(1));
-
-    let es_part = find_language_partition(&triples, &smap, &lang_dt, "es")
-        .expect("Missing @es language partition");
-    assert_eq!(get_void_triples_count(&smap, &es_part), Some(1));
-
-    let de_part = find_language_partition(&triples, &smap, &lang_dt, "de")
-        .expect("Missing @de language partition");
-    assert_eq!(get_void_triples_count(&smap, &de_part), Some(1));
-
-    // Sum of all datatype partition counts should equal property partition total.
-    let dt_sum: u64 = triples
+    let dt_count: usize = triples
         .iter()
         .filter(|(s, p, _)| {
             s == &value_pp && p == "http://ldf.fi/void-ext#datatypePartition"
         })
-        .map(|(_, _, o)| get_void_triples_count(&smap, o).unwrap_or(0))
-        .sum();
-    assert_eq!(
-        dt_sum, 8,
-        "Sum of datatype partition counts ({dt_sum}) should equal 8"
-    );
+        .count();
+    assert_eq!(dt_count, 0, "Dataset-level value should have no datatype partitions");
 
-    // Same checks at class level (Thing class partition).
+    // Class-level (Thing) should have datatype partitions.
     let thing_cp = find_class_partition(&triples, &smap, ds, "<http://example.org/Thing>")
         .expect("Missing Thing class partition");
     let class_value_pp = find_property_partition(
@@ -2099,7 +1992,7 @@ fn test_void_mixed_datatypes_single_property() {
     )
     .expect("Missing value property partition under Thing");
 
-    // Class-level should have identical counts (both subjects are Thing).
+    // xsd:integer: 2 triples.
     let class_int_dt = find_datatype_partition(
         &triples,
         &smap,
@@ -2109,6 +2002,27 @@ fn test_void_mixed_datatypes_single_property() {
     .expect("Missing xsd:integer under Thing/value");
     assert_eq!(get_void_triples_count(&smap, &class_int_dt), Some(2));
 
+    // xsd:string: 2 triples (plain literals).
+    let class_str_dt = find_datatype_partition(
+        &triples,
+        &smap,
+        &class_value_pp,
+        "http://www.w3.org/2001/XMLSchema#string",
+    )
+    .expect("Missing xsd:string under Thing/value");
+    assert_eq!(get_void_triples_count(&smap, &class_str_dt), Some(2));
+
+    // xsd:date: 1 triple.
+    let class_date_dt = find_datatype_partition(
+        &triples,
+        &smap,
+        &class_value_pp,
+        "http://www.w3.org/2001/XMLSchema#date",
+    )
+    .expect("Missing xsd:date under Thing/value");
+    assert_eq!(get_void_triples_count(&smap, &class_date_dt), Some(1));
+
+    // rdf:langString: 3 triples with nested language partitions.
     let class_lang_dt = find_datatype_partition(
         &triples,
         &smap,
@@ -2117,4 +2031,29 @@ fn test_void_mixed_datatypes_single_property() {
     )
     .expect("Missing rdf:langString under Thing/value");
     assert_eq!(get_void_triples_count(&smap, &class_lang_dt), Some(3));
+
+    let en_part = find_language_partition(&triples, &smap, &class_lang_dt, "en")
+        .expect("Missing @en language partition under Thing/value");
+    assert_eq!(get_void_triples_count(&smap, &en_part), Some(1));
+
+    let es_part = find_language_partition(&triples, &smap, &class_lang_dt, "es")
+        .expect("Missing @es language partition under Thing/value");
+    assert_eq!(get_void_triples_count(&smap, &es_part), Some(1));
+
+    let de_part = find_language_partition(&triples, &smap, &class_lang_dt, "de")
+        .expect("Missing @de language partition under Thing/value");
+    assert_eq!(get_void_triples_count(&smap, &de_part), Some(1));
+
+    // Sum of all class-level datatype partition counts should equal property partition total.
+    let dt_sum: u64 = triples
+        .iter()
+        .filter(|(s, p, _)| {
+            s == &class_value_pp && p == "http://ldf.fi/void-ext#datatypePartition"
+        })
+        .map(|(_, _, o)| get_void_triples_count(&smap, o).unwrap_or(0))
+        .sum();
+    assert_eq!(
+        dt_sum, 8,
+        "Sum of class-level datatype partition counts ({dt_sum}) should equal 8"
+    );
 }

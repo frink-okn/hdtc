@@ -178,11 +178,9 @@ struct PropPartitionData {
     target_datatypes: HashMap<u16, u64>,
 }
 
-/// Dataset-level property partition data (triple count + datatype breakdown).
+/// Dataset-level property partition data (triple count only).
 struct DatasetPropData {
     triple_count: u64,
-    /// Datatype/language breakdown for literal objects at dataset level.
-    target_datatypes: HashMap<u16, u64>,
 }
 
 struct ClassPartitionData {
@@ -597,14 +595,8 @@ fn run_stats_pass(
         // Dataset-level property count and datatype accumulation.
         let dpd = dataset_prop_data
             .entry(p_id)
-            .or_insert_with(|| DatasetPropData {
-                triple_count: 0,
-                target_datatypes: HashMap::new(),
-            });
+            .or_insert_with(|| DatasetPropData { triple_count: 0 });
         dpd.triple_count += 1;
-        if dt_id > 0 {
-            *dpd.target_datatypes.entry(dt_id).or_insert(0) += 1;
-        }
 
         // Subject type lookup (update cache on subject change).
         if s_id != prev_subject_id {
@@ -836,17 +828,6 @@ fn write_void_triples(
         written += 1;
         nt(w, &part_node, VOID_TRIPLES, &int_node(dpd.triple_count))?;
         written += 1;
-
-        // Datatype/language partitions for this dataset-level property partition.
-        written += write_datatype_partitions(
-            w,
-            &part_uri,
-            &part_node,
-            use_blank_nodes,
-            &dpd.target_datatypes,
-            datatype_index,
-            &mut bnode_counter,
-        )?;
     }
 
     // -----------------------------------------------------------------------
