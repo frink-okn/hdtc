@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 /// This avoids holding either the dictionary or triples in memory.
 pub fn write_hdt_streaming(
     output_path: &Path,
-    base_uri: &str,
+    dataset_uri: &str,
     counts: &DictCounts,
     dict_section_paths: &[PathBuf],
     dict_section_sizes: &[u64],
@@ -43,7 +43,7 @@ pub fn write_hdt_streaming(
 
     // 2. Header
     let header_content = build_header_ntriples(
-        base_uri,
+        dataset_uri,
         counts,
         triples.num_triples,
         dict_size,
@@ -159,7 +159,7 @@ fn copy_file_with_crc<W: Write>(writer: &mut W, path: &Path) -> Result<u32> {
 
 /// Build the header section content as N-Triples (Java-compatible format).
 fn build_header_ntriples(
-    base_uri: &str,
+    dataset_uri: &str,
     counts: &DictCounts,
     num_triples: u64,
     dict_size: u64,
@@ -167,7 +167,7 @@ fn build_header_ntriples(
     ntriples_size: u64,
 ) -> String {
     let mut lines = Vec::new();
-    let dataset = format!("<{base_uri}>");
+    let dataset = format!("<{dataset_uri}>");
     let void = "http://rdfs.org/ns/void#";
     let rdf = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
     let dcterms = "http://purl.org/dc/terms/";
