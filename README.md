@@ -36,7 +36,7 @@ cargo build --release
 
 ## Usage
 
-hdtc supports five main commands:
+hdtc supports six main commands:
 
 ### `hdtc create` — Convert RDF to HDT
 
@@ -66,6 +66,14 @@ hdtc search [OPTIONS] --query <PATTERN> <HDT_FILE>
 
 ```
 hdtc void [OPTIONS] <HDT_FILE>
+```
+
+### `hdtc header` — Inspect or rewrite the embedded header
+
+```
+hdtc header dump    <HDT_FILE> [OPTIONS]
+hdtc header replace <HDT_FILE> --input <RDF> [OPTIONS]
+hdtc header augment <HDT_FILE> --input <RDF> [OPTIONS]
 ```
 
 ### Create: Basic examples
@@ -289,6 +297,40 @@ The algorithm uses two sequential passes over the HDT triples plus a dictionary 
 
 Partition URIs are generated using MD5 hashes of the corresponding class, property, datatype, or language tag. Blank-node classes (common in OWL ontologies) are automatically filtered out and do not produce class partitions.
 
+### Header: Editing the embedded header
+
+Every HDT file embeds a small N-Triples block in its header describing the dataset — its URI, VoID counts, and format/publication metadata. `hdtc header` inspects or rewrites those triples so a distributed `.hdt` can self-identify (dataset URI, version, provenance, richer VoID).
+
+There are three modes:
+
+- **dump** — write the current header triples to stdout (or a file) as N-Triples.
+- **replace** — replace the header triples wholesale with the triples from an RDF file.
+- **augment** — merge an RDF file's triples into the existing header triples (set union, deduplicated).
+
+Dump the header to stdout:
+
+```sh
+hdtc header dump data.hdt
+```
+
+Replace the header with metadata from a Turtle file (rewrites `data.hdt` in place):
+
+```sh
+hdtc header replace data.hdt --input metadata.ttl
+```
+
+Augment the header, writing to a new file instead of touching the source:
+
+```sh
+hdtc header augment data.hdt --input extra.nt -o data-annotated.hdt
+```
+
+`replace` and `augment` rewrite the file in place by default; pass `-o`/`--output` to write a new HDT and leave the source untouched. The dictionary and triples sections are copied verbatim, so any existing `.hdt.index.v1-1` sidecar remains valid — no need to re-index. (A new file written with `-o` does not get its own index; run `hdtc index` on it if you need one.)
+
+The input may be in any standard RDF format, optionally compressed (`.gz`/`.bz2`/`.xz`). Only triples are used: graph names in quad inputs are ignored.
+
+The dataset triple count (`void:triples` / `hdt:triplesnumTriples`) is a fact about the stored data, so it is always taken from the existing HDT and never from the input — any count statement in the input RDF is ignored. This guarantees the rewritten file stays readable.
+
 ### Create: All options
 
 | Option                             | Default                      | Description                                                 |
@@ -359,6 +401,21 @@ Auto parser tuning is derived from `--memory-limit` (accepts `G`/`M` suffixes, e
 | `-v, --verbose`           | —                            | Increase log verbosity (`-v` debug, `-vv` trace)                    |
 | `-q, --quiet`             | —                            | Suppress all output except errors                                   |
 
+### Header: All options
+
+```
+hdtc header <dump|replace|augment> <HDT_FILE> [OPTIONS]
+```
+
+| Option              | Modes              | Default      | Description                                                                                            |
+| ------------------- | ------------------ | ------------ | ------------------------------------------------------------------------------------------------------ |
+| `<HDT_FILE>`        | all                | _(required)_ | Path to existing HDT file                                                                              |
+| `-i, --input PATH`  | `replace`, `augment` | _(required)_ | RDF file whose triples replace / augment the header (any standard format)                              |
+| `-o, --output PATH` | all                | see desc.    | `dump`: write to file instead of stdout. `replace`/`augment`: write a new HDT instead of rewriting in place |
+| `--benchmark`       | all                | off          | Emit stage timing and RSS high-water summary                                                          |
+| `-v, --verbose`     | all                | —            | Increase log verbosity (`-v` debug, `-vv` trace)                                                      |
+| `-q, --quiet`       | all                | —            | Suppress all output except errors                                                                     |
+
 ## Resource requirements
 
 ### Memory
@@ -409,10 +466,10 @@ All intermediate data is spilled to disk in zstd-compressed temporary files, kee
 src/
   main.rs            CLI entry point and pipeline orchestration
   cli.rs             Argument definitions (clap derive)
-  rdf/               RDF parsing, format/compression detection, input discovery
+  rdf/               RDF parsing & N-Triples serialization, format/compression detection, input discovery
   dictionary/        Dictionary construction, Plain Front Coding (PFC)
   triples/           BitmapTriples encoding
-  hdt/               HDT file serialization
+  hdt/               HDT file serialization, reading, search, VoID, header read/rewrite
   index/             HDT index generation (.hdt.index.v1-1)
   io/                VByte, LogArray, Bitmap, CRC, Control Information
   pipeline/          6-stage pipelined architecture

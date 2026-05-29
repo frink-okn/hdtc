@@ -96,6 +96,7 @@ fn main() -> Result<()> {
         cli::Commands::Search(args) => search_hdt(args, benchmark),
         cli::Commands::Validate(args) => validate_hdt_file(args, benchmark),
         cli::Commands::Void(args) => compute_void(args, benchmark),
+        cli::Commands::Header(args) => run_header(args, benchmark),
     }
 }
 
@@ -378,6 +379,61 @@ fn compute_void(args: cli::VoidArgs, benchmark: bool) -> Result<()> {
     match &args.output {
         Some(p) => tracing::info!("Done! {count} VoID triples written to {}", p.display()),
         None => tracing::info!("Done! {count} VoID triples written"),
+    }
+    Ok(())
+}
+
+/// Inspect or rewrite the N-Triples metadata in an HDT file's header.
+fn run_header(args: cli::HeaderArgs, benchmark: bool) -> Result<()> {
+    let start = std::time::Instant::now();
+
+    match args.action {
+        cli::HeaderAction::Dump(a) => {
+            if !a.hdt_file.exists() {
+                anyhow::bail!("HDT file not found: {}", a.hdt_file.display());
+            }
+            tracing::info!("Dumping header: {}", a.hdt_file.display());
+            let count = hdt::header_dump(&a.hdt_file, a.output.as_deref())?;
+            match &a.output {
+                Some(p) => tracing::info!("Done! {count} header triples written to {}", p.display()),
+                None => tracing::info!("Done! {count} header triples written"),
+            }
+        }
+        cli::HeaderAction::Replace(a) => {
+            if !a.hdt_file.exists() {
+                anyhow::bail!("HDT file not found: {}", a.hdt_file.display());
+            }
+            let dest = a.output.as_deref().unwrap_or(&a.hdt_file);
+            tracing::info!(
+                "Replacing header in {} from {} (output: {})",
+                a.hdt_file.display(),
+                a.input.display(),
+                dest.display()
+            );
+            let count = hdt::header_replace(&a.hdt_file, &a.input, a.output.as_deref())?;
+            tracing::info!("Done! {count} header triples written to {}", dest.display());
+        }
+        cli::HeaderAction::Augment(a) => {
+            if !a.hdt_file.exists() {
+                anyhow::bail!("HDT file not found: {}", a.hdt_file.display());
+            }
+            let dest = a.output.as_deref().unwrap_or(&a.hdt_file);
+            tracing::info!(
+                "Augmenting header in {} from {} (output: {})",
+                a.hdt_file.display(),
+                a.input.display(),
+                dest.display()
+            );
+            let count = hdt::header_augment(&a.hdt_file, &a.input, a.output.as_deref())?;
+            tracing::info!("Done! {count} header triples written to {}", dest.display());
+        }
+    }
+
+    if benchmark {
+        tracing::info!(
+            "Benchmark summary (header): total {:.3}s",
+            start.elapsed().as_secs_f64()
+        );
     }
     Ok(())
 }

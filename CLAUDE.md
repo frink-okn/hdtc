@@ -77,10 +77,10 @@ Key design points:
 src/
   main.rs          - CLI entry point, pipeline orchestration
   cli.rs           - CLI argument definitions (clap)
-  rdf/             - RDF parsing, input discovery, streaming, compressed input
+  rdf/             - RDF parsing & N-Triples serialization, input discovery, streaming, compressed input
   dictionary/      - Dictionary construction, PFC encoding
   triples/         - BitmapTriples encoding (streaming)
-  hdt/             - HDT file serialization (header, dictionary, triples sections)
+  hdt/             - HDT file serialization & reading (dictionary, triples, header read/rewrite, search, VoID)
   index/           - HDT index file generation (.hdt.index.v1-1)
   io/              - VByte, LogArray, Bitmap, CRC utilities, Control Information
   pipeline/        - 6-stage pipeline (batch vocab, partial vocab, merger, ID remapper)
@@ -97,7 +97,7 @@ tests/
 | Crate | Purpose |
 |-------|---------|
 | `clap` | CLI argument parsing (derive API) |
-| `oxrdfio` | RDF parsing (all standard formats, streaming) |
+| `oxrdfio` | RDF parsing & serialization (all standard formats, streaming) |
 | `anyhow` | Application error handling |
 | `thiserror` | Structured error types |
 | `tracing` / `tracing-subscriber` | Structured logging |

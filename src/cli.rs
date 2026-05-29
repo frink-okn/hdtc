@@ -98,6 +98,59 @@ pub enum Commands {
 
     /// Compute VoID statistics for an HDT file and output as N-Triples
     Void(VoidArgs),
+
+    /// Inspect or rewrite the N-Triples metadata in an HDT file's header
+    Header(HeaderArgs),
+}
+
+#[derive(Debug, Parser)]
+pub struct HeaderArgs {
+    #[command(subcommand)]
+    pub action: HeaderAction,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum HeaderAction {
+    /// Print the header triples to stdout as N-Triples
+    Dump(HeaderDumpArgs),
+
+    /// Replace the header triples with those from an RDF file
+    ///
+    /// The dataset triple count (void:triples / hdt:triplesnumTriples) is always
+    /// taken from the existing HDT data, never from the input, so the rewritten
+    /// file stays readable. Any count statement in the input is ignored.
+    Replace(HeaderRewriteArgs),
+
+    /// Merge triples from an RDF file into the header triples (set union)
+    ///
+    /// Existing header triples are kept and the input's triples are added,
+    /// deduplicated. As with replace, the triple count is taken from the
+    /// existing header and any count statement in the input is ignored.
+    Augment(HeaderRewriteArgs),
+}
+
+#[derive(Debug, Parser)]
+pub struct HeaderDumpArgs {
+    /// Path to existing HDT file
+    pub hdt_file: PathBuf,
+
+    /// Write to file instead of stdout
+    #[arg(short, long, value_name = "PATH")]
+    pub output: Option<PathBuf>,
+}
+
+#[derive(Debug, Parser)]
+pub struct HeaderRewriteArgs {
+    /// Path to existing HDT file
+    pub hdt_file: PathBuf,
+
+    /// RDF file whose triples replace / augment the header (any standard format)
+    #[arg(short, long, value_name = "PATH")]
+    pub input: PathBuf,
+
+    /// Write the modified HDT to a new file instead of rewriting in place
+    #[arg(short, long, value_name = "PATH")]
+    pub output: Option<PathBuf>,
 }
 
 #[derive(Debug, Parser)]
