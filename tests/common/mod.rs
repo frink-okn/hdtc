@@ -159,7 +159,7 @@ pub fn hdt_java_classpath(hdt_java_dir: &Path) -> String {
 // Apache Jena download helpers (rdfcompare for graph-isomorphism checks)
 // ---------------------------------------------------------------------------
 
-pub const JENA_VERSION: &str = "6.0.0";
+pub const JENA_VERSION: &str = "6.1.0";
 
 static JENA_DOWNLOAD_ONCE: Once = Once::new();
 
