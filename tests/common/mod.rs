@@ -183,34 +183,49 @@ pub fn ensure_jena() -> PathBuf {
 
         std::fs::create_dir_all(&base_dir).expect("create jena dir");
 
-        let url = format!(
-            "https://dlcdn.apache.org/jena/binaries/apache-jena-{JENA_VERSION}.tar.gz"
-        );
+        // The live mirror (dlcdn) only serves the current release and drops
+        // superseded versions, so a pinned version eventually 404s there. Fall
+        // back to archive.apache.org, which keeps every released version.
+        let urls = [
+            format!("https://dlcdn.apache.org/jena/binaries/apache-jena-{JENA_VERSION}.tar.gz"),
+            format!(
+                "https://archive.apache.org/dist/jena/binaries/apache-jena-{JENA_VERSION}.tar.gz"
+            ),
+        ];
 
-        eprintln!("Downloading Apache Jena from {url}...");
+        let mut extracted = false;
+        for url in &urls {
+            eprintln!("Downloading Apache Jena from {url}...");
 
-        let mut curl = Command::new("curl")
-            .args(["-fsSL", &url])
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .expect("Failed to start curl");
+            let mut curl = Command::new("curl")
+                .args(["-fsSL", url])
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .expect("Failed to start curl");
 
-        let curl_stdout = curl.stdout.take().unwrap();
+            let curl_stdout = curl.stdout.take().unwrap();
 
-        let tar_output = Command::new("tar")
-            .args(["xzf", "-", "--strip-components=1"])
-            .current_dir(&base_dir)
-            .stdin(curl_stdout)
-            .output()
-            .expect("Failed to extract Jena tarball");
+            let tar_output = Command::new("tar")
+                .args(["xzf", "-", "--strip-components=1"])
+                .current_dir(&base_dir)
+                .stdin(curl_stdout)
+                .output()
+                .expect("Failed to extract Jena tarball");
 
-        curl.wait().expect("Failed to wait for curl");
+            curl.wait().expect("Failed to wait for curl");
 
-        assert!(
-            tar_output.status.success(),
-            "tar extraction failed: {}",
-            String::from_utf8_lossy(&tar_output.stderr)
-        );
+            if tar_output.status.success() {
+                extracted = true;
+                break;
+            }
+
+            eprintln!(
+                "  download from {url} failed: {}",
+                String::from_utf8_lossy(&tar_output.stderr)
+            );
+        }
+
+        assert!(extracted, "Jena download failed from all mirrors");
 
         std::fs::write(&marker, "ok").expect("write marker");
         eprintln!("Apache Jena downloaded to {}", base_dir.display());
