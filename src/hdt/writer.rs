@@ -9,9 +9,12 @@
 use crate::dictionary::DictCounts;
 use crate::io::crc_utils::crc8;
 use crate::io::vbyte::encode_vbyte;
+use crate::hdt::header_vocab::{HDT_DATASET, HDT_NS, RDF_TYPE, VOID_DATASET, VOID_NS, VOID_STAT_LOCALS};
 use crate::io::{ControlInfo, ControlType};
+use crate::rdf::serialize_triples;
 use crate::triples::BitmapTriplesFiles;
 use anyhow::{Context, Result};
+use oxrdf::{BlankNode, Literal, NamedNode, Term, Triple};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -49,7 +52,7 @@ pub fn write_hdt_streaming(
         dict_size,
         hdt_data_size,
         ntriples_size,
-    );
+    )?;
     let mut header_ci = ControlInfo::new(ControlType::Header, "ntriples");
     header_ci.set_property("length", header_content.len().to_string());
     header_ci.write_to(&mut writer)?;
@@ -165,105 +168,76 @@ fn build_header_ntriples(
     dict_size: u64,
     hdt_data_size: u64,
     ntriples_size: u64,
-) -> String {
-    let mut lines = Vec::new();
-    let dataset = format!("<{dataset_uri}>");
-    let void = "http://rdfs.org/ns/void#";
-    let rdf = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
+) -> Result<String> {
     let dcterms = "http://purl.org/dc/terms/";
-    let hdt_ns = "http://purl.org/HDT/hdt#";
 
-    // Match Java's type declarations (both hdt#Dataset and void#Dataset)
-    lines.push(format!(
-        "{dataset} <{rdf}type> <{hdt_ns}Dataset> ."
-    ));
-    lines.push(format!(
-        "{dataset} <{rdf}type> <{void}Dataset> ."
-    ));
+    // `new_unchecked` mirrors the previous string-interpolation behaviour: the
+    // dataset base URI is not validated as an IRI here.
+    let iri = |s: &str| NamedNode::new_unchecked(s);
+    let term_iri = |s: &str| Term::NamedNode(NamedNode::new_unchecked(s));
+    let blank = |s: &str| BlankNode::new_unchecked(s);
+    let term_blank = |s: &str| Term::BlankNode(BlankNode::new_unchecked(s));
+    // Counts are untyped (xsd:string) literals to match the Java format.
+    let lit = |s: String| Term::Literal(Literal::new_simple_literal(s));
 
-    // Counts (untyped literals to match Java format)
-    lines.push(format!(
-        "{dataset} <{void}triples> \"{num_triples}\" ."
-    ));
-
-    lines.push(format!(
-        "{dataset} <{void}properties> \"{}\" .",
-        counts.predicates
-    ));
-
+    let dataset = iri(dataset_uri);
     let distinct_subjects = counts.shared + counts.subjects;
-    lines.push(format!(
-        "{dataset} <{void}distinctSubjects> \"{distinct_subjects}\" ."
-    ));
-
     let distinct_objects = counts.shared + counts.objects;
-    lines.push(format!(
-        "{dataset} <{void}distinctObjects> \"{distinct_objects}\" ."
-    ));
-
-    // Blank node for format information (Java style)
-    lines.push(format!(
-        "{dataset} <{hdt_ns}formatInformation> _:format ."
-    ));
-    lines.push(format!(
-        "_:format <{hdt_ns}dictionary> _:dictionary ."
-    ));
-    lines.push(format!(
-        "_:format <{hdt_ns}triples> _:triples ."
-    ));
-
-    // Blank node for statistical information
-    lines.push(format!(
-        "{dataset} <{hdt_ns}statisticalInformation> _:statistics ."
-    ));
-
-    // Blank node for publication information
-    lines.push(format!(
-        "{dataset} <{hdt_ns}publicationInformation> _:publicationInformation ."
-    ));
-
-    // Dictionary format information
-    lines.push(format!(
-        "_:dictionary <{dcterms}format> <{hdt_ns}dictionaryFour> ."
-    ));
-    lines.push(format!(
-        "_:dictionary <{hdt_ns}dictionarynumSharedSubjectObject> \"{shared}\" .",
-        shared = counts.shared
-    ));
-
-    // Dictionary size in bytes (actual encoded size)
-    lines.push(format!(
-        "_:dictionary <{hdt_ns}dictionarysizeStrings> \"{dict_size}\" ."
-    ));
-
-    // Triples format information
-    lines.push(format!(
-        "_:triples <{dcterms}format> <{hdt_ns}triplesBitmap> ."
-    ));
-    lines.push(format!(
-        "_:triples <{hdt_ns}triplesnumTriples> \"{num_triples}\" ."
-    ));
-    lines.push(format!(
-        "_:triples <{hdt_ns}triplesOrder> \"SPO\" ."
-    ));
-
-    // Statistical information (HDT data size in bytes)
-    lines.push(format!(
-        "_:statistics <{hdt_ns}hdtSize> \"{hdt_data_size}\" ."
-    ));
-
-    // Publication information with timestamp (ISO 8601 format)
     let timestamp = generate_timestamp();
-    lines.push(format!(
-        "_:publicationInformation <{dcterms}issued> \"{timestamp}\" ."
-    ));
 
-    // Original N-Triples serialization size
-    lines.push(format!(
-        "_:statistics <{hdt_ns}originalSize> \"{ntriples_size}\" ."
-    ));
+    // Value for each data-derived void statistic, keyed by its local name. The
+    // statistic triples are built by iterating VOID_STAT_LOCALS (below), so the
+    // `header` command's reserved-predicate set cannot drift from what is
+    // emitted here — adding a stat means adding it to both this match and the
+    // shared list.
+    let void_stat_value = |local: &str| -> String {
+        match local {
+            "triples" => num_triples.to_string(),
+            "properties" => counts.predicates.to_string(),
+            "distinctSubjects" => distinct_subjects.to_string(),
+            "distinctObjects" => distinct_objects.to_string(),
+            other => unreachable!("no value for void statistic {other}"),
+        }
+    };
 
-    lines.join("\n") + "\n"
+    let mut triples = vec![
+        // Dataset: type declarations (both hdt#Dataset and void#Dataset, Java style)
+        Triple::new(dataset.clone(), iri(RDF_TYPE), term_iri(HDT_DATASET)),
+        Triple::new(dataset.clone(), iri(RDF_TYPE), term_iri(VOID_DATASET)),
+    ];
+
+    // Dataset: VoID counts (untyped string literals to match Java)
+    for local in VOID_STAT_LOCALS {
+        triples.push(Triple::new(
+            dataset.clone(),
+            iri(&format!("{VOID_NS}{local}")),
+            lit(void_stat_value(local)),
+        ));
+    }
+
+    triples.extend([
+        // Format information: _:format links to the dictionary and triples nodes
+        Triple::new(dataset.clone(), iri(&format!("{HDT_NS}formatInformation")), term_blank("format")),
+        Triple::new(blank("format"), iri(&format!("{HDT_NS}dictionary")), term_blank("dictionary")),
+        Triple::new(blank("format"), iri(&format!("{HDT_NS}triples")), term_blank("triples")),
+        // _:dictionary — format, shared subject/object count, encoded size in bytes
+        Triple::new(blank("dictionary"), iri(&format!("{dcterms}format")), term_iri(&format!("{HDT_NS}dictionaryFour"))),
+        Triple::new(blank("dictionary"), iri(&format!("{HDT_NS}dictionarynumSharedSubjectObject")), lit(counts.shared.to_string())),
+        Triple::new(blank("dictionary"), iri(&format!("{HDT_NS}dictionarysizeStrings")), lit(dict_size.to_string())),
+        // _:triples — format, triple count, ordering
+        Triple::new(blank("triples"), iri(&format!("{dcterms}format")), term_iri(&format!("{HDT_NS}triplesBitmap"))),
+        Triple::new(blank("triples"), iri(&format!("{HDT_NS}triplesnumTriples")), lit(num_triples.to_string())),
+        Triple::new(blank("triples"), iri(&format!("{HDT_NS}triplesOrder")), lit("SPO".to_string())),
+        // Statistical information: _:statistics — HDT data size and original N-Triples size in bytes
+        Triple::new(dataset.clone(), iri(&format!("{HDT_NS}statisticalInformation")), term_blank("statistics")),
+        Triple::new(blank("statistics"), iri(&format!("{HDT_NS}hdtSize")), lit(hdt_data_size.to_string())),
+        Triple::new(blank("statistics"), iri(&format!("{HDT_NS}originalSize")), lit(ntriples_size.to_string())),
+        // Publication information: _:publicationInformation — issue timestamp (ISO 8601)
+        Triple::new(dataset.clone(), iri(&format!("{HDT_NS}publicationInformation")), term_blank("publicationInformation")),
+        Triple::new(blank("publicationInformation"), iri(&format!("{dcterms}issued")), lit(timestamp)),
+    ]);
+
+    serialize_triples(&triples)
 }
 
 /// Generate ISO 8601 timestamp for publication info.
@@ -343,7 +317,9 @@ mod tests {
             graphs: 0,
         };
 
-        let header = build_header_ntriples("http://example.org/dataset", &counts, 100, 150, 200, 1000);
+        let header =
+            build_header_ntriples("http://example.org/dataset", &counts, 100, 150, 200, 1000)
+                .unwrap();
 
         // Check both dataset types (hdt and void)
         assert!(header.contains("hdt#Dataset"));

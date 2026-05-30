@@ -1,13 +1,18 @@
 //! `hdtc header` command: dump or modify the RDF triples embedded in an HDT
 //! file's header section.
 //!
-//! The header is a plain N-Triples blob (one triple per line) carrying dataset
-//! metadata: void statistics, the HDT format/structure description, and any
-//! descriptive triples about the dataset. Because HDT control-info blocks are
-//! self-delimiting and no section stores absolute file offsets (and the
-//! `.hdt.index.v1-1` file does not reference the header), the header can be
-//! resized and the dictionary+triples bytes copied verbatim — no re-encoding
-//! and no index invalidation.
+//! The header is an N-Triples blob carrying dataset metadata: void statistics,
+//! the HDT format/structure description, and any descriptive triples about the
+//! dataset. Because HDT control-info blocks are self-delimiting and no section
+//! stores absolute file offsets (and the `.hdt.index.v1-1` file does not
+//! reference the header), the header can be resized and the dictionary+triples
+//! bytes copied verbatim — no re-encoding and no index invalidation.
+//!
+//! Modifications parse the existing header back into `oxrdf::Triple`s, operate
+//! on those triples, and re-serialize through [`crate::rdf::serialize_triples`]
+//! (the same path the HDT writer uses). Working on real triples — rather than
+//! raw N-Triples text — keeps the command robust to literal escaping, blank
+//! nodes, and IRI quoting.
 //!
 //! Modes:
 //! - no flags  → dump the header N-Triples to stdout
@@ -15,22 +20,19 @@
 //!   descriptive metadata for the triples in an RDF file
 //! - --add     → append the triples from an RDF file to the header
 //! - --dataset-uri → rewrite every occurrence of the current dataset IRI
-//!   (subject or object) to a new IRI
+//!   (subject, predicate or object) to a new IRI
 //!
 //! Any modification writes to `--output`; the original file is never changed.
 
-use crate::hdt::reader::{write_nt_object, write_nt_subject};
+use crate::hdt::header_vocab::{HDT_DATASET, HDT_NS, RDF_TYPE, VOID_DATASET, VOID_NS, VOID_STAT_LOCALS};
 use crate::io::{ControlInfo, ControlType};
-use crate::rdf::{ParseOptions, discover_inputs, stream_quads_with_options};
+use crate::rdf::parser::parse_rdf_to_triples;
+use crate::rdf::{discover_inputs, serialize_triples};
 use anyhow::{Context, Result, bail};
+use oxrdf::{NamedNode, NamedOrBlankNode, Term, Triple};
+use std::collections::HashSet;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::Path;
-
-const VOID_NS: &str = "http://rdfs.org/ns/void#";
-const HDT_NS: &str = "http://purl.org/HDT/hdt#";
-const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
-const HDT_DATASET: &str = "http://purl.org/HDT/hdt#Dataset";
-const VOID_DATASET: &str = "http://rdfs.org/ns/void#Dataset";
 
 /// Entry point for the `header` command. Validates the flag combination, then
 /// either dumps the header to stdout or writes a modified HDT file.
@@ -70,7 +72,13 @@ pub fn run_header_command(
         return Ok(());
     }
 
-    let new_header = build_new_header(&header_text, replace, add, dataset_uri)?;
+    // Parse the existing header into triples, apply the requested edits, and
+    // re-serialize. Everything that can fail (IRI validation, reserved-predicate
+    // rejection) happens here, before any output file is created.
+    let existing =
+        parse_ntriples_text(&header_text).context("Failed to parse existing header as N-Triples")?;
+    let new_triples = build_new_header(existing, replace, add, dataset_uri)?;
+    let new_header = serialize_triples(&new_triples)?;
 
     // `reader` is positioned at the start of the dictionary section; copy the
     // remaining bytes verbatim after the rewritten header.
@@ -109,99 +117,90 @@ fn read_header<R: Read>(reader: &mut R) -> Result<(ControlInfo, ControlInfo, Str
     Ok((global_ci, header_ci, text))
 }
 
-/// Assemble the new header text from the existing header, the optional input
+/// Assemble the new header triples from the existing header, the optional input
 /// RDF file (replace/add), and the optional dataset-IRI rename.
 fn build_new_header(
-    header_text: &str,
+    existing: Vec<Triple>,
     replace: Option<&Path>,
     add: Option<&Path>,
     dataset_uri: Option<&str>,
-) -> Result<String> {
-    let existing: Vec<&str> = header_text
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .collect();
-
+) -> Result<Vec<Triple>> {
     // Validate the new dataset IRI up front so a malformed value can't corrupt
     // the header (and make the file unreadable) only to fail on reopen.
-    if let Some(new_iri) = dataset_uri {
-        validate_iri(new_iri)?;
-    }
+    let new_dataset = dataset_uri.map(make_dataset_node).transpose()?;
 
-    let managed_bnodes = collect_managed_bnodes(&existing);
+    let managed = collect_managed_bnodes(&existing);
 
-    let mut lines: Vec<String> = if replace.is_some() {
-        existing
-            .iter()
-            .filter(|l| is_managed(l, &managed_bnodes))
-            .map(|l| l.to_string())
-            .collect()
+    // `--replace` keeps only the hdtc-managed (data-derived) triples; `--add`
+    // and a bare `--dataset-uri` keep the whole existing header.
+    let mut triples: Vec<Triple> = if replace.is_some() {
+        existing.iter().filter(|t| is_managed(t, &managed)).cloned().collect()
     } else {
-        existing.iter().map(|l| l.to_string()).collect()
+        existing.clone()
     };
 
     if let Some(path) = replace.or(add) {
-        // Offset the parser's blank-node disambiguation index past any `fN_`
-        // blank nodes already present so a later --add can't merge its blank
-        // nodes with ones a prior --add wrote into the header.
+        // Offset the blank-node disambiguation index past any `fN_` blank nodes
+        // already present so a later --add can't merge its blank nodes with ones
+        // a prior --add wrote into the header.
         let blank_offset = next_blank_index(&existing);
-        lines.extend(read_input_triples(path, blank_offset)?);
+        triples.extend(read_input_triples(path, blank_offset)?);
     }
 
-    if let Some(new_iri) = dataset_uri {
-        let old_iri = current_dataset_iri(&existing)
-            .context("Could not determine the current dataset IRI (no rdf:type hdt:Dataset/void:Dataset triple in the header)")?;
-        let old_token = format!("<{old_iri}>");
-        let new_token = format!("<{new_iri}>");
-        for line in &mut lines {
-            *line = reroot_line(line, &old_token, &new_token);
-        }
+    if let Some(new_node) = new_dataset {
+        let old = match dataset_iris(&existing).as_slice() {
+            [one] => one.clone(),
+            [] => bail!(
+                "Could not determine the current dataset IRI (no rdf:type hdt:Dataset/void:Dataset triple in the header)"
+            ),
+            many => bail!(
+                "Header declares {} dataset IRIs ({}); --dataset-uri is ambiguous. Edit the header so exactly one subject has rdf:type hdt:Dataset/void:Dataset.",
+                many.len(),
+                many.join(", ")
+            ),
+        };
+        reroot_triples(&mut triples, &old, &new_node);
     }
 
-    let mut out = lines.join("\n");
-    out.push('\n');
-    Ok(out)
+    Ok(triples)
 }
 
-/// Parse an RDF input file and serialize each triple to an N-Triples line,
-/// rejecting any triple that asserts a reserved (hdtc-managed) predicate.
+/// Parse an RDF input file into triples, rejecting any triple that asserts a
+/// reserved (hdtc-managed) predicate.
 ///
 /// `blank_offset` shifts the blank-node disambiguation index so parsed blank
 /// nodes can't collide with `fN_` blank nodes already in the header.
-fn read_input_triples(path: &Path, blank_offset: usize) -> Result<Vec<String>> {
+fn read_input_triples(path: &Path, blank_offset: usize) -> Result<Vec<Triple>> {
     let discovered = discover_inputs(std::slice::from_ref(&path.to_path_buf()))?;
     if discovered.rdf_inputs.is_empty() {
         bail!("Input is not a recognized RDF file: {}", path.display());
     }
 
     let mut out = Vec::new();
-    let options = ParseOptions::default();
     for (idx, input) in discovered.rdf_inputs.iter().enumerate() {
         // Resolve relative IRIs against the input file's own location, mirroring
         // `create`; otherwise relative/empty IRIs would corrupt the header.
         let base = std::fs::canonicalize(&input.path)
             .ok()
             .map(|p| format!("file://{}", p.display()));
-        stream_quads_with_options(input, blank_offset + idx, true, base.as_deref(), &options, |quad| {
-            if is_reserved_predicate(&quad.predicate) {
+        let prefix = format!("f{}_", blank_offset + idx);
+        let parsed = parse_rdf_to_triples(input, base.as_deref(), &prefix)
+            .with_context(|| format!("Failed to parse {}", input.path.display()))?;
+        if parsed.named_graph_seen {
+            tracing::warn!(
+                "{}: graph names are ignored; only triples are written to the header",
+                input.path.display()
+            );
+        }
+        for triple in parsed.triples {
+            if is_reserved_predicate(triple.predicate.as_str()) {
                 bail!(
                     "Input triple uses reserved hdtc-managed predicate <{}>; these data-derived statistics cannot be set via the header command",
-                    quad.predicate
+                    triple.predicate.as_str()
                 );
             }
-            let mut line = Vec::new();
-            write_nt_subject(&mut line, quad.subject.as_bytes())?;
-            line.push(b' ');
-            // Predicates are always IRIs; write_nt_subject wraps IRIs in <>.
-            write_nt_subject(&mut line, quad.predicate.as_bytes())?;
-            line.push(b' ');
-            write_nt_object(&mut line, quad.object.as_bytes())?;
-            line.extend_from_slice(b" .");
-            out.push(String::from_utf8(line).expect("N-Triples serialization is valid UTF-8"));
-            Ok(())
-        })
-        .with_context(|| format!("Failed to parse {}", input.path.display()))?;
+            out.push(triple);
+        }
     }
     Ok(out)
 }
@@ -233,88 +232,123 @@ fn write_modified_hdt<R: Read>(
 }
 
 // ---------------------------------------------------------------------------
-// Header line classification helpers
+// Triple classification helpers
 // ---------------------------------------------------------------------------
 
-/// Split an N-Triples line into its leading subject token and the remainder
-/// (predicate, object and trailing ` .`).
-fn split_subject(line: &str) -> Option<(&str, &str)> {
-    let line = line.trim();
-    let (subject, rest) = line.split_once(char::is_whitespace)?;
-    Some((subject, rest.trim_start()))
+/// Parse an N-Triples string into oxrdf triples.
+///
+/// Parsing is strict (not lenient): a malformed line in the existing header is
+/// surfaced as an error rather than silently dropped, so a rewrite can never
+/// quietly discard header content it failed to understand.
+fn parse_ntriples_text(text: &str) -> Result<Vec<Triple>> {
+    let parser = oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::NTriples)
+        .for_reader(text.as_bytes());
+
+    let mut triples = Vec::new();
+    for quad in parser {
+        let quad = quad.context("Invalid N-Triples in HDT header")?;
+        triples.push(Triple::new(quad.subject, quad.predicate, quad.object));
+    }
+    Ok(triples)
 }
 
-/// Split an N-Triples line into (subject, predicate, object-and-dot) tokens.
-fn split_triple(line: &str) -> Option<(&str, &str, &str)> {
-    let (subject, rest) = split_subject(line)?;
-    let (predicate, object_part) = rest.split_once(char::is_whitespace)?;
-    Some((subject, predicate, object_part.trim()))
+/// A predicate is reserved if it is one of the void statistics predicates or
+/// lives in the HDT namespace (these are derived from the data / encoding).
+fn is_reserved_predicate(predicate: &str) -> bool {
+    predicate.starts_with(HDT_NS)
+        || predicate
+            .strip_prefix(VOID_NS)
+            .is_some_and(|local| VOID_STAT_LOCALS.contains(&local))
 }
 
-/// Strip the trailing ` .` from the object portion to recover the object term.
-fn object_term(object_part: &str) -> &str {
-    object_part
-        .trim_end()
-        .strip_suffix('.')
-        .unwrap_or(object_part)
-        .trim_end()
+/// Collect the blank nodes that hold the HDT format/statistics/publication
+/// description — they appear as blank-node objects of reserved predicates.
+fn collect_managed_bnodes(triples: &[Triple]) -> HashSet<String> {
+    let mut bnodes = HashSet::new();
+    for triple in triples {
+        if is_reserved_predicate(triple.predicate.as_str())
+            && let Term::BlankNode(b) = &triple.object
+        {
+            bnodes.insert(b.as_str().to_string());
+        }
+    }
+    bnodes
 }
 
-/// Recover the bare IRI from a `<...>` token.
-fn iri_of(token: &str) -> Option<&str> {
-    token.strip_prefix('<').and_then(|t| t.strip_suffix('>'))
+/// Decide whether a header triple is part of the hdtc-managed block.
+fn is_managed(triple: &Triple, managed_bnodes: &HashSet<String>) -> bool {
+    if is_reserved_predicate(triple.predicate.as_str()) {
+        return true;
+    }
+    if let NamedOrBlankNode::BlankNode(b) = &triple.subject
+        && managed_bnodes.contains(b.as_str())
+    {
+        return true;
+    }
+    if triple.predicate.as_str() == RDF_TYPE
+        && let Term::NamedNode(obj) = &triple.object
+    {
+        return obj.as_str() == HDT_DATASET || obj.as_str() == VOID_DATASET;
+    }
+    false
 }
 
-/// Reject IRIs containing characters illegal in an N-Triples IRIREF. Embedding
-/// such an IRI would corrupt the header and make the file unreadable on reopen.
-fn validate_iri(iri: &str) -> Result<()> {
+/// Find the dataset IRIs: the named-node subjects of `rdf:type hdt:Dataset`
+/// (or `void:Dataset`) declarations, distinct and in first-seen order.
+///
+/// A well-formed hdtc header has exactly one, but a header could in principle
+/// carry several (e.g. after manual editing); the caller decides what to do
+/// with zero or many.
+fn dataset_iris(triples: &[Triple]) -> Vec<String> {
+    let mut iris: Vec<String> = Vec::new();
+    for triple in triples {
+        if triple.predicate.as_str() != RDF_TYPE {
+            continue;
+        }
+        let Term::NamedNode(obj) = &triple.object else {
+            continue;
+        };
+        if (obj.as_str() == HDT_DATASET || obj.as_str() == VOID_DATASET)
+            && let NamedOrBlankNode::NamedNode(s) = &triple.subject
+        {
+            let iri = s.as_str();
+            if !iris.iter().any(|existing| existing == iri) {
+                iris.push(iri.to_string());
+            }
+        }
+    }
+    iris
+}
+
+/// Rewrite every occurrence of `old` (a bare IRI) — in subject, predicate, or
+/// object position — to `new`, leaving blank nodes and literals untouched.
+fn reroot_triples(triples: &mut [Triple], old: &str, new: &NamedNode) {
+    for triple in triples.iter_mut() {
+        if matches!(&triple.subject, NamedOrBlankNode::NamedNode(n) if n.as_str() == old) {
+            triple.subject = NamedOrBlankNode::NamedNode(new.clone());
+        }
+        if triple.predicate.as_str() == old {
+            triple.predicate = new.clone();
+        }
+        if matches!(&triple.object, Term::NamedNode(n) if n.as_str() == old) {
+            triple.object = Term::NamedNode(new.clone());
+        }
+    }
+}
+
+/// Validate and build the new dataset IRI node. A malformed IRI is rejected
+/// here (before any output is written) because embedding it would corrupt the
+/// header and make the file unreadable on reopen. Validation is delegated to
+/// `oxrdf::NamedNode`, the same check the serializer applies.
+fn make_dataset_node(iri: &str) -> Result<NamedNode> {
     if iri.is_empty() {
         bail!("--dataset-uri must not be empty");
     }
-    for c in iri.chars() {
-        if (c as u32) <= 0x20 || matches!(c, '<' | '>' | '"' | '{' | '}' | '|' | '^' | '`' | '\\') {
-            bail!(
-                "Invalid --dataset-uri {iri:?}: contains {c:?}, which is not allowed in an N-Triples IRI"
-            );
-        }
-    }
-    Ok(())
+    NamedNode::new(iri).map_err(|e| anyhow::anyhow!("Invalid --dataset-uri {iri:?}: {e}"))
 }
 
-/// Rewrite one N-Triples line, replacing the subject, predicate, and/or object
-/// token wherever it exactly equals `old_token` (`<old_iri>`). Returns the line
-/// unchanged if it can't be parsed as `S P O .`.
-fn reroot_line(line: &str, old_token: &str, new_token: &str) -> String {
-    let trimmed = line.trim();
-    let Some(body) = trimmed.strip_suffix('.') else {
-        return line.to_string();
-    };
-    let body = body.trim_end();
-    let Some((subject, rest)) = body.split_once(char::is_whitespace) else {
-        return line.to_string();
-    };
-    let Some((predicate, object)) = rest.trim_start().split_once(char::is_whitespace) else {
-        return line.to_string();
-    };
-
-    let swap = |term: &str| -> String {
-        if term == old_token {
-            new_token.to_string()
-        } else {
-            term.to_string()
-        }
-    };
-    format!(
-        "{} {} {} .",
-        swap(subject),
-        swap(predicate),
-        swap(object.trim())
-    )
-}
-
-/// Parse the numeric index `N` from a `_:fN_…` disambiguated blank-node label.
-fn blank_fn_index(term: &str) -> Option<usize> {
-    let label = term.strip_prefix("_:")?;
+/// Parse the numeric index `N` from an `fN_…` disambiguated blank-node label.
+fn blank_fn_index(label: &str) -> Option<usize> {
     let rest = label.strip_prefix('f')?;
     let (digits, _) = rest.split_once('_')?;
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
@@ -324,103 +358,36 @@ fn blank_fn_index(term: &str) -> Option<usize> {
 }
 
 /// The next safe blank-node disambiguation index: one greater than the largest
-/// `fN_` prefix already present among the header's blank nodes (0 if none).
-fn next_blank_index(lines: &[&str]) -> usize {
+/// `fN_` label already present among the header's blank nodes (0 if none).
+fn next_blank_index(triples: &[Triple]) -> usize {
     let mut max: Option<usize> = None;
-    for line in lines {
-        if let Some((subject, _predicate, object_part)) = split_triple(line) {
-            for term in [subject, object_term(object_part)] {
-                if let Some(n) = blank_fn_index(term) {
-                    max = Some(max.map_or(n, |m| m.max(n)));
-                }
+    for triple in triples {
+        let labels = [
+            match &triple.subject {
+                NamedOrBlankNode::BlankNode(b) => Some(b.as_str()),
+                _ => None,
+            },
+            match &triple.object {
+                Term::BlankNode(b) => Some(b.as_str()),
+                _ => None,
+            },
+        ];
+        for label in labels.into_iter().flatten() {
+            if let Some(n) = blank_fn_index(label) {
+                max = Some(max.map_or(n, |m| m.max(n)));
             }
         }
     }
     max.map_or(0, |n| n + 1)
 }
 
-/// A predicate is reserved if it is one of the void statistics predicates or
-/// lives in the HDT namespace (these are derived from the data / encoding).
-fn is_reserved_predicate(predicate: &str) -> bool {
-    predicate.starts_with(HDT_NS)
-        || predicate.strip_prefix(VOID_NS).is_some_and(|local| {
-            matches!(
-                local,
-                "triples" | "properties" | "distinctSubjects" | "distinctObjects"
-            )
-        })
-}
-
-/// Collect the blank nodes that hold the HDT format/statistics/publication
-/// description — they appear as blank-node objects of reserved predicates.
-fn collect_managed_bnodes(lines: &[&str]) -> Vec<String> {
-    let mut bnodes = Vec::new();
-    for line in lines {
-        let Some((_, predicate, object_part)) = split_triple(line) else {
-            continue;
-        };
-        let Some(pred_iri) = iri_of(predicate) else {
-            continue;
-        };
-        if !is_reserved_predicate(pred_iri) {
-            continue;
-        }
-        let object = object_term(object_part);
-        if object.starts_with("_:") && !bnodes.iter().any(|b| b == object) {
-            bnodes.push(object.to_string());
-        }
-    }
-    bnodes
-}
-
-/// Decide whether a header line is part of the hdtc-managed block.
-fn is_managed(line: &str, managed_bnodes: &[String]) -> bool {
-    let Some((subject, predicate, object_part)) = split_triple(line) else {
-        return false;
-    };
-    let Some(pred_iri) = iri_of(predicate) else {
-        return false;
-    };
-
-    if is_reserved_predicate(pred_iri) {
-        return true;
-    }
-    if managed_bnodes.iter().any(|b| b == subject) {
-        return true;
-    }
-    if pred_iri == RDF_TYPE
-        && let Some(obj_iri) = iri_of(object_term(object_part))
-    {
-        return obj_iri == HDT_DATASET || obj_iri == VOID_DATASET;
-    }
-    false
-}
-
-/// Find the current dataset IRI: the subject of the `rdf:type hdt:Dataset`
-/// (or `void:Dataset`) declaration.
-fn current_dataset_iri(lines: &[&str]) -> Option<String> {
-    for line in lines {
-        let Some((subject, predicate, object_part)) = split_triple(line) else {
-            continue;
-        };
-        if iri_of(predicate) != Some(RDF_TYPE) {
-            continue;
-        }
-        match iri_of(object_term(object_part)) {
-            Some(HDT_DATASET) | Some(VOID_DATASET) => return iri_of(subject).map(str::to_string),
-            _ => {}
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// A header resembling what `build_header_ntriples` produces.
-    fn sample_header(dataset: &str) -> String {
-        format!(
+    /// A header resembling what `build_header_ntriples` produces, as triples.
+    fn sample_header(dataset: &str) -> Vec<Triple> {
+        let text = format!(
             "<{dataset}> <{RDF_TYPE}> <{HDT_DATASET}> .\n\
              <{dataset}> <{RDF_TYPE}> <{VOID_DATASET}> .\n\
              <{dataset}> <{VOID_NS}triples> \"100\" .\n\
@@ -431,36 +398,72 @@ mod tests {
              _:dictionary <http://purl.org/dc/terms/format> <{HDT_NS}dictionaryFour> .\n\
              _:triples <{HDT_NS}triplesnumTriples> \"100\" .\n\
              _:pub <http://purl.org/dc/terms/issued> \"2024-01-01\" .\n"
-        )
+        );
+        parse_ntriples_text(&text).unwrap()
+    }
+
+    fn triple(s: &str, p: &str, o: &str) -> Triple {
+        parse_ntriples_text(&format!("{s} {p} {o} .\n")).unwrap().remove(0)
     }
 
     #[test]
     fn classifies_managed_and_descriptive() {
         let dataset = "http://example.org/ds";
-        let header = sample_header(dataset);
-        let lines: Vec<&str> = header.lines().map(str::trim).collect();
-        let bnodes = collect_managed_bnodes(&lines);
+        let triples = sample_header(dataset);
+        let bnodes = collect_managed_bnodes(&triples);
 
-        // All hdtc-generated lines are managed.
-        for line in &lines {
-            assert!(is_managed(line, &bnodes), "should be managed: {line}");
+        // All hdtc-generated triples are managed.
+        for t in &triples {
+            assert!(is_managed(t, &bnodes), "should be managed: {t}");
         }
 
         // A user-supplied descriptive triple is not managed, including a
         // non-HDT rdf:type and a Dublin Core title.
-        let title = format!("<{dataset}> <http://purl.org/dc/terms/title> \"My dataset\" .");
-        let dcat = format!("<{dataset}> <{RDF_TYPE}> <http://www.w3.org/ns/dcat#Dataset> .");
+        let title = triple(
+            &format!("<{dataset}>"),
+            "<http://purl.org/dc/terms/title>",
+            "\"My dataset\"",
+        );
+        let dcat = triple(
+            &format!("<{dataset}>"),
+            &format!("<{RDF_TYPE}>"),
+            "<http://www.w3.org/ns/dcat#Dataset>",
+        );
         assert!(!is_managed(&title, &bnodes));
         assert!(!is_managed(&dcat, &bnodes));
     }
 
     #[test]
     fn finds_dataset_iri() {
-        let header = sample_header("http://example.org/ds");
-        let lines: Vec<&str> = header.lines().map(str::trim).collect();
+        let triples = sample_header("http://example.org/ds");
+        assert_eq!(dataset_iris(&triples), vec!["http://example.org/ds".to_string()]);
+    }
+
+    #[test]
+    fn dataset_iris_dedups_and_reports_multiple() {
+        // No dataset declaration → empty.
+        let empty = vec![triple(
+            "<http://ex/s>",
+            "<http://purl.org/dc/terms/title>",
+            "\"T\"",
+        )];
+        assert!(dataset_iris(&empty).is_empty());
+
+        // The two rdf:type declarations in sample_header share one subject, so
+        // it is reported once, not twice.
+        let one = sample_header("http://example.org/ds");
+        assert_eq!(dataset_iris(&one).len(), 1);
+
+        // Two distinct dataset subjects are both reported, in first-seen order.
+        let mut two = sample_header("http://example.org/a");
+        two.push(triple(
+            "<http://example.org/b>",
+            &format!("<{RDF_TYPE}>"),
+            &format!("<{HDT_DATASET}>"),
+        ));
         assert_eq!(
-            current_dataset_iri(&lines).as_deref(),
-            Some("http://example.org/ds")
+            dataset_iris(&two),
+            vec!["http://example.org/a".to_string(), "http://example.org/b".to_string()]
         );
     }
 
@@ -475,55 +478,56 @@ mod tests {
     #[test]
     fn rename_reroots_subject_and_object_occurrences() {
         let old = "http://example.org/ds";
-        let new = "http://example.org/new";
-        let header = sample_header(old)
-            + &format!("<{old}> <http://purl.org/dc/terms/title> \"T\" .\n")
-            // The dataset IRI also appears as an OBJECT here.
-            + &format!("<http://example.org/other> <http://www.w3.org/2002/07/owl#sameAs> <{old}> .\n");
+        let new_iri = "http://example.org/new";
+        let mut triples = sample_header(old);
+        triples.push(triple(
+            &format!("<{old}>"),
+            "<http://purl.org/dc/terms/title>",
+            "\"T\"",
+        ));
+        // The dataset IRI also appears as an OBJECT here.
+        triples.push(triple(
+            "<http://example.org/other>",
+            "<http://www.w3.org/2002/07/owl#sameAs>",
+            &format!("<{old}>"),
+        ));
 
-        let out = build_new_header(&header, None, None, Some(new)).unwrap();
+        reroot_triples(&mut triples, old, &NamedNode::new_unchecked(new_iri));
+        let out = serialize_triples(&triples).unwrap();
 
         assert!(!out.contains(&format!("<{old}>")), "no old IRI should remain");
         // Managed and descriptive subject-position triples are re-rooted.
-        assert!(out.contains(&format!("<{new}> <{VOID_NS}triples> \"100\" .")));
+        assert!(out.contains(&format!("<{new_iri}> <{VOID_NS}triples> \"100\" .")));
         assert!(out.contains(&format!(
-            "<{new}> <http://purl.org/dc/terms/title> \"T\" ."
+            "<{new_iri}> <http://purl.org/dc/terms/title> \"T\" ."
         )));
         // Object-position occurrence is re-rooted too.
         assert!(out.contains(&format!(
-            "<http://example.org/other> <http://www.w3.org/2002/07/owl#sameAs> <{new}> ."
+            "<http://example.org/other> <http://www.w3.org/2002/07/owl#sameAs> <{new_iri}> ."
         )));
         // Blank-node-subject triples are untouched.
         assert!(out.contains(&format!("_:format <{HDT_NS}dictionary> _:dictionary .")));
     }
 
     #[test]
-    fn reroot_line_preserves_literal_with_spaces() {
-        let line = "<http://ex/old> <http://purl.org/dc/terms/title> \"A long title.\" .";
-        let out = reroot_line(line, "<http://ex/old>", "<http://ex/new>");
-        assert_eq!(
-            out,
-            "<http://ex/new> <http://purl.org/dc/terms/title> \"A long title.\" ."
-        );
-    }
-
-    #[test]
-    fn validate_iri_rejects_illegal_chars() {
-        assert!(validate_iri("http://example.org/ok").is_ok());
-        assert!(validate_iri("http://example.org/a b").is_err()); // space
-        assert!(validate_iri("urn:x>y").is_err()); // angle bracket
-        assert!(validate_iri("").is_err()); // empty
-        assert!(validate_iri("http://ex/\"q").is_err()); // quote
+    fn make_dataset_node_rejects_illegal_chars() {
+        assert!(make_dataset_node("http://example.org/ok").is_ok());
+        assert!(make_dataset_node("http://example.org/a b").is_err()); // space
+        assert!(make_dataset_node("urn:x>y").is_err()); // angle bracket
+        assert!(make_dataset_node("").is_err()); // empty
+        assert!(make_dataset_node("http://ex/\"q").is_err()); // quote
     }
 
     #[test]
     fn next_blank_index_advances_past_existing() {
-        let none = ["<http://ex/s> <http://ex/p> _:format ."];
+        let none = sample_header("http://example.org/ds");
+        // Managed blank nodes (format, dictionary, …) don't match the `fN_`
+        // scheme, so the next index starts at 0.
         assert_eq!(next_blank_index(&none), 0);
 
-        let with_f = [
-            "_:f0_x <http://ex/p> \"v\" .",
-            "<http://ex/s> <http://ex/q> _:f3_y .",
+        let with_f = vec![
+            triple("_:f0_x", "<http://ex/p>", "\"v\""),
+            triple("<http://ex/s>", "<http://ex/q>", "_:f3_y"),
         ];
         assert_eq!(next_blank_index(&with_f), 4);
     }
@@ -531,19 +535,18 @@ mod tests {
     #[test]
     fn replace_keeps_managed_drops_descriptive() {
         let dataset = "http://example.org/ds";
-        let header = sample_header(dataset)
-            + &format!("<{dataset}> <http://purl.org/dc/terms/title> \"Old\" .\n");
-        let lines: Vec<&str> = header.lines().map(str::trim).collect();
-        let bnodes = collect_managed_bnodes(&lines);
+        let mut triples = sample_header(dataset);
+        triples.push(triple(
+            &format!("<{dataset}>"),
+            "<http://purl.org/dc/terms/title>",
+            "\"Old\"",
+        ));
+        let bnodes = collect_managed_bnodes(&triples);
 
-        let kept: Vec<&str> = lines
-            .iter()
-            .copied()
-            .filter(|l| is_managed(l, &bnodes))
-            .collect();
+        let kept: Vec<&Triple> = triples.iter().filter(|t| is_managed(t, &bnodes)).collect();
 
         // The descriptive title is dropped; the managed triple count is kept.
-        assert!(!kept.iter().any(|l| l.contains("dc/terms/title")));
-        assert!(kept.iter().any(|l| l.contains("void#triples")));
+        assert!(!kept.iter().any(|t| t.predicate.as_str().contains("dc/terms/title")));
+        assert!(kept.iter().any(|t| t.predicate.as_str() == format!("{VOID_NS}triples")));
     }
 }
