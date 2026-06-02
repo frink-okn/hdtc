@@ -3,7 +3,7 @@
 use crate::rdf::input::{Compression, RdfFormat, RdfInput};
 use anyhow::{Context, Result};
 use crossbeam_channel::TrySendError;
-use oxrdf::{GraphName, Literal, Term};
+use oxrdf::{BlankNode, GraphName, Literal, NamedOrBlankNode, Term, Triple};
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufReader, Read};
@@ -180,6 +180,99 @@ where
         base_uri,
         &mut callback,
     )
+}
+
+/// Triples parsed from an RDF input, in oxrdf form (for header serialization).
+pub(crate) struct ParsedTriples {
+    pub triples: Vec<Triple>,
+    pub errors: u64,
+    /// True if any quad carried a non-default graph (dropped — headers are triples-only).
+    pub named_graph_seen: bool,
+}
+
+/// Parse an RDF input file into oxrdf `Triple`s, dropping graph names.
+///
+/// Unlike [`stream_quads`], this preserves native oxrdf terms (rather than the
+/// dictionary string form) so the triples can be re-serialized as N-Triples for
+/// an HDT header. When `blank_prefix` is non-empty, blank-node labels are
+/// prefixed with it, which keeps blank nodes from different sources disjoint
+/// (used when merging input triples into an existing header).
+pub(crate) fn parse_rdf_to_triples(
+    input: &RdfInput,
+    base_uri: Option<&str>,
+    blank_prefix: &str,
+) -> Result<ParsedTriples> {
+    let reader = open_input(input)?;
+    let format = to_oxrdf_format(input.format);
+    let parser = make_lenient_parser(format, base_uri);
+
+    let mut out = ParsedTriples {
+        triples: Vec::new(),
+        errors: 0,
+        named_graph_seen: false,
+    };
+
+    for result in parser.for_reader(reader) {
+        match result {
+            Ok(quad) => {
+                if !matches!(quad.graph_name, GraphName::DefaultGraph) {
+                    out.named_graph_seen = true;
+                }
+                let subject = prefix_blank_subject(quad.subject, blank_prefix);
+                let object = prefix_blank_object(quad.object, blank_prefix);
+                out.triples
+                    .push(Triple::new(subject, quad.predicate, object));
+            }
+            Err(e) => {
+                out.errors += 1;
+                if out.errors <= 10 {
+                    tracing::warn!("Skipping malformed input in {}: {}", input.path.display(), e);
+                } else if out.errors == 11 {
+                    tracing::warn!(
+                        "Further parse errors in {} will be suppressed",
+                        input.path.display()
+                    );
+                }
+            }
+        }
+    }
+
+    if out.errors > 0 {
+        tracing::warn!(
+            "{}: parsed {} triples, skipped {} errors",
+            input.path.display(),
+            out.triples.len(),
+            out.errors
+        );
+    }
+
+    Ok(out)
+}
+
+/// Prefix a subject's blank-node label, leaving named nodes untouched.
+fn prefix_blank_subject(subject: NamedOrBlankNode, prefix: &str) -> NamedOrBlankNode {
+    if prefix.is_empty() {
+        return subject;
+    }
+    match subject {
+        NamedOrBlankNode::BlankNode(b) => {
+            NamedOrBlankNode::BlankNode(BlankNode::new_unchecked(format!("{prefix}{}", b.as_str())))
+        }
+        named => named,
+    }
+}
+
+/// Prefix an object's blank-node label, leaving named nodes and literals untouched.
+fn prefix_blank_object(object: Term, prefix: &str) -> Term {
+    if prefix.is_empty() {
+        return object;
+    }
+    match object {
+        Term::BlankNode(b) => {
+            Term::BlankNode(BlankNode::new_unchecked(format!("{prefix}{}", b.as_str())))
+        }
+        other => other,
+    }
 }
 
 fn stream_quads_sequential<F>(

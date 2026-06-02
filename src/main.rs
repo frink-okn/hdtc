@@ -96,6 +96,7 @@ fn main() -> Result<()> {
         cli::Commands::Search(args) => search_hdt(args, benchmark),
         cli::Commands::Validate(args) => validate_hdt_file(args, benchmark),
         cli::Commands::Void(args) => compute_void(args, benchmark),
+        cli::Commands::Header(args) => run_header(args, benchmark),
     }
 }
 
@@ -158,6 +159,12 @@ fn create_hdt(args: cli::CreateArgs, benchmark: bool) -> Result<()> {
         }
     };
 
+    // Dataset IRI for the header subject; defaults to the parse base URI.
+    let dataset_uri = args
+        .dataset_uri
+        .clone()
+        .unwrap_or_else(|| base_uri.clone());
+
     // Run the pipelined HDT construction
     let pipeline_result = pipeline::run_pipeline(
         &inputs,
@@ -173,7 +180,7 @@ fn create_hdt(args: cli::CreateArgs, benchmark: bool) -> Result<()> {
     // Write HDT file (streaming: reads dict sections and triples from temp files)
     hdt::write_hdt_streaming(
         &args.output,
-        &base_uri,
+        &dataset_uri,
         &pipeline_result.counts,
         &pipeline_result.dict_section_paths,
         &pipeline_result.dict_section_sizes,
@@ -378,6 +385,27 @@ fn compute_void(args: cli::VoidArgs, benchmark: bool) -> Result<()> {
     match &args.output {
         Some(p) => tracing::info!("Done! {count} VoID triples written to {}", p.display()),
         None => tracing::info!("Done! {count} VoID triples written"),
+    }
+    Ok(())
+}
+
+/// Dump or modify the RDF triples embedded in an HDT file's header.
+fn run_header(args: cli::HeaderArgs, benchmark: bool) -> Result<()> {
+    let start = std::time::Instant::now();
+
+    hdt::run_header_command(
+        &args.hdt_file,
+        args.replace.as_deref(),
+        args.add.as_deref(),
+        args.dataset_uri.as_deref(),
+        args.output.as_deref(),
+    )?;
+
+    if benchmark {
+        tracing::info!(
+            "Benchmark summary (header): total {:.3}s",
+            start.elapsed().as_secs_f64()
+        );
     }
     Ok(())
 }

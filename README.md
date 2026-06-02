@@ -68,6 +68,27 @@ hdtc search [OPTIONS] --query <PATTERN> <HDT_FILE>
 hdtc void [OPTIONS] <HDT_FILE>
 ```
 
+### `hdtc header` — Dump or modify the embedded header triples
+
+```
+hdtc header <HDT_FILE> [--replace FILE | --add FILE] [--dataset-uri IRI] [--output PATH]
+```
+
+With no flags, dumps the header N-Triples to stdout. With `--replace`/`--add`/
+`--dataset-uri`, writes a modified copy to `--output` (the original is never
+changed; the dictionary and triples are copied verbatim, so any
+`.hdt.index.v1-1` stays valid):
+
+- `--replace FILE` — swap the descriptive metadata for the triples in `FILE`,
+  keeping the data-derived statistics hdtc generated.
+- `--add FILE` — append the triples in `FILE` to the header.
+- `--dataset-uri IRI` — rename the dataset: rewrite every occurrence of the
+  current dataset IRI in the header (subject or object) to `IRI` (the post-hoc
+  counterpart to `create --dataset-uri`).
+
+`--replace`/`--add` reject any input triple that asserts an hdtc-managed
+predicate (the `void:` statistics and the `hdt:` namespace).
+
 ### Create: Basic examples
 
 Convert a single N-Triples file:
@@ -297,7 +318,8 @@ Partition URIs are generated using MD5 hashes of the corresponding class, proper
 | `-o, --output`                     | _(required)_                 | Output HDT file path                                        |
 | `--temp-dir`                       | system temp                  | Directory for temporary working files                       |
 | `--index`                          | off                          | Generate `.hdt.index.v1-1` index file                       |
-| `--base-uri`                       | `http://example.org/dataset` | Base URI for the HDT header                                 |
+| `--base-uri`                       | first input's `file://` URI  | Base URI used to resolve relative IRIs while parsing input  |
+| `--dataset-uri`                    | `--base-uri` value           | Dataset IRI recorded as the subject of the header metadata  |
 | `--memory-limit SIZE`              | `4G`                         | Soft memory limit for internal buffers (e.g. `4G`, `2000M`) |
 | `--parse-file-workers N`           | auto                         | Number of files parsed concurrently                         |
 | `--parse-chunk-workers N`          | auto (capped)                | Parser workers per active NT/NQ file                        |
