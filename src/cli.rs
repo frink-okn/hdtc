@@ -33,7 +33,12 @@ impl std::str::FromStr for MemorySize {
                 s
             )
         })?;
-        Ok(MemorySize(n * multiplier))
+        if n == 0 {
+            return Err("memory size must be greater than zero".to_string());
+        }
+        n.checked_mul(multiplier)
+            .map(MemorySize)
+            .ok_or_else(|| "memory size is too large".to_string())
     }
 }
 
@@ -48,10 +53,25 @@ impl std::fmt::Display for MemorySize {
     }
 }
 
-#[derive(Debug, Clone, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum OutputMode {
     Triples,
     Quads,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum InputSidecarPolicy {
+    Preserve,
+    Require,
+    Drop,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum DumpGraphView {
+    /// The N unique triples in the HDT, ignoring dataset graph layers.
+    Union,
+    /// The M distinct dataset memberships from the graph sidecar as N-Quads.
+    Dataset,
 }
 
 #[derive(Debug, Parser)]
@@ -87,13 +107,13 @@ pub enum Commands {
     /// Create index file for an existing HDT file
     Index(IndexArgs),
 
-    /// Dump an HDT file to N-Triples (tab-delimited: S\tP\tO\t.)
+    /// Export an HDT triples union or sidecar-backed RDF dataset
     Dump(DumpArgs),
 
-    /// Search an HDT file with a triple pattern
+    /// Search an HDT/sidecar with a triple or quad pattern
     Search(SearchArgs),
 
-    /// Validate HDT triples structures (ArrayY/ArrayZ/BitmapZ) for indexing
+    /// Validate HDT structures and any discovered graph sidecar
     Validate(ValidateArgs),
 
     /// Compute VoID statistics for an HDT file and output as N-Triples
@@ -113,9 +133,13 @@ pub struct CreateArgs {
     #[arg(short, long)]
     pub output: PathBuf,
 
-    /// Output mode: triples or quads
-    #[arg(short, long, value_enum, default_value_t = OutputMode::Triples)]
+    /// Output mode: triples drops graph information; quads writes a packed sidecar
+    #[arg(short, long, value_enum, default_value = "triples")]
     pub mode: OutputMode,
+
+    /// Handle .graphs files beside HDT inputs: preserve if present, require, or ignore
+    #[arg(long = "input-sidecars", value_enum)]
+    pub input_sidecars: Option<InputSidecarPolicy>,
 
     /// Directory for temporary working files
     #[arg(long)]
@@ -139,7 +163,7 @@ pub struct CreateArgs {
     #[arg(long = "graph-map", value_name = "PATH=URI")]
     pub graph_map: Vec<String>,
 
-    /// Default graph URI for triples without an explicit graph (quads mode)
+    /// Fallback named graph URI for otherwise-unassigned statements
     #[arg(long)]
     pub default_graph: Option<String>,
 
@@ -182,6 +206,14 @@ pub struct IndexArgs {
 pub struct ValidateArgs {
     /// Path to existing HDT file
     pub hdt_file: PathBuf,
+
+    /// Directory for graph-sidecar validation sort files
+    #[arg(long)]
+    pub temp_dir: Option<PathBuf>,
+
+    /// Soft memory limit for graph-sidecar validation (e.g. 4G, 2000M)
+    #[arg(long, value_name = "SIZE", default_value = "4G")]
+    pub memory_limit: MemorySize,
 }
 
 #[derive(Debug, Parser)]
@@ -189,12 +221,14 @@ pub struct SearchArgs {
     /// Path to existing HDT file
     pub hdt_file: PathBuf,
 
-    /// Triple pattern query (three N-Triples terms; use `?` or `*` as a wildcard).
+    /// Triple/quad pattern: 3 positions search the union, 4 search graph memberships
     ///
     /// Examples:
     ///   "<http://example.org/alice> ? ?"
     ///   "? <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?"
     ///   "? ? \"Alice\"@en"
+    ///   "? ? ? <http://example.org/graph>"
+    ///   "? ? ? default"
     #[arg(long, value_name = "PATTERN")]
     pub query: String,
 
@@ -202,7 +236,7 @@ pub struct SearchArgs {
     #[arg(short, long, value_name = "PATH")]
     pub output: Option<PathBuf>,
 
-    /// Print only the count of matching triples, not the triples themselves
+    /// Print only the count of matching triples or graph memberships
     #[arg(long)]
     pub count: bool,
 
@@ -222,7 +256,11 @@ pub struct SearchArgs {
     #[arg(long)]
     pub no_index: bool,
 
-    /// Soft memory limit for dictionary caches (e.g. 4G, 2000M)
+    /// Directory for bounded external sorting used by wildcard-graph queries
+    #[arg(long, value_name = "DIR")]
+    pub temp_dir: Option<PathBuf>,
+
+    /// Soft memory limit for dictionary caches and graph-membership sorting
     #[arg(short = 'm', long, value_name = "SIZE", default_value = "4G")]
     pub memory_limit: MemorySize,
 }
@@ -262,6 +300,14 @@ pub struct DumpArgs {
     /// Write results to file instead of stdout
     #[arg(short, long, value_name = "PATH")]
     pub output: Option<PathBuf>,
+
+    /// Export the triples union or the lossless RDF dataset graph memberships
+    #[arg(long, value_enum, default_value = "union")]
+    pub graph_view: DumpGraphView,
+
+    /// Directory for bounded external sorting used by dataset export
+    #[arg(long, value_name = "DIR")]
+    pub temp_dir: Option<PathBuf>,
 
     /// Soft memory limit for dictionary cache (e.g. 4G, 2000M)
     #[arg(long, value_name = "SIZE", default_value = "4G")]

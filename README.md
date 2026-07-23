@@ -14,10 +14,44 @@ Development of hdtc is done primarily through Claude Code.
 - **Scalable** — streaming, disk-backed pipeline with configurable memory limit (default 4 GB)
 - **Multiple inputs** — accepts any mix of RDF files, HDT files, and directories; recursively discovers RDF files
 - **Parallel NT/NQ parsing** — newline-safe chunk parsing for N-Triples/N-Quads (including `.gz`, `.bz2`, `.xz`) with bounded in-flight memory
-- **Quad inputs** — N-Quads and TriG inputs are accepted; the graph component is dropped and triples are indexed normally
+- **Named graphs** — optional packed `<data.hdt>.graphs` sidecars preserve N-Quads/TriG datasets while the standard HDT remains the deduplicated triples union
 - **Index generation** — optional `.hdt.index.v1-1` enables efficient `? P ?`, `? ? O`, and `? P O` queries
 - **VoID statistics** — compute dataset-level, property, and class partition statistics as N-Triples
 - **Resilient parsing** — skips malformed triples with warnings, reports total skipped at the end
+
+## Named graphs
+
+hdtc preserves RDF datasets without changing the standard HDT triples format. In
+quads mode, the output is a pair of files:
+
+- `data.hdt` is an ordinary HDT containing the deduplicated union of all triples
+  in the dataset. It remains usable by existing HDT software that knows nothing
+  about named graphs.
+- `data.hdt.graphs` records which default or named graphs contain each union
+  triple. It has a sorted graph dictionary and one compressed membership layer
+  per graph. Graph ID 0 denotes the RDF default graph; named graphs receive
+  consecutive IDs starting at 1.
+
+The union and the default graph are distinct views. A triple may occur in the
+default graph, in one or more named graphs, or in both. Repeated copies of the
+same quad create one membership, while the same triple in different graphs
+creates one HDT triple with several memberships.
+
+Memberships refer to final SPO positions in the associated HDT. The sidecar is
+bound to the HDT's exact dictionary-and-triples bytes with a SHA-256 digest, so
+it cannot accidentally be used with another HDT. Each graph layer independently
+uses a dense chunk table, sparse chunk table, or Elias–Fano encoding according to
+its density. Readers can answer access, rank, select, iteration, and graph lookup
+directly from the file without loading a whole layer.
+
+Creation remains streaming and bounded by `--memory-limit`. hdtc deduplicates and
+sorts memberships on disk, then encodes one graph layer at a time using reusable
+scratch space. Merging HDTs reconstructs memberships by graph name and triple,
+instead of copying position-dependent bitmaps.
+
+See the normative [HDT graphs sidecar format, version 1](docs/graphs-sidecar-format.md)
+for the binary layout, checksums, identity rules, encodings, and validation
+requirements.
 
 ## Installation
 
@@ -36,7 +70,7 @@ cargo build --release
 
 ## Usage
 
-hdtc supports five main commands:
+hdtc supports these main commands:
 
 ### `hdtc create` — Convert RDF to HDT
 
@@ -50,13 +84,13 @@ hdtc create [OPTIONS] --output <OUTPUT> <INPUTS>...
 hdtc index [OPTIONS] <HDT_FILE>
 ```
 
-### `hdtc dump` — Convert HDT to N-Triples
+### `hdtc dump` — Export the triples union or RDF dataset
 
 ```
 hdtc dump [OPTIONS] <HDT_FILE>
 ```
 
-### `hdtc search` — Query an HDT file with a triple pattern
+### `hdtc search` — Query triples or graph memberships
 
 ```
 hdtc search [OPTIONS] --query <PATTERN> <HDT_FILE>
@@ -88,6 +122,41 @@ changed; the dictionary and triples are copied verbatim, so any
 
 `--replace`/`--add` reject any input triple that asserts an hdtc-managed
 predicate (the `void:` statistics and the `hdt:` namespace).
+
+### Create: Named graph options
+
+Use `-m quads` (or `--mode quads`) to write a standard triples HDT plus its
+packed graph sidecar. The default mode is `triples`, which drops graph
+information. In quads mode, the HDT contains the `N` unique union triples and
+the sidecar contains the `M` distinct default/named-graph memberships described
+in the [format specification](docs/graphs-sidecar-format.md).
+
+```sh
+hdtc create dataset.nq -o dataset.hdt -m quads
+# Creates dataset.hdt and dataset.hdt.graphs
+```
+
+`--graph-map PATH=URI` adds a source-level named graph, and `--default-graph URI`
+is the fallback for otherwise unassigned statements.
+
+When an input is itself an HDT file, hdtc looks beside it for
+`<input.hdt>.graphs`. `--input-sidecars` controls those input artifacts only; it
+does not affect graph names parsed directly from RDF inputs:
+
+- `preserve` — preserve and validate a sidecar when present, but allow an HDT
+  input without one. This is the default in quads mode.
+- `require` — require every HDT input to have a valid sidecar. This fail-closed
+  setting is useful for automated merges where a missing file must not silently
+  discard the input dataset's original graph memberships.
+- `drop` — ignore input sidecars even when present and use only each HDT's triples
+  union.
+
+For an HDT whose sidecar is absent or dropped, memberships come from a matching
+`--graph-map`, then `--default-graph`, or finally the RDF default graph. Graph
+construction and source-position remapping use bounded external sorts governed
+by `--memory-limit`. Graph maps, default graph assignment, and preserving or
+requiring input sidecars require `--mode quads`; triples mode always drops input
+sidecars.
 
 ### Create: Basic examples
 
@@ -158,12 +227,19 @@ With custom memory and temp settings:
 hdtc index existing.hdt --memory-limit 8G --temp-dir /mnt/fast-ssd/tmp
 ```
 
-### Dump: Exporting to N-Triples
+### Dump: Exporting the union or dataset
 
 Export an HDT file to N-Triples (writes to stdout if `--output` is omitted):
 
 ```sh
 hdtc dump existing.hdt -o existing.nt
+```
+
+The default is explicitly the triples **union view**. For a lossless N-Quads
+export from an HDT/sidecar pair:
+
+```sh
+hdtc dump dataset.hdt --graph-view dataset -o dataset.nq
 ```
 
 Stream directly to another tool:
@@ -174,14 +250,30 @@ hdtc dump existing.hdt | gzip > existing.nt.gz
 
 If the output file already exists, it is overwritten.
 
-### Search: Querying with triple patterns
+### Search: Querying triples and graph memberships
 
-Search using a triple pattern — three N-Triples terms separated by whitespace, with `?` as a wildcard for any position. Outputs tab-delimited N-Triples (`S\tP\tO\t.`) to stdout or a file.
+Query arity selects the view: three positions search the HDT triples union and
+emit N-Triples; four positions search graph memberships and emit N-Quads. Use
+`?` or `*` as a wildcard. In graph position, `default` binds the RDF default
+graph. Default-graph results have no fourth RDF term, as required by N-Quads.
 
 Output all triples (equivalent to `hdtc dump`):
 
 ```sh
 hdtc search existing.hdt --query "? ? ?"
+```
+
+Output every default/named-graph membership from a graph sidecar:
+
+```sh
+hdtc search dataset.hdt --query "? ? ? ?"
+```
+
+Search one named graph, or the RDF default graph:
+
+```sh
+hdtc search dataset.hdt --query "? ? ? <http://example.org/graph>"
+hdtc search dataset.hdt --query "? ? ? default"
 ```
 
 Find all triples about a specific subject:
@@ -271,6 +363,12 @@ hdtc search data.hdt --query "? <http://www.w3.org/1999/02/22-rdf-syntax-ns#type
 
 For `? P ?`, `? ? O`, and `? P O`, hdtc uses the `.hdt.index.v1-1` sidecar file (auto-detected next to the HDT file, or specified with `--index`). Pass `--no-index` to fall back to a sequential full scan instead. For `? P O`, hdtc automatically chooses the most efficient query path based on predicate selectivity.
 
+Adding a fourth graph position applies any of the same S/P/O constraints to
+dataset memberships. A bound graph streams its layer directly. A wildcard graph
+uses a disk-backed position transpose governed by `--memory-limit` and
+`--temp-dir`, so memory remains bounded independently of dataset size. A
+four-position query requires `<HDT_FILE>.graphs`.
+
 ### Void: Computing VoID statistics
 
 Compute [VoID](https://www.w3.org/TR/void/) (Vocabulary of Interlinked Datasets) statistics for an HDT file and output the results as N-Triples. This is useful for generating dataset metadata describing the structure and content of an RDF dataset.
@@ -316,6 +414,10 @@ Partition URIs are generated using MD5 hashes of the corresponding class, proper
 | ---------------------------------- | ---------------------------- | ----------------------------------------------------------- |
 | `<INPUTS>...`                      | _(required)_                 | Input RDF files or directories                              |
 | `-o, --output`                     | _(required)_                 | Output HDT file path                                        |
+| `-m, --mode triples\|quads`        | `triples`                    | Drop graphs or write a packed graph sidecar                  |
+| `--graph-map PATH=URI`             | —                            | Add a named graph to statements from a path                  |
+| `--default-graph URI`              | —                            | Fallback graph for otherwise-unassigned statements           |
+| `--input-sidecars POLICY`          | preserve in quads mode       | Preserve, require, or ignore sidecars beside HDT inputs      |
 | `--temp-dir`                       | system temp                  | Directory for temporary working files                       |
 | `--index`                          | off                          | Generate `.hdt.index.v1-1` index file                       |
 | `--base-uri`                       | first input's `file://` URI  | Base URI used to resolve relative IRIs while parsing input  |
@@ -358,14 +460,15 @@ Auto parser tuning is derived from `--memory-limit` (accepts `G`/`M` suffixes, e
 | Option                | Default                     | Description                                                              |
 | --------------------- | --------------------------- | ------------------------------------------------------------------------ |
 | `<HDT_FILE>`          | _(required)_                | Path to existing HDT file                                                |
-| `--query PATTERN`     | _(required)_                | Triple pattern (three N-Triples terms, `?` or `*` as wildcard)           |
+| `--query PATTERN`     | _(required)_                | Three-position triple or four-position quad pattern                      |
 | `-o, --output PATH`   | stdout                      | Write results to file instead of stdout                                  |
 | `--count`             | off                         | Print only the count of matching triples                                 |
 | `--limit N`           | unlimited                   | Stop after N results (ignored when combined with `--count`)              |
 | `--offset N`          | 0                           | Skip the first N matching results (ignored when combined with `--count`) |
 | `--index PATH`        | `<HDT_FILE>.hdt.index.v1-1` | Index file path (used for `? P ?`, `? ? O`, and `? P O` queries)         |
 | `--no-index`          | off                         | Disable index use; fall back to sequential scan for all patterns         |
-| `--memory-limit SIZE` | `4G`                        | Soft memory limit for dictionary caches (e.g. `4G`, `2000M`)             |
+| `--temp-dir DIR`      | system temp                 | Directory for wildcard-graph membership sorting                          |
+| `--memory-limit SIZE` | `4G`                        | Memory limit for dictionary caches and membership sorting                |
 | `-v, --verbose`       | —                           | Increase log verbosity (`-v` debug, `-vv` trace)                         |
 | `-q, --quiet`         | —                           | Suppress all output except errors                                        |
 

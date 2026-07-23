@@ -4,7 +4,8 @@ use crate::rdf::input::{Compression, RdfFormat, RdfInput};
 use anyhow::{Context, Result};
 use crossbeam_channel::TrySendError;
 use oxrdf::{BlankNode, GraphName, Literal, NamedOrBlankNode, Term, Triple};
-use std::collections::BTreeMap;
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::sync::{Arc, Condvar, Mutex};
@@ -87,7 +88,47 @@ pub struct ExtractedQuad {
     pub subject: String,
     pub predicate: String,
     pub object: String,
-    pub graph: Option<String>,
+    pub graph: Option<Arc<str>>,
+}
+
+#[derive(Default)]
+struct GraphInterner {
+    terms: HashMap<Arc<str>, ()>,
+    last: Option<Arc<str>>,
+}
+
+impl GraphInterner {
+    fn intern(&mut self, term: &str) -> Arc<str> {
+        if let Some(last) = &self.last
+            && last.as_ref() == term
+        {
+            return Arc::clone(last);
+        }
+        if let Some((existing, ())) = self.terms.get_key_value(term) {
+            self.last = Some(Arc::clone(existing));
+            return Arc::clone(existing);
+        }
+
+        // Sequential parsers do not have natural chunk lifetimes, so cap the
+        // cache as well as using per-chunk instances in the parallel parser.
+        if self.terms.len() >= 4_096 {
+            self.terms.clear();
+        }
+        let term: Arc<str> = Arc::from(term);
+        self.terms.insert(Arc::clone(&term), ());
+        self.last = Some(Arc::clone(&term));
+        term
+    }
+}
+
+fn extract_graph_name<'a>(graph_name: &'a GraphName, blank_prefix: &str) -> Option<Cow<'a, str>> {
+    match graph_name {
+        GraphName::DefaultGraph => None,
+        GraphName::NamedNode(node) => Some(Cow::Borrowed(node.as_str())),
+        GraphName::BlankNode(node) => {
+            Some(Cow::Owned(format!("_:{}{}", blank_prefix, node.as_str())))
+        }
+    }
 }
 
 /// Convert our RdfFormat enum to oxrdfio's RdfFormat.
@@ -295,6 +336,7 @@ where
         String::new()
     };
     let mut stats = ParseStats::default();
+    let mut graph_interner = GraphInterner::default();
 
     for result in parser.for_reader(reader) {
         match result {
@@ -314,13 +356,8 @@ where
                 );
                 let predicate = quad.predicate.as_str().to_string();
                 let object = term_to_hdt_string(&quad.object, &blank_prefix);
-                let graph = match &quad.graph_name {
-                    GraphName::DefaultGraph => None,
-                    GraphName::NamedNode(n) => Some(n.as_str().to_string()),
-                    GraphName::BlankNode(b) => {
-                        Some(format!("_:{}{}", blank_prefix, b.as_str()))
-                    }
-                };
+                let graph = extract_graph_name(&quad.graph_name, &blank_prefix)
+                    .map(|graph| graph_interner.intern(graph.as_ref()));
 
                 stats.quads += 1;
                 callback(ExtractedQuad {
@@ -455,6 +492,9 @@ where
         worker_handles.push(std::thread::spawn(move || -> Result<()> {
             for task in task_rx {
                 let chunk_len = task.bytes.len();
+                // One interner per bounded parser chunk shares common graph names
+                // without retaining an unbounded file-wide vocabulary.
+                let mut graph_interner = GraphInterner::default();
                 let mut parsed = ChunkParsed {
                     sequence: task.sequence,
                     quads: Vec::new(),
@@ -478,13 +518,8 @@ where
                                 term_to_hdt_string(&Term::from(quad.subject), &blank_prefix);
                             let predicate = quad.predicate.as_str().to_string();
                             let object = term_to_hdt_string(&quad.object, &blank_prefix);
-                            let graph = match &quad.graph_name {
-                                GraphName::DefaultGraph => None,
-                                GraphName::NamedNode(n) => Some(n.as_str().to_string()),
-                                GraphName::BlankNode(b) => {
-                                    Some(format!("_:{}{}", blank_prefix, b.as_str()))
-                                }
-                            };
+                            let graph = extract_graph_name(&quad.graph_name, &blank_prefix)
+                                .map(|graph| graph_interner.intern(graph.as_ref()));
 
                             parsed.stats.quads += 1;
                             parsed.quads.push(ExtractedQuad {
@@ -800,6 +835,14 @@ mod tests {
             compression: Compression::None,
         };
         (f, input)
+    }
+
+    #[test]
+    fn graph_interner_reuses_repeated_graph_storage() {
+        let mut interner = GraphInterner::default();
+        let first = interner.intern("http://example.org/graph");
+        let second = interner.intern("http://example.org/graph");
+        assert!(Arc::ptr_eq(&first, &second));
     }
 
     fn make_temp_nt_gz(content: &str) -> (tempfile::NamedTempFile, RdfInput) {

@@ -1,9 +1,10 @@
 //! Parallel ID remapping from local to global IDs.
 
 use crate::hdt::input_adapter::HdtTripleReader;
-use crate::pipeline::batch_vocab::LocalIdTriple;
+use crate::pipeline::batch_vocab::LocalIdQuad;
 use crate::pipeline::vocab_merger::IdMapping;
-use crate::triples::id_triple::IdTriple;
+use crate::quads::{IdQuad, PositionGraphMembership};
+use crate::sort::Sortable;
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender};
 use std::fs::File;
@@ -22,11 +23,19 @@ pub enum TripleSource {
         num_sp_pairs: u64,
         shared_count: u64,
         subjects_count: u64,
+        /// Position-major, zstd-compressed source-sidecar memberships.
+        memberships_path: Option<PathBuf>,
+        /// Local named-graph IDs added to every source triple by graph maps.
+        mapped_graphs: Vec<u32>,
+        /// Named fallback used only when neither preserved nor mapped graphs exist.
+        fallback_named_graph: Option<u32>,
     },
 }
 
 /// Information about a batch for remapping.
 pub struct BatchRemapInfo {
+    /// Whether local-ID files carry the named-graph column.
+    pub include_graphs: bool,
     pub batch_id: usize,
     pub triple_source: TripleSource,
     pub mapping_path: PathBuf,
@@ -35,17 +44,21 @@ pub struct BatchRemapInfo {
 /// Remap a single batch: local IDs → global IDs.
 fn remap_batch(
     batch_info: &BatchRemapInfo,
-    global_triple_tx: &Sender<Vec<IdTriple>>,
+    global_quad_tx: &Sender<Vec<IdQuad>>,
     chunk_size: usize,
 ) -> Result<usize> {
     // Load ID mapping
-    let mapping = IdMapping::read_from_file(&batch_info.mapping_path)
-        .with_context(|| format!("Failed to load ID mapping for batch {}", batch_info.batch_id))?;
+    let mapping = IdMapping::read_from_file(&batch_info.mapping_path).with_context(|| {
+        format!(
+            "Failed to load ID mapping for batch {}",
+            batch_info.batch_id
+        )
+    })?;
 
     let mut count = 0;
-    let mut chunk: Vec<IdTriple> = Vec::with_capacity(chunk_size);
+    let mut chunk: Vec<IdQuad> = Vec::with_capacity(chunk_size);
 
-    let mut remap_and_send = |s: u32, p: u32, o: u32| -> Result<()> {
+    let mut remap_and_send = |s: u32, p: u32, o: u32, g: Option<u32>| -> Result<()> {
         let global_subject = *mapping.so_map.get(s as usize).ok_or_else(|| {
             anyhow::anyhow!(
                 "SO mapping missing for local subject ID {} in batch {} (map size: {})",
@@ -71,15 +84,28 @@ fn remap_batch(
             )
         })?;
 
-        chunk.push(IdTriple {
+        let global_graph = match g {
+            Some(local_graph) => *mapping.g_map.get(local_graph as usize).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "G mapping missing for local graph ID {} in batch {} (map size: {})",
+                    local_graph,
+                    batch_info.batch_id,
+                    mapping.g_map.len()
+                )
+            })?,
+            None => 0,
+        };
+
+        chunk.push(IdQuad {
             subject: global_subject,
             predicate: global_predicate,
             object: global_object,
+            graph: global_graph,
         });
         if chunk.len() >= chunk_size {
             let chunk_to_send = std::mem::take(&mut chunk);
-            if global_triple_tx.send(chunk_to_send).is_err() {
-                anyhow::bail!("Global triple receiver disconnected");
+            if global_quad_tx.send(chunk_to_send).is_err() {
+                anyhow::bail!("Global quad receiver disconnected");
             }
             chunk = Vec::with_capacity(chunk_size);
         }
@@ -99,8 +125,8 @@ fn remap_batch(
             let mut decoder = zstd::Decoder::with_buffer(buf_reader)?;
 
             loop {
-                match LocalIdTriple::read_from(&mut decoder) {
-                    Ok(Some(t)) => remap_and_send(t.subject, t.predicate, t.object)?,
+                match LocalIdQuad::read_from(&mut decoder, batch_info.include_graphs) {
+                    Ok(Some(t)) => remap_and_send(t.subject, t.predicate, t.object, t.graph)?,
                     Ok(None) => break,
                     Err(e) => {
                         return Err(e).with_context(|| {
@@ -120,6 +146,9 @@ fn remap_batch(
             num_sp_pairs,
             shared_count,
             subjects_count,
+            memberships_path,
+            mapped_graphs,
+            fallback_named_graph,
         } => {
             let mut reader = HdtTripleReader::open(
                 path,
@@ -136,9 +165,59 @@ fn remap_batch(
                 )
             })?;
 
+            let mut membership_decoder = memberships_path
+                .as_ref()
+                .map(|membership_path| -> Result<_> {
+                    let file = File::open(membership_path)
+                        .with_context(|| format!("Failed to open {}", membership_path.display()))?;
+                    Ok(zstd::Decoder::with_buffer(BufReader::new(file))?)
+                })
+                .transpose()?;
+            let mut next_membership = membership_decoder
+                .as_mut()
+                .map(PositionGraphMembership::read_from)
+                .transpose()?
+                .flatten();
+
+            let mut position = 0u64;
             while let Some((s, p, o)) = reader.next_triple()? {
-                remap_and_send(s, p, o)?;
+                if let Some(membership) = next_membership {
+                    anyhow::ensure!(
+                        membership.position >= position,
+                        "source graph memberships are not position ordered"
+                    );
+                }
+                let mut emitted = false;
+                while next_membership.is_some_and(|membership| membership.position == position) {
+                    let membership = next_membership.take().unwrap();
+                    let local_graph = if membership.graph == 0 {
+                        None
+                    } else {
+                        Some(u32::try_from(membership.graph - 1).with_context(|| {
+                            format!(
+                                "source graph ID {} exceeds local ID range",
+                                membership.graph
+                            )
+                        })?)
+                    };
+                    remap_and_send(s, p, o, local_graph)?;
+                    emitted = true;
+                    next_membership =
+                        PositionGraphMembership::read_from(membership_decoder.as_mut().unwrap())?;
+                }
+                for &local_graph in mapped_graphs {
+                    remap_and_send(s, p, o, Some(local_graph))?;
+                    emitted = true;
+                }
+                if !emitted {
+                    remap_and_send(s, p, o, *fallback_named_graph)?;
+                }
+                position += 1;
             }
+            anyhow::ensure!(
+                next_membership.is_none(),
+                "source sidecar has positions beyond HDT triples"
+            );
             reader.finalize().with_context(|| {
                 format!(
                     "HDT triples CRC verification failed for batch {}",
@@ -148,8 +227,8 @@ fn remap_batch(
         }
     }
 
-    if !chunk.is_empty() && global_triple_tx.send(chunk).is_err() {
-        anyhow::bail!("Global triple receiver disconnected");
+    if !chunk.is_empty() && global_quad_tx.send(chunk).is_err() {
+        anyhow::bail!("Global quad receiver disconnected");
     }
 
     Ok(count)
@@ -160,7 +239,7 @@ fn remap_batch(
 /// Processes batches in parallel, remapping local IDs to global IDs.
 pub fn id_remapper_stage(
     batch_remap_rx: Receiver<BatchRemapInfo>,
-    global_triple_tx: Sender<Vec<IdTriple>>,
+    global_quad_tx: Sender<Vec<IdQuad>>,
     num_threads: usize,
     chunk_size: usize,
 ) -> Result<u64> {
@@ -177,7 +256,7 @@ pub fn id_remapper_stage(
             batches
                 .par_iter()
                 .map(|batch_info| {
-                    match remap_batch(batch_info, &global_triple_tx, chunk_size) {
+                    match remap_batch(batch_info, &global_quad_tx, chunk_size) {
                         Ok(count) => {
                             // Files fully consumed — delete temp files to free disk space.
                             // HDT source files are not owned by us, so skip deletion.
@@ -191,10 +270,19 @@ pub fn id_remapper_stage(
                                     e
                                 );
                             }
+                            if let TripleSource::HdtFile {
+                                memberships_path: Some(path),
+                                ..
+                            } = &batch_info.triple_source
+                                && let Err(e) = std::fs::remove_file(path)
+                            {
+                                tracing::warn!("Failed to delete {}: {}", path.display(), e);
+                            }
                             if let Err(e) = std::fs::remove_file(&batch_info.mapping_path) {
                                 tracing::warn!(
                                     "Failed to delete {}: {}",
-                                    batch_info.mapping_path.display(), e
+                                    batch_info.mapping_path.display(),
+                                    e
                                 );
                             }
                             tracing::debug!(
@@ -250,18 +338,21 @@ mod tests {
             encoder.write_all(&id.to_le_bytes())?;
         }
 
+        // Empty named-graph map for default-graph test records.
+        encoder.write_all(&0u32.to_le_bytes())?;
+
         encoder.finish()?;
         Ok(())
     }
 
     /// Create a test triples file with local IDs.
-    fn create_test_triples(path: &Path, triples: Vec<LocalIdTriple>) -> Result<()> {
+    fn create_test_triples(path: &Path, triples: Vec<LocalIdQuad>) -> Result<()> {
         let file = std::fs::File::create(path)?;
         let writer = std::io::BufWriter::new(file);
         let mut encoder = zstd::Encoder::new(writer, 3)?;
 
         for triple in triples {
-            triple.write_to(&mut encoder)?;
+            triple.write_to(&mut encoder, true)?;
         }
 
         encoder.finish()?;
@@ -280,18 +371,19 @@ mod tests {
         let mapping_path = temp_path.join("mapping.map.zst");
         create_test_mapping(
             &mapping_path,
-            vec![10u64, 11u64, 12u64],       // SO map
-            vec![20u64, 21u64],              // P map
+            vec![10u64, 11u64, 12u64], // SO map
+            vec![20u64, 21u64],        // P map
         )?;
 
         // Create a triple: local (0, 0, 1)
         let triples_path = temp_path.join("triples.bin.zst");
         create_test_triples(
             &triples_path,
-            vec![LocalIdTriple {
+            vec![LocalIdQuad {
                 subject: 0,
                 predicate: 0,
                 object: 1,
+                graph: None,
             }],
         )?;
 
@@ -299,6 +391,7 @@ mod tests {
         let (tx, rx) = crossbeam_channel::bounded(10);
 
         let batch_info = BatchRemapInfo {
+            include_graphs: true,
             batch_id: 0,
             triple_source: TripleSource::LtrFile(triples_path),
             mapping_path,
@@ -342,15 +435,31 @@ mod tests {
         create_test_triples(
             &triples_path,
             vec![
-                LocalIdTriple { subject: 0, predicate: 0, object: 1 },
-                LocalIdTriple { subject: 1, predicate: 1, object: 2 },
-                LocalIdTriple { subject: 2, predicate: 0, object: 3 },
+                LocalIdQuad {
+                    subject: 0,
+                    predicate: 0,
+                    object: 1,
+                    graph: None,
+                },
+                LocalIdQuad {
+                    subject: 1,
+                    predicate: 1,
+                    object: 2,
+                    graph: None,
+                },
+                LocalIdQuad {
+                    subject: 2,
+                    predicate: 0,
+                    object: 3,
+                    graph: None,
+                },
             ],
         )?;
 
         let (tx, rx) = crossbeam_channel::bounded(10);
 
         let batch_info = BatchRemapInfo {
+            include_graphs: true,
             batch_id: 0,
             triple_source: TripleSource::LtrFile(triples_path),
             mapping_path,
@@ -361,16 +470,37 @@ mod tests {
 
         assert_eq!(count, 3);
 
-        let remapped_triples: Vec<_> = rx
-            .iter()
-            .flat_map(|chunk| chunk.into_iter())
-            .collect();
+        let remapped_triples: Vec<_> = rx.iter().flat_map(|chunk| chunk.into_iter()).collect();
         assert_eq!(remapped_triples.len(), 3);
 
         // Verify each triple
-        assert_eq!(remapped_triples[0], IdTriple { subject: 100, predicate: 200, object: 101 });
-        assert_eq!(remapped_triples[1], IdTriple { subject: 101, predicate: 201, object: 102 });
-        assert_eq!(remapped_triples[2], IdTriple { subject: 102, predicate: 200, object: 103 });
+        assert_eq!(
+            remapped_triples[0],
+            IdQuad {
+                subject: 100,
+                predicate: 200,
+                object: 101,
+                graph: 0
+            }
+        );
+        assert_eq!(
+            remapped_triples[1],
+            IdQuad {
+                subject: 101,
+                predicate: 201,
+                object: 102,
+                graph: 0
+            }
+        );
+        assert_eq!(
+            remapped_triples[2],
+            IdQuad {
+                subject: 102,
+                predicate: 200,
+                object: 103,
+                graph: 0
+            }
+        );
 
         Ok(())
     }
@@ -385,22 +515,24 @@ mod tests {
 
         // Create a small mapping: only 2 SO IDs
         let mapping_path = temp_path.join("mapping.map.zst");
-        create_test_mapping(
-            &mapping_path,
-            vec![100u64, 101u64],
-            vec![200u64],
-        )?;
+        create_test_mapping(&mapping_path, vec![100u64, 101u64], vec![200u64])?;
 
         // Create a triple referencing local SO ID 5 (out of bounds)
         let triples_path = temp_path.join("triples.bin.zst");
         create_test_triples(
             &triples_path,
-            vec![LocalIdTriple { subject: 5, predicate: 0, object: 1 }],
+            vec![LocalIdQuad {
+                subject: 5,
+                predicate: 0,
+                object: 1,
+                graph: None,
+            }],
         )?;
 
         let (tx, _rx) = crossbeam_channel::bounded(10);
 
         let batch_info = BatchRemapInfo {
+            include_graphs: true,
             batch_id: 0,
             triple_source: TripleSource::LtrFile(triples_path),
             mapping_path,
@@ -408,7 +540,12 @@ mod tests {
 
         let result = remap_batch(&batch_info, &tx, 4);
         assert!(result.is_err(), "Should error on out-of-bounds ID");
-        assert!(result.unwrap_err().to_string().contains("SO mapping missing"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("SO mapping missing")
+        );
 
         Ok(())
     }
@@ -423,30 +560,40 @@ mod tests {
 
         // Create a mapping with only 1 predicate ID
         let mapping_path = temp_path.join("mapping.map.zst");
-        create_test_mapping(
-            &mapping_path,
-            vec![100u64, 101u64],
-            vec![200u64],
-        )?;
+        create_test_mapping(&mapping_path, vec![100u64, 101u64], vec![200u64])?;
 
         // Create a triple referencing predicate ID 5 (out of bounds)
         let triples_path = temp_path.join("triples.bin.zst");
         create_test_triples(
             &triples_path,
-            vec![LocalIdTriple { subject: 0, predicate: 5, object: 1 }],
+            vec![LocalIdQuad {
+                subject: 0,
+                predicate: 5,
+                object: 1,
+                graph: None,
+            }],
         )?;
 
         let (tx, _rx) = crossbeam_channel::bounded(10);
 
         let batch_info = BatchRemapInfo {
+            include_graphs: true,
             batch_id: 0,
             triple_source: TripleSource::LtrFile(triples_path),
             mapping_path,
         };
 
         let result = remap_batch(&batch_info, &tx, 4);
-        assert!(result.is_err(), "Should error on out-of-bounds predicate ID");
-        assert!(result.unwrap_err().to_string().contains("P mapping missing"));
+        assert!(
+            result.is_err(),
+            "Should error on out-of-bounds predicate ID"
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("P mapping missing")
+        );
 
         Ok(())
     }

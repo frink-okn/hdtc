@@ -15,15 +15,17 @@
 //! - `?PO`  — predicate + object bound, auto-routes via selectivity
 
 use crate::hdt::index_reader::{
-    bitmap_index_z_group_stats, open_index, open_index_section, read_index_z_range,
-    read_predicate_count, ObjectGroupStats,
+    ObjectGroupStats, bitmap_index_z_group_stats, open_index, open_index_section,
+    read_index_z_range, read_predicate_count,
 };
-use crate::hdt::reader::{BitmapTriplesScanner, DictionaryResolver, HdtSectionOffsets, open_hdt, write_triple_tab};
+use crate::hdt::reader::{
+    BitmapTriplesScanner, DictionaryResolver, HdtSectionOffsets, open_hdt, write_triple_tab,
+};
 use crate::io::{StreamingBitmapDecoder, StreamingLogArrayDecoder};
 use anyhow::{Context, Result, bail};
 use std::fs::File;
-use std::io::{BufReader, SeekFrom, Write};
 use std::io::Seek;
+use std::io::{BufReader, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
@@ -41,6 +43,39 @@ pub enum QueryTerm {
     /// - Blank nodes: `_:id`
     /// - Literals: `"value"`, `"value"@lang`, or `"value"^^<type>`
     Bound(Vec<u8>),
+}
+
+/// The fourth position in a quad pattern.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GraphQueryTerm {
+    /// `?` or `*` — matches the default graph and every named graph.
+    Wildcard,
+    /// The RDF dataset default graph, written as `default` in a query.
+    DefaultGraph,
+    /// A named graph IRI or blank node in the sidecar graph dictionary.
+    Named(Vec<u8>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TriplePattern {
+    pub subject: QueryTerm,
+    pub predicate: QueryTerm,
+    pub object: QueryTerm,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuadPattern {
+    pub subject: QueryTerm,
+    pub predicate: QueryTerm,
+    pub object: QueryTerm,
+    pub graph: GraphQueryTerm,
+}
+
+/// Query view selected solely by the number of positions in the pattern.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SearchQuery {
+    Triple(TriplePattern),
+    Quad(QuadPattern),
 }
 
 /// Classified query pattern based on which positions are bound.
@@ -76,9 +111,7 @@ impl PatternKind {
                 Self::SubjectObjectBound
             }
             (QueryTerm::Bound(_), QueryTerm::Bound(_), QueryTerm::Bound(_)) => Self::Exact,
-            (QueryTerm::Wildcard, QueryTerm::Bound(_), QueryTerm::Wildcard) => {
-                Self::PredicateBound
-            }
+            (QueryTerm::Wildcard, QueryTerm::Bound(_), QueryTerm::Wildcard) => Self::PredicateBound,
             (QueryTerm::Wildcard, QueryTerm::Wildcard, QueryTerm::Bound(_)) => Self::ObjectBound,
             (QueryTerm::Wildcard, QueryTerm::Bound(_), QueryTerm::Bound(_)) => {
                 Self::PredicateObjectBound
@@ -90,6 +123,64 @@ impl PatternKind {
 // ---------------------------------------------------------------------------
 // Query parser
 // ---------------------------------------------------------------------------
+
+/// Parse a three-position triples query or four-position dataset query.
+///
+/// Three positions select the HDT triples-union view. Four positions select
+/// graph memberships from the packed sidecar. In graph position, `default`
+/// binds the RDF default graph; `?` and `*` match default and named graphs.
+pub fn parse_search_query(query: &str) -> Result<SearchQuery> {
+    let bytes = query.as_bytes();
+    let mut pos = 0;
+    let mut terms: Vec<QueryTerm> = Vec::with_capacity(3);
+
+    while terms.len() < 3 {
+        skip_query_whitespace(bytes, &mut pos);
+        if pos >= bytes.len() {
+            break;
+        }
+
+        let term = parse_one_term(bytes, &mut pos)
+            .with_context(|| format!("Failed to parse term {} in query", terms.len() + 1))?;
+        terms.push(term);
+    }
+
+    if terms.len() != 3 {
+        bail!(
+            "Query must have exactly 3 or 4 positions (got {}): {:?}",
+            terms.len(),
+            query
+        );
+    }
+
+    let subject = terms.remove(0);
+    let predicate = terms.remove(0);
+    let object = terms.remove(0);
+    skip_query_whitespace(bytes, &mut pos);
+    if pos == bytes.len() {
+        return Ok(SearchQuery::Triple(TriplePattern {
+            subject,
+            predicate,
+            object,
+        }));
+    }
+
+    let graph = parse_graph_term(bytes, &mut pos).context("Failed to parse graph query term")?;
+    skip_query_whitespace(bytes, &mut pos);
+    if pos < bytes.len() {
+        bail!(
+            "Unexpected trailing content in query after 4 positions: {:?}",
+            &query[pos..]
+        );
+    }
+
+    Ok(SearchQuery::Quad(QuadPattern {
+        subject,
+        predicate,
+        object,
+        graph,
+    }))
+}
 
 /// Parse a triple pattern query string into three `QueryTerm`s.
 ///
@@ -105,47 +196,42 @@ impl PatternKind {
 /// Literal values in the query are in N-Triples syntax and are unescaped
 /// before comparison with the raw HDT dictionary bytes.
 pub fn parse_query(query: &str) -> Result<(QueryTerm, QueryTerm, QueryTerm)> {
-    let bytes = query.as_bytes();
-    let mut pos = 0;
-    let mut terms: Vec<QueryTerm> = Vec::with_capacity(3);
+    match parse_search_query(query)? {
+        SearchQuery::Triple(pattern) => Ok((pattern.subject, pattern.predicate, pattern.object)),
+        SearchQuery::Quad(_) => bail!("Triple search requires exactly 3 positions"),
+    }
+}
 
-    while terms.len() < 3 {
-        // Skip whitespace
-        while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
-            pos += 1;
+fn skip_query_whitespace(bytes: &[u8], pos: &mut usize) {
+    while *pos < bytes.len() && bytes[*pos].is_ascii_whitespace() {
+        *pos += 1;
+    }
+}
+
+fn parse_graph_term(bytes: &[u8], pos: &mut usize) -> Result<GraphQueryTerm> {
+    match bytes[*pos] {
+        b'?' | b'*' => {
+            *pos += 1;
+            Ok(GraphQueryTerm::Wildcard)
         }
-        if pos >= bytes.len() {
-            break;
+        b'<' | b'_' => match parse_one_term(bytes, pos)? {
+            QueryTerm::Bound(value) => Ok(GraphQueryTerm::Named(value)),
+            QueryTerm::Wildcard => unreachable!(),
+        },
+        b'"' => bail!("Graph position cannot be a literal"),
+        _ => {
+            let start = *pos;
+            while *pos < bytes.len() && !bytes[*pos].is_ascii_whitespace() {
+                *pos += 1;
+            }
+            let token = &bytes[start..*pos];
+            if token.eq_ignore_ascii_case(b"default") {
+                Ok(GraphQueryTerm::DefaultGraph)
+            } else {
+                bail!("Graph position must be an IRI, blank node, `default`, `?`, or `*`")
+            }
         }
-
-        let term = parse_one_term(bytes, &mut pos)
-            .with_context(|| format!("Failed to parse term {} in query", terms.len() + 1))?;
-        terms.push(term);
     }
-
-    // Skip trailing whitespace and verify nothing left
-    while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
-        pos += 1;
-    }
-    if pos < bytes.len() {
-        bail!(
-            "Unexpected trailing content in query after 3 terms: {:?}",
-            &query[pos..]
-        );
-    }
-
-    if terms.len() != 3 {
-        bail!(
-            "Query must have exactly 3 terms (got {}): {:?}",
-            terms.len(),
-            query
-        );
-    }
-
-    let o = terms.pop().unwrap();
-    let p = terms.pop().unwrap();
-    let s = terms.pop().unwrap();
-    Ok((s, p, o))
 }
 
 fn parse_one_term(bytes: &[u8], pos: &mut usize) -> Result<QueryTerm> {
@@ -252,9 +338,7 @@ fn parse_nt_literal(bytes: &[u8], pos: &mut usize) -> Result<QueryTerm> {
         // Language tag
         suffix.push(b'@');
         *pos += 1;
-        while *pos < bytes.len()
-            && (bytes[*pos].is_ascii_alphanumeric() || bytes[*pos] == b'-')
-        {
+        while *pos < bytes.len() && (bytes[*pos].is_ascii_alphanumeric() || bytes[*pos] == b'-') {
             suffix.push(bytes[*pos]);
             *pos += 1;
         }
@@ -379,15 +463,13 @@ fn search_predicate_bound(
 
     // Open all five streaming decoders. ArrayY is not needed — we already know
     // the predicate ID. predicateIndex.bitmap/seq guide the BitmapY/BitmapZ/ArrayZ scan.
-    let mut pred_bitmap = StreamingBitmapDecoder::new(
-        open_index_section(index_path, idx.pred_bitmap_start)?,
-    )
-    .context("Failed to open predicateIndex.bitmap decoder")?;
+    let mut pred_bitmap =
+        StreamingBitmapDecoder::new(open_index_section(index_path, idx.pred_bitmap_start)?)
+            .context("Failed to open predicateIndex.bitmap decoder")?;
 
-    let mut pred_seq = StreamingLogArrayDecoder::new(
-        open_index_section(index_path, idx.pred_seq_start)?,
-    )
-    .context("Failed to open predicateIndex.seq decoder")?;
+    let mut pred_seq =
+        StreamingLogArrayDecoder::new(open_index_section(index_path, idx.pred_seq_start)?)
+            .context("Failed to open predicateIndex.seq decoder")?;
 
     let mut bitmap_y = StreamingBitmapDecoder::new(open_at(offsets.by_start)?)
         .context("Failed to open BitmapY decoder")?;
@@ -522,9 +604,9 @@ fn search_predicate_bound(
         }
 
         // Consume the BitmapY bit for `pos_y` to keep the subject counter current.
-        let by_bit = bitmap_y.next_bit()?.with_context(|| {
-            format!("BitmapY ended early after emitting pos_y {pos_y}")
-        })?;
+        let by_bit = bitmap_y
+            .next_bit()?
+            .with_context(|| format!("BitmapY ended early after emitting pos_y {pos_y}"))?;
         if by_bit {
             subject += 1;
         }
@@ -1111,10 +1193,7 @@ mod tests {
     #[test]
     fn test_parse_iri_subject() {
         let (s, p, o) = parse_query("<http://example.org/alice> ? ?").unwrap();
-        assert_eq!(
-            s,
-            QueryTerm::Bound(b"http://example.org/alice".to_vec())
-        );
+        assert_eq!(s, QueryTerm::Bound(b"http://example.org/alice".to_vec()));
         assert_eq!(p, QueryTerm::Wildcard);
         assert_eq!(o, QueryTerm::Wildcard);
     }
@@ -1126,9 +1205,7 @@ mod tests {
         assert_eq!(s, QueryTerm::Wildcard);
         assert_eq!(
             p,
-            QueryTerm::Bound(
-                b"http://www.w3.org/1999/02/22-rdf-syntax-ns#type".to_vec()
-            )
+            QueryTerm::Bound(b"http://www.w3.org/1999/02/22-rdf-syntax-ns#type".to_vec())
         );
         assert_eq!(o, QueryTerm::Wildcard);
     }
@@ -1155,9 +1232,7 @@ mod tests {
             parse_query("? ? \"42\"^^<http://www.w3.org/2001/XMLSchema#integer>").unwrap();
         assert_eq!(
             o,
-            QueryTerm::Bound(
-                b"\"42\"^^<http://www.w3.org/2001/XMLSchema#integer>".to_vec()
-            )
+            QueryTerm::Bound(b"\"42\"^^<http://www.w3.org/2001/XMLSchema#integer>".to_vec())
         );
         assert_eq!(s, QueryTerm::Wildcard);
         assert_eq!(p, QueryTerm::Wildcard);
@@ -1180,10 +1255,9 @@ mod tests {
 
     #[test]
     fn test_parse_all_bound() {
-        let (s, p, o) = parse_query(
-            "<http://example.org/s> <http://example.org/p> <http://example.org/o>",
-        )
-        .unwrap();
+        let (s, p, o) =
+            parse_query("<http://example.org/s> <http://example.org/p> <http://example.org/o>")
+                .unwrap();
         assert_eq!(s, QueryTerm::Bound(b"http://example.org/s".to_vec()));
         assert_eq!(p, QueryTerm::Bound(b"http://example.org/p".to_vec()));
         assert_eq!(o, QueryTerm::Bound(b"http://example.org/o".to_vec()));
@@ -1197,6 +1271,35 @@ mod tests {
     #[test]
     fn test_parse_too_many_terms() {
         assert!(parse_query("? ? ? ?").is_err());
+    }
+
+    #[test]
+    fn test_parse_quad_query_views() {
+        let SearchQuery::Quad(wildcard) = parse_search_query("? ? ? ?").unwrap() else {
+            panic!("expected quad query");
+        };
+        assert_eq!(wildcard.graph, GraphQueryTerm::Wildcard);
+
+        let SearchQuery::Quad(default) = parse_search_query("? ? ? default").unwrap() else {
+            panic!("expected quad query");
+        };
+        assert_eq!(default.graph, GraphQueryTerm::DefaultGraph);
+
+        let SearchQuery::Quad(named) =
+            parse_search_query("? ? ? <http://example.org/graph>").unwrap()
+        else {
+            panic!("expected quad query");
+        };
+        assert_eq!(
+            named.graph,
+            GraphQueryTerm::Named(b"http://example.org/graph".to_vec())
+        );
+    }
+
+    #[test]
+    fn test_parse_quad_query_rejects_invalid_graph_terms_and_extra_positions() {
+        assert!(parse_search_query("? ? ? \"literal\"").is_err());
+        assert!(parse_search_query("? ? ? default ?").is_err());
     }
 
     #[test]
@@ -1216,8 +1319,7 @@ mod tests {
 
     #[test]
     fn test_pattern_kind_sp_bound() {
-        let (s, p, o) =
-            parse_query("<http://example.org/s> <http://example.org/p> ?").unwrap();
+        let (s, p, o) = parse_query("<http://example.org/s> <http://example.org/p> ?").unwrap();
         assert_eq!(
             PatternKind::from_terms(&s, &p, &o),
             PatternKind::SubjectPredicateBound
@@ -1226,10 +1328,9 @@ mod tests {
 
     #[test]
     fn test_pattern_kind_exact() {
-        let (s, p, o) = parse_query(
-            "<http://example.org/s> <http://example.org/p> <http://example.org/o>",
-        )
-        .unwrap();
+        let (s, p, o) =
+            parse_query("<http://example.org/s> <http://example.org/p> <http://example.org/o>")
+                .unwrap();
         assert_eq!(PatternKind::from_terms(&s, &p, &o), PatternKind::Exact);
     }
 

@@ -11,6 +11,7 @@ mod triples;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing_subscriber::EnvFilter;
 
@@ -51,6 +52,88 @@ fn make_default_temp_dir() -> Result<std::path::PathBuf> {
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("Failed to create temp dir {}", dir.display()))?;
     Ok(dir)
+}
+
+/// An existing graph sidecar moved out of its canonical name while a new HDT
+/// is published. Keeping the backup in a sibling directory makes both moves
+/// atomic on supported filesystems.
+struct RetiredSidecar {
+    original_path: PathBuf,
+    backup_path: PathBuf,
+    _quarantine: tempfile::TempDir,
+}
+
+impl RetiredSidecar {
+    fn restore(&self) -> Result<()> {
+        match std::fs::symlink_metadata(&self.original_path) {
+            Ok(_) => anyhow::bail!(
+                "Cannot restore graph sidecar {} because another entry now exists there",
+                self.original_path.display()
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "Failed to inspect graph sidecar path {} before rollback",
+                        self.original_path.display()
+                    )
+                });
+            }
+        }
+        std::fs::rename(&self.backup_path, &self.original_path).with_context(|| {
+            format!(
+                "Failed to restore graph sidecar {}",
+                self.original_path.display()
+            )
+        })
+    }
+}
+
+fn retire_existing_sidecar(
+    sidecar_path: &Path,
+    output_parent: &Path,
+) -> Result<Option<RetiredSidecar>> {
+    let metadata = match std::fs::symlink_metadata(sidecar_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "Failed to inspect existing graph sidecar {}",
+                    sidecar_path.display()
+                )
+            });
+        }
+    };
+    let file_type = metadata.file_type();
+    anyhow::ensure!(
+        file_type.is_file() || file_type.is_symlink(),
+        "Refusing to replace graph sidecar path {} because it is not a file",
+        sidecar_path.display()
+    );
+
+    let quarantine = tempfile::Builder::new()
+        .prefix(".hdtc-retired-graphs-")
+        .tempdir_in(output_parent)
+        .with_context(|| {
+            format!(
+                "Failed to create sidecar quarantine in {}",
+                output_parent.display()
+            )
+        })?;
+    let backup_path = quarantine.path().join("previous.hdt.graphs");
+    std::fs::rename(sidecar_path, &backup_path).with_context(|| {
+        format!(
+            "Failed to retire existing graph sidecar {}",
+            sidecar_path.display()
+        )
+    })?;
+
+    Ok(Some(RetiredSidecar {
+        original_path: sidecar_path.to_path_buf(),
+        backup_path,
+        _quarantine: quarantine,
+    }))
 }
 
 fn main() -> Result<()> {
@@ -119,7 +202,26 @@ fn create_hdt(args: cli::CreateArgs, benchmark: bool) -> Result<()> {
     }
 
     tracing::info!("Output: {}", args.output.display());
+    let include_graphs = args.mode == cli::OutputMode::Quads;
+    let graph_options_require_quads = !args.graph_map.is_empty()
+        || args.default_graph.is_some()
+        || matches!(
+            args.input_sidecars,
+            Some(cli::InputSidecarPolicy::Preserve | cli::InputSidecarPolicy::Require)
+        );
+    if !include_graphs && graph_options_require_quads {
+        anyhow::bail!(
+            "--graph-map, --default-graph, and preserve/require --input-sidecars require --mode quads"
+        );
+    }
+    let input_sidecar_policy = if include_graphs {
+        args.input_sidecars
+            .unwrap_or(cli::InputSidecarPolicy::Preserve)
+    } else {
+        cli::InputSidecarPolicy::Drop
+    };
     tracing::info!("Mode: {:?}", args.mode);
+    tracing::debug!("Input sidecars: {:?}", input_sidecar_policy);
 
     // Set up temp directory
     let temp_dir = match &args.temp_dir {
@@ -135,7 +237,8 @@ fn create_hdt(args: cli::CreateArgs, benchmark: bool) -> Result<()> {
     let memory_budget = args.memory_limit.as_bytes();
     tracing::info!("Memory limit: {}", args.memory_limit);
 
-    let include_graphs = matches!(args.mode, cli::OutputMode::Quads);
+    let graph_assignments =
+        quads::GraphAssignments::parse(&args.graph_map, args.default_graph.as_deref())?;
     let parser_parallelism = pipeline::ParserParallelismConfig {
         file_workers: args.parse_file_workers,
         chunk_workers: args.parse_chunk_workers,
@@ -153,17 +256,13 @@ fn create_hdt(args: cli::CreateArgs, benchmark: bool) -> Result<()> {
                 .map(|i| &i.path)
                 .or(hdt_inputs.first())
                 .expect("at least one input file");
-            let abs_path =
-                std::fs::canonicalize(first_path).unwrap_or_else(|_| first_path.clone());
+            let abs_path = std::fs::canonicalize(first_path).unwrap_or_else(|_| first_path.clone());
             format!("file://{}", abs_path.display())
         }
     };
 
     // Dataset IRI for the header subject; defaults to the parse base URI.
-    let dataset_uri = args
-        .dataset_uri
-        .clone()
-        .unwrap_or_else(|| base_uri.clone());
+    let dataset_uri = args.dataset_uri.clone().unwrap_or_else(|| base_uri.clone());
 
     // Run the pipelined HDT construction
     let pipeline_result = pipeline::run_pipeline(
@@ -172,14 +271,32 @@ fn create_hdt(args: cli::CreateArgs, benchmark: bool) -> Result<()> {
         &temp_dir,
         memory_budget,
         include_graphs,
+        input_sidecar_policy,
+        &graph_assignments,
         &base_uri,
         &parser_parallelism,
         benchmark,
     )?;
 
-    // Write HDT file (streaming: reads dict sections and triples from temp files)
+    // Assemble the HDT and sidecar under sibling temporary names. The HDT is
+    // published only after sidecar construction succeeds, then the sidecar is
+    // renamed second as required by the detectable two-file publication model.
+    let output_parent = args
+        .output
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let hdt_temp = tempfile::Builder::new()
+        .prefix(".hdtc-hdt-")
+        .tempfile_in(output_parent)
+        .with_context(|| {
+            format!(
+                "Failed to create HDT temp file in {}",
+                output_parent.display()
+            )
+        })?
+        .into_temp_path();
     hdt::write_hdt_streaming(
-        &args.output,
+        &hdt_temp,
         &dataset_uri,
         &pipeline_result.counts,
         &pipeline_result.dict_section_paths,
@@ -190,11 +307,88 @@ fn create_hdt(args: cli::CreateArgs, benchmark: bool) -> Result<()> {
 
     let num_triples = pipeline_result.bitmap_triples.num_triples;
 
+    let canonical_graphs_path = quads::canonical_sidecar_path(&args.output);
+    let sidecar_temp = if include_graphs {
+        let membership_path = pipeline_result
+            .membership_path
+            .as_deref()
+            .context("Graph sidecar requested but the membership stream is missing")?;
+        let sidecar_temp = tempfile::Builder::new()
+            .prefix(".hdtc-graphs-")
+            .tempfile_in(output_parent)
+            .with_context(|| {
+                format!(
+                    "Failed to create sidecar temp file in {}",
+                    output_parent.display()
+                )
+            })?
+            .into_temp_path();
+        quads::write_graph_sidecar(
+            &sidecar_temp,
+            &hdt_temp,
+            &pipeline_result.graph_section_path,
+            pipeline_result.graph_section_size,
+            pipeline_result.counts.graphs,
+            num_triples,
+            pipeline_result.membership_count,
+            membership_path,
+            pipeline_result.has_blank_graph_names,
+            &temp_dir,
+        )?;
+        Some(sidecar_temp)
+    } else {
+        None
+    };
+
+    // Move the old sidecar out of its canonical name before replacing the HDT.
+    // A crash can therefore leave a detectably missing sidecar, but never a
+    // new HDT next to stale graph data.
+    let retired_sidecar = retire_existing_sidecar(&canonical_graphs_path, output_parent)?;
+    if let Err(error) = hdt_temp.persist(&args.output) {
+        let publish_error = anyhow::Error::new(error.error)
+            .context(format!("Failed to publish HDT file {}", args.output.display()));
+        if let Some(retired) = retired_sidecar.as_ref()
+            && let Err(restore_error) = retired.restore()
+        {
+            return Err(anyhow::anyhow!(
+                "{publish_error:#}; additionally failed to roll back the graph sidecar: {restore_error:#}"
+            ));
+        }
+        return Err(publish_error);
+    }
+
+    if !include_graphs && retired_sidecar.is_some() {
+        tracing::info!(
+            "Removed stale graph sidecar: {}",
+            canonical_graphs_path.display()
+        );
+    }
+
+    if let Some(sidecar_temp) = sidecar_temp {
+        sidecar_temp
+            .persist(&canonical_graphs_path)
+            .with_context(|| {
+                format!(
+                    "Failed to publish graph sidecar {}",
+                    canonical_graphs_path.display()
+                )
+            })?;
+        tracing::info!("Graph sidecar written: {}", canonical_graphs_path.display());
+    }
+
     // Clean up dict section and triples temp files
     for path in &pipeline_result.dict_section_paths {
         if let Err(e) = std::fs::remove_file(path) {
             tracing::debug!("Failed to remove dict section temp file: {e}");
         }
+    }
+    if let Err(e) = std::fs::remove_file(&pipeline_result.graph_section_path) {
+        tracing::debug!("Failed to remove graph dictionary temp file: {e}");
+    }
+    if let Some(path) = &pipeline_result.membership_path
+        && let Err(e) = std::fs::remove_file(path)
+    {
+        tracing::debug!("Failed to remove membership temp file: {e}");
     }
     pipeline_result.bitmap_triples.cleanup();
 
@@ -267,13 +461,20 @@ fn create_index_from_hdt(args: cli::IndexArgs, benchmark: bool) -> Result<()> {
     }
 }
 
-/// Dump an existing HDT file to N-Triples.
+/// Dump an existing HDT file as the triples union or lossless RDF dataset.
 fn dump_hdt_to_ntriples(args: cli::DumpArgs, benchmark: bool) -> Result<()> {
     if !args.hdt_file.exists() {
         anyhow::bail!("HDT file not found: {}", args.hdt_file.display());
     }
 
-    tracing::info!("Dumping HDT to N-Triples: {}", args.hdt_file.display());
+    tracing::info!(
+        "Dumping HDT {} view: {}",
+        match args.graph_view {
+            cli::DumpGraphView::Union => "union",
+            cli::DumpGraphView::Dataset => "dataset",
+        },
+        args.hdt_file.display()
+    );
     match &args.output {
         Some(p) => tracing::info!("Output: {}", p.display()),
         None => tracing::info!("Output: stdout"),
@@ -282,8 +483,8 @@ fn dump_hdt_to_ntriples(args: cli::DumpArgs, benchmark: bool) -> Result<()> {
     let start = std::time::Instant::now();
     let memory_limit = args.memory_limit.as_bytes();
     tracing::info!("Memory limit: {} bytes", memory_limit);
-    let count =
-        hdt::search_hdt_streaming(
+    let count = match args.graph_view {
+        cli::DumpGraphView::Union => hdt::search_hdt_streaming(
             &args.hdt_file,
             "? ? ?",
             args.output.as_deref(),
@@ -293,7 +494,24 @@ fn dump_hdt_to_ntriples(args: cli::DumpArgs, benchmark: bool) -> Result<()> {
             memory_limit,
             None,
             false,
-        )?;
+        )?,
+        cli::DumpGraphView::Dataset => {
+            let temp_dir = match &args.temp_dir {
+                Some(path) => {
+                    std::fs::create_dir_all(path)
+                        .with_context(|| format!("Failed to create temp dir {}", path.display()))?;
+                    path.clone()
+                }
+                None => make_default_temp_dir()?,
+            };
+            quads::export_dataset_nquads(
+                &args.hdt_file,
+                args.output.as_deref(),
+                &temp_dir,
+                memory_limit,
+            )?
+        }
+    };
 
     if benchmark {
         tracing::info!(
@@ -303,8 +521,8 @@ fn dump_hdt_to_ntriples(args: cli::DumpArgs, benchmark: bool) -> Result<()> {
     }
 
     match &args.output {
-        Some(p) => tracing::info!("Done! {count} triples written to {}", p.display()),
-        None => tracing::info!("Done! {count} triples written"),
+        Some(p) => tracing::info!("Done! {count} statements written to {}", p.display()),
+        None => tracing::info!("Done! {count} statements written"),
     }
     Ok(())
 }
@@ -327,18 +545,35 @@ fn search_hdt(args: cli::SearchArgs, benchmark: bool) -> Result<()> {
 
     let start = std::time::Instant::now();
     let memory_limit = args.memory_limit.as_bytes();
+    let query = hdt::parse_search_query(&args.query)
+        .with_context(|| format!("Invalid query: {:?}", args.query))?;
+    let is_quad_query = matches!(query, hdt::SearchQuery::Quad(_));
+    let limit = if args.count { None } else { args.limit };
+    let offset = if args.count { None } else { args.offset };
 
-    let count = hdt::search_hdt_streaming(
-        &args.hdt_file,
-        &args.query,
-        args.output.as_deref(),
-        args.count,
-        if args.count { None } else { args.limit },
-        if args.count { None } else { args.offset },
-        memory_limit,
-        args.index.as_deref(),
-        args.no_index,
-    )?;
+    let count = match query {
+        hdt::SearchQuery::Triple(_) => hdt::search_hdt_streaming(
+            &args.hdt_file,
+            &args.query,
+            args.output.as_deref(),
+            args.count,
+            limit,
+            offset,
+            memory_limit,
+            args.index.as_deref(),
+            args.no_index,
+        )?,
+        hdt::SearchQuery::Quad(pattern) => quads::search_dataset_streaming(
+            &args.hdt_file,
+            &pattern,
+            args.output.as_deref(),
+            args.count,
+            limit,
+            offset,
+            memory_limit,
+            args.temp_dir.as_deref(),
+        )?,
+    };
 
     if benchmark {
         tracing::info!(
@@ -347,7 +582,14 @@ fn search_hdt(args: cli::SearchArgs, benchmark: bool) -> Result<()> {
         );
     }
 
-    tracing::info!("Done! {count} matching triple(s)");
+    tracing::info!(
+        "Done! {count} matching {}",
+        if is_quad_query {
+            "quad(s)"
+        } else {
+            "triple(s)"
+        }
+    );
     Ok(())
 }
 
@@ -410,7 +652,7 @@ fn run_header(args: cli::HeaderArgs, benchmark: bool) -> Result<()> {
     Ok(())
 }
 
-/// Validate an existing HDT file's triples structures for indexing.
+/// Validate an HDT and, when present, its graph sidecar.
 fn validate_hdt_file(args: cli::ValidateArgs, benchmark: bool) -> Result<()> {
     if !args.hdt_file.exists() {
         anyhow::bail!("HDT file not found: {}", args.hdt_file.display());
@@ -424,6 +666,19 @@ fn validate_hdt_file(args: cli::ValidateArgs, benchmark: bool) -> Result<()> {
     let start = std::time::Instant::now();
     match index::validate_hdt_triples(&args.hdt_file) {
         Ok(()) => {
+            let sidecar_path = quads::canonical_sidecar_path(&args.hdt_file);
+            if sidecar_path.exists() {
+                tracing::info!("Validating graph sidecar: {}", sidecar_path.display());
+                let temp_dir = match &args.temp_dir {
+                    Some(path) => {
+                        std::fs::create_dir_all(path)?;
+                        path.clone()
+                    }
+                    None => make_default_temp_dir()?,
+                };
+                let mut sidecar = quads::GraphSidecarReader::open(&sidecar_path, &args.hdt_file)?;
+                sidecar.validate_strict(&temp_dir, args.memory_limit.as_bytes(), None)?;
+            }
             if benchmark {
                 tracing::info!(
                     "Benchmark summary (validate): total {:.3}s",
@@ -437,5 +692,38 @@ fn validate_hdt_file(args: cli::ValidateArgs, benchmark: bool) -> Result<()> {
             tracing::error!("Validation failed: {}", e);
             Err(e)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retired_sidecar_can_be_restored() {
+        let dir = tempfile::tempdir().unwrap();
+        let sidecar = dir.path().join("dataset.hdt.graphs");
+        std::fs::write(&sidecar, b"old sidecar").unwrap();
+
+        let retired = retire_existing_sidecar(&sidecar, dir.path())
+            .unwrap()
+            .unwrap();
+        assert!(!sidecar.exists());
+        assert_eq!(std::fs::read(&retired.backup_path).unwrap(), b"old sidecar");
+
+        retired.restore().unwrap();
+        drop(retired);
+        assert_eq!(std::fs::read(sidecar).unwrap(), b"old sidecar");
+    }
+
+    #[test]
+    fn sidecar_directory_is_not_retired() {
+        let dir = tempfile::tempdir().unwrap();
+        let sidecar = dir.path().join("dataset.hdt.graphs");
+        std::fs::create_dir(&sidecar).unwrap();
+
+        let result = retire_existing_sidecar(&sidecar, dir.path());
+        assert!(result.is_err());
+        assert!(sidecar.is_dir());
     }
 }

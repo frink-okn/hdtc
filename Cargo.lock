@@ -446,6 +446,7 @@ dependencies = [
  "oxrdf",
  "oxrdfio",
  "rayon",
+ "sha2",
  "tempfile",
  "thiserror",
  "tracing",

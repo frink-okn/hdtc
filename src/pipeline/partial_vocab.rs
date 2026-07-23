@@ -17,12 +17,25 @@ pub struct PartialVocabEntry {
     pub roles: Roles,
     pub so_local_id: Option<u32>, // Local ID in subject/object space (if used as S or O)
     pub p_local_id: Option<u32>,  // Local ID in predicate space (if used as P)
+    pub g_local_id: Option<u32>,  // Local ID in named-graph space (if used as G)
 }
 
 impl PartialVocabEntry {
     #[cfg(test)]
-    pub fn new(term: Vec<u8>, roles: Roles, so_local_id: Option<u32>, p_local_id: Option<u32>) -> Self {
-        Self { term, roles, so_local_id, p_local_id }
+    pub fn new(
+        term: Vec<u8>,
+        roles: Roles,
+        so_local_id: Option<u32>,
+        p_local_id: Option<u32>,
+        g_local_id: Option<u32>,
+    ) -> Self {
+        Self {
+            term,
+            roles,
+            so_local_id,
+            p_local_id,
+            g_local_id,
+        }
     }
 
     /// Create from a `VocabEntry` (cloning the term).
@@ -32,6 +45,7 @@ impl PartialVocabEntry {
             roles: entry.roles,
             so_local_id: entry.so_local_id,
             p_local_id: entry.p_local_id,
+            g_local_id: entry.g_local_id,
         }
     }
 }
@@ -54,7 +68,13 @@ impl PartialVocabWriter {
     }
 
     /// Write header (magic + count + max local IDs).
-    pub fn write_header(&mut self, entry_count: u32, max_so_id: u32, max_p_id: u32) -> Result<()> {
+    pub fn write_header(
+        &mut self,
+        entry_count: u32,
+        max_so_id: u32,
+        max_p_id: u32,
+        max_g_id: u32,
+    ) -> Result<()> {
         // Write magic number
         self.encoder.write_all(&MAGIC.to_le_bytes())?;
         // Write entry count
@@ -62,6 +82,7 @@ impl PartialVocabWriter {
         // Write max local IDs for pre-allocating mappings
         self.encoder.write_all(&max_so_id.to_le_bytes())?;
         self.encoder.write_all(&max_p_id.to_le_bytes())?;
+        self.encoder.write_all(&max_g_id.to_le_bytes())?;
         Ok(())
     }
 
@@ -77,14 +98,25 @@ impl PartialVocabWriter {
 
         // Write SO local ID if term is used as subject/object
         if entry.roles.intersects(Roles::SUBJECT | Roles::OBJECT) {
-            let so_id = entry.so_local_id.expect("SO local ID must be present when roles include S/O");
+            let so_id = entry
+                .so_local_id
+                .expect("SO local ID must be present when roles include S/O");
             self.encoder.write_all(&so_id.to_le_bytes())?;
         }
 
         // Write P local ID if term is used as predicate
         if entry.roles.contains(Roles::PREDICATE) {
-            let p_id = entry.p_local_id.expect("P local ID must be present when roles include P");
+            let p_id = entry
+                .p_local_id
+                .expect("P local ID must be present when roles include P");
             self.encoder.write_all(&p_id.to_le_bytes())?;
+        }
+
+        if entry.roles.contains(Roles::GRAPH) {
+            let g_id = entry
+                .g_local_id
+                .expect("G local ID must be present when roles include GRAPH");
+            self.encoder.write_all(&g_id.to_le_bytes())?;
         }
 
         self.count += 1;
@@ -109,6 +141,7 @@ pub struct PartialVocabReader {
     count: u32,
     max_so_id: u32,
     max_p_id: u32,
+    max_g_id: u32,
     entries_read: u32,
 }
 
@@ -125,7 +158,11 @@ impl PartialVocabReader {
         decoder.read_exact(&mut magic_bytes)?;
         let magic = u32::from_le_bytes(magic_bytes);
         if magic != MAGIC {
-            anyhow::bail!("Invalid partial vocab file magic: expected {:#x}, got {:#x}", MAGIC, magic);
+            anyhow::bail!(
+                "Invalid partial vocab file magic: expected {:#x}, got {:#x}",
+                MAGIC,
+                magic
+            );
         }
 
         let mut count_bytes = [0u8; 4];
@@ -140,11 +177,16 @@ impl PartialVocabReader {
         decoder.read_exact(&mut max_p_id_bytes)?;
         let max_p_id = u32::from_le_bytes(max_p_id_bytes);
 
+        let mut max_g_id_bytes = [0u8; 4];
+        decoder.read_exact(&mut max_g_id_bytes)?;
+        let max_g_id = u32::from_le_bytes(max_g_id_bytes);
+
         Ok(Self {
             decoder,
             count,
             max_so_id,
             max_p_id,
+            max_g_id,
             entries_read: 0,
         })
     }
@@ -157,6 +199,11 @@ impl PartialVocabReader {
     /// Get max P local ID in this batch.
     pub fn max_p_id(&self) -> u32 {
         self.max_p_id
+    }
+
+    /// Get max named-graph local ID in this batch.
+    pub fn max_g_id(&self) -> u32 {
+        self.max_g_id
     }
 
     /// Read the next entry.
@@ -199,9 +246,23 @@ impl PartialVocabReader {
             None
         };
 
+        let g_local_id = if roles.contains(Roles::GRAPH) {
+            let mut id_bytes = [0u8; 4];
+            self.decoder.read_exact(&mut id_bytes)?;
+            Some(u32::from_le_bytes(id_bytes))
+        } else {
+            None
+        };
+
         self.entries_read += 1;
 
-        Ok(Some(PartialVocabEntry { term, roles, so_local_id, p_local_id }))
+        Ok(Some(PartialVocabEntry {
+            term,
+            roles,
+            so_local_id,
+            p_local_id,
+            g_local_id,
+        }))
     }
 
     /// Get total number of entries in the file.
@@ -235,10 +296,28 @@ mod tests {
 
         // Write some entries
         let mut writer = PartialVocabWriter::create(&path)?;
-        writer.write_header(3, 2, 1)?; // 3 entries, max_so_id=2, max_p_id=1
-        writer.write_entry(&PartialVocabEntry::new(b"term1".to_vec(), Roles::SUBJECT, Some(0), None))?; // subject only
-        writer.write_entry(&PartialVocabEntry::new(b"term2".to_vec(), Roles::PREDICATE, None, Some(0)))?; // predicate only
-        writer.write_entry(&PartialVocabEntry::new(b"term3".to_vec(), Roles::OBJECT, Some(1), None))?; // object only
+        writer.write_header(3, 2, 1, 0)?; // 3 entries, max_so_id=2, max_p_id=1
+        writer.write_entry(&PartialVocabEntry::new(
+            b"term1".to_vec(),
+            Roles::SUBJECT,
+            Some(0),
+            None,
+            None,
+        ))?; // subject only
+        writer.write_entry(&PartialVocabEntry::new(
+            b"term2".to_vec(),
+            Roles::PREDICATE,
+            None,
+            Some(0),
+            None,
+        ))?; // predicate only
+        writer.write_entry(&PartialVocabEntry::new(
+            b"term3".to_vec(),
+            Roles::OBJECT,
+            Some(1),
+            None,
+            None,
+        ))?; // object only
         let count = writer.count();
         writer.finish()?;
 

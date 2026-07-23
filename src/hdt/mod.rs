@@ -10,6 +10,6 @@ pub(crate) mod void;
 pub(crate) mod writer;
 
 pub use header::run_header_command;
-pub use search::search_hdt_streaming;
+pub use search::{SearchQuery, parse_search_query, search_hdt_streaming};
 pub use void::compute_void;
 pub use writer::write_hdt_streaming;
