@@ -30,7 +30,7 @@ use crate::sort::{ExternalSorter, Sortable};
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, bounded};
 use std::fs::File;
-use std::io::BufWriter;
+use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -38,6 +38,9 @@ use std::time::{Duration, Instant};
 use batch_vocab::{LocalIdQuad, Roles, VocabEntry};
 
 const STAGE5_TO_STAGE6_CHUNK_SIZE: usize = 16_384;
+const DIRECT_GRAPH_SPOOL_MAX_LAYERS: u64 = 128;
+const DIRECT_GRAPH_SPOOL_BUFFER_SIZE: usize = 64 * 1024;
+const DIRECT_GRAPH_SPOOL_ESTIMATED_BYTES_PER_LAYER: usize = 2 * 1024 * 1024;
 const RECOMMENDED_MIN_MEMORY_BUDGET: usize = 2 * 1024 * 1024 * 1024;
 const MIB: usize = 1024 * 1024;
 
@@ -451,7 +454,8 @@ fn local_triples_path(temp_dir: &Path, batch_id: usize) -> PathBuf {
 //
 //   Batch channel (Stage 1→2):  `batch_channel_cap` batches of Vec<ExtractedQuad>.
 //     Each ExtractedQuad has 3 heap-allocated Strings (subject, predicate, object)
-//     + Option<String> graph.  Stack: ~96 bytes, heap: ~240 bytes → ~350 bytes/quad.
+//     + a chunk-interned Option<Arc<str>> graph. The 350-byte estimate remains
+//     deliberately conservative for unusually long RDF terms.
 //
 //   Stage 2 processing (1 batch): arena (~100 bytes/triple for unique terms) +
 //     hashmap (~80 bytes/unique term) + LocalIdQuad vec (16 bytes/statement).
@@ -487,8 +491,8 @@ fn calculate_group_a(memory_budget: usize) -> (usize, usize, usize, usize) {
     let processed_channel_cap = tune_usize("HDTC_TUNE_PROCESSED_CHANNEL_CAP", 2).clamp(1, 8);
 
     // Per-triple memory costs at each pipeline stage.
-    // ExtractedQuad: 3 Strings (24 bytes stack + ~80 bytes heap each) + Option<String>
-    // = ~96 bytes stack + ~240 bytes heap ≈ 350 bytes per quad.
+    // ExtractedQuad: 3 Strings plus a chunk-interned graph Arc. Keep the
+    // historical 350-byte estimate as a conservative bound for long terms.
     let raw_bytes_per_quad = tune_usize("HDTC_TUNE_RAW_BYTES_PER_QUAD", 350).max(100);
     // Stage 2: arena + hashmap + LocalIdQuad vec
     let processing_bytes_per_triple =
@@ -700,14 +704,35 @@ fn parser_stage(
                     disambiguate_blank_nodes,
                     Some(&base_uri),
                     &parse_options,
-                    |quad| {
+                    |mut quad| {
                         if include_graphs {
-                            for graph in source_assignment.memberships(quad.graph.clone()) {
-                                let mut assigned = quad.clone();
-                                assigned.graph = graph;
-                                staged_quads.push(assigned);
+                            // Preserving the parsed graph with no graph-map rules is by far
+                            // the common case. Move the quad straight into the batch instead
+                            // of cloning all four strings and allocating a temporary Vec.
+                            if source_assignment.mapped_graphs().is_empty() {
+                                if quad.graph.is_none()
+                                    && let Some(graph) = source_assignment.default_graph_term()
+                                {
+                                    quad.graph = Some(Arc::clone(graph));
+                                }
+                                staged_quads.push(quad);
+                            } else {
+                                let mut memberships =
+                                    source_assignment.memberships(quad.graph.take());
+                                let last_graph = memberships
+                                    .pop()
+                                    .context("graph assignment emitted no memberships")?;
+                                for graph in memberships {
+                                    let mut assigned = quad.clone();
+                                    assigned.graph = graph;
+                                    staged_quads.push(assigned);
+                                }
+                                quad.graph = last_graph;
+                                staged_quads.push(quad);
                             }
                         } else {
+                            // Graph strings have no downstream use in triples mode.
+                            quad.graph = None;
                             staged_quads.push(quad);
                         }
                         if staged_quads.len() >= 4096 {
@@ -942,6 +967,165 @@ fn cleanup_batch_files(batches: &[BatchComplete]) {
         let _ = std::fs::remove_file(&batch.triples_path);
     }
     tracing::debug!("Cleaned up {} batch temp files", batches.len());
+}
+
+type MembershipEncoder = zstd::Encoder<'static, BufWriter<File>>;
+
+/// Collect graph memberships in graph-major order without a second global sort
+/// when the graph dictionary is small enough for bounded per-layer spools.
+///
+/// QuadUnionIterator visits union positions monotonically, so the positions
+/// sent to any one graph layer are already sorted. Each non-empty layer is
+/// written as its own zstd frame; concatenating the frames by graph ID produces
+/// the graph-major membership stream consumed by the sidecar writer.
+struct DirectGraphMembershipSpool {
+    temp_dir: PathBuf,
+    encoders: Vec<Option<MembershipEncoder>>,
+    last_positions: Vec<Option<u64>>,
+    membership_count: u64,
+}
+
+impl DirectGraphMembershipSpool {
+    fn new(temp_dir: &Path, layer_count: u64) -> Result<Self> {
+        let layer_count = usize::try_from(layer_count).context("graph layer count overflow")?;
+        Ok(Self {
+            temp_dir: temp_dir.to_path_buf(),
+            encoders: std::iter::repeat_with(|| None).take(layer_count).collect(),
+            last_positions: vec![None; layer_count],
+            membership_count: 0,
+        })
+    }
+
+    fn push(&mut self, membership: GraphMembership) -> Result<()> {
+        let graph = usize::try_from(membership.graph).context("graph ID overflow")?;
+        let last_position = self
+            .last_positions
+            .get_mut(graph)
+            .context("graph membership ID exceeds graph dictionary")?;
+        anyhow::ensure!(
+            last_position.is_none_or(|last| membership.position > last),
+            "graph membership positions are not strictly increasing"
+        );
+        *last_position = Some(membership.position);
+
+        if self.encoders[graph].is_none() {
+            let file = tempfile::tempfile_in(&self.temp_dir)
+                .context("failed to create direct graph membership spool")?;
+            self.encoders[graph] = Some(zstd::Encoder::new(
+                BufWriter::with_capacity(DIRECT_GRAPH_SPOOL_BUFFER_SIZE, file),
+                1,
+            )?);
+        }
+        let encoder = self.encoders[graph]
+            .as_mut()
+            .context("membership encoder was not initialized")?;
+        membership.write_to(encoder)?;
+        self.membership_count = self
+            .membership_count
+            .checked_add(1)
+            .context("graph membership count overflow")?;
+        Ok(())
+    }
+
+    fn finish(self, membership_path: &Path) -> Result<u64> {
+        let output = File::create(membership_path).with_context(|| {
+            format!(
+                "Failed to create membership file {}",
+                membership_path.display()
+            )
+        })?;
+
+        if self.membership_count == 0 {
+            // Keep the internal stream valid even for an empty dataset.
+            zstd::Encoder::new(BufWriter::new(output), 1)?.finish()?;
+            return Ok(0);
+        }
+
+        let mut output = BufWriter::with_capacity(256 * 1024, output);
+        for encoder in self.encoders.into_iter().flatten() {
+            let mut writer = encoder.finish()?;
+            writer.flush()?;
+            let mut file = writer.into_inner().map_err(|error| error.into_error())?;
+            file.seek(SeekFrom::Start(0))?;
+            std::io::copy(&mut file, &mut output)?;
+        }
+        output.flush()?;
+        Ok(self.membership_count)
+    }
+}
+
+struct SortedGraphMembershipSpool {
+    sorter: ExternalSorter,
+    buffer: Vec<GraphMembership>,
+    memory_used: usize,
+}
+
+enum GraphMembershipSpool {
+    Direct(DirectGraphMembershipSpool),
+    Sorted(SortedGraphMembershipSpool),
+}
+
+impl GraphMembershipSpool {
+    fn new(temp_dir: &Path, layer_count: u64, sort_budget: usize) -> Result<Self> {
+        let memory_layer_limit = u64::try_from(
+            (sort_budget / DIRECT_GRAPH_SPOOL_ESTIMATED_BYTES_PER_LAYER).max(1),
+        )
+        .unwrap_or(u64::MAX);
+        let direct_layer_limit = DIRECT_GRAPH_SPOOL_MAX_LAYERS.min(memory_layer_limit);
+        if layer_count <= direct_layer_limit {
+            tracing::info!(layer_count, "Spooling graph memberships directly by layer");
+            Ok(Self::Direct(DirectGraphMembershipSpool::new(
+                temp_dir,
+                layer_count,
+            )?))
+        } else {
+            tracing::info!(
+                layer_count,
+                direct_layer_limit,
+                "Graph count exceeds direct-spool resource limit; using external membership sort"
+            );
+            Ok(Self::Sorted(SortedGraphMembershipSpool {
+                sorter: ExternalSorter::new(temp_dir, sort_budget),
+                buffer: Vec::new(),
+                memory_used: 0,
+            }))
+        }
+    }
+
+    fn push(&mut self, membership: GraphMembership) -> Result<()> {
+        match self {
+            Self::Direct(spool) => spool.push(membership),
+            Self::Sorted(spool) => {
+                spool
+                    .sorter
+                    .push(membership, &mut spool.buffer, &mut spool.memory_used)
+            }
+        }
+    }
+
+    fn finish(self, membership_path: &Path) -> Result<u64> {
+        match self {
+            Self::Direct(spool) => spool.finish(membership_path),
+            Self::Sorted(mut spool) => {
+                let file = File::create(membership_path).with_context(|| {
+                    format!(
+                        "Failed to create membership file {}",
+                        membership_path.display()
+                    )
+                })?;
+                let mut encoder = zstd::Encoder::new(BufWriter::new(file), 3)?;
+                let mut membership_count = 0u64;
+                for membership in spool.sorter.finish(&mut spool.buffer)? {
+                    membership?.write_to(&mut encoder)?;
+                    membership_count = membership_count
+                        .checked_add(1)
+                        .context("graph membership count overflow")?;
+                }
+                encoder.finish()?;
+                Ok(membership_count)
+            }
+        }
+    }
 }
 
 /// Run the complete pipeline: RDF → HDT.
@@ -1413,13 +1597,19 @@ pub fn run_pipeline(
         None
     };
     let (bitmap_triples, membership_path, membership_count) = if include_graphs {
-        let mut membership_sorter = ExternalSorter::new(temp_dir, stage56_budget.sort_budget_bytes);
-        let mut membership_buffer: Vec<GraphMembership> = Vec::new();
-        let mut membership_mem = 0usize;
+        let graph_layer_count = merge_result
+            .counts
+            .graphs
+            .checked_add(1)
+            .context("graph layer count overflow")?;
+        let mut membership_spool = GraphMembershipSpool::new(
+            temp_dir,
+            graph_layer_count,
+            stage56_budget.sort_budget_bytes,
+        )?;
 
-        let union_triples = QuadUnionIterator::new(sorted_quads, |membership| {
-            membership_sorter.push(membership, &mut membership_buffer, &mut membership_mem)
-        });
+        let union_triples =
+            QuadUnionIterator::new(sorted_quads, |membership| membership_spool.push(membership));
         let bitmap = crate::triples::build_bitmap_triples_to_files(
             union_triples,
             max_subject,
@@ -1429,21 +1619,7 @@ pub fn run_pipeline(
         )?;
 
         let membership_path = temp_dir.join("graph_memberships.gmp.zst");
-        let file = File::create(&membership_path).with_context(|| {
-            format!(
-                "Failed to create membership file {}",
-                membership_path.display()
-            )
-        })?;
-        let mut encoder = zstd::Encoder::new(BufWriter::new(file), 3)?;
-        let mut membership_count = 0u64;
-        for membership in membership_sorter.finish(&mut membership_buffer)? {
-            membership?.write_to(&mut encoder)?;
-            membership_count = membership_count
-                .checked_add(1)
-                .context("graph membership count overflow")?;
-        }
-        encoder.finish()?;
+        let membership_count = membership_spool.finish(&membership_path)?;
         (bitmap, Some(membership_path), membership_count)
     } else {
         let union_triples = QuadUnionIterator::new(sorted_quads, |_membership| Ok(()));
@@ -1485,4 +1661,124 @@ pub fn run_pipeline(
         bitmap_triples,
         ntriples_size,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::BufReader;
+
+    #[test]
+    fn direct_graph_spool_emits_graph_major_concatenated_frames() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("memberships.gmp.zst");
+        let mut spool = GraphMembershipSpool::new(temp.path(), 3, 8 * MIB).unwrap();
+        assert!(matches!(spool, GraphMembershipSpool::Direct(_)));
+
+        for membership in [
+            GraphMembership {
+                graph: 0,
+                position: 0,
+            },
+            GraphMembership {
+                graph: 2,
+                position: 0,
+            },
+            GraphMembership {
+                graph: 1,
+                position: 1,
+            },
+            GraphMembership {
+                graph: 2,
+                position: 1,
+            },
+        ] {
+            spool.push(membership).unwrap();
+        }
+
+        assert_eq!(spool.finish(&output).unwrap(), 4);
+        let file = File::open(output).unwrap();
+        let mut decoder = zstd::Decoder::with_buffer(BufReader::new(file)).unwrap();
+        let mut actual = Vec::new();
+        while let Some(membership) = GraphMembership::read_from(&mut decoder).unwrap() {
+            actual.push(membership);
+        }
+        assert_eq!(
+            actual,
+            vec![
+                GraphMembership {
+                    graph: 0,
+                    position: 0,
+                },
+                GraphMembership {
+                    graph: 1,
+                    position: 1,
+                },
+                GraphMembership {
+                    graph: 2,
+                    position: 0,
+                },
+                GraphMembership {
+                    graph: 2,
+                    position: 1,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn direct_graph_spool_writes_valid_empty_stream() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("empty.gmp.zst");
+        let spool = GraphMembershipSpool::new(temp.path(), 1, 2 * MIB).unwrap();
+        assert_eq!(spool.finish(&output).unwrap(), 0);
+
+        let file = File::open(output).unwrap();
+        let mut decoder = zstd::Decoder::with_buffer(BufReader::new(file)).unwrap();
+        assert!(GraphMembership::read_from(&mut decoder).unwrap().is_none());
+    }
+
+    #[test]
+    fn high_graph_count_keeps_sorted_spool_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("sorted.gmp.zst");
+        let mut spool = GraphMembershipSpool::new(
+            temp.path(),
+            DIRECT_GRAPH_SPOOL_MAX_LAYERS + 1,
+            64,
+        )
+        .unwrap();
+        assert!(matches!(spool, GraphMembershipSpool::Sorted(_)));
+        spool
+            .push(GraphMembership {
+                graph: 2,
+                position: 0,
+            })
+            .unwrap();
+        spool
+            .push(GraphMembership {
+                graph: 1,
+                position: 1,
+            })
+            .unwrap();
+        assert_eq!(spool.finish(&output).unwrap(), 2);
+
+        let file = File::open(output).unwrap();
+        let mut decoder = zstd::Decoder::with_buffer(BufReader::new(file)).unwrap();
+        assert_eq!(
+            GraphMembership::read_from(&mut decoder).unwrap(),
+            Some(GraphMembership {
+                graph: 1,
+                position: 1,
+            })
+        );
+        assert_eq!(
+            GraphMembership::read_from(&mut decoder).unwrap(),
+            Some(GraphMembership {
+                graph: 2,
+                position: 0,
+            })
+        );
+        assert!(GraphMembership::read_from(&mut decoder).unwrap().is_none());
+    }
 }

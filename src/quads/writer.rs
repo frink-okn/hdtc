@@ -368,7 +368,10 @@ fn spool_layer<R: Read>(
     memberships: &mut MembershipStream<R>,
     positions: &mut File,
 ) -> Result<LayerStats> {
-    positions.set_len(0)?;
+    // Reuse the allocated extent from the largest preceding layer. Readers
+    // consume exactly `member_count` positions, so stale trailing bytes are
+    // irrelevant. Truncating here can spend seconds freeing a multi-GB extent
+    // before a tiny following layer.
     positions.seek(SeekFrom::Start(0))?;
     let mut positions_writer = BufWriter::with_capacity(1024 * 1024, &mut *positions);
     let mut stats = LayerStats {

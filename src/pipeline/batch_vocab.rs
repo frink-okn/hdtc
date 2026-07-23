@@ -103,6 +103,8 @@ pub struct BatchVocabBuilder<'bump> {
     next_p_id: LocalId,
     /// Next ID to assign (named graph ID space, separate)
     next_g_id: LocalId,
+    /// Fast path for graph-grouped inputs without hashing the same IRI again.
+    last_graph: Option<(&'bump [u8], LocalId)>,
     /// Count of unique terms across both maps
     unique_term_count: usize,
     /// Accumulated quad memberships with local IDs
@@ -124,6 +126,7 @@ impl<'bump> BatchVocabBuilder<'bump> {
             next_so_id: 0,
             next_p_id: 0,
             next_g_id: 0,
+            last_graph: None,
             unique_term_count: 0,
             id_quads: Vec::new(),
         }
@@ -174,7 +177,13 @@ impl<'bump> BatchVocabBuilder<'bump> {
 
     /// Get or assign a local ID in the separate named-graph ID space.
     pub fn get_or_assign_graph_id(&mut self, term: &[u8]) -> LocalId {
-        if let Some(&id) = self.g_term_map.get(term) {
+        if let Some((last_term, id)) = self.last_graph
+            && last_term == term
+        {
+            return id;
+        }
+        if let Some((&stored_term, &id)) = self.g_term_map.get_key_value(term) {
+            self.last_graph = Some((stored_term, id));
             return id;
         }
 
@@ -182,13 +191,14 @@ impl<'bump> BatchVocabBuilder<'bump> {
             self.unique_term_count += 1;
         }
 
-        let arena_term = self.arena.alloc_slice_copy(term);
+        let arena_term: &'bump [u8] = self.arena.alloc_slice_copy(term);
         let id = self.next_g_id;
         self.next_g_id = self
             .next_g_id
             .checked_add(1)
             .expect("too many graph terms in one batch");
         self.g_term_map.insert(arena_term, id);
+        self.last_graph = Some((arena_term, id));
         id
     }
 

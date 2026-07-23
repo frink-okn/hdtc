@@ -1,26 +1,27 @@
 use anyhow::{Context, Result, bail};
 use oxrdf::NamedNode;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 struct GraphMapRule {
     path: PathBuf,
     is_file: bool,
-    graph: String,
+    graph: Arc<str>,
 }
 
 /// Canonicalized named-graph assignment rules shared by RDF and HDT inputs.
 #[derive(Debug, Clone, Default)]
 pub struct GraphAssignments {
     rules: Vec<GraphMapRule>,
-    default_graph: Option<String>,
+    default_graph: Option<Arc<str>>,
 }
 
 /// The most-specific source mappings resolved once per input file.
 #[derive(Debug, Clone, Default)]
 pub struct SourceGraphAssignment {
-    mapped_graphs: Vec<String>,
-    default_graph: Option<String>,
+    mapped_graphs: Vec<Arc<str>>,
+    default_graph: Option<Arc<str>>,
 }
 
 impl GraphAssignments {
@@ -98,7 +99,7 @@ impl GraphAssignments {
 
 impl SourceGraphAssignment {
     /// Apply the normative assignment order to one parsed statement.
-    pub fn memberships(&self, explicit_graph: Option<String>) -> Vec<Option<String>> {
+    pub fn memberships(&self, explicit_graph: Option<Arc<str>>) -> Vec<Option<Arc<str>>> {
         let mut named = Vec::with_capacity(1 + self.mapped_graphs.len());
         if let Some(graph) = explicit_graph {
             named.push(graph);
@@ -120,19 +121,23 @@ impl SourceGraphAssignment {
         }
     }
 
-    pub fn mapped_graphs(&self) -> &[String] {
+    pub fn mapped_graphs(&self) -> &[Arc<str>] {
         &self.mapped_graphs
     }
 
     pub fn default_graph(&self) -> Option<&str> {
         self.default_graph.as_deref()
     }
+
+    pub fn default_graph_term(&self) -> Option<&Arc<str>> {
+        self.default_graph.as_ref()
+    }
 }
 
-fn validate_graph_iri(value: &str) -> Result<String> {
+fn validate_graph_iri(value: &str) -> Result<Arc<str>> {
     NamedNode::new(value)
         .with_context(|| format!("Graph name must be an absolute IRI: {value}"))?;
-    Ok(value.to_string())
+    Ok(Arc::from(value))
 }
 
 #[cfg(test)]
