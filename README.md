@@ -19,6 +19,40 @@ Development of hdtc is done primarily through Claude Code.
 - **VoID statistics** — compute dataset-level, property, and class partition statistics as N-Triples
 - **Resilient parsing** — skips malformed triples with warnings, reports total skipped at the end
 
+## Named graphs
+
+hdtc preserves RDF datasets without changing the standard HDT triples format. In
+quads mode, the output is a pair of files:
+
+- `data.hdt` is an ordinary HDT containing the deduplicated union of all triples
+  in the dataset. It remains usable by existing HDT software that knows nothing
+  about named graphs.
+- `data.hdt.graphs` records which default or named graphs contain each union
+  triple. It has a sorted graph dictionary and one compressed membership layer
+  per graph. Graph ID 0 denotes the RDF default graph; named graphs receive
+  consecutive IDs starting at 1.
+
+The union and the default graph are distinct views. A triple may occur in the
+default graph, in one or more named graphs, or in both. Repeated copies of the
+same quad create one membership, while the same triple in different graphs
+creates one HDT triple with several memberships.
+
+Memberships refer to final SPO positions in the associated HDT. The sidecar is
+bound to the HDT's exact dictionary-and-triples bytes with a SHA-256 digest, so
+it cannot accidentally be used with another HDT. Each graph layer independently
+uses a dense chunk table, sparse chunk table, or Elias–Fano encoding according to
+its density. Readers can answer access, rank, select, iteration, and graph lookup
+directly from the file without loading a whole layer.
+
+Creation remains streaming and bounded by `--memory-limit`. hdtc deduplicates and
+sorts memberships on disk, then encodes one graph layer at a time using reusable
+scratch space. Merging HDTs reconstructs memberships by graph name and triple,
+instead of copying position-dependent bitmaps.
+
+See the normative [HDT graphs sidecar format, version 1](docs/graphs-sidecar-format.md)
+for the binary layout, checksums, identity rules, encodings, and validation
+requirements.
+
 ## Installation
 
 Requires [Rust](https://www.rust-lang.org/tools/install) 1.85 or later.
@@ -89,12 +123,13 @@ changed; the dictionary and triples are copied verbatim, so any
 `--replace`/`--add` reject any input triple that asserts an hdtc-managed
 predicate (the `void:` statistics and the `hdt:` namespace).
 
-### Create: Preserving named graphs
+### Create: Named graph options
 
 Use `-m quads` (or `--mode quads`) to write a standard triples HDT plus its
 packed graph sidecar. The default mode is `triples`, which drops graph
 information. In quads mode, the HDT contains the `N` unique union triples and
-the sidecar contains the `M` distinct default/named-graph memberships.
+the sidecar contains the `M` distinct default/named-graph memberships described
+in the [format specification](docs/graphs-sidecar-format.md).
 
 ```sh
 hdtc create dataset.nq -o dataset.hdt -m quads
