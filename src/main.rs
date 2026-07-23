@@ -585,7 +585,7 @@ fn search_hdt(args: cli::SearchArgs, benchmark: bool) -> Result<()> {
     tracing::info!(
         "Done! {count} matching {}",
         if is_quad_query {
-            "graph membership(s)"
+            "quad(s)"
         } else {
             "triple(s)"
         }
