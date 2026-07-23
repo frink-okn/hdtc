@@ -25,26 +25,37 @@ pub struct VocabEntry {
     pub roles: Roles,
     pub so_local_id: Option<LocalId>,
     pub p_local_id: Option<LocalId>,
+    pub g_local_id: Option<LocalId>,
 }
 
-/// Triple with local IDs (compact: 12 bytes).
+/// Quad membership record with batch-local IDs.
+///
+/// `graph = None` is the RDF default graph. Named graph IDs use a separate
+/// local ID space and are never shared with subject/object IDs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LocalIdTriple {
+pub struct LocalIdQuad {
     pub subject: LocalId,
     pub predicate: LocalId,
     pub object: LocalId,
+    pub graph: Option<LocalId>,
 }
 
-impl LocalIdTriple {
-    /// Write this triple to a writer in binary format.
+impl LocalIdQuad {
+    /// Write this quad membership to a writer in binary format.
+    ///
+    /// Graph zero is the default graph; named local ID `g` is stored as `g + 1`.
     pub fn write_to<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
         writer.write_all(&self.subject.to_le_bytes())?;
         writer.write_all(&self.predicate.to_le_bytes())?;
         writer.write_all(&self.object.to_le_bytes())?;
+        let encoded_graph = self
+            .graph
+            .map_or(0, |id| id.checked_add(1).expect("graph local ID overflow"));
+        writer.write_all(&encoded_graph.to_le_bytes())?;
         Ok(())
     }
 
-    /// Read a triple from a reader.
+    /// Read a quad membership from a reader.
     pub fn read_from<R: std::io::Read>(reader: &mut R) -> std::io::Result<Option<Self>> {
         let mut subject_bytes = [0u8; 4];
         if reader.read_exact(&mut subject_bytes).is_err() {
@@ -60,10 +71,15 @@ impl LocalIdTriple {
         reader.read_exact(&mut object_bytes)?;
         let object = u32::from_le_bytes(object_bytes);
 
-        Ok(Some(LocalIdTriple {
+        let mut graph_bytes = [0u8; 4];
+        reader.read_exact(&mut graph_bytes)?;
+        let encoded_graph = u32::from_le_bytes(graph_bytes);
+
+        Ok(Some(LocalIdQuad {
             subject,
             predicate,
             object,
+            graph: encoded_graph.checked_sub(1),
         }))
     }
 }
@@ -77,16 +93,20 @@ pub struct BatchVocabBuilder<'bump> {
     so_term_map: HashMap<&'bump [u8], (LocalId, Roles)>,
     /// HashMap for predicate terms: term bytes → local_id
     p_term_map: HashMap<&'bump [u8], LocalId>,
+    /// HashMap for named graph terms: term bytes → local_id
+    g_term_map: HashMap<&'bump [u8], LocalId>,
     /// Arena allocator for term storage
     arena: &'bump Bump,
     /// Next ID to assign (subject/object ID space)
     next_so_id: LocalId,
     /// Next ID to assign (predicate ID space, separate)
     next_p_id: LocalId,
+    /// Next ID to assign (named graph ID space, separate)
+    next_g_id: LocalId,
     /// Count of unique terms across both maps
     unique_term_count: usize,
-    /// Accumulated triples with local IDs
-    pub id_triples: Vec<LocalIdTriple>,
+    /// Accumulated quad memberships with local IDs
+    pub id_quads: Vec<LocalIdQuad>,
 }
 
 impl<'bump> BatchVocabBuilder<'bump> {
@@ -99,11 +119,13 @@ impl<'bump> BatchVocabBuilder<'bump> {
         Self {
             so_term_map: HashMap::with_capacity(expected_terms),
             p_term_map: HashMap::with_capacity(expected_terms / 10), // Fewer predicates typically
+            g_term_map: HashMap::new(),
             arena,
             next_so_id: 0,
             next_p_id: 0,
+            next_g_id: 0,
             unique_term_count: 0,
-            id_triples: Vec::new(),
+            id_quads: Vec::new(),
         }
     }
 
@@ -111,6 +133,7 @@ impl<'bump> BatchVocabBuilder<'bump> {
     ///
     /// Returns the local ID for this term in the appropriate ID space.
     pub fn get_or_assign_id(&mut self, term: &[u8], role: Roles) -> LocalId {
+        debug_assert!(!role.contains(Roles::GRAPH));
         if role.contains(Roles::PREDICATE) {
             // Predicate ID space
             if let Some(&id) = self.p_term_map.get(term) {
@@ -149,6 +172,26 @@ impl<'bump> BatchVocabBuilder<'bump> {
         }
     }
 
+    /// Get or assign a local ID in the separate named-graph ID space.
+    pub fn get_or_assign_graph_id(&mut self, term: &[u8]) -> LocalId {
+        if let Some(&id) = self.g_term_map.get(term) {
+            return id;
+        }
+
+        if !self.so_term_map.contains_key(term) && !self.p_term_map.contains_key(term) {
+            self.unique_term_count += 1;
+        }
+
+        let arena_term = self.arena.alloc_slice_copy(term);
+        let id = self.next_g_id;
+        self.next_g_id = self
+            .next_g_id
+            .checked_add(1)
+            .expect("too many graph terms in one batch");
+        self.g_term_map.insert(arena_term, id);
+        id
+    }
+
     /// Add a triple to this batch (test helper).
     #[cfg(test)]
     pub fn add_triple(&mut self, subject: &[u8], predicate: &[u8], object: &[u8]) {
@@ -156,10 +199,11 @@ impl<'bump> BatchVocabBuilder<'bump> {
         let p_id = self.get_or_assign_id(predicate, Roles::PREDICATE);
         let o_id = self.get_or_assign_id(object, Roles::OBJECT);
 
-        self.id_triples.push(LocalIdTriple {
+        self.id_quads.push(LocalIdQuad {
             subject: s_id,
             predicate: p_id,
             object: o_id,
+            graph: None,
         });
     }
 
@@ -168,10 +212,11 @@ impl<'bump> BatchVocabBuilder<'bump> {
     /// Consumes the builder and returns:
     /// - Sorted vocabulary entries
     /// - Local-ID triples
-    pub fn finish(self) -> (Vec<VocabEntry>, Vec<LocalIdTriple>) {
+    pub fn finish(self) -> (Vec<VocabEntry>, Vec<LocalIdQuad>) {
         // Collect entries directly into a Vec — no intermediate HashMap needed.
-        let mut entries: Vec<VocabEntry> =
-            Vec::with_capacity(self.so_term_map.len() + self.p_term_map.len());
+        let mut entries: Vec<VocabEntry> = Vec::with_capacity(
+            self.so_term_map.len() + self.p_term_map.len() + self.g_term_map.len(),
+        );
 
         for (term, (so_id, roles)) in self.so_term_map {
             entries.push(VocabEntry {
@@ -179,6 +224,7 @@ impl<'bump> BatchVocabBuilder<'bump> {
                 roles,
                 so_local_id: Some(so_id),
                 p_local_id: None,
+                g_local_id: None,
             });
         }
 
@@ -188,6 +234,17 @@ impl<'bump> BatchVocabBuilder<'bump> {
                 roles: Roles::PREDICATE,
                 so_local_id: None,
                 p_local_id: Some(p_id),
+                g_local_id: None,
+            });
+        }
+
+        for (term, g_id) in self.g_term_map {
+            entries.push(VocabEntry {
+                term: term.to_vec(),
+                roles: Roles::GRAPH,
+                so_local_id: None,
+                p_local_id: None,
+                g_local_id: Some(g_id),
             });
         }
 
@@ -198,22 +255,29 @@ impl<'bump> BatchVocabBuilder<'bump> {
         entries.dedup_by(|b, a| {
             if a.term == b.term {
                 a.roles |= b.roles;
-                if a.so_local_id.is_none() { a.so_local_id = b.so_local_id; }
-                if a.p_local_id.is_none() { a.p_local_id = b.p_local_id; }
+                if a.so_local_id.is_none() {
+                    a.so_local_id = b.so_local_id;
+                }
+                if a.p_local_id.is_none() {
+                    a.p_local_id = b.p_local_id;
+                }
+                if a.g_local_id.is_none() {
+                    a.g_local_id = b.g_local_id;
+                }
                 true
             } else {
                 false
             }
         });
 
-        (entries, self.id_triples)
+        (entries, self.id_quads)
     }
 
     /// Get statistics about this batch.
     pub fn stats(&self) -> BatchStats {
         BatchStats {
             num_terms: self.unique_term_count,
-            num_triples: self.id_triples.len(),
+            num_triples: self.id_quads.len(),
         }
     }
 }
@@ -354,7 +418,7 @@ mod tests {
         let mut builder = BatchVocabBuilder::new(&arena, 100);
 
         // Add terms in various combinations
-        builder.add_triple(b"shared", b"p", b"shared");  // "shared" as subject+object, "p" as predicate
+        builder.add_triple(b"shared", b"p", b"shared"); // "shared" as subject+object, "p" as predicate
         builder.add_triple(b"multi", b"multi", b"other"); // "multi" as subject+predicate
 
         let stats = builder.stats();
@@ -396,7 +460,7 @@ mod tests {
         let arena = Bump::new();
         let mut builder = BatchVocabBuilder::new(&arena, 100);
 
-        builder.add_triple(b"s", b"p", b"s");  // subject/object reuse
+        builder.add_triple(b"s", b"p", b"s"); // subject/object reuse
         builder.add_triple(b"p", b"q", b"o"); // "p" also appears as subject
 
         let (vocab, _) = builder.finish();

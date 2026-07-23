@@ -27,6 +27,7 @@ bumpalo = "3"
 bitflags = "2"
 libc = "0.2"
 md5 = "0.8"
+sha2 = "0.10"
 
 [dev-dependencies]
 hdt = "0.4"

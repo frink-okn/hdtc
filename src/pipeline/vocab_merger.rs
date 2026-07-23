@@ -23,6 +23,7 @@ pub struct TermBatchInfo {
     pub roles: Roles,
     pub so_local_id: Option<u32>,
     pub p_local_id: Option<u32>,
+    pub g_local_id: Option<u32>,
 }
 
 /// ID mapping for a single batch (local ID → global ID).
@@ -33,6 +34,8 @@ pub struct IdMapping {
     pub so_map: Vec<u64>,
     /// Predicate local ID → global predicate ID
     pub p_map: Vec<u64>,
+    /// Named-graph local ID → global graph ID (global IDs start at 1)
+    pub g_map: Vec<u64>,
 }
 
 impl IdMapping {
@@ -54,6 +57,12 @@ impl IdMapping {
         // Write P map
         encoder.write_all(&(self.p_map.len() as u32).to_le_bytes())?;
         for &id in &self.p_map {
+            encoder.write_all(&id.to_le_bytes())?;
+        }
+
+        // Write G map
+        encoder.write_all(&(self.g_map.len() as u32).to_le_bytes())?;
+        for &id in &self.g_map {
             encoder.write_all(&id.to_le_bytes())?;
         }
 
@@ -98,10 +107,21 @@ impl IdMapping {
             p_map.push(u64::from_le_bytes(id_bytes));
         }
 
+        let mut g_len_bytes = [0u8; 4];
+        decoder.read_exact(&mut g_len_bytes)?;
+        let g_len = u32::from_le_bytes(g_len_bytes) as usize;
+        let mut g_map = Vec::with_capacity(g_len);
+        for _ in 0..g_len {
+            let mut id_bytes = [0u8; 8];
+            decoder.read_exact(&mut id_bytes)?;
+            g_map.push(u64::from_le_bytes(id_bytes));
+        }
+
         Ok(Self {
             batch_id,
             so_map,
             p_map,
+            g_map,
         })
     }
 }
@@ -110,7 +130,7 @@ impl IdMapping {
 // Sharded ID mapping writer
 // ---------------------------------------------------------------------------
 
-const NUM_MAPPING_SHARDS: usize = 128;
+const NUM_MAPPING_SHARDS: usize = 32;
 
 /// Shard entry: (batch_id, local_id, global_id) packed as 16 bytes.
 #[derive(Clone, Copy)]
@@ -147,30 +167,42 @@ impl ShardEntry {
 
 /// Writes ID mapping entries to sharded temp files during the merge.
 ///
-/// Uses `NUM_MAPPING_SHARDS` shard files each for SO and P mappings (256 total FDs).
+/// Uses `NUM_MAPPING_SHARDS` shard files for each of SO, P, and G mappings.
 /// Entry format: (batch_id: u32, local_id: u32, global_id: u64) = 16 bytes.
 /// Shard selection: `batch_id % NUM_MAPPING_SHARDS`.
 struct ShardedMappingWriter {
     so_shards: Vec<zstd::Encoder<'static, BufWriter<File>>>,
     p_shards: Vec<zstd::Encoder<'static, BufWriter<File>>>,
+    g_shards: Vec<zstd::Encoder<'static, BufWriter<File>>>,
     so_shard_paths: Vec<PathBuf>,
     p_shard_paths: Vec<PathBuf>,
+    g_shard_paths: Vec<PathBuf>,
     /// Max SO local ID per batch (indexed by batch_id).
     batch_max_so: Vec<u32>,
     /// Max P local ID per batch (indexed by batch_id).
     batch_max_p: Vec<u32>,
+    /// Max named-graph local ID per batch (indexed by batch_id).
+    batch_max_g: Vec<u32>,
 }
 
 impl ShardedMappingWriter {
-    fn new(temp_dir: &Path, batch_max_so: Vec<u32>, batch_max_p: Vec<u32>) -> Result<Self> {
+    fn new(
+        temp_dir: &Path,
+        batch_max_so: Vec<u32>,
+        batch_max_p: Vec<u32>,
+        batch_max_g: Vec<u32>,
+    ) -> Result<Self> {
         let mut so_shards = Vec::with_capacity(NUM_MAPPING_SHARDS);
         let mut p_shards = Vec::with_capacity(NUM_MAPPING_SHARDS);
+        let mut g_shards = Vec::with_capacity(NUM_MAPPING_SHARDS);
         let mut so_shard_paths = Vec::with_capacity(NUM_MAPPING_SHARDS);
         let mut p_shard_paths = Vec::with_capacity(NUM_MAPPING_SHARDS);
+        let mut g_shard_paths = Vec::with_capacity(NUM_MAPPING_SHARDS);
 
         for i in 0..NUM_MAPPING_SHARDS {
             let so_path = temp_dir.join(format!("id_shard_so_{i:03}.tmp.zst"));
             let p_path = temp_dir.join(format!("id_shard_p_{i:03}.tmp.zst"));
+            let g_path = temp_dir.join(format!("id_shard_g_{i:03}.tmp.zst"));
             so_shards.push(zstd::Encoder::new(
                 BufWriter::new(File::create(&so_path)?),
                 3,
@@ -179,17 +211,25 @@ impl ShardedMappingWriter {
                 BufWriter::new(File::create(&p_path)?),
                 3,
             )?);
+            g_shards.push(zstd::Encoder::new(
+                BufWriter::new(File::create(&g_path)?),
+                3,
+            )?);
             so_shard_paths.push(so_path);
             p_shard_paths.push(p_path);
+            g_shard_paths.push(g_path);
         }
 
         Ok(Self {
             so_shards,
             p_shards,
+            g_shards,
             so_shard_paths,
             p_shard_paths,
+            g_shard_paths,
             batch_max_so,
             batch_max_p,
+            batch_max_g,
         })
     }
 
@@ -215,6 +255,17 @@ impl ShardedMappingWriter {
         Ok(())
     }
 
+    fn write_g(&mut self, batch_id: usize, local_id: u32, global_id: u64) -> Result<()> {
+        let shard_idx = batch_id % NUM_MAPPING_SHARDS;
+        let entry = ShardEntry {
+            batch_id: batch_id as u32,
+            local_id,
+            global_id,
+        };
+        entry.write_to(&mut self.g_shards[shard_idx])?;
+        Ok(())
+    }
+
     /// Flush all shard writers and process shards into per-batch mapping files.
     fn finish(mut self, shared_count: u64, temp_dir: &Path) -> Result<()> {
         // Finalize all zstd encoders
@@ -222,6 +273,9 @@ impl ShardedMappingWriter {
             w.finish()?;
         }
         for w in self.p_shards.drain(..) {
+            w.finish()?;
+        }
+        for w in self.g_shards.drain(..) {
             w.finish()?;
         }
 
@@ -286,6 +340,7 @@ impl ShardedMappingWriter {
                         // This shouldn't happen since we process SO shards first
                         existing_p_map
                     },
+                    g_map: vec![0u64; (self.batch_max_g[bid_usize] + 1) as usize],
                 };
                 mapping.write_to_file(&mapping_path)?;
             }
@@ -324,6 +379,7 @@ impl ShardedMappingWriter {
                         batch_id: bid_usize,
                         so_map: vec![0u64; so_size],
                         p_map: Vec::new(),
+                        g_map: vec![0u64; (self.batch_max_g[bid_usize] + 1) as usize],
                     }
                 };
 
@@ -340,8 +396,57 @@ impl ShardedMappingWriter {
                     batch_id: bid_usize,
                     so_map: existing.so_map,
                     p_map,
+                    g_map: existing.g_map,
                 };
                 mapping.write_to_file(&mapping_path)?;
+            }
+        }
+
+        // Process named-graph shards.
+        for shard_idx in 0..NUM_MAPPING_SHARDS {
+            let shard_path = &self.g_shard_paths[shard_idx];
+            let file = File::open(shard_path)?;
+            let mut reader = zstd::Decoder::new(BufReader::new(file))?;
+            let mut entries: Vec<ShardEntry> = Vec::new();
+            while let Some(entry) = ShardEntry::read_from(&mut reader)? {
+                entries.push(entry);
+            }
+
+            let mut batch_ids: Vec<u32> = entries.iter().map(|e| e.batch_id).collect();
+            batch_ids.sort_unstable();
+            batch_ids.dedup();
+
+            for bid in batch_ids {
+                let bid_usize = bid as usize;
+                if bid_usize >= num_batches {
+                    continue;
+                }
+                let mapping_path = temp_dir.join(format!("id_mapping_{bid_usize:06}.map.zst"));
+                let existing = if mapping_path.exists() {
+                    IdMapping::read_from_file(&mapping_path)?
+                } else {
+                    IdMapping {
+                        batch_id: bid_usize,
+                        so_map: vec![0u64; (self.batch_max_so[bid_usize] + 1) as usize],
+                        p_map: vec![0u64; (self.batch_max_p[bid_usize] + 1) as usize],
+                        g_map: Vec::new(),
+                    }
+                };
+
+                let map_size = (self.batch_max_g[bid_usize] + 1) as usize;
+                let mut g_map = vec![0u64; map_size];
+                for entry in &entries {
+                    if entry.batch_id == bid && (entry.local_id as usize) < map_size {
+                        g_map[entry.local_id as usize] = entry.global_id;
+                    }
+                }
+                IdMapping {
+                    batch_id: bid_usize,
+                    so_map: existing.so_map,
+                    p_map: existing.p_map,
+                    g_map,
+                }
+                .write_to_file(&mapping_path)?;
             }
         }
 
@@ -354,6 +459,7 @@ impl ShardedMappingWriter {
                     batch_id: bid,
                     so_map: vec![0u64; (self.batch_max_so[bid] + 1) as usize],
                     p_map: vec![0u64; (self.batch_max_p[bid] + 1) as usize],
+                    g_map: vec![0u64; (self.batch_max_g[bid] + 1) as usize],
                 };
                 mapping.write_to_file(&mapping_path)?;
             }
@@ -364,6 +470,9 @@ impl ShardedMappingWriter {
             let _ = std::fs::remove_file(path);
         }
         for path in &self.p_shard_paths {
+            let _ = std::fs::remove_file(path);
+        }
+        for path in &self.g_shard_paths {
             let _ = std::fs::remove_file(path);
         }
 
@@ -377,6 +486,7 @@ pub struct StreamEntry {
     pub roles: Roles,
     pub so_local_id: Option<u32>,
     pub p_local_id: Option<u32>,
+    pub g_local_id: Option<u32>,
     pub source_batch: usize,
 }
 
@@ -397,6 +507,10 @@ impl Mergeable for StreamEntry {
         if self.roles.contains(Roles::PREDICATE) {
             let p_id = self.p_local_id.expect("P local ID must be present");
             writer.write_all(&p_id.to_le_bytes())?;
+        }
+        if self.roles.contains(Roles::GRAPH) {
+            let g_id = self.g_local_id.expect("G local ID must be present");
+            writer.write_all(&g_id.to_le_bytes())?;
         }
         writer.write_all(&(self.source_batch as u32).to_le_bytes())?;
         Ok(())
@@ -434,6 +548,14 @@ impl Mergeable for StreamEntry {
             None
         };
 
+        let g_local_id = if roles.contains(Roles::GRAPH) {
+            let mut buf = [0u8; 4];
+            reader.read_exact(&mut buf)?;
+            Some(u32::from_le_bytes(buf))
+        } else {
+            None
+        };
+
         let mut batch_buf = [0u8; 4];
         reader.read_exact(&mut batch_buf)?;
         let source_batch = u32::from_le_bytes(batch_buf) as usize;
@@ -443,6 +565,7 @@ impl Mergeable for StreamEntry {
             roles,
             so_local_id,
             p_local_id,
+            g_local_id,
             source_batch,
         }))
     }
@@ -469,6 +592,9 @@ fn decode_provisional_so_id(id: u64) -> u64 {
 pub struct VocabMergeResult {
     pub dict_section_paths: Vec<PathBuf>, // PFC section files: [shared, subjects, predicates, objects]
     pub dict_section_sizes: Vec<u64>,     // Corresponding file sizes
+    pub graph_section_path: PathBuf,
+    pub graph_section_size: u64,
+    pub has_blank_graph_names: bool,
     pub counts: DictCounts,
     #[allow(dead_code)]
     pub predicate_ids: HashMap<String, u64>,
@@ -484,6 +610,7 @@ pub struct VocabSource {
     pub batch_id: usize,
     pub max_so_id: u32,
     pub max_p_id: u32,
+    pub max_g_id: u32,
     pub factory: VocabFactory,
 }
 
@@ -493,32 +620,35 @@ pub fn vocab_source_from_pvoc(batch_id: usize, vocab_path: PathBuf) -> Result<Vo
         .with_context(|| format!("Failed to open partial vocab for batch {}", batch_id))?;
     let max_so_id = reader.max_so_id();
     let max_p_id = reader.max_p_id();
+    let max_g_id = reader.max_g_id();
     drop(reader);
 
     let factory: VocabFactory = Box::new(move || {
         let delete_path = vocab_path.clone();
-        let reader = PartialVocabReader::open(&vocab_path).with_context(|| {
-            format!("Failed to open partial vocab for batch {}", batch_id)
-        })?;
+        let reader = PartialVocabReader::open(&vocab_path)
+            .with_context(|| format!("Failed to open partial vocab for batch {}", batch_id))?;
         let iter = reader.map(move |entry_result| {
             entry_result.map(|entry| StreamEntry {
                 term: entry.term,
                 roles: entry.roles,
                 so_local_id: entry.so_local_id,
                 p_local_id: entry.p_local_id,
+                g_local_id: entry.g_local_id,
                 source_batch: batch_id,
             })
         });
         Ok(Box::new(DeleteOnDrop {
             inner: iter,
             path: delete_path,
-        }) as Box<dyn Iterator<Item = Result<StreamEntry>> + Send>)
+        })
+            as Box<dyn Iterator<Item = Result<StreamEntry>> + Send>)
     });
 
     Ok(VocabSource {
         batch_id,
         max_so_id,
         max_p_id,
+        max_g_id,
         factory,
     })
 }
@@ -540,16 +670,19 @@ pub fn merge_vocabularies(
     // Separate metadata from factories
     let mut batch_max_so: Vec<u32> = Vec::with_capacity(sources.len());
     let mut batch_max_p: Vec<u32> = Vec::with_capacity(sources.len());
+    let mut batch_max_g: Vec<u32> = Vec::with_capacity(sources.len());
     let mut factories: Vec<(usize, VocabFactory)> = Vec::with_capacity(sources.len());
 
     for source in sources {
         batch_max_so.push(source.max_so_id);
         batch_max_p.push(source.max_p_id);
+        batch_max_g.push(source.max_g_id);
         factories.push((source.batch_id, source.factory));
     }
 
-    let mut shard_writer = ShardedMappingWriter::new(temp_dir, batch_max_so, batch_max_p)
-        .context("Failed to create sharded mapping writer")?;
+    let mut shard_writer =
+        ShardedMappingWriter::new(temp_dir, batch_max_so, batch_max_p, batch_max_g)
+            .context("Failed to create sharded mapping writer")?;
 
     // Initialize streaming PFC encoders for each section
     let mut shared_enc = StreamingPfcEncoder::new(temp_dir, "shared")
@@ -560,9 +693,12 @@ pub fn merge_vocabularies(
         .context("Failed to create predicates PFC encoder")?;
     let mut objects_enc = StreamingPfcEncoder::new(temp_dir, "objects")
         .context("Failed to create objects PFC encoder")?;
+    let mut graphs_enc = StreamingPfcEncoder::new(temp_dir, "graphs")
+        .context("Failed to create graphs PFC encoder")?;
 
     let mut counts = DictCounts::default();
     let mut predicate_ids = HashMap::new();
+    let mut has_blank_graph_names = false;
 
     // Single-pass streaming merge:
     // - Aggregate term roles across batches
@@ -602,6 +738,10 @@ pub fn merge_vocabularies(
             let roles_in_batch = stream_entry.roles;
             let so_local_id = stream_entry.so_local_id;
             let p_local_id = stream_entry.p_local_id;
+            let g_local_id = stream_entry.g_local_id;
+            if roles_in_batch.contains(Roles::GRAPH) && term.starts_with(b"_:") {
+                has_blank_graph_names = true;
+            }
 
             let is_same_term = current_term.as_ref() == Some(&term);
 
@@ -616,6 +756,7 @@ pub fn merge_vocabularies(
                     &mut subjects_enc,
                     &mut predicates_enc,
                     &mut objects_enc,
+                    &mut graphs_enc,
                     &mut predicate_ids,
                     &mut shard_writer,
                 )?;
@@ -631,6 +772,7 @@ pub fn merge_vocabularies(
                 roles: roles_in_batch,
                 so_local_id,
                 p_local_id,
+                g_local_id,
             });
             current_term = Some(term);
         }
@@ -646,6 +788,7 @@ pub fn merge_vocabularies(
                 &mut subjects_enc,
                 &mut predicates_enc,
                 &mut objects_enc,
+                &mut graphs_enc,
                 &mut predicate_ids,
                 &mut shard_writer,
             )?;
@@ -681,6 +824,9 @@ pub fn merge_vocabularies(
     let objects_section = objects_enc
         .finish()
         .context("Failed to finish objects PFC encoder")?;
+    let graph_section = graphs_enc
+        .finish()
+        .context("Failed to finish graphs PFC encoder")?;
 
     let dict_section_paths = vec![
         shared_section.path,
@@ -720,6 +866,9 @@ pub fn merge_vocabularies(
         dict_section_sizes,
         counts,
         predicate_ids,
+        graph_section_path: graph_section.path,
+        graph_section_size: graph_section.size,
+        has_blank_graph_names,
     })
 }
 
@@ -792,6 +941,7 @@ fn assign_global_ids_and_record_mappings(
     subjects_enc: &mut StreamingPfcEncoder,
     predicates_enc: &mut StreamingPfcEncoder,
     objects_enc: &mut StreamingPfcEncoder,
+    graphs_enc: &mut StreamingPfcEncoder,
     predicate_ids: &mut HashMap<String, u64>,
     shard_writer: &mut ShardedMappingWriter,
 ) -> Result<()> {
@@ -844,6 +994,21 @@ fn assign_global_ids_and_record_mappings(
         }
     }
 
+    if roles.contains(Roles::GRAPH) {
+        counts.graphs = counts
+            .graphs
+            .checked_add(1)
+            .context("named graph count overflow")?;
+        graphs_enc.push(term_str)?;
+        for info in batches {
+            if info.roles.contains(Roles::GRAPH)
+                && let Some(local_g_id) = info.g_local_id
+            {
+                shard_writer.write_g(info.batch_id, local_g_id, counts.graphs)?;
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -864,25 +1029,24 @@ mod tests {
     }
 
     /// Convert batch_infos to factory tuples for build_vocab_merge_tree tests.
-    fn to_factories(
-        batch_infos: Vec<(usize, PathBuf)>,
-    ) -> Vec<(usize, VocabFactory)> {
+    fn to_factories(batch_infos: Vec<(usize, PathBuf)>) -> Vec<(usize, VocabFactory)> {
         batch_infos
             .into_iter()
             .map(|(batch_id, vocab_path)| {
                 let factory: VocabFactory = Box::new(move || {
-                        let reader = PartialVocabReader::open(&vocab_path)?;
-                        let iter = reader.map(move |entry_result| {
-                            entry_result.map(|entry| StreamEntry {
-                                term: entry.term,
-                                roles: entry.roles,
-                                so_local_id: entry.so_local_id,
-                                p_local_id: entry.p_local_id,
-                                source_batch: batch_id,
-                            })
-                        });
-                        Ok(Box::new(iter) as Box<dyn Iterator<Item = Result<StreamEntry>> + Send>)
+                    let reader = PartialVocabReader::open(&vocab_path)?;
+                    let iter = reader.map(move |entry_result| {
+                        entry_result.map(|entry| StreamEntry {
+                            term: entry.term,
+                            roles: entry.roles,
+                            so_local_id: entry.so_local_id,
+                            p_local_id: entry.p_local_id,
+                            g_local_id: entry.g_local_id,
+                            source_batch: batch_id,
+                        })
                     });
+                    Ok(Box::new(iter) as Box<dyn Iterator<Item = Result<StreamEntry>> + Send>)
+                });
                 (batch_id, factory)
             })
             .collect()
@@ -911,10 +1075,10 @@ mod tests {
         }
 
         let mut writer = PartialVocabWriter::create(path)?;
-        writer.write_header(entries.len() as u32, max_so_id, max_p_id)?;
+        writer.write_header(entries.len() as u32, max_so_id, max_p_id, 0)?;
 
         for (term, roles, so_id, p_id) in entries {
-            let entry = PartialVocabEntry::new(term.as_bytes().to_vec(), roles, so_id, p_id);
+            let entry = PartialVocabEntry::new(term.as_bytes().to_vec(), roles, so_id, p_id, None);
             writer.write_entry(&entry)?;
         }
         writer.finish()?;
@@ -950,7 +1114,11 @@ mod tests {
         )?;
 
         let batch_infos = vec![(0, batch0_path), (1, batch1_path)];
-        let result = merge_vocabularies(to_vocab_sources(batch_infos)?, temp_path, TEST_MEMORY_BUDGET)?;
+        let result = merge_vocabularies(
+            to_vocab_sources(batch_infos)?,
+            temp_path,
+            TEST_MEMORY_BUDGET,
+        )?;
 
         // Verify counts
         assert_eq!(result.counts.shared, 0);
@@ -1002,7 +1170,11 @@ mod tests {
         )?;
 
         let batch_infos = vec![(0, batch0_path), (1, batch1_path)];
-        let result = merge_vocabularies(to_vocab_sources(batch_infos)?, temp_path, TEST_MEMORY_BUDGET)?;
+        let result = merge_vocabularies(
+            to_vocab_sources(batch_infos)?,
+            temp_path,
+            TEST_MEMORY_BUDGET,
+        )?;
 
         // "x" should be shared (appears as both subject and object)
         // "p1" should be a predicate
@@ -1047,7 +1219,11 @@ mod tests {
         create_test_partial_vocab(&batch2_path, vec![("multi", Roles::OBJECT, Some(0), None)])?;
 
         let batch_infos = vec![(0, batch0_path), (1, batch1_path), (2, batch2_path)];
-        let result = merge_vocabularies(to_vocab_sources(batch_infos)?, temp_path, TEST_MEMORY_BUDGET)?;
+        let result = merge_vocabularies(
+            to_vocab_sources(batch_infos)?,
+            temp_path,
+            TEST_MEMORY_BUDGET,
+        )?;
 
         // "multi" should be shared (appears as both subject and object)
         // and also as predicate
@@ -1107,7 +1283,11 @@ mod tests {
         )?;
 
         let batch_infos = vec![(0, batch0_path), (1, batch1_path), (2, batch2_path)];
-        let result = merge_vocabularies(to_vocab_sources(batch_infos)?, temp_path, TEST_MEMORY_BUDGET)?;
+        let result = merge_vocabularies(
+            to_vocab_sources(batch_infos)?,
+            temp_path,
+            TEST_MEMORY_BUDGET,
+        )?;
 
         // "a" shared (subject + object), "b" shared (subject + object) + predicate, "c" predicate, "d" subject
         assert_eq!(result.counts.shared, 2); // a, b
@@ -1158,7 +1338,11 @@ mod tests {
         create_test_partial_vocab(&batch1_path, vec![])?;
 
         let batch_infos = vec![(0, batch0_path), (1, batch1_path)];
-        let result = merge_vocabularies(to_vocab_sources(batch_infos)?, temp_path, TEST_MEMORY_BUDGET)?;
+        let result = merge_vocabularies(
+            to_vocab_sources(batch_infos)?,
+            temp_path,
+            TEST_MEMORY_BUDGET,
+        )?;
 
         // Should only count terms from batch 0
         assert_eq!(result.counts.shared, 0);
@@ -1255,10 +1439,11 @@ mod tests {
             batch_id: 0,
             so_map: vec![111],
             p_map: vec![222, 333],
+            g_map: vec![0],
         }
         .write_to_file(&mapping_path)?;
 
-        let mut writer = ShardedMappingWriter::new(temp_path, vec![0], vec![1])?;
+        let mut writer = ShardedMappingWriter::new(temp_path, vec![0], vec![1], vec![0])?;
         writer.write_so(0, 0, 5)?;
         writer.finish(0, temp_path)?;
 

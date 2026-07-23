@@ -5,9 +5,13 @@
 //! 2. A streaming triple reader (for the ID remapper in Stage 5)
 
 use crate::hdt::pfc_reader::{PfcSectionHeader, PfcSectionIterator};
-use crate::io::{ControlInfo, ControlType, StreamingBitmapDecoder, StreamingLogArrayDecoder, skip_bitmap_section, skip_log_array_section};
+use crate::io::{
+    ControlInfo, ControlType, StreamingBitmapDecoder, StreamingLogArrayDecoder,
+    skip_bitmap_section, skip_log_array_section,
+};
 use crate::pipeline::batch_vocab::Roles;
 use crate::pipeline::vocab_merger::StreamEntry;
+use crate::quads::{GraphSidecarReader, GraphTerm};
 use anyhow::{Context, Result, bail};
 use oxrdfio::{RdfFormat, RdfParser};
 use std::cmp::Ordering;
@@ -39,6 +43,16 @@ pub struct HdtInputAdapter {
     triples_data_offset: u64,
     /// Number of (subject, predicate) pairs (= ArrayY/BitmapY entries).
     num_sp_pairs: u64,
+}
+
+/// Named-graph vocabulary attached to an HDT input. Existing sidecar graph
+/// IDs occupy local IDs `0..named_graph_count`; command-line assignments are
+/// appended after them.
+#[derive(Debug, Clone)]
+pub struct HdtGraphVocabulary {
+    pub sidecar_path: Option<PathBuf>,
+    pub named_graph_count: u64,
+    pub additional_terms: Vec<(String, u32)>,
 }
 
 impl HdtInputAdapter {
@@ -79,8 +93,8 @@ impl HdtInputAdapter {
         let (num_triples, original_size) = parse_header_metadata(&header_text)?;
 
         // Dictionary control info
-        let dict_ci =
-            ControlInfo::read_from(&mut reader).context("Failed to read dictionary control info")?;
+        let dict_ci = ControlInfo::read_from(&mut reader)
+            .context("Failed to read dictionary control info")?;
         if dict_ci.control_type != ControlType::Dictionary {
             bail!("Expected dictionary control info");
         }
@@ -188,8 +202,8 @@ impl HdtInputAdapter {
         &self,
         batch_id: usize,
         file_index: Option<usize>,
-    ) -> crate::pipeline::vocab_merger::VocabFactory
-    {
+        graph_vocabulary: Option<HdtGraphVocabulary>,
+    ) -> crate::pipeline::vocab_merger::VocabFactory {
         let path = self.path.clone();
         let shared_section_offset = self.shared_section_offset;
         let subjects_section_offset = self.subjects_section_offset;
@@ -201,7 +215,7 @@ impl HdtInputAdapter {
         Box::new(move || {
             let bnode_prefix = file_index.map(|idx| format!("f{idx}_"));
 
-            let iter = StreamingFourWayMerge::open(
+            let base = StreamingFourWayMerge::open(
                 &path,
                 shared_section_offset,
                 subjects_section_offset,
@@ -212,11 +226,154 @@ impl HdtInputAdapter {
                 batch_id,
                 bnode_prefix,
             )?;
+            if let Some(graph_vocabulary) = graph_vocabulary {
+                let graphs =
+                    GraphVocabIterator::open(&path, batch_id, file_index, graph_vocabulary)?;
+                Ok(Box::new(MergedHdtVocabIterator::new(base, graphs))
+                    as Box<dyn Iterator<Item = Result<StreamEntry>> + Send>)
+            } else {
+                Ok(Box::new(base) as Box<dyn Iterator<Item = Result<StreamEntry>> + Send>)
+            }
+        })
+    }
+}
 
-            Ok(Box::new(iter) as Box<dyn Iterator<Item = Result<StreamEntry>> + Send>)
+/// Lazily reads sidecar graph terms and merges them with the small set of
+/// command-line graph assignments. It never materializes the sidecar graph
+/// dictionary.
+struct GraphVocabIterator {
+    reader: Option<GraphSidecarReader>,
+    next_graph_id: u64,
+    named_graph_count: u64,
+    pending_sidecar: Option<(Vec<u8>, u32)>,
+    additional: std::iter::Peekable<std::vec::IntoIter<(String, u32)>>,
+    batch_id: usize,
+    bnode_prefix: Option<String>,
+}
+
+impl GraphVocabIterator {
+    fn open(
+        hdt_path: &Path,
+        batch_id: usize,
+        file_index: Option<usize>,
+        mut vocabulary: HdtGraphVocabulary,
+    ) -> Result<Self> {
+        vocabulary
+            .additional_terms
+            .sort_unstable_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
+        let reader = vocabulary
+            .sidecar_path
+            .as_deref()
+            .map(|sidecar| GraphSidecarReader::open(sidecar, hdt_path))
+            .transpose()?;
+        Ok(Self {
+            reader,
+            next_graph_id: 1,
+            named_graph_count: vocabulary.named_graph_count,
+            pending_sidecar: None,
+            additional: vocabulary.additional_terms.into_iter().peekable(),
+            batch_id,
+            bnode_prefix: file_index.map(|index| format!("f{index}_")),
         })
     }
 
+    fn disambiguate(&self, term: Vec<u8>) -> Vec<u8> {
+        if term.starts_with(b"_:")
+            && let Some(prefix) = &self.bnode_prefix
+        {
+            let mut result = Vec::with_capacity(term.len() + prefix.len());
+            result.extend_from_slice(b"_:");
+            result.extend_from_slice(prefix.as_bytes());
+            result.extend_from_slice(&term[2..]);
+            result
+        } else {
+            term
+        }
+    }
+
+    fn entry(&self, term: Vec<u8>, local_id: u32) -> StreamEntry {
+        StreamEntry {
+            term: self.disambiguate(term),
+            roles: Roles::GRAPH,
+            so_local_id: None,
+            p_local_id: None,
+            g_local_id: Some(local_id),
+            source_batch: self.batch_id,
+        }
+    }
+}
+
+impl Iterator for GraphVocabIterator {
+    type Item = Result<StreamEntry>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.pending_sidecar.is_none() && self.next_graph_id <= self.named_graph_count {
+            let graph_id = self.next_graph_id;
+            self.next_graph_id += 1;
+            let result = self
+                .reader
+                .as_mut()
+                .expect("sidecar reader missing for named graphs")
+                .graph(graph_id);
+            match result {
+                Ok(GraphTerm::Named(term)) => {
+                    self.pending_sidecar = Some((term.into_bytes(), (graph_id - 1) as u32));
+                }
+                Ok(GraphTerm::DefaultGraph) => unreachable!(),
+                Err(error) => return Some(Err(error)),
+            }
+        }
+
+        let take_sidecar = match (&self.pending_sidecar, self.additional.peek()) {
+            (Some((sidecar, _)), Some((additional, _))) => {
+                sidecar.as_slice() <= additional.as_bytes()
+            }
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (None, None) => return None,
+        };
+        if take_sidecar {
+            let (term, local_id) = self.pending_sidecar.take().unwrap();
+            Some(Ok(self.entry(term, local_id)))
+        } else {
+            let (term, local_id) = self.additional.next().unwrap();
+            Some(Ok(self.entry(term.into_bytes(), local_id)))
+        }
+    }
+}
+
+struct MergedHdtVocabIterator {
+    base: std::iter::Peekable<StreamingFourWayMerge>,
+    graphs: std::iter::Peekable<GraphVocabIterator>,
+}
+
+impl MergedHdtVocabIterator {
+    fn new(base: StreamingFourWayMerge, graphs: GraphVocabIterator) -> Self {
+        Self {
+            base: base.peekable(),
+            graphs: graphs.peekable(),
+        }
+    }
+}
+
+impl Iterator for MergedHdtVocabIterator {
+    type Item = Result<StreamEntry>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let take_base = match (self.base.peek(), self.graphs.peek()) {
+            (Some(Err(_)), _) => true,
+            (_, Some(Err(_))) => false,
+            (Some(Ok(base)), Some(Ok(graph))) => base.term <= graph.term,
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (None, None) => return None,
+        };
+        if take_base {
+            self.base.next()
+        } else {
+            self.graphs.next()
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -290,13 +447,14 @@ impl StreamingFourWayMerge {
         batch_id: usize,
         bnode_prefix: Option<String>,
     ) -> Result<Self> {
-        let open_section = |offset: u64, name: &str| -> Result<PfcSectionIterator<BufReader<File>>> {
-            let mut f = File::open(path)?;
-            f.seek(SeekFrom::Start(offset))?;
-            let mut reader = BufReader::with_capacity(256 * 1024, f);
-            let header = PfcSectionHeader::read_from(&mut reader, name)?;
-            Ok(PfcSectionIterator::new(reader, &header, name))
-        };
+        let open_section =
+            |offset: u64, name: &str| -> Result<PfcSectionIterator<BufReader<File>>> {
+                let mut f = File::open(path)?;
+                f.seek(SeekFrom::Start(offset))?;
+                let mut reader = BufReader::with_capacity(256 * 1024, f);
+                let header = PfcSectionHeader::read_from(&mut reader, name)?;
+                Ok(PfcSectionIterator::new(reader, &header, name))
+            };
 
         let mut shared_iter = open_section(shared_offset, "shared")?;
         let mut subjects_iter = open_section(subjects_offset, "subjects")?;
@@ -307,16 +465,28 @@ impl StreamingFourWayMerge {
 
         // Seed the heap with the first term from each non-empty section
         if let Some(term) = Self::next_from(&mut shared_iter)? {
-            heap.push(HeapEntry { term, section: SectionKind::Shared });
+            heap.push(HeapEntry {
+                term,
+                section: SectionKind::Shared,
+            });
         }
         if let Some(term) = Self::next_from(&mut subjects_iter)? {
-            heap.push(HeapEntry { term, section: SectionKind::Subjects });
+            heap.push(HeapEntry {
+                term,
+                section: SectionKind::Subjects,
+            });
         }
         if let Some(term) = Self::next_from(&mut predicates_iter)? {
-            heap.push(HeapEntry { term, section: SectionKind::Predicates });
+            heap.push(HeapEntry {
+                term,
+                section: SectionKind::Predicates,
+            });
         }
         if let Some(term) = Self::next_from(&mut objects_iter)? {
-            heap.push(HeapEntry { term, section: SectionKind::Objects });
+            heap.push(HeapEntry {
+                term,
+                section: SectionKind::Objects,
+            });
         }
 
         Ok(Self {
@@ -394,6 +564,7 @@ impl StreamingFourWayMerge {
                 roles: Roles::SUBJECT | Roles::OBJECT,
                 so_local_id: Some(index as u32),
                 p_local_id: None,
+                g_local_id: None,
                 source_batch: self.batch_id,
             },
             SectionKind::Subjects => StreamEntry {
@@ -401,6 +572,7 @@ impl StreamingFourWayMerge {
                 roles: Roles::SUBJECT,
                 so_local_id: Some((self.shared_count + index) as u32),
                 p_local_id: None,
+                g_local_id: None,
                 source_batch: self.batch_id,
             },
             SectionKind::Objects => StreamEntry {
@@ -408,6 +580,7 @@ impl StreamingFourWayMerge {
                 roles: Roles::OBJECT,
                 so_local_id: Some((self.shared_count + self.subjects_count + index) as u32),
                 p_local_id: None,
+                g_local_id: None,
                 source_batch: self.batch_id,
             },
             SectionKind::Predicates => StreamEntry {
@@ -415,6 +588,7 @@ impl StreamingFourWayMerge {
                 roles: Roles::PREDICATE,
                 so_local_id: None,
                 p_local_id: Some(index as u32),
+                g_local_id: None,
                 source_batch: self.batch_id,
             },
         }
@@ -541,9 +715,7 @@ impl HdtTripleReader {
 
         // Read first predicate
         let current_predicate = if num_sp_pairs > 0 {
-            array_y
-                .next_entry()?
-                .context("ArrayY unexpectedly empty")?
+            array_y.next_entry()?.context("ArrayY unexpectedly empty")?
         } else {
             0
         };

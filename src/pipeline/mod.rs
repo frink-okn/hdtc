@@ -11,27 +11,31 @@
 //! Stages are connected by bounded crossbeam channels for automatic backpressure.
 
 pub(crate) mod batch_vocab;
+pub(crate) mod id_remapper;
 mod partial_vocab;
 pub(crate) mod vocab_merger;
-pub(crate) mod id_remapper;
 
 pub use batch_vocab::BatchVocabBuilder;
 pub use partial_vocab::{PartialVocabEntry, PartialVocabReader, PartialVocabWriter};
 
+use crate::cli::InputSidecarPolicy;
 use crate::dictionary::DictCounts;
-use crate::hdt::input_adapter::HdtInputAdapter;
-use crate::rdf::{stream_quads_with_options, ExtractedQuad, ParseOptions, RdfInput};
-use crate::sort::ExternalSorter;
-use crate::triples::id_triple::IdTriple;
+use crate::hdt::input_adapter::{HdtGraphVocabulary, HdtInputAdapter};
+use crate::quads::{
+    GraphAssignments, GraphMembership, GraphSidecarReader, IdQuad, PositionGraphMembership,
+    QuadUnionIterator, SourceGraphAssignment, canonical_sidecar_path,
+};
+use crate::rdf::{ExtractedQuad, ParseOptions, RdfInput, stream_quads_with_options};
+use crate::sort::{ExternalSorter, Sortable};
 use anyhow::{Context, Result};
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender, bounded};
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use batch_vocab::{LocalIdTriple, Roles, VocabEntry};
+use batch_vocab::{LocalIdQuad, Roles, VocabEntry};
 
 const STAGE5_TO_STAGE6_CHUNK_SIZE: usize = 16_384;
 const RECOMMENDED_MIN_MEMORY_BUDGET: usize = 2 * 1024 * 1024 * 1024;
@@ -65,8 +69,8 @@ struct PipelineMemoryPlan {
     // Group A
     parser_budget_bytes: usize,
     batch_size: usize,
-    batch_channel_cap: usize,      // Stage 1→2 channel capacity (batches of quads)
-    processed_channel_cap: usize,   // Stage 2→3 channel capacity (processed batches)
+    batch_channel_cap: usize, // Stage 1→2 channel capacity (batches of quads)
+    processed_channel_cap: usize, // Stage 2→3 channel capacity (processed batches)
 
     // Group B1
     stage4_budget_bytes: usize,
@@ -80,7 +84,12 @@ pub(super) fn tune_f64(name: &str, default: f64) -> f64 {
         Ok(raw) => match raw.parse::<f64>() {
             Ok(v) if v.is_finite() && v > 0.0 => v,
             _ => {
-                tracing::warn!("Ignoring invalid {}='{}', using default {}", name, raw, default);
+                tracing::warn!(
+                    "Ignoring invalid {}='{}', using default {}",
+                    name,
+                    raw,
+                    default
+                );
                 default
             }
         },
@@ -93,7 +102,12 @@ pub(super) fn tune_usize(name: &str, default: usize) -> usize {
         Ok(raw) => match raw.parse::<usize>() {
             Ok(v) if v > 0 => v,
             _ => {
-                tracing::warn!("Ignoring invalid {}='{}', using default {}", name, raw, default);
+                tracing::warn!(
+                    "Ignoring invalid {}='{}', using default {}",
+                    name,
+                    raw,
+                    default
+                );
                 default
             }
         },
@@ -114,6 +128,11 @@ pub struct PipelineResult {
     pub counts: DictCounts,
     pub dict_section_paths: Vec<PathBuf>, // PFC section temp files
     pub dict_section_sizes: Vec<u64>,     // Corresponding file sizes
+    pub graph_section_path: PathBuf,
+    pub graph_section_size: u64,
+    pub has_blank_graph_names: bool,
+    pub membership_path: Option<PathBuf>,
+    pub membership_count: u64,
     pub bitmap_triples: crate::triples::BitmapTriplesFiles,
     pub ntriples_size: u64, // N-Triples serialization size of parsed data
 }
@@ -131,6 +150,48 @@ struct SharedBatchAssembler {
     batch_size: usize,
     batch_tx: Sender<BatchedQuads>,
     state: Mutex<BatchAssemblerState>,
+}
+
+struct PreparedHdtInput {
+    batch_id: usize,
+    adapter: HdtInputAdapter,
+    graph_vocabulary: Option<HdtGraphVocabulary>,
+    position_memberships: Option<PathBuf>,
+    mapped_graphs: Vec<u32>,
+    fallback_named_graph: Option<u32>,
+}
+
+fn transpose_source_memberships(
+    reader: &mut GraphSidecarReader,
+    batch_id: usize,
+    temp_dir: &Path,
+    memory_budget: usize,
+) -> Result<PathBuf> {
+    let mut sorter = ExternalSorter::new(temp_dir, memory_budget.max(MIB));
+    let mut buffer = Vec::<PositionGraphMembership>::new();
+    let mut memory_used = 0usize;
+    for graph in 0..=reader.named_graph_count() {
+        for position in reader.layer_iter(graph)? {
+            sorter.push(
+                PositionGraphMembership {
+                    position: position?,
+                    graph,
+                },
+                &mut buffer,
+                &mut memory_used,
+            )?;
+        }
+    }
+
+    let path = temp_dir.join(format!("hdt_graph_positions_{batch_id:06}.pgm.zst"));
+    let file =
+        File::create(&path).with_context(|| format!("Failed to create {}", path.display()))?;
+    let mut encoder = zstd::Encoder::new(BufWriter::new(file), 3)?;
+    for membership in sorter.finish(&mut buffer)? {
+        membership?.write_to(&mut encoder)?;
+    }
+    encoder.finish()?;
+    Ok(path)
 }
 
 impl SharedBatchAssembler {
@@ -214,7 +275,7 @@ impl SharedBatchAssembler {
 struct ProcessedBatch {
     batch_id: usize,
     vocab: Vec<VocabEntry>,
-    triples: Vec<LocalIdTriple>,
+    quads: Vec<LocalIdQuad>,
 }
 
 /// Notification that a batch has been written (Stage 3 → Stage 4).
@@ -279,7 +340,8 @@ fn current_rss_bytes() -> Option<u64> {
     }
     unsafe {
         let mut info = MaybeUninit::<MachTaskBasicInfo>::uninit();
-        let mut count = (std::mem::size_of::<MachTaskBasicInfo>() / std::mem::size_of::<u32>()) as u32;
+        let mut count =
+            (std::mem::size_of::<MachTaskBasicInfo>() / std::mem::size_of::<u32>()) as u32;
         let kr = libc::task_info(
             libc::mach_task_self(),
             MACH_TASK_BASIC_INFO,
@@ -392,12 +454,12 @@ fn local_triples_path(temp_dir: &Path, batch_id: usize) -> PathBuf {
 //     + Option<String> graph.  Stack: ~96 bytes, heap: ~240 bytes → ~350 bytes/quad.
 //
 //   Stage 2 processing (1 batch): arena (~100 bytes/triple for unique terms) +
-//     hashmap (~80 bytes/unique term) + LocalIdTriple vec (12 bytes/triple).
+//     hashmap (~80 bytes/unique term) + LocalIdQuad vec (16 bytes/statement).
 //     Effective: ~200 bytes/triple.
 //
 //   Processed channel (Stage 2→3): `processed_channel_cap` ProcessedBatch items.
 //     Each holds Vec<VocabEntry> (amortized ~20 bytes/triple for unique terms) +
-//     Vec<LocalIdTriple> (12 bytes/triple).  Effective: ~50 bytes/triple.
+//     Vec<LocalIdQuad> (16 bytes/statement). Effective: ~54 bytes/statement.
 //
 //   Parser I/O: chunk buffers + in-flight bytes, allocated separately.
 //
@@ -415,8 +477,10 @@ fn calculate_group_a(memory_budget: usize) -> (usize, usize, usize, usize) {
     let parser_share = tune_f64("HDTC_TUNE_PARSER_SHARE", 0.15).clamp(0.05, 0.40);
     let parser_min = tune_usize("HDTC_TUNE_PARSER_MIN_MIB", 64) * MIB;
     let parser_max = tune_usize("HDTC_TUNE_PARSER_MAX_MIB", 2048) * MIB;
-    let parser_budget = (((memory_budget as f64) * parser_share) as usize)
-        .clamp(parser_min, parser_max.max(parser_min));
+    let parser_floor = parser_min.min(memory_budget / 2);
+    let parser_ceiling = parser_max.min(memory_budget / 2).max(parser_floor);
+    let parser_budget =
+        (((memory_budget as f64) * parser_share) as usize).clamp(parser_floor, parser_ceiling);
 
     // Channel depths
     let batch_channel_cap = tune_usize("HDTC_TUNE_BATCH_CHANNEL_CAP", 3).clamp(1, 16);
@@ -426,9 +490,10 @@ fn calculate_group_a(memory_budget: usize) -> (usize, usize, usize, usize) {
     // ExtractedQuad: 3 Strings (24 bytes stack + ~80 bytes heap each) + Option<String>
     // = ~96 bytes stack + ~240 bytes heap ≈ 350 bytes per quad.
     let raw_bytes_per_quad = tune_usize("HDTC_TUNE_RAW_BYTES_PER_QUAD", 350).max(100);
-    // Stage 2: arena + hashmap + LocalIdTriple vec
-    let processing_bytes_per_triple = tune_usize("HDTC_TUNE_PROCESSING_BYTES_PER_TRIPLE", 200).max(50);
-    // ProcessedBatch: Vec<LocalIdTriple> (12b) + amortized Vec<VocabEntry>
+    // Stage 2: arena + hashmap + LocalIdQuad vec
+    let processing_bytes_per_triple =
+        tune_usize("HDTC_TUNE_PROCESSING_BYTES_PER_TRIPLE", 200).max(50);
+    // ProcessedBatch: Vec<LocalIdQuad> (16b) + amortized Vec<VocabEntry>
     let processed_bytes_per_triple = tune_usize("HDTC_TUNE_PROCESSED_BYTES_PER_TRIPLE", 50).max(16);
 
     let min_batch = tune_usize("HDTC_TUNE_MIN_BATCH", 50_000);
@@ -443,37 +508,38 @@ fn calculate_group_a(memory_budget: usize) -> (usize, usize, usize, usize) {
         .min(group_a_max_mib * MIB);
 
     // Weighted cost per triple across all in-flight positions
-    let weighted_cost_per_triple =
-        batch_channel_cap * raw_bytes_per_quad
+    let weighted_cost_per_triple = batch_channel_cap * raw_bytes_per_quad
         + processing_bytes_per_triple
         + processed_channel_cap * processed_bytes_per_triple;
 
-    let batch_size = (batch_budget / weighted_cost_per_triple)
-        .clamp(min_batch, max_batch);
+    let affordable_batch = (batch_budget / weighted_cost_per_triple).max(1);
+    let batch_size = affordable_batch.clamp(min_batch.min(affordable_batch), max_batch);
 
-    (parser_budget, batch_size, batch_channel_cap, processed_channel_cap)
+    (
+        parser_budget,
+        batch_size,
+        batch_channel_cap,
+        processed_channel_cap,
+    )
 }
 
 // ---------------------------------------------------------------------------
 // Group B1: Stage 4 (vocab merger — runs alone after Group A)
 // ---------------------------------------------------------------------------
-// Gets the full memory budget.  The main consumers are:
-//   - id_mappings: Vec<IdMapping> — per-batch SO + P mapping arrays accumulated
-//     in RAM during Stage 4 before being flushed to temporary files on disk
-//   - PFC encoders: accumulate all dictionary strings (currently unbounded)
+// Gets most of the memory budget. The main consumers are:
+//   - sharded SO/P/G mapping writers
+//   - streaming PFC encoders
 //   - Merge stream channel: bounded buffer of StreamEntry items
 //   - Per-batch partial vocab reader threads
-//
-// We reserve a fraction for the stream channel and I/O; the rest is available
-// for PFC accumulators and the transient in-RAM id_mappings before they are
-// written to disk.
 
 fn calculate_stage4_budget(memory_budget: usize) -> usize {
     // Stage 4 runs alone — it can use nearly all available memory.
     // We reserve a small margin for OS/allocator overhead.
     let stage4_share = tune_f64("HDTC_TUNE_STAGE4_SHARE", 0.85).clamp(0.30, 0.95);
     let stage4_min = tune_usize("HDTC_TUNE_STAGE4_MIN_MIB", 256) * MIB;
-    (((memory_budget as f64) * stage4_share) as usize).max(stage4_min)
+    (((memory_budget as f64) * stage4_share) as usize)
+        .max(stage4_min.min(memory_budget))
+        .min(memory_budget)
 }
 
 // ---------------------------------------------------------------------------
@@ -492,7 +558,8 @@ fn calculate_stage56_budget(memory_budget: usize) -> Stage56Budget {
 
     // Remapper: each worker holds one decompressed IdMapping + decoder + chunk buffer.
     let per_worker_mib = tune_usize("HDTC_TUNE_REMAP_WORKER_MIB", 128);
-    let per_worker_bytes = per_worker_mib * MIB;
+    let configured_per_worker = per_worker_mib.saturating_mul(MIB);
+    let per_worker_bytes = configured_per_worker.min((memory_budget / 4).max(1));
 
     // Number of remapper threads: limited by CPUs and memory.
     let max_remap_threads = (memory_budget / 4 / per_worker_bytes).max(1); // don't let remap exceed 25%
@@ -500,16 +567,16 @@ fn calculate_stage56_budget(memory_budget: usize) -> Stage56Budget {
     let remap_budget_bytes = remap_threads * per_worker_bytes;
 
     // Remap→sort channel capacity: small bounded queue.
-    let chunk_bytes = STAGE5_TO_STAGE6_CHUNK_SIZE * std::mem::size_of::<IdTriple>();
-    let queue_budget = (memory_budget / 32).clamp(16 * MIB, 256 * MIB);
-    let remap_to_sort_channel_capacity = (queue_budget / chunk_bytes).clamp(16, 256);
+    let chunk_bytes = STAGE5_TO_STAGE6_CHUNK_SIZE * std::mem::size_of::<IdQuad>();
+    let queue_budget = memory_budget / 32;
+    let remap_to_sort_channel_capacity = (queue_budget / chunk_bytes).clamp(1, 256);
+    let actual_queue_budget = remap_to_sort_channel_capacity * chunk_bytes;
 
     // Sorter gets the full budget minus remapper overhead and channel.
-    let sort_min = tune_usize("HDTC_TUNE_SORT_MIN_MIB", 256) * MIB;
     let sort_budget_bytes = memory_budget
         .saturating_sub(remap_budget_bytes)
-        .saturating_sub(queue_budget)
-        .max(sort_min);
+        .saturating_sub(actual_queue_budget)
+        .max(std::mem::size_of::<IdQuad>());
 
     Stage56Budget {
         sort_budget_bytes,
@@ -541,6 +608,7 @@ fn parser_stage(
     batch_size: usize,
     parser_budget_total: usize,
     include_graphs: bool,
+    graph_assignments: GraphAssignments,
     base_uri: String,
     parser_parallelism: ParserParallelismConfig,
     batch_tx: Sender<BatchedQuads>,
@@ -552,12 +620,18 @@ fn parser_stage(
         .map(|n| n.get())
         .unwrap_or(4)
         .max(1);
-    let default_file_workers = inputs.len().min(available_cpus).max(1);
+    let max_file_workers_by_budget = (parser_budget_total / MIB).max(1);
+    let default_file_workers = inputs
+        .len()
+        .min(available_cpus)
+        .min(max_file_workers_by_budget)
+        .max(1);
     let file_workers = parser_parallelism
         .file_workers
         .unwrap_or(default_file_workers)
         .max(1)
-        .min(inputs.len().max(1));
+        .min(inputs.len().max(1))
+        .min(max_file_workers_by_budget);
     let default_chunk_workers = (available_cpus / file_workers).max(1);
     let capped_default_chunk_workers = default_chunk_workers.min(4);
     let chunk_workers = parser_parallelism
@@ -565,11 +639,12 @@ fn parser_stage(
         .unwrap_or(capped_default_chunk_workers)
         .max(1);
 
-    let parser_budget_per_file = (parser_budget_total / file_workers.max(1)).max(16 * MIB);
+    const MIN_PARSER_CHUNK: usize = 64 * 1024;
+    let parser_budget_per_file = (parser_budget_total / file_workers.max(1)).max(MIN_PARSER_CHUNK);
 
     let chunk_size_bytes = parser_parallelism
         .chunk_size_bytes
-        .unwrap_or((parser_budget_per_file / 8).clamp(MIB, 8 * MIB))
+        .unwrap_or((parser_budget_per_file / 8).clamp(MIN_PARSER_CHUNK, 8 * MIB))
         .max(1);
     let max_inflight_bytes = parser_parallelism
         .max_inflight_bytes
@@ -594,10 +669,12 @@ fn parser_stage(
 
     let assembler = Arc::new(SharedBatchAssembler::new(batch_size, batch_tx));
 
-    let (file_tx, file_rx) = bounded::<(usize, RdfInput)>(inputs.len().max(1));
+    let (file_tx, file_rx) =
+        bounded::<(usize, RdfInput, SourceGraphAssignment)>(inputs.len().max(1));
     for (file_index, input) in inputs.into_iter().enumerate() {
+        let source_assignment = graph_assignments.for_source(&input.path)?;
         file_tx
-            .send((file_index, input))
+            .send((file_index, input, source_assignment))
             .map_err(|_| anyhow::anyhow!("File parser queue disconnected"))?;
     }
     drop(file_tx);
@@ -613,7 +690,7 @@ fn parser_stage(
         let parse_options = parse_options.clone();
 
         worker_handles.push(std::thread::spawn(move || {
-            for (file_index, input) in file_rx {
+            for (file_index, input, source_assignment) in file_rx {
                 tracing::info!("Parsing: {}", input.path.display());
 
                 let mut staged_quads = Vec::with_capacity(4096);
@@ -624,7 +701,15 @@ fn parser_stage(
                     Some(&base_uri),
                     &parse_options,
                     |quad| {
-                        staged_quads.push(quad);
+                        if include_graphs {
+                            for graph in source_assignment.memberships(quad.graph.clone()) {
+                                let mut assigned = quad.clone();
+                                assigned.graph = graph;
+                                staged_quads.push(assigned);
+                            }
+                        } else {
+                            staged_quads.push(quad);
+                        }
                         if staged_quads.len() >= 4096 {
                             let chunk = std::mem::take(&mut staged_quads);
                             assembler.push_many(chunk)?;
@@ -720,16 +805,19 @@ fn vocab_builder_stage(
             let p_id = builder.get_or_assign_id(quad.predicate.as_bytes(), Roles::PREDICATE);
             let o_id = builder.get_or_assign_id(quad.object.as_bytes(), Roles::OBJECT);
 
-            if include_graphs
-                && let Some(ref graph) = quad.graph
-            {
-                builder.get_or_assign_id(graph.as_bytes(), Roles::GRAPH);
-            }
+            let graph = if include_graphs {
+                quad.graph
+                    .as_ref()
+                    .map(|graph| builder.get_or_assign_graph_id(graph.as_bytes()))
+            } else {
+                None
+            };
 
-            builder.id_triples.push(LocalIdTriple {
+            builder.id_quads.push(LocalIdQuad {
                 subject: s_id,
                 predicate: p_id,
                 object: o_id,
+                graph,
             });
         }
 
@@ -745,14 +833,14 @@ fn vocab_builder_stage(
         );
 
         // Finish and get sorted vocab + triples
-        let (vocab, triples) = builder.finish();
+        let (vocab, quads) = builder.finish();
 
         // Send to writer stage
         if processed_tx
             .send(ProcessedBatch {
                 batch_id,
                 vocab,
-                triples,
+                quads,
             })
             .is_err()
         {
@@ -781,6 +869,7 @@ fn vocab_writer_stage(
         let entry_count = batch.vocab.len() as u32;
         let mut max_so_id = 0u32;
         let mut max_p_id = 0u32;
+        let mut max_g_id = 0u32;
         for entry in &batch.vocab {
             if let Some(so_id) = entry.so_local_id {
                 max_so_id = max_so_id.max(so_id);
@@ -788,11 +877,15 @@ fn vocab_writer_stage(
             if let Some(p_id) = entry.p_local_id {
                 max_p_id = max_p_id.max(p_id);
             }
+            if let Some(g_id) = entry.g_local_id {
+                max_g_id = max_g_id.max(g_id);
+            }
         }
 
-        let mut vocab_writer = PartialVocabWriter::create(&vocab_path)
-            .with_context(|| format!("Failed to create vocab writer for batch {}", batch.batch_id))?;
-        vocab_writer.write_header(entry_count, max_so_id, max_p_id)?;
+        let mut vocab_writer = PartialVocabWriter::create(&vocab_path).with_context(|| {
+            format!("Failed to create vocab writer for batch {}", batch.batch_id)
+        })?;
+        vocab_writer.write_header(entry_count, max_so_id, max_p_id, max_g_id)?;
         for entry in &batch.vocab {
             vocab_writer.write_entry(&PartialVocabEntry::from_vocab_entry(entry))?;
         }
@@ -800,17 +893,18 @@ fn vocab_writer_stage(
         vocab_writer.finish()?;
 
         // Write local-ID triples
-        let triples_file = File::create(&triples_path)
-            .with_context(|| format!("Failed to create triples file for batch {}", batch.batch_id))?;
+        let triples_file = File::create(&triples_path).with_context(|| {
+            format!("Failed to create triples file for batch {}", batch.batch_id)
+        })?;
         let buf_writer = BufWriter::new(triples_file);
         let mut encoder = zstd::Encoder::new(buf_writer, 3)?;
 
-        for triple in &batch.triples {
-            triple.write_to(&mut encoder)?;
+        for quad in &batch.quads {
+            quad.write_to(&mut encoder)?;
         }
 
         encoder.finish()?;
-        let triple_count = batch.triples.len();
+        let triple_count = batch.quads.len();
 
         tracing::info!(
             "Wrote batch {}: {} terms, {} triples",
@@ -861,6 +955,8 @@ pub fn run_pipeline(
     temp_dir: &Path,
     memory_budget: usize,
     include_graphs: bool,
+    input_sidecar_policy: InputSidecarPolicy,
+    graph_assignments: &GraphAssignments,
     base_uri: &str,
     parser_parallelism: &ParserParallelismConfig,
     benchmark: bool,
@@ -878,7 +974,11 @@ pub fn run_pipeline(
     let memory_plan = build_memory_plan(memory_budget);
 
     let mut stage_metrics: Vec<StageMetric> = Vec::new();
-    let rss_start = if benchmark { process_peak_rss_bytes() } else { None };
+    let rss_start = if benchmark {
+        process_peak_rss_bytes()
+    } else {
+        None
+    };
     let stages123_start = Instant::now();
 
     let batch_size = memory_plan.batch_size;
@@ -913,6 +1013,7 @@ pub fn run_pipeline(
     let inputs_owned = inputs.to_vec();
     let base_uri_owned = base_uri.to_string();
     let parser_parallelism_owned = parser_parallelism.clone();
+    let graph_assignments_owned = (*graph_assignments).clone();
     let parser_budget = memory_plan.parser_budget_bytes;
     let total_input_count = inputs.len() + hdt_inputs.len();
     let parser_handle = std::thread::spawn(move || {
@@ -921,6 +1022,7 @@ pub fn run_pipeline(
             batch_size,
             parser_budget,
             include_graphs,
+            graph_assignments_owned,
             base_uri_owned,
             parser_parallelism_owned,
             batch_tx,
@@ -1003,7 +1105,7 @@ pub fn run_pipeline(
     );
 
     // Pre-process HDT inputs: scan headers, create adapters
-    let mut hdt_adapters: Vec<(usize, HdtInputAdapter)> = Vec::new();
+    let mut hdt_adapters: Vec<PreparedHdtInput> = Vec::new();
     if !hdt_inputs.is_empty() {
         tracing::info!("Scanning {} HDT input file(s)", hdt_inputs.len());
         let rdf_batch_count = batches.len();
@@ -1012,16 +1114,114 @@ pub fn run_pipeline(
             let adapter = HdtInputAdapter::scan(hdt_path)
                 .with_context(|| format!("Failed to scan HDT input {}", hdt_path.display()))?;
             ntriples_size += adapter.original_size;
-            hdt_adapters.push((batch_id, adapter));
+
+            let mut graph_vocabulary = None;
+            let mut position_memberships = None;
+            let mut mapped_graphs = Vec::new();
+            let mut fallback_named_graph = None;
+            if include_graphs {
+                let assignment = graph_assignments.for_source(hdt_path)?;
+                let sidecar_path = canonical_sidecar_path(hdt_path);
+                let preserve_sidecar = match input_sidecar_policy {
+                    InputSidecarPolicy::Drop => {
+                        if sidecar_path.exists() {
+                            tracing::info!(
+                                "Ignoring input graph sidecar {} (--input-sidecars drop)",
+                                sidecar_path.display()
+                            );
+                        }
+                        false
+                    }
+                    InputSidecarPolicy::Preserve => sidecar_path.exists(),
+                    InputSidecarPolicy::Require => {
+                        anyhow::ensure!(
+                            sidecar_path.exists(),
+                            "Required graph sidecar not found: {}",
+                            sidecar_path.display()
+                        );
+                        true
+                    }
+                };
+
+                let mut named_graph_count = 0u64;
+                let retained_sidecar_path = if preserve_sidecar {
+                    tracing::info!("Validating input graph sidecar {}", sidecar_path.display());
+                    let mut reader = GraphSidecarReader::open(&sidecar_path, hdt_path)?;
+                    let per_input_budget = memory_plan
+                        .stage4_budget_bytes
+                        .checked_div(hdt_inputs.len().max(1))
+                        .unwrap_or(memory_plan.stage4_budget_bytes)
+                        .max(MIB);
+                    reader.validate_strict(temp_dir, per_input_budget)?;
+                    named_graph_count = reader.named_graph_count();
+                    anyhow::ensure!(
+                        named_graph_count <= u64::from(u32::MAX),
+                        "Input sidecar has too many named graphs for local IDs"
+                    );
+                    position_memberships = Some(transpose_source_memberships(
+                        &mut reader,
+                        batch_id,
+                        temp_dir,
+                        per_input_budget,
+                    )?);
+                    Some(sidecar_path)
+                } else {
+                    None
+                };
+
+                let mut additional_terms = Vec::new();
+                let mut next_local = u32::try_from(named_graph_count)
+                    .context("Input sidecar named-graph count exceeds local ID range")?;
+                for term in assignment.mapped_graphs() {
+                    additional_terms.push((term.to_string(), next_local));
+                    mapped_graphs.push(next_local);
+                    next_local = next_local
+                        .checked_add(1)
+                        .context("Too many graph names in one HDT input")?;
+                }
+                if retained_sidecar_path.is_none()
+                    && mapped_graphs.is_empty()
+                    && let Some(term) = assignment.default_graph()
+                {
+                    anyhow::ensure!(
+                        next_local < u32::MAX,
+                        "Too many graph names in one HDT input"
+                    );
+                    additional_terms.push((term.to_string(), next_local));
+                    fallback_named_graph = Some(next_local);
+                }
+                graph_vocabulary = Some(HdtGraphVocabulary {
+                    sidecar_path: retained_sidecar_path,
+                    named_graph_count,
+                    additional_terms,
+                });
+            }
+
+            hdt_adapters.push(PreparedHdtInput {
+                batch_id,
+                adapter,
+                graph_vocabulary,
+                position_memberships,
+                mapped_graphs,
+                fallback_named_graph,
+            });
         }
     }
 
     // Stage 4: Merge vocabularies and build global dictionary
     let total_sources = batches.len() + hdt_adapters.len();
-    tracing::info!("Stage 4: Merging {} vocabulary sources ({} RDF batches + {} HDT inputs)",
-        total_sources, batches.len(), hdt_adapters.len());
+    tracing::info!(
+        "Stage 4: Merging {} vocabulary sources ({} RDF batches + {} HDT inputs)",
+        total_sources,
+        batches.len(),
+        hdt_adapters.len()
+    );
     let stage4_start = Instant::now();
-    let stage4_rss_before = if benchmark { process_peak_rss_bytes() } else { None };
+    let stage4_rss_before = if benchmark {
+        process_peak_rss_bytes()
+    } else {
+        None
+    };
     let mut vocab_sources: Vec<vocab_merger::VocabSource> = Vec::with_capacity(total_sources);
     for batch in &batches {
         let source =
@@ -1031,21 +1231,37 @@ pub fn run_pipeline(
     // Disambiguate blank nodes when there are multiple total input files
     let total_input_files = inputs.len() + hdt_inputs.len();
     let disambiguate = total_input_files > 1;
-    for (i, (batch_id, adapter)) in hdt_adapters.iter().enumerate() {
-        let file_index = if disambiguate { Some(inputs.len() + i) } else { None };
+    for (i, prepared) in hdt_adapters.iter().enumerate() {
+        let adapter = &prepared.adapter;
+        let file_index = if disambiguate {
+            Some(inputs.len() + i)
+        } else {
+            None
+        };
+        let graph_term_count = prepared
+            .graph_vocabulary
+            .as_ref()
+            .map_or(0u64, |vocabulary| {
+                vocabulary.named_graph_count + vocabulary.additional_terms.len() as u64
+            });
         vocab_sources.push(vocab_merger::VocabSource {
-            batch_id: *batch_id,
+            batch_id: prepared.batch_id,
             max_so_id: adapter.max_so_id(),
             max_p_id: adapter.max_p_id(),
-            factory: adapter.vocab_factory(*batch_id, file_index),
+            max_g_id: u32::try_from(graph_term_count.saturating_sub(1))
+                .context("Too many graph terms in one HDT input")?,
+            factory: adapter.vocab_factory(
+                prepared.batch_id,
+                file_index,
+                prepared.graph_vocabulary.clone(),
+            ),
         });
     }
 
     let stage4_budget = memory_plan.stage4_budget_bytes;
     tracing::debug!("Stage 4 merge budget: {} MiB", stage4_budget / MIB);
 
-    let merge_result =
-        vocab_merger::merge_vocabularies(vocab_sources, temp_dir, stage4_budget)?;
+    let merge_result = vocab_merger::merge_vocabularies(vocab_sources, temp_dir, stage4_budget)?;
 
     tracing::info!(
         "Stage 4 complete: {} shared, {} subjects, {} predicates, {} objects (elapsed: {:.1}s)",
@@ -1067,13 +1283,17 @@ pub fn run_pipeline(
     // Stage 5: ID remapping (parallel)
     tracing::info!("Stage 5: Remapping local IDs to global IDs");
     let stage5_start = Instant::now();
-    let stage5_rss_before = if benchmark { process_peak_rss_bytes() } else { None };
+    let stage5_rss_before = if benchmark {
+        process_peak_rss_bytes()
+    } else {
+        None
+    };
 
     let stage56_budget = memory_plan.stage56_budget;
 
-    // Set up channel for global-ID triples (chunked to reduce per-message overhead)
-    let (global_triple_tx, global_triple_rx) =
-        bounded::<Vec<IdTriple>>(stage56_budget.remap_to_sort_channel_capacity);
+    // Set up channel for global-ID quads (chunked to reduce per-message overhead)
+    let (global_quad_tx, global_quad_rx) =
+        bounded::<Vec<IdQuad>>(stage56_budget.remap_to_sort_channel_capacity);
 
     // Prepare batch remap info (files are cleaned up per-batch by the remapper)
     let total_remap_batches = batches.len() + hdt_adapters.len();
@@ -1088,11 +1308,12 @@ pub fn run_pipeline(
             })
             .ok();
     }
-    for (batch_id, adapter) in &hdt_adapters {
-        let mapping_path = temp_dir.join(format!("id_mapping_{:06}.map.zst", batch_id));
+    for prepared in &hdt_adapters {
+        let adapter = &prepared.adapter;
+        let mapping_path = temp_dir.join(format!("id_mapping_{:06}.map.zst", prepared.batch_id));
         remap_tx
             .send(id_remapper::BatchRemapInfo {
-                batch_id: *batch_id,
+                batch_id: prepared.batch_id,
                 triple_source: id_remapper::TripleSource::HdtFile {
                     path: adapter.path.clone(),
                     triples_data_offset: adapter.triples_data_offset(),
@@ -1100,6 +1321,9 @@ pub fn run_pipeline(
                     num_sp_pairs: adapter.num_sp_pairs(),
                     shared_count: adapter.shared_count,
                     subjects_count: adapter.subjects_count,
+                    memberships_path: prepared.position_memberships.clone(),
+                    mapped_graphs: prepared.mapped_graphs.clone(),
+                    fallback_named_graph: prepared.fallback_named_graph,
                 },
                 mapping_path,
             })
@@ -1113,30 +1337,30 @@ pub fn run_pipeline(
     let remapper_handle = std::thread::spawn(move || {
         id_remapper::id_remapper_stage(
             remap_rx,
-            global_triple_tx,
+            global_quad_tx,
             remap_threads,
             STAGE5_TO_STAGE6_CHUNK_SIZE,
         )
     });
 
     // Stage 6: External sort + BitmapTriples construction
-    tracing::info!("Stage 6: Sorting global-ID triples in SPO order");
+    tracing::info!("Stage 6: Sorting global-ID quad memberships in SPO+G order");
 
-    // Collect triples into external sorter, tracking max IDs for BitmapTriples bit widths
+    // Collect quads into external sorter, tracking max IDs for BitmapTriples bit widths
     let mut sorter = ExternalSorter::new(temp_dir, stage56_budget.sort_budget_bytes);
-    let mut buffer: Vec<IdTriple> = Vec::new();
+    let mut buffer: Vec<IdQuad> = Vec::new();
     let mut mem_used: usize = 0;
     let mut triple_count = 0u64;
     let mut max_subject: u64 = 0;
     let mut max_predicate: u64 = 0;
     let mut max_object: u64 = 0;
 
-    for triple_chunk in global_triple_rx {
-        for triple in triple_chunk {
-            max_subject = max_subject.max(triple.subject);
-            max_predicate = max_predicate.max(triple.predicate);
-            max_object = max_object.max(triple.object);
-            sorter.push(triple, &mut buffer, &mut mem_used)?;
+    for quad_chunk in global_quad_rx {
+        for quad in quad_chunk {
+            max_subject = max_subject.max(quad.subject);
+            max_predicate = max_predicate.max(quad.predicate);
+            max_object = max_object.max(quad.object);
+            sorter.push(quad, &mut buffer, &mut mem_used)?;
             triple_count += 1;
 
             if triple_count.is_multiple_of(10_000_000) {
@@ -1166,8 +1390,12 @@ pub fn run_pipeline(
 
     // Finish sorting
     let sort_start = Instant::now();
-    let sort_rss_before = if benchmark { process_peak_rss_bytes() } else { None };
-    let sorted_triples = sorter.finish(&mut buffer)?;
+    let sort_rss_before = if benchmark {
+        process_peak_rss_bytes()
+    } else {
+        None
+    };
+    let sorted_quads = sorter.finish(&mut buffer)?;
 
     push_stage_metric(
         &mut stage_metrics,
@@ -1179,14 +1407,55 @@ pub fn run_pipeline(
 
     // Build BitmapTriples — stream each component to temp files (O(1) memory)
     let bitmap_start = Instant::now();
-    let bitmap_rss_before = if benchmark { process_peak_rss_bytes() } else { None };
-    let bitmap_triples = crate::triples::build_bitmap_triples_to_files(
-        sorted_triples,
-        max_subject,
-        max_predicate,
-        max_object,
-        temp_dir,
-    )?;
+    let bitmap_rss_before = if benchmark {
+        process_peak_rss_bytes()
+    } else {
+        None
+    };
+    let (bitmap_triples, membership_path, membership_count) = if include_graphs {
+        let mut membership_sorter = ExternalSorter::new(temp_dir, stage56_budget.sort_budget_bytes);
+        let mut membership_buffer: Vec<GraphMembership> = Vec::new();
+        let mut membership_mem = 0usize;
+
+        let union_triples = QuadUnionIterator::new(sorted_quads, |membership| {
+            membership_sorter.push(membership, &mut membership_buffer, &mut membership_mem)
+        });
+        let bitmap = crate::triples::build_bitmap_triples_to_files(
+            union_triples,
+            max_subject,
+            max_predicate,
+            max_object,
+            temp_dir,
+        )?;
+
+        let membership_path = temp_dir.join("graph_memberships.gmp.zst");
+        let file = File::create(&membership_path).with_context(|| {
+            format!(
+                "Failed to create membership file {}",
+                membership_path.display()
+            )
+        })?;
+        let mut encoder = zstd::Encoder::new(BufWriter::new(file), 3)?;
+        let mut membership_count = 0u64;
+        for membership in membership_sorter.finish(&mut membership_buffer)? {
+            membership?.write_to(&mut encoder)?;
+            membership_count = membership_count
+                .checked_add(1)
+                .context("graph membership count overflow")?;
+        }
+        encoder.finish()?;
+        (bitmap, Some(membership_path), membership_count)
+    } else {
+        let union_triples = QuadUnionIterator::new(sorted_quads, |_membership| Ok(()));
+        let bitmap = crate::triples::build_bitmap_triples_to_files(
+            union_triples,
+            max_subject,
+            max_predicate,
+            max_object,
+            temp_dir,
+        )?;
+        (bitmap, None, 0)
+    };
 
     push_stage_metric(
         &mut stage_metrics,
@@ -1208,6 +1477,11 @@ pub fn run_pipeline(
         counts: merge_result.counts,
         dict_section_paths: merge_result.dict_section_paths,
         dict_section_sizes: merge_result.dict_section_sizes,
+        graph_section_path: merge_result.graph_section_path,
+        graph_section_size: merge_result.graph_section_size,
+        has_blank_graph_names: merge_result.has_blank_graph_names,
+        membership_path,
+        membership_count,
         bitmap_triples,
         ntriples_size,
     })
