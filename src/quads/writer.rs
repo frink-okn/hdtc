@@ -131,6 +131,32 @@ enum ChosenEncoding {
     EliasFano,
 }
 
+/// Scratch files shared by every layer encoder.
+///
+/// The finalizer must not create temporary files per graph, so this fixed set
+/// is opened once and truncated for reuse by each layer it encodes.
+struct LayerScratch {
+    metadata: File,
+    payloads: File,
+    lower: File,
+    superranks: File,
+    subranks: File,
+    upper: File,
+}
+
+impl LayerScratch {
+    fn new(temp_dir: &Path) -> Result<Self> {
+        Ok(Self {
+            metadata: tempfile::tempfile_in(temp_dir)?,
+            payloads: tempfile::tempfile_in(temp_dir)?,
+            lower: tempfile::tempfile_in(temp_dir)?,
+            superranks: tempfile::tempfile_in(temp_dir)?,
+            subranks: tempfile::tempfile_in(temp_dir)?,
+            upper: tempfile::tempfile_in(temp_dir)?,
+        })
+    }
+}
+
 /// Return the automatically discovered sidecar path by appending `.graphs` to
 /// the complete HDT path.
 pub fn canonical_sidecar_path(hdt_path: &Path) -> PathBuf {
@@ -182,6 +208,8 @@ pub fn write_graph_sidecar(
     let mut layers_file = tempfile::tempfile_in(temp_dir)?;
     let mut directory_file = tempfile::tempfile_in(temp_dir)?;
     let mut positions_file = tempfile::tempfile_in(temp_dir)?;
+    // One fixed scratch set reused by every layer, never one file per graph.
+    let mut scratch = LayerScratch::new(temp_dir)?;
 
     let membership_file = File::open(membership_path)
         .with_context(|| format!("Failed to open {}", membership_path.display()))?;
@@ -215,7 +243,7 @@ pub fn write_graph_sidecar(
                     stats,
                     true,
                     0,
-                    temp_dir,
+                    &mut scratch,
                 )?,
                 ChosenEncoding::SparseChunks { hash_capacity } => encode_chunked_layer(
                     &mut layers_file,
@@ -225,7 +253,7 @@ pub fn write_graph_sidecar(
                     stats,
                     false,
                     hash_capacity,
-                    temp_dir,
+                    &mut scratch,
                 )?,
                 ChosenEncoding::EliasFano => encode_elias_fano_layer(
                     &mut layers_file,
@@ -233,7 +261,7 @@ pub fn write_graph_sidecar(
                     &mut positions_file,
                     triple_count,
                     stats,
-                    temp_dir,
+                    &mut scratch,
                 )?,
             }
         };
@@ -521,11 +549,14 @@ fn encode_chunked_layer(
     stats: LayerStats,
     dense: bool,
     hash_capacity: u64,
-    temp_dir: &Path,
+    scratch: &mut LayerScratch,
 ) -> Result<LayerEntry> {
-    let mut metadata = tempfile::tempfile_in(temp_dir)?;
-    let mut payloads = tempfile::tempfile_in(temp_dir)?;
-    build_chunk_payloads(positions, stats.member_count, &mut metadata, &mut payloads)?;
+    build_chunk_payloads(
+        positions,
+        stats.member_count,
+        &mut scratch.metadata,
+        &mut scratch.payloads,
+    )?;
 
     let universe_chunks = universe_chunk_count(universe);
     let stored_chunks = if dense {
@@ -561,11 +592,12 @@ fn encode_chunked_layer(
         8,
     )?;
 
-    rewind(&mut metadata)?;
-    let mut metadata_reader = BufReader::new(&mut metadata);
+    rewind(&mut scratch.metadata)?;
+    let mut metadata_reader = BufReader::new(&mut scratch.metadata);
     let mut next_meta = ChunkMeta::read_from(&mut metadata_reader)?;
     let mut primary_digest = CRC32C_ALGO.digest();
     let mut rank_before = 0u64;
+    let mut directory_writer = BufWriter::with_capacity(256 * 1024, &mut *layers);
 
     for entry_index in 0..stored_chunks {
         let key = if dense {
@@ -601,9 +633,12 @@ fn encode_chunked_layer(
                 .checked_add(u64::from(meta.cardinality))
                 .context("chunk rank overflow")?;
         }
-        layers.write_all(&bytes)?;
+        directory_writer.write_all(&bytes)?;
         primary_digest.update(&bytes);
     }
+    directory_writer.flush()?;
+    drop(directory_writer);
+    drop(metadata_reader);
     ensure!(
         next_meta.is_none(),
         "unused chunk metadata after directory encoding"
@@ -618,16 +653,22 @@ fn encode_chunked_layer(
         (0, 0)
     } else {
         pad_layer_to_absolute(layers, layers_base, secondary_offset)?;
-        let mut hash = tempfile::tempfile_in(temp_dir)?;
-        build_sparse_hash(&mut hash, &mut metadata, hash_capacity)?;
-        rewind(&mut hash)?;
-        let crc = copy_with_crc(&mut hash, layers)?;
-        (crc, hash_capacity)
+        let table = build_sparse_hash(&mut scratch.metadata, hash_capacity)?;
+        let mut digest = CRC32C_ALGO.digest();
+        let mut hash_writer = BufWriter::with_capacity(256 * 1024, &mut *layers);
+        for slot in &table {
+            let bytes = slot.to_le_bytes();
+            digest.update(&bytes);
+            hash_writer.write_all(&bytes)?;
+        }
+        hash_writer.flush()?;
+        drop(hash_writer);
+        (digest.finalize(), hash_capacity)
     };
 
     pad_layer_to_absolute(layers, layers_base, payload_base)?;
-    rewind(&mut payloads)?;
-    std::io::copy(&mut payloads, layers)?;
+    rewind(&mut scratch.payloads)?;
+    std::io::copy(&mut scratch.payloads, layers)?;
 
     Ok(LayerEntry {
         primary_offset,
@@ -663,6 +704,10 @@ fn build_chunk_payloads(
     payloads.seek(SeekFrom::Start(0))?;
 
     let mut reader = BufReader::new(positions);
+    let mut metadata_writer = BufWriter::with_capacity(256 * 1024, &mut *metadata);
+    let mut payload_writer = BufWriter::with_capacity(1024 * 1024, &mut *payloads);
+    // Tracked explicitly: the buffered writer's position is not the file's.
+    let mut payload_position = 0u64;
     let mut remaining = member_count;
     let mut pending = if remaining > 0 {
         remaining -= 1;
@@ -687,8 +732,9 @@ fn build_chunk_payloads(
             }
         }
 
-        let relative_offset = align_up(payloads.stream_position()?, 8)?;
-        pad_to_absolute(payloads, relative_offset)?;
+        let relative_offset = align_up(payload_position, 8)?;
+        write_zeros(&mut payload_writer, relative_offset - payload_position)?;
+        payload_position = relative_offset;
         let payload = encode_chunk_payload(&offsets)?;
         let meta = ChunkMeta {
             key,
@@ -697,11 +743,18 @@ fn build_chunk_payloads(
             payload_length: u32::try_from(payload.len()).context("chunk payload too large")?,
             payload_crc: crc32c(&payload),
         };
-        payloads.write_all(&payload)?;
-        meta.write_to(metadata)?;
+        payload_writer.write_all(&payload)?;
+        payload_position = payload_position
+            .checked_add(payload.len() as u64)
+            .context("chunk payload offset overflow")?;
+        meta.write_to(&mut metadata_writer)?;
     }
 
     ensure!(remaining == 0, "position scratch ended inconsistently");
+    metadata_writer.flush()?;
+    payload_writer.flush()?;
+    drop(metadata_writer);
+    drop(payload_writer);
     metadata.flush()?;
     payloads.flush()?;
     Ok(())
@@ -733,33 +786,31 @@ fn encode_chunk_payload(offsets: &[u16]) -> Result<Vec<u8>> {
     Ok(payload)
 }
 
-fn build_sparse_hash(hash: &mut File, metadata: &mut File, capacity: u64) -> Result<()> {
+/// Build the sparse access hash table in memory.
+///
+/// The table is `capacity * 8` bytes and `capacity` is bounded by twice the
+/// number of non-empty chunks, so it fits comfortably in the writer's budget
+/// and avoids a seek/read/write syscall pair per probe.
+fn build_sparse_hash(metadata: &mut File, capacity: u64) -> Result<Vec<u64>> {
     ensure!(
         capacity >= 2 && capacity.is_power_of_two(),
         "invalid sparse hash capacity"
     );
-    hash.set_len(capacity.checked_mul(8).context("hash size overflow")?)?;
+    let slots = usize::try_from(capacity).context("sparse hash capacity overflow")?;
+    let mut table = vec![0u64; slots];
     metadata.seek(SeekFrom::Start(0))?;
-    let mut reader = BufReader::new(metadata);
+    let mut reader = BufReader::with_capacity(256 * 1024, metadata);
     let mut entry_index = 0u64;
 
     while let Some(meta) = ChunkMeta::read_from(&mut reader)? {
-        let mut slot = mix64(meta.key) & (capacity - 1);
-        loop {
-            hash.seek(SeekFrom::Start(slot * 8))?;
-            let mut bytes = [0u8; 8];
-            hash.read_exact(&mut bytes)?;
-            if u64::from_le_bytes(bytes) == 0 {
-                hash.seek(SeekFrom::Start(slot * 8))?;
-                hash.write_all(&(entry_index + 1).to_le_bytes())?;
-                break;
-            }
-            slot = (slot + 1) & (capacity - 1);
+        let mut slot = (mix64(meta.key) & (capacity - 1)) as usize;
+        while table[slot] != 0 {
+            slot = (slot + 1) & (slots - 1);
         }
+        table[slot] = entry_index + 1;
         entry_index += 1;
     }
-    hash.flush()?;
-    Ok(())
+    Ok(table)
 }
 
 fn mix64(chunk_key: u64) -> u64 {
@@ -831,44 +882,45 @@ fn encode_elias_fano_layer(
     positions: &mut File,
     universe: u64,
     stats: LayerStats,
-    temp_dir: &Path,
+    scratch: &mut LayerScratch,
 ) -> Result<LayerEntry> {
     let params = EliasFanoParams::new(universe, stats.member_count)?;
-    let mut lower = tempfile::tempfile_in(temp_dir)?;
-    let mut superranks = tempfile::tempfile_in(temp_dir)?;
-    let mut subranks = tempfile::tempfile_in(temp_dir)?;
-    let mut upper = tempfile::tempfile_in(temp_dir)?;
 
-    encode_lower_parts(positions, stats.member_count, params.low_bits, &mut lower)?;
+    encode_lower_parts(
+        positions,
+        stats.member_count,
+        params.low_bits,
+        &mut scratch.lower,
+    )?;
     encode_upper_parts(
         positions,
         stats.member_count,
         params,
-        &mut superranks,
-        &mut subranks,
-        &mut upper,
+        &mut scratch.superranks,
+        &mut scratch.subranks,
+        &mut scratch.upper,
     )?;
     ensure!(
-        lower.metadata()?.len() == params.lower_length,
+        scratch.lower.metadata()?.len() == params.lower_length,
         "lower length mismatch"
     );
     ensure!(
-        superranks.metadata()?.len() == params.superrank_length,
+        scratch.superranks.metadata()?.len() == params.superrank_length,
         "superrank length mismatch"
     );
     ensure!(
-        subranks.metadata()?.len() == params.subrank_length,
+        scratch.subranks.metadata()?.len() == params.subrank_length,
         "subrank length mismatch"
     );
     ensure!(
-        upper.metadata()?.len() == params.upper_length,
+        scratch.upper.metadata()?.len() == params.upper_length,
         "upper length mismatch"
     );
 
-    let lower_crc = file_crc(&mut lower)?;
-    let superrank_crc = file_crc(&mut superranks)?;
-    let subrank_crc = file_crc(&mut subranks)?;
-    let upper_crc = file_crc(&mut upper)?;
+    let lower_crc = file_crc(&mut scratch.lower)?;
+    let superrank_crc = file_crc(&mut scratch.superranks)?;
+    let subrank_crc = file_crc(&mut scratch.subranks)?;
+    let upper_crc = file_crc(&mut scratch.upper)?;
 
     align_layer_file(layers, layers_base, 64)?;
     let primary_offset = layer_absolute_position(layers, layers_base)?;
@@ -927,14 +979,14 @@ fn encode_elias_fano_layer(
 
     if params.lower_length != 0 {
         pad_layer_to_absolute(layers, layers_base, lower_offset)?;
-        copy_file(&mut lower, layers)?;
+        copy_file(&mut scratch.lower, layers)?;
     }
     pad_layer_to_absolute(layers, layers_base, superrank_offset)?;
-    copy_file(&mut superranks, layers)?;
+    copy_file(&mut scratch.superranks, layers)?;
     pad_layer_to_absolute(layers, layers_base, subrank_offset)?;
-    copy_file(&mut subranks, layers)?;
+    copy_file(&mut scratch.subranks, layers)?;
     pad_layer_to_absolute(layers, layers_base, upper_offset)?;
-    copy_file(&mut upper, layers)?;
+    copy_file(&mut scratch.upper, layers)?;
 
     Ok(LayerEntry {
         primary_offset,
@@ -1247,20 +1299,6 @@ fn copy_exact_file<W: Write>(path: &Path, expected_length: u64, writer: &mut W) 
 fn copy_file(source: &mut File, destination: &mut File) -> Result<u64> {
     rewind(source)?;
     Ok(std::io::copy(source, destination)?)
-}
-
-fn copy_with_crc<R: Read, W: Write>(reader: &mut R, writer: &mut W) -> Result<u32> {
-    let mut digest = CRC32C_ALGO.digest();
-    let mut buffer = [0u8; 64 * 1024];
-    loop {
-        let read = reader.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        digest.update(&buffer[..read]);
-        writer.write_all(&buffer[..read])?;
-    }
-    Ok(digest.finalize())
 }
 
 fn file_crc(file: &mut File) -> Result<u32> {

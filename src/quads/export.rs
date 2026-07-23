@@ -52,6 +52,9 @@ pub fn export_dataset_nquads(
     let mut object = Vec::new();
     let mut position = 0u64;
     let mut written = 0u64;
+    // Memberships arrive in position order, so consecutive rows repeat graph
+    // IDs. Caching the last term avoids a PFC block decode per statement.
+    let mut cached_graph: Option<(u64, GraphTerm)> = None;
 
     while let Some((subject_id, predicate_id, object_id)) = scanner.next_triple()? {
         dictionary.subject_term(subject_id, &mut subject)?;
@@ -68,7 +71,10 @@ pub fn export_dataset_nquads(
             writer.write_all(&predicate)?;
             writer.write_all(b">\t")?;
             write_nt_object(&mut writer, &object)?;
-            match sidecar.graph(membership.graph)? {
+            if cached_graph.as_ref().map(|(id, _)| *id) != Some(membership.graph) {
+                cached_graph = Some((membership.graph, sidecar.graph(membership.graph)?));
+            }
+            match &cached_graph.as_ref().unwrap().1 {
                 GraphTerm::DefaultGraph => writer.write_all(b"\t.\n")?,
                 GraphTerm::Named(graph) => {
                     writer.write_all(b"\t")?;

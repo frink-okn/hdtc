@@ -22,11 +22,12 @@ use crate::cli::InputSidecarPolicy;
 use crate::dictionary::DictCounts;
 use crate::hdt::input_adapter::{HdtGraphVocabulary, HdtInputAdapter};
 use crate::quads::{
-    GraphAssignments, GraphMembership, GraphSidecarReader, IdQuad, PositionGraphMembership,
-    QuadUnionIterator, SourceGraphAssignment, canonical_sidecar_path,
+    GraphAssignments, GraphMembership, GraphSidecarReader, IdQuad, QuadUnionIterator,
+    SourceGraphAssignment, canonical_sidecar_path,
 };
 use crate::rdf::{ExtractedQuad, ParseOptions, RdfInput, stream_quads_with_options};
 use crate::sort::{ExternalSorter, Sortable};
+use crate::triples::id_triple::IdTriple;
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, bounded};
 use std::fs::File;
@@ -162,39 +163,6 @@ struct PreparedHdtInput {
     position_memberships: Option<PathBuf>,
     mapped_graphs: Vec<u32>,
     fallback_named_graph: Option<u32>,
-}
-
-fn transpose_source_memberships(
-    reader: &mut GraphSidecarReader,
-    batch_id: usize,
-    temp_dir: &Path,
-    memory_budget: usize,
-) -> Result<PathBuf> {
-    let mut sorter = ExternalSorter::new(temp_dir, memory_budget.max(MIB));
-    let mut buffer = Vec::<PositionGraphMembership>::new();
-    let mut memory_used = 0usize;
-    for graph in 0..=reader.named_graph_count() {
-        for position in reader.layer_iter(graph)? {
-            sorter.push(
-                PositionGraphMembership {
-                    position: position?,
-                    graph,
-                },
-                &mut buffer,
-                &mut memory_used,
-            )?;
-        }
-    }
-
-    let path = temp_dir.join(format!("hdt_graph_positions_{batch_id:06}.pgm.zst"));
-    let file =
-        File::create(&path).with_context(|| format!("Failed to create {}", path.display()))?;
-    let mut encoder = zstd::Encoder::new(BufWriter::new(file), 3)?;
-    for membership in sorter.finish(&mut buffer)? {
-        membership?.write_to(&mut encoder)?;
-    }
-    encoder.finish()?;
-    Ok(path)
 }
 
 impl SharedBatchAssembler {
@@ -884,6 +852,7 @@ fn vocab_writer_stage(
     processed_rx: Receiver<ProcessedBatch>,
     complete_tx: Sender<BatchComplete>,
     temp_dir: PathBuf,
+    include_graphs: bool,
 ) -> Result<()> {
     for batch in processed_rx {
         let vocab_path = partial_vocab_path(&temp_dir, batch.batch_id);
@@ -925,7 +894,7 @@ fn vocab_writer_stage(
         let mut encoder = zstd::Encoder::new(buf_writer, 3)?;
 
         for quad in &batch.quads {
-            quad.write_to(&mut encoder)?;
+            quad.write_to(&mut encoder, include_graphs)?;
         }
 
         encoder.finish()?;
@@ -1128,6 +1097,94 @@ impl GraphMembershipSpool {
     }
 }
 
+/// Stage 6 record collector.
+///
+/// Triples mode never reads the graph column, so it sorts bare 24-byte
+/// `IdTriple` records rather than paying 32 bytes per statement for a field
+/// that is always zero.
+enum StatementSorter {
+    Quads {
+        sorter: ExternalSorter,
+        buffer: Vec<IdQuad>,
+    },
+    Triples {
+        sorter: ExternalSorter,
+        buffer: Vec<IdTriple>,
+    },
+}
+
+impl StatementSorter {
+    fn new(temp_dir: &Path, budget: usize, include_graphs: bool) -> Self {
+        let sorter = ExternalSorter::new(temp_dir, budget);
+        if include_graphs {
+            Self::Quads {
+                sorter,
+                buffer: Vec::new(),
+            }
+        } else {
+            Self::Triples {
+                sorter,
+                buffer: Vec::new(),
+            }
+        }
+    }
+
+    fn push(&mut self, quad: IdQuad, memory_used: &mut usize) -> Result<()> {
+        match self {
+            Self::Quads { sorter, buffer } => sorter.push(quad, buffer, memory_used),
+            Self::Triples { sorter, buffer } => sorter.push(
+                IdTriple {
+                    subject: quad.subject,
+                    predicate: quad.predicate,
+                    object: quad.object,
+                },
+                buffer,
+                memory_used,
+            ),
+        }
+    }
+}
+
+/// Collapse duplicate triples in a sorted stream.
+///
+/// Quads mode gets this from `QuadUnionIterator`'s SPO grouping; triples mode
+/// needs it directly so that the HDT holds each triple exactly once.
+struct DedupSortedTriples<I> {
+    inner: I,
+    previous: Option<IdTriple>,
+}
+
+impl<I> DedupSortedTriples<I> {
+    fn new(inner: I) -> Self {
+        Self {
+            inner,
+            previous: None,
+        }
+    }
+}
+
+impl<I> Iterator for DedupSortedTriples<I>
+where
+    I: Iterator<Item = Result<IdTriple>>,
+{
+    type Item = Result<IdTriple>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            match self.inner.next()? {
+                Ok(triple) => {
+                    if self.previous == Some(triple) {
+                        continue;
+                    }
+                    self.previous = Some(triple);
+                    return Some(Ok(triple));
+                }
+                Err(error) => return Some(Err(error)),
+            }
+        }
+    }
+}
+
 /// Run the complete pipeline: RDF → HDT.
 ///
 /// Accepts both RDF text inputs (parsed via stages 1-3) and HDT inputs
@@ -1224,7 +1281,7 @@ pub fn run_pipeline(
 
     let temp_dir_owned = temp_dir.to_path_buf();
     let writer_handle = std::thread::spawn(move || {
-        if let Err(e) = vocab_writer_stage(processed_rx, complete_tx, temp_dir_owned) {
+        if let Err(e) = vocab_writer_stage(processed_rx, complete_tx, temp_dir_owned, include_graphs) {
             tracing::error!("Vocab writer stage failed: {}", e);
             return Err(e);
         }
@@ -1336,18 +1393,18 @@ pub fn run_pipeline(
                         .checked_div(hdt_inputs.len().max(1))
                         .unwrap_or(memory_plan.stage4_budget_bytes)
                         .max(MIB);
-                    reader.validate_strict(temp_dir, per_input_budget)?;
                     named_graph_count = reader.named_graph_count();
                     anyhow::ensure!(
                         named_graph_count <= u64::from(u32::MAX),
                         "Input sidecar has too many named graphs for local IDs"
                     );
-                    position_memberships = Some(transpose_source_memberships(
-                        &mut reader,
-                        batch_id,
-                        temp_dir,
-                        per_input_budget,
-                    )?);
+                    // The strict sweep already sorts every membership into
+                    // position order; have it emit the Stage 5 join input
+                    // instead of sorting the same records a second time.
+                    let transposed =
+                        temp_dir.join(format!("hdt_graph_positions_{batch_id:06}.pgm.zst"));
+                    reader.validate_strict(temp_dir, per_input_budget, Some(&transposed))?;
+                    position_memberships = Some(transposed);
                     Some(sidecar_path)
                 } else {
                     None
@@ -1486,6 +1543,7 @@ pub fn run_pipeline(
         let mapping_path = temp_dir.join(format!("id_mapping_{:06}.map.zst", batch.batch_id));
         remap_tx
             .send(id_remapper::BatchRemapInfo {
+                include_graphs,
                 batch_id: batch.batch_id,
                 triple_source: id_remapper::TripleSource::LtrFile(batch.triples_path.clone()),
                 mapping_path,
@@ -1497,6 +1555,7 @@ pub fn run_pipeline(
         let mapping_path = temp_dir.join(format!("id_mapping_{:06}.map.zst", prepared.batch_id));
         remap_tx
             .send(id_remapper::BatchRemapInfo {
+                include_graphs,
                 batch_id: prepared.batch_id,
                 triple_source: id_remapper::TripleSource::HdtFile {
                     path: adapter.path.clone(),
@@ -1530,9 +1589,13 @@ pub fn run_pipeline(
     // Stage 6: External sort + BitmapTriples construction
     tracing::info!("Stage 6: Sorting global-ID quad memberships in SPO+G order");
 
-    // Collect quads into external sorter, tracking max IDs for BitmapTriples bit widths
-    let mut sorter = ExternalSorter::new(temp_dir, stage56_budget.sort_budget_bytes);
-    let mut buffer: Vec<IdQuad> = Vec::new();
+    // Collect statements into the external sorter, tracking max IDs for
+    // BitmapTriples bit widths.
+    let mut statements = StatementSorter::new(
+        temp_dir,
+        stage56_budget.sort_budget_bytes,
+        include_graphs,
+    );
     let mut mem_used: usize = 0;
     let mut triple_count = 0u64;
     let mut max_subject: u64 = 0;
@@ -1544,7 +1607,7 @@ pub fn run_pipeline(
             max_subject = max_subject.max(quad.subject);
             max_predicate = max_predicate.max(quad.predicate);
             max_object = max_object.max(quad.object);
-            sorter.push(quad, &mut buffer, &mut mem_used)?;
+            statements.push(quad, &mut mem_used)?;
             triple_count += 1;
 
             if triple_count.is_multiple_of(10_000_000) {
@@ -1579,58 +1642,84 @@ pub fn run_pipeline(
     } else {
         None
     };
-    let sorted_quads = sorter.finish(&mut buffer)?;
-
-    push_stage_metric(
-        &mut stage_metrics,
-        "Stage 6 external sort",
-        sort_start,
-        sort_rss_before,
-        benchmark,
-    );
 
     // Build BitmapTriples — stream each component to temp files (O(1) memory)
-    let bitmap_start = Instant::now();
-    let bitmap_rss_before = if benchmark {
-        process_peak_rss_bytes()
-    } else {
-        None
-    };
-    let (bitmap_triples, membership_path, membership_count) = if include_graphs {
-        let graph_layer_count = merge_result
-            .counts
-            .graphs
-            .checked_add(1)
-            .context("graph layer count overflow")?;
-        let mut membership_spool = GraphMembershipSpool::new(
-            temp_dir,
-            graph_layer_count,
-            stage56_budget.sort_budget_bytes,
-        )?;
+    let bitmap_start;
+    let bitmap_rss_before;
+    let (bitmap_triples, membership_path, membership_count) = match statements {
+        StatementSorter::Quads {
+            mut sorter,
+            mut buffer,
+        } => {
+            let sorted_quads = sorter.finish(&mut buffer)?;
+            push_stage_metric(
+                &mut stage_metrics,
+                "Stage 6 external sort",
+                sort_start,
+                sort_rss_before,
+                benchmark,
+            );
+            bitmap_start = Instant::now();
+            bitmap_rss_before = if benchmark {
+                process_peak_rss_bytes()
+            } else {
+                None
+            };
 
-        let union_triples =
-            QuadUnionIterator::new(sorted_quads, |membership| membership_spool.push(membership));
-        let bitmap = crate::triples::build_bitmap_triples_to_files(
-            union_triples,
-            max_subject,
-            max_predicate,
-            max_object,
-            temp_dir,
-        )?;
+            let graph_layer_count = merge_result
+                .counts
+                .graphs
+                .checked_add(1)
+                .context("graph layer count overflow")?;
+            let mut membership_spool = GraphMembershipSpool::new(
+                temp_dir,
+                graph_layer_count,
+                stage56_budget.sort_budget_bytes,
+            )?;
 
-        let membership_path = temp_dir.join("graph_memberships.gmp.zst");
-        let membership_count = membership_spool.finish(&membership_path)?;
-        (bitmap, Some(membership_path), membership_count)
-    } else {
-        let union_triples = QuadUnionIterator::new(sorted_quads, |_membership| Ok(()));
-        let bitmap = crate::triples::build_bitmap_triples_to_files(
-            union_triples,
-            max_subject,
-            max_predicate,
-            max_object,
-            temp_dir,
-        )?;
-        (bitmap, None, 0)
+            let union_triples = QuadUnionIterator::new(sorted_quads, |membership| {
+                membership_spool.push(membership)
+            });
+            let bitmap = crate::triples::build_bitmap_triples_to_files(
+                union_triples,
+                max_subject,
+                max_predicate,
+                max_object,
+                temp_dir,
+            )?;
+
+            let membership_path = temp_dir.join("graph_memberships.gmp.zst");
+            let membership_count = membership_spool.finish(&membership_path)?;
+            (bitmap, Some(membership_path), membership_count)
+        }
+        StatementSorter::Triples {
+            mut sorter,
+            mut buffer,
+        } => {
+            let sorted_triples = sorter.finish(&mut buffer)?;
+            push_stage_metric(
+                &mut stage_metrics,
+                "Stage 6 external sort",
+                sort_start,
+                sort_rss_before,
+                benchmark,
+            );
+            bitmap_start = Instant::now();
+            bitmap_rss_before = if benchmark {
+                process_peak_rss_bytes()
+            } else {
+                None
+            };
+
+            let bitmap = crate::triples::build_bitmap_triples_to_files(
+                DedupSortedTriples::new(sorted_triples),
+                max_subject,
+                max_predicate,
+                max_object,
+                temp_dir,
+            )?;
+            (bitmap, None, 0)
+        }
     };
 
     push_stage_metric(

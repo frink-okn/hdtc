@@ -13,7 +13,7 @@ use oxrdf::NamedNode;
 use oxrdfio::{RdfFormat, RdfParser};
 use sha2::{Digest, Sha256};
 use std::fs::File;
-use std::io::{BufReader, Cursor, Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 const HEADER_SIZE: u64 = 256;
@@ -170,6 +170,8 @@ pub struct GraphSidecarReader {
     header: Header,
     dictionary: GraphDictionary,
     hdt_data_offset: u64,
+    /// Last Elias-Fano header parsed, keyed by its layer primary offset.
+    ef_header_cache: Option<(u64, EfHeader)>,
 }
 
 impl GraphSidecarReader {
@@ -199,6 +201,7 @@ impl GraphSidecarReader {
             header,
             dictionary,
             hdt_data_offset,
+            ef_header_cache: None,
         })
     }
 
@@ -352,7 +355,18 @@ impl GraphSidecarReader {
 
     /// Perform full identity, checksum, encoding, dictionary, and exhaustive
     /// membership validation with an externally sorted position sweep.
-    pub fn validate_strict(&mut self, temp_dir: &Path, memory_limit: usize) -> Result<()> {
+    ///
+    /// The sweep already sorts every membership into `(position, graph)` order.
+    /// When `transposed_output` is given, that sorted stream is also written
+    /// there as a zstd-compressed `PositionGraphMembership` file, so a caller
+    /// that needs the transposition (a graph-preserving merge) does not have to
+    /// repeat the sort.
+    pub fn validate_strict(
+        &mut self,
+        temp_dir: &Path,
+        memory_limit: usize,
+        transposed_output: Option<&Path>,
+    ) -> Result<()> {
         self.validate_identity_digest()?;
         ensure!(
             range_crc(
@@ -502,11 +516,24 @@ impl GraphSidecarReader {
             );
         }
 
+        let mut transposed = transposed_output
+            .map(|path| -> Result<_> {
+                let file = File::create(path)
+                    .with_context(|| format!("Failed to create {}", path.display()))?;
+                Ok(zstd::Encoder::new(BufWriter::new(file), 3)?)
+            })
+            .transpose()?;
+
         let mut expected_position = 0u64;
         let mut current_position = None;
         let mut graph_count_at_position = 0u64;
         for item in sorter.finish(&mut buffer)? {
             let item = item?;
+            if let Some(encoder) = transposed.as_mut() {
+                // Same field order and 16-byte layout as
+                // `PositionGraphMembership`, which is what consumers read back.
+                item.write_to(encoder)?;
+            }
             if current_position != Some(item.position) {
                 if let Some(previous) = current_position {
                     ensure!(
@@ -537,6 +564,9 @@ impl GraphSidecarReader {
             expected_position == self.header.triple_count,
             "non-exhaustive graph memberships"
         );
+        if let Some(encoder) = transposed {
+            encoder.finish()?.flush()?;
+        }
         Ok(())
     }
 
@@ -611,7 +641,11 @@ impl GraphSidecarReader {
         match layer.encoding {
             ENCODING_DENSE | ENCODING_SPARSE => {
                 ensure!(
-                    layer.primary_length == layer.item_count_a * CHUNK_ENTRY_SIZE,
+                    layer.primary_length
+                        == layer
+                            .item_count_a
+                            .checked_mul(CHUNK_ENTRY_SIZE)
+                            .context("chunk directory length overflow")?,
                     "chunk directory length mismatch"
                 );
                 if layer.encoding == ENCODING_DENSE {
@@ -642,7 +676,11 @@ impl GraphSidecarReader {
                         "invalid sparse hash capacity"
                     );
                     ensure!(
-                        layer.parameter >= layer.item_count_a * 2,
+                        layer.parameter
+                            >= layer
+                                .item_count_a
+                                .checked_mul(2)
+                                .context("sparse chunk count overflow")?,
                         "sparse hash load factor too high"
                     );
                     ensure!(
@@ -650,7 +688,11 @@ impl GraphSidecarReader {
                         "unaligned sparse hash"
                     );
                     ensure!(
-                        layer.secondary_length == layer.parameter * 8,
+                        layer.secondary_length
+                            == layer
+                                .parameter
+                                .checked_mul(8)
+                                .context("sparse hash length overflow")?,
                         "sparse hash length mismatch"
                     );
                     self.ensure_layer_range(layer.secondary_offset, layer.secondary_length)?;
@@ -1232,7 +1274,7 @@ impl GraphSidecarReader {
     fn chunked_rank(&mut self, layer: LayerEntry, position: u64) -> Result<u64> {
         let key = position >> CHUNK_SHIFT;
         let offset = (position & 0xffff) as u16;
-        let (_, entry) = if layer.encoding == ENCODING_DENSE {
+        let (insertion, entry) = if layer.encoding == ENCODING_DENSE {
             let entry = self.read_chunk(layer, key)?;
             (key, Some(entry))
         } else {
@@ -1244,13 +1286,10 @@ impl GraphSidecarReader {
             } else {
                 Ok(entry.rank_before + self.container_rank(entry, offset)?)
             }
+        } else if insertion == layer.item_count_a {
+            Ok(layer.member_count)
         } else {
-            let (insertion, _) = self.find_chunk_sorted(layer, key)?;
-            if insertion == layer.item_count_a {
-                Ok(layer.member_count)
-            } else {
-                Ok(self.read_chunk(layer, insertion)?.rank_before)
-            }
+            Ok(self.read_chunk(layer, insertion)?.rank_before)
         }
     }
 
@@ -1272,40 +1311,18 @@ impl GraphSidecarReader {
         Ok((entry.key << CHUNK_SHIFT) | u64::from(local))
     }
 
+    /// Read a layer's Elias-Fano header, reusing the last one parsed. The
+    /// header is immutable file data, so a single-slot cache removes the
+    /// repeated 160-byte read and CRC32C from every rank/select/access.
     fn ef_header(&mut self, layer: LayerEntry) -> Result<EfHeader> {
-        ensure!(
-            layer.primary_length == 160,
-            "invalid Elias-Fano header length"
-        );
-        let mut bytes = [0u8; 160];
-        read_exact_at(&mut self.file, layer.primary_offset, &mut bytes)?;
-        ensure!(&bytes[0..8] == b"$HDTEF01", "invalid Elias-Fano magic");
-        ensure!(get_u32(&bytes, 8) == 160, "invalid Elias-Fano header size");
-        ensure!(
-            crc32c(&bytes[..156]) == get_u32(&bytes, 156),
-            "Elias-Fano header CRC mismatch"
-        );
-        Ok(EfHeader {
-            low_bits: get_u32(&bytes, 12),
-            universe: get_u64(&bytes, 16),
-            members: get_u64(&bytes, 24),
-            upper_bits: get_u64(&bytes, 32),
-            high_buckets: get_u64(&bytes, 40),
-            lower_offset: get_u64(&bytes, 48),
-            lower_length: get_u64(&bytes, 56),
-            superrank_offset: get_u64(&bytes, 64),
-            superrank_length: get_u64(&bytes, 72),
-            subrank_offset: get_u64(&bytes, 80),
-            subrank_length: get_u64(&bytes, 88),
-            upper_offset: get_u64(&bytes, 96),
-            upper_length: get_u64(&bytes, 104),
-            superrank_count: get_u64(&bytes, 112),
-            subrank_count: get_u64(&bytes, 120),
-            lower_crc: get_u32(&bytes, 128),
-            superrank_crc: get_u32(&bytes, 132),
-            subrank_crc: get_u32(&bytes, 136),
-            upper_crc: get_u32(&bytes, 140),
-        })
+        if let Some((offset, header)) = self.ef_header_cache
+            && offset == layer.primary_offset
+        {
+            return Ok(header);
+        }
+        let header = read_ef_header_from(&mut self.file, layer)?;
+        self.ef_header_cache = Some((layer.primary_offset, header));
+        Ok(header)
     }
 
     fn ef_lower(&mut self, header: EfHeader, index: u64) -> Result<u64> {
@@ -1370,6 +1387,10 @@ impl GraphSidecarReader {
                 .sum::<u64>())
     }
 
+    /// Directory-guided select over the upper bitmap: binary-search the
+    /// superblock end ranks, then the containing superblock's eight
+    /// subblocks, then at most eight 64-bit words. Reads stay bounded
+    /// instead of scaling with the bitmap length.
     fn ef_select_bit(&mut self, header: EfHeader, ordinal: u64, one: bool) -> Result<u64> {
         let total = if one {
             header.members
@@ -1377,19 +1398,85 @@ impl GraphSidecarReader {
             header.upper_bits - header.members
         };
         ensure!(ordinal < total, "Elias-Fano select ordinal out of range");
+
+        // Rank of the requested bit value in `[0, min(bit, upper_bits))`,
+        // given the number of one bits in that same prefix.
+        let upper_bits = header.upper_bits;
+        let value_rank = move |ones: u64, bit: u64| -> u64 {
+            if one { ones } else { bit.min(upper_bits) - ones }
+        };
+
+        // Last 4096-bit superblock whose start rank is at or below `ordinal`.
+        let superblocks = header
+            .superrank_count
+            .checked_sub(1)
+            .filter(|count| *count > 0)
+            .context("Elias-Fano superrank directory is empty")?;
         let mut low = 0u64;
-        let mut high = header.upper_bits;
+        let mut high = superblocks - 1;
         while low < high {
-            let mid = low + (high - low) / 2;
-            let ones = self.ef_rank1(header, mid + 1)?;
-            let rank = if one { ones } else { mid + 1 - ones };
-            if rank > ordinal {
-                high = mid;
+            let mid = low + (high - low).div_ceil(2);
+            let ones = read_u64_at(&mut self.file, header.superrank_offset + mid * 8)?;
+            if value_rank(ones, mid * 4096) <= ordinal {
+                low = mid;
             } else {
-                low = mid + 1;
+                high = mid - 1;
             }
         }
-        Ok(low)
+        let superblock = low;
+        let superblock_ones =
+            read_u64_at(&mut self.file, header.superrank_offset + superblock * 8)?;
+
+        // Last 512-bit subblock of that superblock whose start rank fits.
+        let mut low = superblock * 8;
+        let mut high = (low + 7).min(header.subrank_count - 1);
+        while low < high {
+            let mid = low + (high - low).div_ceil(2);
+            let relative = u64::from(read_u16_at(&mut self.file, header.subrank_offset + mid * 2)?);
+            if value_rank(superblock_ones + relative, mid * 512) <= ordinal {
+                low = mid;
+            } else {
+                high = mid - 1;
+            }
+        }
+        let subblock = low;
+        let relative =
+            u64::from(read_u16_at(&mut self.file, header.subrank_offset + subblock * 2)?);
+        let mut rank = value_rank(superblock_ones + relative, subblock * 512);
+
+        // At most eight words inside the subblock.
+        let start = subblock * 512;
+        for word_index in 0..8u64 {
+            let bit_base = start + word_index * 64;
+            if bit_base >= header.upper_bits {
+                break;
+            }
+            let byte_offset = bit_base / 8;
+            let bytes_to_read = (header.upper_length - byte_offset).min(8) as usize;
+            let mut bytes = [0u8; 8];
+            read_exact_at(
+                &mut self.file,
+                header.upper_offset + byte_offset,
+                &mut bytes[..bytes_to_read],
+            )?;
+            let mut word = u64::from_le_bytes(bytes);
+            if !one {
+                word = !word;
+            }
+            // Bits at or beyond `upper_bits` are not part of the bitmap and
+            // must not be selected, especially after inverting for select0.
+            let valid = (header.upper_bits - bit_base).min(64);
+            if valid < 64 {
+                word &= (1u64 << valid) - 1;
+            }
+            let ones = u64::from(word.count_ones());
+            if rank + ones > ordinal {
+                let bit = select_in_word(word, ordinal - rank)?;
+                return Ok(bit_base + u64::from(bit));
+            }
+            rank += ones;
+        }
+        bail!("Elias-Fano rank directory disagrees with the upper bitmap")
     }
 
     fn ef_select(&mut self, layer: LayerEntry, ordinal: u64) -> Result<u64> {
@@ -1422,14 +1509,14 @@ impl GraphSidecarReader {
         if high >= header.high_buckets {
             return Ok(header.members);
         }
+        // Exactly `j` zeros precede the zero-based `j`th zero bit, so
+        // `rank1(select0(j)) == select0(j) - j` and no rank probe is needed.
         let start = if high == 0 {
             0
         } else {
-            let zero = self.ef_select_bit(header, high - 1, false)?;
-            self.ef_rank1(header, zero)?
+            self.ef_select_bit(header, high - 1, false)? - (high - 1)
         };
-        let zero = self.ef_select_bit(header, high, false)?;
-        let end = self.ef_rank1(header, zero)?;
+        let end = self.ef_select_bit(header, high, false)? - high;
         let mut left = start;
         let mut right = end;
         while left < right {
@@ -2160,6 +2247,10 @@ fn read_ef_header_from(file: &mut File, layer: LayerEntry) -> Result<EfHeader> {
         crc32c(&bytes[..156]) == get_u32(&bytes, 156),
         "Elias-Fano header CRC mismatch"
     );
+    ensure!(
+        bytes[144..156].iter().all(|byte| *byte == 0),
+        "nonzero Elias-Fano header reserved bytes"
+    );
     Ok(EfHeader {
         low_bits: get_u32(&bytes, 12),
         universe: get_u64(&bytes, 16),
@@ -2353,7 +2444,116 @@ mod tests {
         assert_eq!(reader.next_member(0, 4096)?, None);
         assert_eq!(reader.graphs_of(4096)?, vec![1, 2]);
         assert_eq!(reader.graphs_of(5000)?, vec![2]);
-        reader.validate_strict(temp.path(), 1024 * 1024)?;
+        reader.validate_strict(temp.path(), 1024 * 1024, None)?;
+        Ok(())
+    }
+
+    /// Exercise the Elias-Fano and sparse-chunk layer encodings, which the
+    /// dense fixture above never selects.
+    ///
+    /// `choose_encoding` only reaches Elias-Fano below 1/64 density, and only
+    /// reaches sparse chunks when the non-empty chunks plus access hash are
+    /// smaller than a full dense directory, so both layers are shaped to land
+    /// on those branches.
+    #[test]
+    fn reader_operations_cover_elias_fano_and_sparse_layers() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let hdt = temp.path().join("data.hdt");
+        let sidecar = canonical_sidecar_path(&hdt);
+        let memberships = temp.path().join("memberships.zst");
+        const N: u64 = 1_000_000;
+        fake_hdt(&hdt, N)?;
+
+        // Scattered across several 65,536-position chunks and both sides of a
+        // chunk boundary, including the last position in the universe.
+        let sparse_positions: Vec<u64> = vec![
+            0,
+            1,
+            65_535,
+            65_536,
+            65_537,
+            131_072,
+            200_000,
+            499_999,
+            500_000,
+            999_999,
+        ];
+        // One dense run inside a single chunk: sparse chunk table + bitmap
+        // container, far above the Elias-Fano density threshold.
+        let clustered: Vec<u64> = (0..20_000u64).collect();
+
+        let mut graph_dictionary = StreamingPfcEncoder::new(temp.path(), "ef-graphs")?;
+        graph_dictionary.push("urn:ef")?;
+        graph_dictionary.push("urn:sparse")?;
+        let graph_dictionary = graph_dictionary.finish()?;
+
+        let membership_file = File::create(&memberships)?;
+        let mut encoder = zstd::Encoder::new(BufWriter::new(membership_file), 1)?;
+        for position in 0..N {
+            GraphMembership { graph: 0, position }.write_to(&mut encoder)?;
+        }
+        for &position in &sparse_positions {
+            GraphMembership { graph: 1, position }.write_to(&mut encoder)?;
+        }
+        for &position in &clustered {
+            GraphMembership { graph: 2, position }.write_to(&mut encoder)?;
+        }
+        encoder.finish()?;
+
+        let expected_memberships = N + sparse_positions.len() as u64 + clustered.len() as u64;
+        write_graph_sidecar(
+            &sidecar,
+            &hdt,
+            &graph_dictionary.path,
+            graph_dictionary.size,
+            2,
+            N,
+            expected_memberships,
+            &memberships,
+            false,
+            temp.path(),
+        )?;
+
+        let mut reader = GraphSidecarReader::open_for_hdt(&hdt)?;
+        assert_eq!(reader.layer_entry(1)?.encoding, ENCODING_ELIAS_FANO);
+        assert_eq!(reader.layer_entry(2)?.encoding, ENCODING_SPARSE);
+        assert_eq!(reader.layer_entry(0)?.encoding, ENCODING_DENSE);
+
+        // Elias-Fano: iteration, select, rank and access must agree.
+        let iterated = reader.layer_iter(1)?.collect::<Result<Vec<_>>>()?;
+        assert_eq!(iterated, sparse_positions);
+        assert_eq!(reader.count(1)?, sparse_positions.len() as u64);
+        for (ordinal, &position) in sparse_positions.iter().enumerate() {
+            assert_eq!(reader.select(1, ordinal as u64)?, position);
+            assert_eq!(reader.rank(1, position)?, ordinal as u64);
+            assert_eq!(reader.rank(1, position + 1)?, ordinal as u64 + 1);
+            assert!(reader.access(1, position)?);
+            assert_eq!(reader.next_member(1, position)?, Some(position));
+        }
+        assert_eq!(reader.rank(1, 0)?, 0);
+        assert_eq!(reader.rank(1, N)?, sparse_positions.len() as u64);
+        for probe in [2u64, 65_538, 300_000, 999_998] {
+            assert!(!reader.access(1, probe)?, "unexpected member at {probe}");
+        }
+        assert_eq!(reader.next_member(1, 2)?, Some(65_535));
+        assert_eq!(reader.next_member(1, 500_001)?, Some(999_999));
+        assert!(reader.select(1, sparse_positions.len() as u64).is_err());
+
+        // Sparse chunk table: access probes go through the on-disk hash.
+        assert_eq!(reader.count(2)?, clustered.len() as u64);
+        assert!(reader.access(2, 0)?);
+        assert!(reader.access(2, 19_999)?);
+        assert!(!reader.access(2, 20_000)?);
+        assert!(!reader.access(2, 65_536)?);
+        assert_eq!(reader.rank(2, 20_000)?, 20_000);
+        assert_eq!(reader.select(2, 19_999)?, 19_999);
+        assert_eq!(reader.layer_iter(2)?.collect::<Result<Vec<_>>>()?, clustered);
+
+        assert_eq!(reader.graphs_of(0)?, vec![0, 1, 2]);
+        assert_eq!(reader.graphs_of(65_535)?, vec![0, 1]);
+        assert_eq!(reader.graphs_of(300_000)?, vec![0]);
+
+        reader.validate_strict(temp.path(), 4 * 1024 * 1024, None)?;
         Ok(())
     }
 }

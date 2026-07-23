@@ -130,7 +130,10 @@ impl IdMapping {
 // Sharded ID mapping writer
 // ---------------------------------------------------------------------------
 
-const NUM_MAPPING_SHARDS: usize = 32;
+// `finish()` loads one shard fully into memory, so the shard count sets the
+// peak RAM of the merge and the size of its per-shard batch scan. Keep it high;
+// `raise_fd_limit()` gives the process ample headroom for 3 * 128 shard files.
+const NUM_MAPPING_SHARDS: usize = 128;
 
 /// Shard entry: (batch_id, local_id, global_id) packed as 16 bytes.
 #[derive(Clone, Copy)]

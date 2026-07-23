@@ -34,6 +34,8 @@ pub enum TripleSource {
 
 /// Information about a batch for remapping.
 pub struct BatchRemapInfo {
+    /// Whether local-ID files carry the named-graph column.
+    pub include_graphs: bool,
     pub batch_id: usize,
     pub triple_source: TripleSource,
     pub mapping_path: PathBuf,
@@ -123,7 +125,7 @@ fn remap_batch(
             let mut decoder = zstd::Decoder::with_buffer(buf_reader)?;
 
             loop {
-                match LocalIdQuad::read_from(&mut decoder) {
+                match LocalIdQuad::read_from(&mut decoder, batch_info.include_graphs) {
                     Ok(Some(t)) => remap_and_send(t.subject, t.predicate, t.object, t.graph)?,
                     Ok(None) => break,
                     Err(e) => {
@@ -350,7 +352,7 @@ mod tests {
         let mut encoder = zstd::Encoder::new(writer, 3)?;
 
         for triple in triples {
-            triple.write_to(&mut encoder)?;
+            triple.write_to(&mut encoder, true)?;
         }
 
         encoder.finish()?;
@@ -389,6 +391,7 @@ mod tests {
         let (tx, rx) = crossbeam_channel::bounded(10);
 
         let batch_info = BatchRemapInfo {
+            include_graphs: true,
             batch_id: 0,
             triple_source: TripleSource::LtrFile(triples_path),
             mapping_path,
@@ -456,6 +459,7 @@ mod tests {
         let (tx, rx) = crossbeam_channel::bounded(10);
 
         let batch_info = BatchRemapInfo {
+            include_graphs: true,
             batch_id: 0,
             triple_source: TripleSource::LtrFile(triples_path),
             mapping_path,
@@ -528,6 +532,7 @@ mod tests {
         let (tx, _rx) = crossbeam_channel::bounded(10);
 
         let batch_info = BatchRemapInfo {
+            include_graphs: true,
             batch_id: 0,
             triple_source: TripleSource::LtrFile(triples_path),
             mapping_path,
@@ -572,6 +577,7 @@ mod tests {
         let (tx, _rx) = crossbeam_channel::bounded(10);
 
         let batch_info = BatchRemapInfo {
+            include_graphs: true,
             batch_id: 0,
             triple_source: TripleSource::LtrFile(triples_path),
             mapping_path,

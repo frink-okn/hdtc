@@ -257,6 +257,13 @@ fn create_hdt(args: cli::CreateArgs, benchmark: bool) -> Result<()> {
         None
     };
 
+    hdt_temp
+        .persist(&args.output)
+        .with_context(|| format!("Failed to publish HDT file {}", args.output.display()))?;
+
+    // Drop any stale sidecar only once the new HDT is published. Removing it
+    // earlier would strip the sidecar from the previous HDT if publication
+    // then failed, destroying data this run was not asked to replace.
     if !include_graphs && canonical_graphs_path.exists() {
         std::fs::remove_file(&canonical_graphs_path).with_context(|| {
             format!(
@@ -270,9 +277,6 @@ fn create_hdt(args: cli::CreateArgs, benchmark: bool) -> Result<()> {
         );
     }
 
-    hdt_temp
-        .persist(&args.output)
-        .with_context(|| format!("Failed to publish HDT file {}", args.output.display()))?;
     if let Some(sidecar_temp) = sidecar_temp {
         sidecar_temp
             .persist(&canonical_graphs_path)
@@ -586,7 +590,7 @@ fn validate_hdt_file(args: cli::ValidateArgs, benchmark: bool) -> Result<()> {
                     None => make_default_temp_dir()?,
                 };
                 let mut sidecar = quads::GraphSidecarReader::open(&sidecar_path, &args.hdt_file)?;
-                sidecar.validate_strict(&temp_dir, args.memory_limit.as_bytes())?;
+                sidecar.validate_strict(&temp_dir, args.memory_limit.as_bytes(), None)?;
             }
             if benchmark {
                 tracing::info!(

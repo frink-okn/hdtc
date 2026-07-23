@@ -44,19 +44,31 @@ impl LocalIdQuad {
     /// Write this quad membership to a writer in binary format.
     ///
     /// Graph zero is the default graph; named local ID `g` is stored as `g + 1`.
-    pub fn write_to<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+    /// The graph column is omitted entirely when `include_graphs` is false, so
+    /// triples mode keeps the historical 12-byte record.
+    pub fn write_to<W: std::io::Write>(
+        &self,
+        writer: &mut W,
+        include_graphs: bool,
+    ) -> std::io::Result<()> {
         writer.write_all(&self.subject.to_le_bytes())?;
         writer.write_all(&self.predicate.to_le_bytes())?;
         writer.write_all(&self.object.to_le_bytes())?;
-        let encoded_graph = self
-            .graph
-            .map_or(0, |id| id.checked_add(1).expect("graph local ID overflow"));
-        writer.write_all(&encoded_graph.to_le_bytes())?;
+        if include_graphs {
+            let encoded_graph = self
+                .graph
+                .map_or(0, |id| id.checked_add(1).expect("graph local ID overflow"));
+            writer.write_all(&encoded_graph.to_le_bytes())?;
+        }
         Ok(())
     }
 
-    /// Read a quad membership from a reader.
-    pub fn read_from<R: std::io::Read>(reader: &mut R) -> std::io::Result<Option<Self>> {
+    /// Read a quad membership from a reader. `include_graphs` must match the
+    /// value used to write the file.
+    pub fn read_from<R: std::io::Read>(
+        reader: &mut R,
+        include_graphs: bool,
+    ) -> std::io::Result<Option<Self>> {
         let mut subject_bytes = [0u8; 4];
         if reader.read_exact(&mut subject_bytes).is_err() {
             return Ok(None); // End of file
@@ -71,15 +83,19 @@ impl LocalIdQuad {
         reader.read_exact(&mut object_bytes)?;
         let object = u32::from_le_bytes(object_bytes);
 
-        let mut graph_bytes = [0u8; 4];
-        reader.read_exact(&mut graph_bytes)?;
-        let encoded_graph = u32::from_le_bytes(graph_bytes);
+        let graph = if include_graphs {
+            let mut graph_bytes = [0u8; 4];
+            reader.read_exact(&mut graph_bytes)?;
+            u32::from_le_bytes(graph_bytes).checked_sub(1)
+        } else {
+            None
+        };
 
         Ok(Some(LocalIdQuad {
             subject,
             predicate,
             object,
-            graph: encoded_graph.checked_sub(1),
+            graph,
         }))
     }
 }

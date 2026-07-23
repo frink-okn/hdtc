@@ -114,6 +114,20 @@ pub fn search_dataset_streaming(
             limit,
             offset,
         )?
+    } else if resolved.subject.is_some() {
+        // A bound subject stops the SPO scan early, so probing `graphs_of`
+        // per matching triple beats transposing every membership.
+        scan_wildcard_graph_direct(
+            &mut sidecar,
+            &offsets,
+            hdt_path,
+            &mut dictionary,
+            resolved,
+            &mut writer,
+            count_only,
+            limit,
+            offset,
+        )?
     } else {
         let owned_temp = if temp_dir.is_none() {
             Some(
@@ -324,6 +338,81 @@ where
             "Graph sidecar contains membership at out-of-range position {}",
             membership.position
         );
+    }
+    scanner.finish()?;
+    Ok(count)
+}
+
+/// Wildcard-graph scan for a pattern with a bound subject.
+///
+/// The SPO scan terminates at the first subject past the bound one, so the
+/// membership set of each matching triple can be read directly from the
+/// sidecar instead of externally sorting every membership in the file.
+#[allow(clippy::too_many_arguments)]
+fn scan_wildcard_graph_direct(
+    sidecar: &mut GraphSidecarReader,
+    offsets: &HdtSectionOffsets,
+    hdt_path: &Path,
+    dictionary: &mut DictionaryResolver,
+    pattern: ResolvedTriplePattern,
+    writer: &mut OutputWriter,
+    count_only: bool,
+    limit: Option<u64>,
+    offset: Option<u64>,
+) -> Result<u64> {
+    let mut scanner = BitmapTriplesScanner::new(offsets, hdt_path)
+        .context("Failed to create BitmapTriples scanner")?;
+    let mut position = 0u64;
+    let mut remaining_offset = offset.unwrap_or(0);
+    let mut count = 0u64;
+    let mut subject_buf = Vec::new();
+    let mut predicate_buf = Vec::new();
+    let mut object_buf = Vec::new();
+    let mut cached_graph: Option<(u64, GraphTerm)> = None;
+
+    while let Some((subject, predicate, object)) = scanner.next_triple()? {
+        if pattern.subject.is_some_and(|expected| subject > expected) {
+            return Ok(count);
+        }
+        if pattern.matches(subject, predicate, object) {
+            let graphs = sidecar.graphs_of(position)?;
+            ensure!(
+                !graphs.is_empty(),
+                "graph sidecar is not exhaustive at position {position}"
+            );
+            let mut triple_resolved = false;
+            for graph_id in graphs {
+                if remaining_offset > 0 {
+                    remaining_offset -= 1;
+                    continue;
+                }
+                count = count
+                    .checked_add(1)
+                    .context("Search result count overflow")?;
+                if !count_only {
+                    if !triple_resolved {
+                        dictionary.subject_term(subject, &mut subject_buf)?;
+                        dictionary.predicate_term(predicate, &mut predicate_buf)?;
+                        dictionary.object_term(object, &mut object_buf)?;
+                        triple_resolved = true;
+                    }
+                    if cached_graph.as_ref().map(|(id, _)| *id) != Some(graph_id) {
+                        cached_graph = Some((graph_id, sidecar.graph(graph_id)?));
+                    }
+                    write_statement(
+                        writer,
+                        &subject_buf,
+                        &predicate_buf,
+                        &object_buf,
+                        &cached_graph.as_ref().unwrap().1,
+                    )?;
+                }
+                if limit.is_some_and(|limit| count >= limit) {
+                    return Ok(count);
+                }
+            }
+        }
+        position += 1;
     }
     scanner.finish()?;
     Ok(count)
