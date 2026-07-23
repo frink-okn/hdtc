@@ -11,6 +11,7 @@ mod triples;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing_subscriber::EnvFilter;
 
@@ -51,6 +52,88 @@ fn make_default_temp_dir() -> Result<std::path::PathBuf> {
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("Failed to create temp dir {}", dir.display()))?;
     Ok(dir)
+}
+
+/// An existing graph sidecar moved out of its canonical name while a new HDT
+/// is published. Keeping the backup in a sibling directory makes both moves
+/// atomic on supported filesystems.
+struct RetiredSidecar {
+    original_path: PathBuf,
+    backup_path: PathBuf,
+    _quarantine: tempfile::TempDir,
+}
+
+impl RetiredSidecar {
+    fn restore(&self) -> Result<()> {
+        match std::fs::symlink_metadata(&self.original_path) {
+            Ok(_) => anyhow::bail!(
+                "Cannot restore graph sidecar {} because another entry now exists there",
+                self.original_path.display()
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "Failed to inspect graph sidecar path {} before rollback",
+                        self.original_path.display()
+                    )
+                });
+            }
+        }
+        std::fs::rename(&self.backup_path, &self.original_path).with_context(|| {
+            format!(
+                "Failed to restore graph sidecar {}",
+                self.original_path.display()
+            )
+        })
+    }
+}
+
+fn retire_existing_sidecar(
+    sidecar_path: &Path,
+    output_parent: &Path,
+) -> Result<Option<RetiredSidecar>> {
+    let metadata = match std::fs::symlink_metadata(sidecar_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "Failed to inspect existing graph sidecar {}",
+                    sidecar_path.display()
+                )
+            });
+        }
+    };
+    let file_type = metadata.file_type();
+    anyhow::ensure!(
+        file_type.is_file() || file_type.is_symlink(),
+        "Refusing to replace graph sidecar path {} because it is not a file",
+        sidecar_path.display()
+    );
+
+    let quarantine = tempfile::Builder::new()
+        .prefix(".hdtc-retired-graphs-")
+        .tempdir_in(output_parent)
+        .with_context(|| {
+            format!(
+                "Failed to create sidecar quarantine in {}",
+                output_parent.display()
+            )
+        })?;
+    let backup_path = quarantine.path().join("previous.hdt.graphs");
+    std::fs::rename(sidecar_path, &backup_path).with_context(|| {
+        format!(
+            "Failed to retire existing graph sidecar {}",
+            sidecar_path.display()
+        )
+    })?;
+
+    Ok(Some(RetiredSidecar {
+        original_path: sidecar_path.to_path_buf(),
+        backup_path,
+        _quarantine: quarantine,
+    }))
 }
 
 fn main() -> Result<()> {
@@ -257,20 +340,24 @@ fn create_hdt(args: cli::CreateArgs, benchmark: bool) -> Result<()> {
         None
     };
 
-    hdt_temp
-        .persist(&args.output)
-        .with_context(|| format!("Failed to publish HDT file {}", args.output.display()))?;
+    // Move the old sidecar out of its canonical name before replacing the HDT.
+    // A crash can therefore leave a detectably missing sidecar, but never a
+    // new HDT next to stale graph data.
+    let retired_sidecar = retire_existing_sidecar(&canonical_graphs_path, output_parent)?;
+    if let Err(error) = hdt_temp.persist(&args.output) {
+        let publish_error = anyhow::Error::new(error.error)
+            .context(format!("Failed to publish HDT file {}", args.output.display()));
+        if let Some(retired) = retired_sidecar.as_ref()
+            && let Err(restore_error) = retired.restore()
+        {
+            return Err(anyhow::anyhow!(
+                "{publish_error:#}; additionally failed to roll back the graph sidecar: {restore_error:#}"
+            ));
+        }
+        return Err(publish_error);
+    }
 
-    // Drop any stale sidecar only once the new HDT is published. Removing it
-    // earlier would strip the sidecar from the previous HDT if publication
-    // then failed, destroying data this run was not asked to replace.
-    if !include_graphs && canonical_graphs_path.exists() {
-        std::fs::remove_file(&canonical_graphs_path).with_context(|| {
-            format!(
-                "Failed to remove stale graph sidecar {}",
-                canonical_graphs_path.display()
-            )
-        })?;
+    if !include_graphs && retired_sidecar.is_some() {
         tracing::info!(
             "Removed stale graph sidecar: {}",
             canonical_graphs_path.display()
@@ -605,5 +692,38 @@ fn validate_hdt_file(args: cli::ValidateArgs, benchmark: bool) -> Result<()> {
             tracing::error!("Validation failed: {}", e);
             Err(e)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retired_sidecar_can_be_restored() {
+        let dir = tempfile::tempdir().unwrap();
+        let sidecar = dir.path().join("dataset.hdt.graphs");
+        std::fs::write(&sidecar, b"old sidecar").unwrap();
+
+        let retired = retire_existing_sidecar(&sidecar, dir.path())
+            .unwrap()
+            .unwrap();
+        assert!(!sidecar.exists());
+        assert_eq!(std::fs::read(&retired.backup_path).unwrap(), b"old sidecar");
+
+        retired.restore().unwrap();
+        drop(retired);
+        assert_eq!(std::fs::read(sidecar).unwrap(), b"old sidecar");
+    }
+
+    #[test]
+    fn sidecar_directory_is_not_retired() {
+        let dir = tempfile::tempdir().unwrap();
+        let sidecar = dir.path().join("dataset.hdt.graphs");
+        std::fs::create_dir(&sidecar).unwrap();
+
+        let result = retire_existing_sidecar(&sidecar, dir.path());
+        assert!(result.is_err());
+        assert!(sidecar.is_dir());
     }
 }

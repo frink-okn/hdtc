@@ -18,6 +18,41 @@ struct ResolvedTriplePattern {
     object: Option<u64>,
 }
 
+const MAX_DIRECT_GRAPH_LAYER_PROBES: u64 = 1_000_000;
+
+fn should_probe_wildcard_graph_direct(
+    pattern: ResolvedTriplePattern,
+    named_graph_count: u64,
+    limit: Option<u64>,
+    offset: Option<u64>,
+) -> bool {
+    if pattern.subject.is_none() {
+        return false;
+    }
+
+    // An exact SPO lookup can match at most one triple, so a single
+    // `graphs_of` call is preferable to transposing every membership.
+    if pattern.predicate.is_some() && pattern.object.is_some() {
+        return true;
+    }
+
+    // Each matching triple has at least one membership. With a finite result
+    // window, offset + limit therefore bounds the number of `graphs_of` calls.
+    // Unbounded scans use the graph-major transpose to avoid O(T * G) reads.
+    let Some(limit) = limit else {
+        return false;
+    };
+    offset
+        .unwrap_or(0)
+        .checked_add(limit)
+        .and_then(|needed| {
+            named_graph_count
+                .checked_add(1)
+                .and_then(|layers| needed.checked_mul(layers))
+        })
+        .is_some_and(|probes| probes <= MAX_DIRECT_GRAPH_LAYER_PROBES)
+}
+
 impl ResolvedTriplePattern {
     fn matches(self, subject: u64, predicate: u64, object: u64) -> bool {
         self.subject.is_none_or(|expected| expected == subject)
@@ -114,9 +149,14 @@ pub fn search_dataset_streaming(
             limit,
             offset,
         )?
-    } else if resolved.subject.is_some() {
-        // A bound subject stops the SPO scan early, so probing `graphs_of`
-        // per matching triple beats transposing every membership.
+    } else if should_probe_wildcard_graph_direct(
+        resolved,
+        sidecar.named_graph_count(),
+        limit,
+        offset,
+    ) {
+        // Direct probing is bounded either by an exact SPO lookup or a finite
+        // result window. Larger scans use the graph-major transpose below.
         scan_wildcard_graph_direct(
             &mut sidecar,
             &offsets,
@@ -455,4 +495,77 @@ fn write_count_result(output: Option<&Path>, count: u64) -> Result<u64> {
     writeln!(writer, "{count}")?;
     writer.flush()?;
     Ok(count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pattern(
+        subject: Option<u64>,
+        predicate: Option<u64>,
+        object: Option<u64>,
+    ) -> ResolvedTriplePattern {
+        ResolvedTriplePattern {
+            subject,
+            predicate,
+            object,
+        }
+    }
+
+    #[test]
+    fn direct_graph_probing_requires_a_bound_subject() {
+        assert!(!should_probe_wildcard_graph_direct(
+            pattern(None, Some(1), Some(1)),
+            1,
+            Some(1),
+            None,
+        ));
+    }
+
+    #[test]
+    fn exact_spo_lookup_always_uses_direct_graph_probing() {
+        assert!(should_probe_wildcard_graph_direct(
+            pattern(Some(1), Some(1), Some(1)),
+            u64::MAX,
+            None,
+            None,
+        ));
+    }
+
+    #[test]
+    fn unbounded_subject_scan_uses_membership_transpose() {
+        assert!(!should_probe_wildcard_graph_direct(
+            pattern(Some(1), None, None),
+            1,
+            None,
+            None,
+        ));
+    }
+
+    #[test]
+    fn finite_result_window_bounds_direct_graph_probing() {
+        assert!(should_probe_wildcard_graph_direct(
+            pattern(Some(1), None, None),
+            99,
+            Some(10),
+            Some(5),
+        ));
+        assert!(!should_probe_wildcard_graph_direct(
+            pattern(Some(1), None, None),
+            100_000,
+            Some(10),
+            Some(5),
+        ));
+    }
+
+    #[test]
+    fn direct_graph_probe_estimate_rejects_overflow() {
+        assert!(!should_probe_wildcard_graph_direct(
+            pattern(Some(1), None, None),
+            u64::MAX,
+            Some(1),
+            Some(u64::MAX),
+        ));
+    }
 }

@@ -883,8 +883,12 @@ impl GraphSidecarReader {
             header.high_buckets == 1 + ((header.universe - 1) >> header.low_bits),
             "Elias-Fano high-bucket count mismatch"
         );
+        let expected_upper_bits = header
+            .high_buckets
+            .checked_add(header.members)
+            .context("Elias-Fano upper length overflow")?;
         ensure!(
-            header.upper_bits == header.high_buckets + header.members,
+            header.upper_bits == expected_upper_bits,
             "Elias-Fano upper length mismatch"
         );
         ensure!(
