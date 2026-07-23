@@ -505,6 +505,19 @@ fn quad_search_filters_graphs_triples_and_counts_memberships() {
         )
     );
 
+    let limited = search(
+        &hdt,
+        "? ? ? ?",
+        &temp.path().join("limited-search"),
+        &["--limit", "2"],
+    );
+    assert!(limited.status.success());
+    assert_eq!(
+        limited.stdout,
+        b"<urn:a>\t<urn:b>\t<urn:c>\t.\n\
+          <urn:a>\t<urn:b>\t<urn:c>\t<urn:g1>\t.\n"
+    );
+
     for (query, expected) in [("? ? ? ?", "5\n"), ("? ? ? default", "2\n")] {
         let counted = search(&hdt, query, &temp.path().join("count-search"), &["--count"]);
         assert!(counted.status.success());

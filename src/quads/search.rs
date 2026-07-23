@@ -26,13 +26,9 @@ fn should_probe_wildcard_graph_direct(
     limit: Option<u64>,
     offset: Option<u64>,
 ) -> bool {
-    if pattern.subject.is_none() {
-        return false;
-    }
-
     // An exact SPO lookup can match at most one triple, so a single
     // `graphs_of` call is preferable to transposing every membership.
-    if pattern.predicate.is_some() && pattern.object.is_some() {
+    if pattern.subject.is_some() && pattern.predicate.is_some() && pattern.object.is_some() {
         return true;
     }
 
@@ -109,8 +105,9 @@ pub fn search_dataset_streaming(
         return write_empty_result(output, count_only);
     }
 
-    // Wildcard graph queries transpose the graph-major sidecar into SPO-position
-    // order. Split the budget between that external sort and dictionary caches.
+    // Wildcard graph queries may transpose the graph-major sidecar into
+    // SPO-position order. Reserve half the budget for that possible external
+    // sort; bounded direct probes do not consume the reserved half.
     let dictionary_budget = if graph_filter.is_none() {
         memory_limit / 2
     } else {
@@ -383,11 +380,11 @@ where
     Ok(count)
 }
 
-/// Wildcard-graph scan for a pattern with a bound subject.
+/// Wildcard-graph scan using direct position-to-graph probes.
 ///
-/// The SPO scan terminates at the first subject past the bound one, so the
-/// membership set of each matching triple can be read directly from the
-/// sidecar instead of externally sorting every membership in the file.
+/// Exact SPO lookups and finite result windows bound the number of matching
+/// triples whose graph layers must be probed. A bound subject additionally
+/// stops the SPO scan at the first subject past the requested one.
 #[allow(clippy::too_many_arguments)]
 fn scan_wildcard_graph_direct(
     sidecar: &mut GraphSidecarReader,
@@ -514,11 +511,11 @@ mod tests {
     }
 
     #[test]
-    fn direct_graph_probing_requires_a_bound_subject() {
-        assert!(!should_probe_wildcard_graph_direct(
-            pattern(None, Some(1), Some(1)),
-            1,
-            Some(1),
+    fn finite_result_window_allows_unbound_subject() {
+        assert!(should_probe_wildcard_graph_direct(
+            pattern(None, None, None),
+            66,
+            Some(10),
             None,
         ));
     }
@@ -534,9 +531,15 @@ mod tests {
     }
 
     #[test]
-    fn unbounded_subject_scan_uses_membership_transpose() {
+    fn unbounded_non_exact_scan_uses_membership_transpose() {
         assert!(!should_probe_wildcard_graph_direct(
             pattern(Some(1), None, None),
+            1,
+            None,
+            None,
+        ));
+        assert!(!should_probe_wildcard_graph_direct(
+            pattern(None, Some(1), Some(1)),
             1,
             None,
             None,
