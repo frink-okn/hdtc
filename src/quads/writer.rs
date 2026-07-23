@@ -153,6 +153,13 @@ pub fn write_graph_sidecar(
     has_blank_graph_names: bool,
     temp_dir: &Path,
 ) -> Result<()> {
+    let started = std::time::Instant::now();
+    tracing::info!(
+        triple_count,
+        named_graph_count,
+        expected_membership_count,
+        "Encoding graph sidecar"
+    );
     let directory_length = named_graph_count
         .checked_add(1)
         .and_then(|count| count.checked_mul(DIRECTORY_ENTRY_SIZE))
@@ -184,6 +191,7 @@ pub fn write_graph_sidecar(
 
     let mut directory_crc = CRC32C_ALGO.digest();
     for graph_id in 0..=named_graph_count {
+        let layer_started = std::time::Instant::now();
         let stats = spool_layer(
             graph_id,
             triple_count,
@@ -233,6 +241,22 @@ pub fn write_graph_sidecar(
         let bytes = entry.bytes();
         directory_file.write_all(&bytes)?;
         directory_crc.update(&bytes);
+        let layer_elapsed = layer_started.elapsed();
+        if stats.member_count > 0 && layer_elapsed.as_secs() >= 1 {
+            tracing::info!(
+                graph_id,
+                memberships = stats.member_count,
+                elapsed_seconds = layer_elapsed.as_secs_f64(),
+                "Encoded graph layer"
+            );
+        } else {
+            tracing::debug!(
+                graph_id,
+                memberships = stats.member_count,
+                elapsed_seconds = layer_elapsed.as_secs_f64(),
+                "Encoded graph layer"
+            );
+        }
     }
 
     ensure!(
@@ -313,6 +337,11 @@ pub fn write_graph_sidecar(
         actual_size == sidecar_size,
         "sidecar size mismatch after assembly"
     );
+    tracing::info!(
+        bytes = actual_size,
+        elapsed_seconds = started.elapsed().as_secs_f64(),
+        "Graph sidecar encoding complete"
+    );
     Ok(())
 }
 
@@ -341,6 +370,7 @@ fn spool_layer<R: Read>(
 ) -> Result<LayerStats> {
     positions.set_len(0)?;
     positions.seek(SeekFrom::Start(0))?;
+    let mut positions_writer = BufWriter::with_capacity(1024 * 1024, &mut *positions);
     let mut stats = LayerStats {
         minimum: universe,
         ..LayerStats::default()
@@ -365,7 +395,7 @@ fn spool_layer<R: Read>(
             "duplicate or unsorted graph membership"
         );
 
-        positions.write_all(&item.position.to_le_bytes())?;
+        positions_writer.write_all(&item.position.to_le_bytes())?;
         stats.minimum = stats.minimum.min(item.position);
         stats.maximum_exclusive = item
             .position
@@ -396,7 +426,8 @@ fn spool_layer<R: Read>(
     if current_chunk.is_some() {
         finish_chunk_stats(&mut stats, current_cardinality)?;
     }
-    positions.flush()?;
+    positions_writer.flush()?;
+    drop(positions_writer);
     positions.seek(SeekFrom::Start(0))?;
     Ok(stats)
 }
@@ -932,6 +963,7 @@ fn encode_lower_parts(
     }
     positions.seek(SeekFrom::Start(0))?;
     let mut reader = BufReader::new(positions);
+    let mut writer = BufWriter::with_capacity(1024 * 1024, &mut *output);
     let mask = (1u64 << low_bits) - 1;
     let mut current = 0u64;
     let mut used = 0u32;
@@ -939,7 +971,7 @@ fn encode_lower_parts(
         let value = read_u64(&mut reader)? & mask;
         current |= value << used;
         if used + low_bits >= 64 {
-            output.write_all(&current.to_le_bytes())?;
+            writer.write_all(&current.to_le_bytes())?;
             let overflow = used + low_bits - 64;
             current = if overflow == 0 {
                 0
@@ -953,9 +985,9 @@ fn encode_lower_parts(
     }
     if used > 0 {
         let bytes = used.div_ceil(8) as usize;
-        output.write_all(&current.to_le_bytes()[..bytes])?;
+        writer.write_all(&current.to_le_bytes()[..bytes])?;
     }
-    output.flush()?;
+    writer.flush()?;
     Ok(())
 }
 
@@ -973,6 +1005,9 @@ fn encode_upper_parts(
     }
     positions.seek(SeekFrom::Start(0))?;
     let mut reader = BufReader::new(positions);
+    let mut superrank_writer = BufWriter::with_capacity(256 * 1024, &mut *superranks);
+    let mut subrank_writer = BufWriter::with_capacity(256 * 1024, &mut *subranks);
+    let mut upper_writer = BufWriter::with_capacity(1024 * 1024, &mut *upper);
     let mut member_index = 0u64;
     let mut next_one = if members > 0 {
         let value = read_u64(&mut reader)?;
@@ -986,12 +1021,12 @@ fn encode_upper_parts(
 
     for word_index in 0..word_count {
         if word_index.is_multiple_of(64) {
-            superranks.write_all(&rank.to_le_bytes())?;
+            superrank_writer.write_all(&rank.to_le_bytes())?;
             super_base = rank;
         }
         if word_index.is_multiple_of(8) {
             let relative = u16::try_from(rank - super_base).context("EF subrank overflow")?;
-            subranks.write_all(&relative.to_le_bytes())?;
+            subrank_writer.write_all(&relative.to_le_bytes())?;
         }
 
         let start = word_index * 64;
@@ -1013,16 +1048,16 @@ fn encode_upper_parts(
         rank += u64::from(word.count_ones());
         let remaining = params.upper_length - word_index * 8;
         let bytes = remaining.min(8) as usize;
-        upper.write_all(&word.to_le_bytes()[..bytes])?;
+        upper_writer.write_all(&word.to_le_bytes()[..bytes])?;
     }
-    superranks.write_all(&rank.to_le_bytes())?;
+    superrank_writer.write_all(&rank.to_le_bytes())?;
     ensure!(
         rank == members && next_one.is_none(),
         "EF upper cardinality mismatch"
     );
-    for file in [superranks, subranks, upper] {
-        file.flush()?;
-    }
+    superrank_writer.flush()?;
+    subrank_writer.flush()?;
+    upper_writer.flush()?;
     Ok(())
 }
 
