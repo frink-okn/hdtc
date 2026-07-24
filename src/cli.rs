@@ -332,7 +332,7 @@ pub struct SketchArgs {
     pub k: u32,
 
     /// Binary fuse fingerprint width
-    #[arg(long, value_enum, default_value = "8", value_name = "BITS")]
+    #[arg(long, value_enum, default_value = "16", value_name = "BITS")]
     pub filter_bits: SketchFilterBits,
 
     /// Dictionary roles to emit, as a comma-separated list

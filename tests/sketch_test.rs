@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use xorf::{BinaryFuse8Ref, BinaryFuse16Ref, Filter, FilterRef};
+use xorf::{BinaryFuse16Ref, Filter, FilterRef};
 use xxhash_rust::xxh64::xxh64;
 
 const SKETCH_NT: &str = r#"<http://example.org/a> <http://example.org/p> <http://example.org/shared> .
@@ -110,14 +110,14 @@ fn sketch_writes_standard_role_artifacts() {
             role,
             expected.len() as u64,
         ));
-        assert_eq!(filter[56], 8);
+        assert_eq!(filter[56], 16);
         assert_eq!(&filter[57..64], &[0; 7]);
         // Reserved by docs/sketch-format.md §5.1; readers may require zero.
         assert_eq!(read_u32(&filter, 84), 0);
         let fingerprint_len = read_u64(&filter, 88) as usize;
-        assert_eq!(filter.len(), 96 + fingerprint_len + 4);
+        assert_eq!(filter.len(), 96 + fingerprint_len * 2 + 4);
         let filter_ref =
-            BinaryFuse8Ref::from_dma(&filter[64..84], &filter[96..96 + fingerprint_len]);
+            BinaryFuse16Ref::from_dma(&filter[64..84], &filter[96..96 + fingerprint_len * 2]);
         for hash in expected {
             assert!(filter_ref.contains(&hash), "false negative for {hash:#x}");
         }
@@ -264,8 +264,10 @@ fn sketch_can_select_the_objects_role_alone() {
     assert_eq!(minima, expected);
 
     let filter = fs::read(output_dir.join("objects.filter")).unwrap();
+    assert_eq!(filter[56], 16);
     let fingerprint_len = read_u64(&filter, 88) as usize;
-    let filter_ref = BinaryFuse8Ref::from_dma(&filter[64..84], &filter[96..96 + fingerprint_len]);
+    let filter_ref =
+        BinaryFuse16Ref::from_dma(&filter[64..84], &filter[96..96 + fingerprint_len * 2]);
     for hash in expected {
         assert!(filter_ref.contains(&hash), "false negative for {hash:#x}");
     }
@@ -354,7 +356,14 @@ fn sketch_reproduces_the_frozen_conformance_vectors() {
     let toy_dir = temp.path().join("toy-filters");
     let output = run_sketch(
         &toy_hdt,
-        &["--k", "16", "--output-dir", toy_dir.to_str().unwrap()],
+        &[
+            "--k",
+            "16",
+            "--filter-bits",
+            "8",
+            "--output-dir",
+            toy_dir.to_str().unwrap(),
+        ],
     );
     assert!(
         output.status.success(),

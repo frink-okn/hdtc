@@ -257,16 +257,16 @@ dictionary sections. Object artifacts contain distinct IRIs from the shared and
 object-only sections. Literals and blank nodes are excluded. Shared IRIs belong
 to both roles. Predicates are not currently a supported sketch role.
 
-The `.filter` files use deterministic BinaryFuse8 by default; use
-`--filter-bits 16` for a lower false-positive rate at approximately twice the
-filter size. The `.minhash` files contain the smallest distinct XXH64 hashes,
-with a default capacity of 65,536 (about 512 KiB per saturated role). Hashing
-uses seed 0 over the exact IRI UTF-8 bytes without normalization.
+The `.filter` files use deterministic BinaryFuse16 by default; use
+`--filter-bits 8` to roughly halve the filter size at the cost of a higher
+false-positive rate. The `.minhash` files contain the smallest distinct XXH64
+hashes, with a default capacity of 65,536 (about 512 KiB per saturated role).
+Hashing uses seed 0 over the exact IRI UTF-8 bytes without normalization.
 
 Choose a larger MinHash or emit only one role:
 
 ```sh
-hdtc sketch data.hdt --k 131072 --filter-bits 16
+hdtc sketch data.hdt --k 131072 --filter-bits 8
 hdtc sketch data.hdt --roles subjects --output-dir subject-filters
 ```
 
@@ -517,7 +517,7 @@ Auto parser tuning is derived from `--memory-limit` (accepts `G`/`M` suffixes, e
 | `<HDT_FILE>`              | _(required)_             | Source HDT file                                                     |
 | `-o, --output-dir DIR`    | `filters/` beside HDT    | Directory for generated artifacts                                  |
 | `--k N`                   | `65536`                  | Bottom-k MinHash capacity (minimum 2)                               |
-| `--filter-bits 8\|16`     | `8`                      | Binary fuse fingerprint width                                      |
+| `--filter-bits 8\|16`     | `16`                     | Binary fuse fingerprint width                                      |
 | `--roles ROLE,...`        | `subjects,objects`       | Roles to emit (`subjects` and/or `objects`)                         |
 | `--temp-dir DIR`          | system temp              | Directory for uncompressed temporary hashed-key files              |
 | `-m, --memory-limit SIZE` | `4G`                     | Soft budget for combined MinHash and per-role filter construction  |
