@@ -17,6 +17,7 @@ Development of hdtc is done primarily through Claude Code.
 - **Named graphs** — optional packed `<data.hdt>.graphs` sidecars preserve N-Quads/TriG datasets while the standard HDT remains the deduplicated triples union
 - **Index generation** — optional `.hdt.index.v1-1` enables efficient `? P ?`, `? ? O`, and `? P O` queries
 - **VoID statistics** — compute dataset-level, property, and class partition statistics as N-Triples
+- **Membership and overlap sketches** — build source-bound binary fuse filters and bottom-k MinHash files directly from an HDT dictionary
 - **Resilient parsing** — skips malformed triples with warnings, reports total skipped at the end
 
 ## Named graphs
@@ -100,6 +101,12 @@ hdtc search [OPTIONS] --query <PATTERN> <HDT_FILE>
 
 ```
 hdtc void [OPTIONS] <HDT_FILE>
+```
+
+### `hdtc sketch` — Build membership filters and overlap sketches
+
+```
+hdtc sketch [OPTIONS] <HDT_FILE>
 ```
 
 ### `hdtc header` — Dump or modify the embedded header triples
@@ -226,6 +233,65 @@ With custom memory and temp settings:
 ```sh
 hdtc index existing.hdt --memory-limit 8G --temp-dir /mnt/fast-ssd/tmp
 ```
+
+### Sketch: Building membership and overlap artifacts
+
+Build the default subject and object artifacts from an existing HDT:
+
+```sh
+hdtc sketch data.hdt
+```
+
+By default this creates a `filters/` directory beside the HDT containing:
+
+```text
+filters/
+  subjects.filter
+  objects.filter
+  subjects.minhash
+  objects.minhash
+```
+
+Subject artifacts contain distinct IRIs from the HDT shared and subject-only
+dictionary sections. Object artifacts contain distinct IRIs from the shared and
+object-only sections. Literals and blank nodes are excluded. Shared IRIs belong
+to both roles. Predicates are not currently a supported sketch role.
+
+The `.filter` files use deterministic BinaryFuse8 by default; use
+`--filter-bits 16` for a lower false-positive rate at approximately twice the
+filter size. The `.minhash` files contain the smallest distinct XXH64 hashes,
+with a default capacity of 65,536 (about 512 KiB per saturated role). Hashing
+uses seed 0 over the exact IRI UTF-8 bytes without normalization.
+
+Choose a larger MinHash or emit only one role:
+
+```sh
+hdtc sketch data.hdt --k 131072 --filter-bits 16
+hdtc sketch data.hdt --roles subjects --output-dir subject-filters
+```
+
+Each file is self-describing, protected by CRC32C, and bound to the source HDT
+with a SHA-256 digest. As with `.graphs` sidecars, that digest covers the
+dictionary and triples but not the header, so artifacts stay valid across
+`hdtc header` rewrites of the same data. Existing target artifacts are not
+overwritten.
+
+These artifacts are meant to be read by other tools, in other languages, built
+by other parties. See the normative
+[HDT sketch artifact formats, version 1](docs/sketch-format.md) for the byte
+layouts, the term-to-key rule, the complete membership probe algorithm, the
+validation a reader must perform on untrusted files, and the frozen conformance
+vectors. Nothing in the format requires a particular library: an implementation
+can be written from that document alone.
+
+IRI hashes are streamed to temporary disk files, and each role's filter is built
+separately from its own file. `--memory-limit` bounds both phases: before
+scanning, hdtc checks the combined MinHash estimate for all selected roles;
+during the scan, each role stops as soon as it has more IRIs than the binary
+fuse scratch arrays, fingerprints, keys, and retained MinHash values can fit —
+so an oversized input is refused while it is being read rather than after. If a
+role does not fit, reduce `--k` or increase the limit. Use `--temp-dir` to place
+the uncompressed hashed-key files on a disk with sufficient space.
 
 ### Dump: Exporting the union or dataset
 
@@ -444,6 +510,21 @@ Auto parser tuning is derived from `--memory-limit` (accepts `G`/`M` suffixes, e
 | `-v, --verbose`       | —            | Increase log verbosity (`-v` debug, `-vv` trace)              |
 | `-q, --quiet`         | —            | Suppress all output except errors                             |
 
+### Sketch: All options
+
+| Option                    | Default                  | Description                                                        |
+| ------------------------- | ------------------------ | ------------------------------------------------------------------ |
+| `<HDT_FILE>`              | _(required)_             | Source HDT file                                                     |
+| `-o, --output-dir DIR`    | `filters/` beside HDT    | Directory for generated artifacts                                  |
+| `--k N`                   | `65536`                  | Bottom-k MinHash capacity (minimum 2)                               |
+| `--filter-bits 8\|16`     | `8`                      | Binary fuse fingerprint width                                      |
+| `--roles ROLE,...`        | `subjects,objects`       | Roles to emit (`subjects` and/or `objects`)                         |
+| `--temp-dir DIR`          | system temp              | Directory for uncompressed temporary hashed-key files              |
+| `-m, --memory-limit SIZE` | `4G`                     | Soft budget for combined MinHash and per-role filter construction  |
+| `--benchmark`             | off                      | Emit total sketch timing                                           |
+| `-v, --verbose`           | —                        | Increase log verbosity (`-v` debug, `-vv` trace)                    |
+| `-q, --quiet`             | —                        | Suppress all output except errors                                  |
+
 ### Dump: All options
 
 | Option                | Default      | Description                                                 |
@@ -502,6 +583,11 @@ The single-pass pipeline deduplicates terms early via per-batch hash maps, so te
 
 Actual usage varies with term uniqueness and compressibility (~6–10 bytes/triple after compression). Temporary files are automatically cleaned up after completion. Use `--temp-dir` to direct them to a disk with sufficient space.
 
+`hdtc sketch` additionally writes an uncompressed 8-byte hash for each
+qualifying IRI in every selected role while building the filters. An IRI in the
+shared dictionary is therefore present in both temporary role files when both
+roles are selected. These files are also cleaned up automatically.
+
 ### Output size
 
 HDT files are typically 10–20% of the equivalent uncompressed N-Triples.
@@ -537,7 +623,7 @@ src/
   rdf/               RDF parsing, format/compression detection, input discovery
   dictionary/        Dictionary construction, Plain Front Coding (PFC)
   triples/           BitmapTriples encoding
-  hdt/               HDT file serialization
+  hdt/               HDT serialization, reading, querying, statistics, and sketches
   index/             HDT index generation (.hdt.index.v1-1)
   io/                VByte, LogArray, Bitmap, CRC, Control Information
   pipeline/          6-stage pipelined architecture
@@ -545,7 +631,11 @@ src/
 tests/
   integration_test.rs   End-to-end pipeline tests
   compat_test.rs        Compatibility tests against the hdt crate
+  sketch_test.rs        Sketch envelope, role, filter, and edge-case tests
   data/                 Sample RDF fixtures
+docs/
+  graphs-sidecar-format.md  Normative .graphs sidecar format
+  sketch-format.md          Normative .filter / .minhash formats
 ```
 
 ## Development

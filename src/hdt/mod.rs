@@ -6,10 +6,12 @@ pub(crate) mod input_adapter;
 pub(crate) mod pfc_reader;
 pub(crate) mod reader;
 pub(crate) mod search;
+pub(crate) mod sketch;
 pub(crate) mod void;
 pub(crate) mod writer;
 
 pub use header::run_header_command;
 pub use search::{SearchQuery, parse_search_query, search_hdt_streaming};
+pub use sketch::{Role as SketchRole, SketchConfig, create_sketches};
 pub use void::compute_void;
 pub use writer::write_hdt_streaming;

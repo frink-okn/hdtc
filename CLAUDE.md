@@ -80,7 +80,7 @@ src/
   rdf/             - RDF parsing, input discovery, streaming, compressed input
   dictionary/      - Dictionary construction, PFC encoding
   triples/         - BitmapTriples encoding (streaming)
-  hdt/             - HDT file serialization (header, dictionary, triples sections)
+  hdt/             - HDT serialization, reading, querying, statistics, and sketches
   index/           - HDT index file generation (.hdt.index.v1-1)
   io/              - VByte, LogArray, Bitmap, CRC utilities, Control Information
   pipeline/        - 6-stage pipeline (batch vocab, partial vocab, merger, ID remapper)
@@ -89,8 +89,19 @@ src/
 tests/
   integration_test.rs - End-to-end pipeline tests
   compat_test.rs      - Compatibility tests against the hdt crate
+  sketch_test.rs      - Sketch envelope, role, filter, and edge-case tests
   data/               - Sample RDF fixtures
+docs/
+  graphs-sidecar-format.md - Normative .graphs sidecar format
+  sketch-format.md         - Normative .filter / .minhash formats
 ```
+
+## Published formats
+
+`docs/` holds normative wire-format specifications for the artifacts hdtc emits
+alongside standard HDT. They are consumed by other tools, in other languages,
+built by other parties, so they are the authority — code changes that alter
+emitted bytes must update the spec and its frozen conformance vectors together.
 
 ## Key Dependencies
 
@@ -108,6 +119,8 @@ tests/
 | `hashbrown` | High-performance hash maps (batch vocabulary) |
 | `bumpalo` | Arena allocator (per-batch term storage) |
 | `bitflags` | Type-safe role flags |
+| `xxhash-rust` | XXH64 term hashing for sketches |
+| `xorf` | Binary fuse membership filters (exact version pin — defines `.filter` bytes) |
 | `indicatif` | Progress bars and status reporting |
 | `flate2` | Gzip decompression |
 | `bzip2` | Bzip2 decompression |

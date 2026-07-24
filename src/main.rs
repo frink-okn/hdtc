@@ -179,6 +179,7 @@ fn main() -> Result<()> {
         cli::Commands::Search(args) => search_hdt(args, benchmark),
         cli::Commands::Validate(args) => validate_hdt_file(args, benchmark),
         cli::Commands::Void(args) => compute_void(args, benchmark),
+        cli::Commands::Sketch(args) => create_sketches(args, benchmark),
         cli::Commands::Header(args) => run_header(args, benchmark),
     }
 }
@@ -628,6 +629,82 @@ fn compute_void(args: cli::VoidArgs, benchmark: bool) -> Result<()> {
         Some(p) => tracing::info!("Done! {count} VoID triples written to {}", p.display()),
         None => tracing::info!("Done! {count} VoID triples written"),
     }
+    Ok(())
+}
+
+/// Build role-specific membership filters and MinHash sketches.
+fn create_sketches(args: cli::SketchArgs, benchmark: bool) -> Result<()> {
+    if !args.hdt_file.is_file() {
+        anyhow::bail!("HDT file not found: {}", args.hdt_file.display());
+    }
+
+    let output_dir = args.output_dir.unwrap_or_else(|| {
+        args.hdt_file
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("filters")
+    });
+    let mut roles: Vec<hdt::SketchRole> = Vec::with_capacity(args.roles.len());
+    for role in &args.roles {
+        let role = match role {
+            cli::SketchRole::Subjects => hdt::SketchRole::Subjects,
+            cli::SketchRole::Objects => hdt::SketchRole::Objects,
+        };
+        if !roles.contains(&role) {
+            roles.push(role);
+        }
+    }
+
+    let temp_dir = match &args.temp_dir {
+        Some(dir) => {
+            std::fs::create_dir_all(dir)
+                .with_context(|| format!("Failed to create temp dir {}", dir.display()))?;
+            dir.clone()
+        }
+        None => make_default_temp_dir()?,
+    };
+
+    tracing::info!("Building sketches: {}", args.hdt_file.display());
+    tracing::info!("Output directory: {}", output_dir.display());
+    tracing::info!("Temp directory: {}", temp_dir.display());
+    tracing::info!(
+        "Roles: {}",
+        roles
+            .iter()
+            .map(|role| role.file_stem())
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    tracing::info!("MinHash k: {}", args.k);
+    tracing::info!("Filter bits: {}", args.filter_bits.as_u8());
+
+    let start = std::time::Instant::now();
+    let summary = hdt::create_sketches(hdt::SketchConfig {
+        hdt_path: &args.hdt_file,
+        output_dir: &output_dir,
+        temp_dir: &temp_dir,
+        roles: &roles,
+        k: args.k,
+        filter_bits: args.filter_bits.as_u8(),
+        memory_limit: args.memory_limit.as_bytes(),
+    })?;
+
+    if benchmark {
+        tracing::info!(
+            "Benchmark summary (sketch): total {:.3}s",
+            start.elapsed().as_secs_f64()
+        );
+    }
+    tracing::info!(
+        "Done! {} file(s) written ({})",
+        summary.files_written,
+        summary
+            .role_counts
+            .iter()
+            .map(|(role, count)| format!("{}: {count} IRIs", role.file_stem()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
     Ok(())
 }
 

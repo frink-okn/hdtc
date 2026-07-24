@@ -1,11 +1,10 @@
 //! Streaming writer for the packed HDT graphs sidecar, version 1.
 
-use crate::io::ControlInfo;
+use crate::hdt::reader::{hdt_data_offset, sha256_to_end};
 use crate::io::crc_utils::{CRC32C_ALGO, crc32c};
 use crate::quads::GraphMembership;
 use crate::sort::Sortable;
 use anyhow::{Context, Result, bail, ensure};
-use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -1188,33 +1187,14 @@ fn hdt_position_identity(hdt_path: &Path) -> Result<(u64, [u8; 32])> {
         .with_context(|| format!("Failed to open HDT file {}", hdt_path.display()))?;
     let file_length = file.metadata()?.len();
     let mut reader = BufReader::with_capacity(256 * 1024, file);
-    ControlInfo::read_from(&mut reader).context("Failed to read HDT global control info")?;
-    let header =
-        ControlInfo::read_from(&mut reader).context("Failed to read HDT header control info")?;
-    let header_length: u64 = header
-        .get_property("length")
-        .context("HDT header is missing length")?
-        .parse()
-        .context("Invalid HDT header length")?;
-    reader.seek(SeekFrom::Current(
-        i64::try_from(header_length).context("HDT header is too large to seek")?,
-    ))?;
-    let data_offset = reader.stream_position()?;
+    let data_offset = hdt_data_offset(&mut reader)?;
     ensure!(
         data_offset <= file_length,
         "HDT dictionary offset exceeds file length"
     );
 
-    let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 256 * 1024];
-    loop {
-        let read = reader.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Ok((file_length - data_offset, hasher.finalize().into()))
+    let digest = sha256_to_end(&mut reader)?;
+    Ok((file_length - data_offset, digest))
 }
 
 fn universe_chunk_count(universe: u64) -> u64 {

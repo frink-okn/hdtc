@@ -187,6 +187,47 @@ impl HdtInputAdapter {
         self.num_sp_pairs
     }
 
+    fn open_dictionary_terms(
+        &self,
+        offset: u64,
+        expected_count: u64,
+        section_name: &str,
+    ) -> Result<PfcSectionIterator<BufReader<File>>> {
+        let file = File::open(&self.path)
+            .with_context(|| format!("Failed to open HDT file {}", self.path.display()))?;
+        let mut reader = BufReader::with_capacity(256 * 1024, file);
+        reader.seek(SeekFrom::Start(offset))?;
+        let header = PfcSectionHeader::read_from(&mut reader, section_name)?;
+        if header.string_count != expected_count {
+            bail!(
+                "{} dictionary count changed while reading: expected {}, found {}",
+                section_name,
+                expected_count,
+                header.string_count
+            );
+        }
+        Ok(PfcSectionIterator::new(reader, header, section_name))
+    }
+
+    /// Stream the shared dictionary section without materializing it.
+    pub(crate) fn shared_terms(&self) -> Result<PfcSectionIterator<BufReader<File>>> {
+        self.open_dictionary_terms(self.shared_section_offset, self.shared_count, "shared")
+    }
+
+    /// Stream the subject-only dictionary section without materializing it.
+    pub(crate) fn subject_terms(&self) -> Result<PfcSectionIterator<BufReader<File>>> {
+        self.open_dictionary_terms(
+            self.subjects_section_offset,
+            self.subjects_count,
+            "subjects",
+        )
+    }
+
+    /// Stream the object-only dictionary section without materializing it.
+    pub(crate) fn object_terms(&self) -> Result<PfcSectionIterator<BufReader<File>>> {
+        self.open_dictionary_terms(self.objects_section_offset, self.objects_count, "objects")
+    }
+
     /// Create a factory closure that produces a sorted vocabulary stream.
     ///
     /// The stream is a streaming 4-way merge of PFC sections (shared, subjects,
@@ -453,7 +494,7 @@ impl StreamingFourWayMerge {
                 f.seek(SeekFrom::Start(offset))?;
                 let mut reader = BufReader::with_capacity(256 * 1024, f);
                 let header = PfcSectionHeader::read_from(&mut reader, name)?;
-                Ok(PfcSectionIterator::new(reader, &header, name))
+                Ok(PfcSectionIterator::new(reader, header, name))
             };
 
         let mut shared_iter = open_section(shared_offset, "shared")?;
