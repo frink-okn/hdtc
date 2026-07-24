@@ -48,8 +48,9 @@ codegen-units = 1
 # xorf's debug-only duplicate check builds an unbounded BTreeSet before the
 # bounded filter construction. `read_distinct_keys` in src/hdt/sketch.rs sorts
 # and deduplicates every key set before handing it over, so keep development
-# builds on the production memory path. Note this also disables xorf's overflow
-# checks, which is why the key ceiling is enforced in our code instead
-# (MAX_BINARY_FUSE_KEYS; docs/sketch-format.md §5.3).
+# builds on the production memory path. This does not affect overflow checks,
+# which Cargo controls separately and leaves on for dev; release builds are why
+# the key ceiling is enforced in our code (MAX_BINARY_FUSE_KEYS,
+# docs/sketch-format.md §5.3) rather than left to a panic.
 [profile.dev.package.xorf]
 debug-assertions = false

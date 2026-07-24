@@ -113,9 +113,16 @@ construction; see §5.4.
 - All integers are **unsigned** and **little-endian**.
 - Offsets are absolute byte offsets from the start of the file.
 - `u8`, `u16`, `u32`, `u64` denote 1, 2, 4, and 8 byte unsigned integers.
-- All arithmetic in this document is on unsigned integers of the stated width
-  and **wraps modulo 2^width** unless stated otherwise. `>>` is a logical
-  (zero-filling) shift. `^` is bitwise XOR, `&` bitwise AND.
+- `>>` is a logical (zero-filling) shift. `^` is bitwise XOR, `&` bitwise AND.
+- **Arithmetic over sizes, counts, offsets, and every validation rule is exact**:
+  it is evaluated over mathematical integers, or equivalently in a width that
+  cannot overflow (`u64` or wider for values read as `u32`), or with checked
+  operations that fail the file. It MUST NOT wrap. A reader that evaluates a
+  §5.3 or §6.2 invariant in the field's own width can be made to accept a file
+  that fails it — see the worked example in §5.3 — so this is a requirement, not
+  a matter of convenience.
+- **Wrapping arithmetic occurs only inside the membership probe (§5.2)**, where
+  each step states its width explicitly. Nothing outside §5.2 wraps.
 - Fields named `reserved` MUST be written as zero, and a reader MUST reject a
   file in which any reserved field is nonzero. This is what keeps a future
   version's added fields from being silently ignored by an old reader.
@@ -200,18 +207,23 @@ emit `hash_id = 1`.
 
 ### 3.3 Key collisions
 
-Distinct IRIs can hash to the same `u64`. At one billion distinct IRIs in a role
-the probability of at least one collision is roughly 2.7%; at the structural
-ceiling of §5.3 it is roughly 43%. A collision is not a correctness failure of
-the format — it merely means two IRIs are indistinguishable to these artifacts,
-which slightly overstates overlap and understates cardinality. Both effects are
-far below the sampling error of the estimators in §6.3.
+Distinct IRIs can hash to the same `u64`. By the birthday bound, at one billion
+distinct IRIs in a role the probability of at least one collision is about 2.7%;
+at the structural ceiling of §5.3 it is about 32.6%. A collision is not a
+correctness failure of the format — it merely means two IRIs are
+indistinguishable to these artifacts, which slightly overstates overlap and
+understates cardinality. Both effects are far below the sampling error of the
+estimators in §6.3.
 
 Producers MUST deduplicate the key set before filter construction (§5.4), and
-MUST NOT emit duplicate values in `minima` (§6.2). Producers SHOULD report the
-number of collisions observed. `key_count` is the number of **distinct
-qualifying IRIs**, which may therefore exceed the number of distinct keys; see
-§5.3 for why this does not affect validation.
+MUST NOT emit duplicate values in `minima` (§6.2). Producers SHOULD log the
+number of collisions observed, for operator visibility.
+
+`key_count` is the number of **distinct qualifying IRIs**, which may therefore
+exceed the number of distinct keys. No validation rule may depend on the
+difference, because the file does not record it: §5.3 explains why
+`fingerprint_len` cannot be re-derived from `key_count`, and §6.2 explains why
+`saturated` is defined from `stored_count` instead.
 
 ## 4. Common file envelope
 
@@ -361,7 +373,7 @@ and producers MUST NOT omit it.
 
 Let `segment_count = segment_count_length / segment_length`. A reader MUST
 verify **all** of the following before probing, and MUST reject the file if any
-fails:
+fails. Per §2, every rule here is evaluated in exact arithmetic:
 
 1. `variant` is `8` or `16`.
 2. `segment_length` is a power of two, and `4 ≤ segment_length ≤ 262144`.
@@ -386,6 +398,17 @@ artifacts. A file with an inflated `segment_count_length` and a short
 fingerprint array is a straightforward out-of-bounds read in an implementation
 that trusts the header, and in a memory-mapped reader that is an out-of-bounds
 read against mapped memory.
+
+**Evaluating invariant 5 in 32-bit arithmetic defeats it.** Consider a crafted
+file with `segment_length = 4`, `segment_count_length = 0xFFFFFFFC`, and
+`fingerprint_len = 4`. In exact arithmetic, `segment_count_length + 2 ×
+segment_length` is `4294967300`, so invariant 5 fails and the file is rejected.
+Evaluated in `u32`, the same sum wraps to `4`, invariant 5 appears to hold, and
+every other invariant passes — invariant 4 is satisfied because `0xFFFFFFFC` is
+a multiple of 4, and the file is a legal 104 bytes. The probe would then compute
+`h0` anywhere below `0xFFFFFFFC` and index a four-entry array with it. This is
+why §2 requires exact arithmetic, and it is the single most important place to
+get that right.
 
 **Key ceiling.** Invariant 6 bounds how many keys a filter can hold. Under the
 reference sizing of §5.4, `segment_count_length + 2 × segment_length` first
@@ -467,7 +490,7 @@ estimator in §6.3 then returns a true value, not an estimate.
 |---:|---:|---|---|---|
 | 56 | 4 | `u32` | `k` | configured capacity; `65536` standard, `≥ 2` |
 | 60 | 4 | `u32` | `stored_count` | number of minima that follow |
-| 64 | 1 | `u8` | `saturated` | `1` if `key_count ≥ k`, else `0` |
+| 64 | 1 | `u8` | `saturated` | `1` iff `stored_count == k`, else `0` |
 | 65 | 7 | `u8[7]` | `reserved` | MUST be zero |
 | 72 | `stored_count × 8` | `u64[]` LE | `minima` | key values, ascending, distinct |
 
@@ -477,13 +500,27 @@ A reader MUST verify:
 
 1. `k ≥ 2`.
 2. `stored_count ≤ k`.
-3. `stored_count == min(k, key_count)`, unless key collisions were reported by
-   the producer, in which case `stored_count ≤ min(k, key_count)`.
-4. `saturated == 1` iff `key_count ≥ k`.
+3. `stored_count ≤ key_count`.
+4. `saturated == 1` iff `stored_count == k`.
 5. `minima` is strictly ascending — which enforces both sorted order and
    distinctness in one pass.
 6. The file length is exactly `72 + stored_count × 8 + 4`.
 7. The CRC32C trailer matches the preceding bytes.
+
+Every one of these is checkable from the file alone. That is deliberate: a
+reader has no way to learn anything about the producer's build that the file
+does not state, so no rule may depend on such knowledge.
+
+**`saturated` is defined from `stored_count`, not from `key_count`.** The two
+differ only when distinct keys are fewer than distinct IRIs, which §3.3 shows is
+possible on very large roles, and the difference matters: if `saturated` meant
+`key_count ≥ k`, a role with `key_count ≥ k` but `k − 1` distinct keys would set
+`saturated = 1` with `stored_count < k`, and the §6.3 saturated branch would
+read `minima[k − 1]` past the end of the array. Defining it from `stored_count`
+makes `minima[k − 1]` valid whenever `saturated == 1`, and makes rule 4
+checkable without trusting the producer. `key_count` remains the distinct
+qualifying IRI count, for reporting; it is not a source of truth about the
+sketch's contents.
 
 Strict ascent is required rather than merely recommended: it makes the k-th
 smallest value `minima[stored_count - 1]` without a scan, makes union merges
@@ -519,16 +556,27 @@ U   = dedup(minima_A ∪ minima_B)             # ascending
 S∪  = the min(k*, |U|) smallest values of U   # bottom-k* sketch of A ∪ B
 D   = |S∪|
 
-n̂∪  = D  if D < k*  else  (k* - 1) / φ(S∪[k* - 1])
+if D == 0:                                    # both roles are empty
+    n̂∪ = 0;  Ĵ = 1;  |A ∩ B| = 0
+else:
+    n̂∪  = D  if D < k*  else  (k* - 1) / φ(S∪[k* - 1])
 
-y   = |{ v ∈ S∪ : v ∈ minima_A and v ∈ minima_B }|
-Ĵ   = y / D
+    y   = |{ v ∈ S∪ : v ∈ minima_A and v ∈ minima_B }|
+    Ĵ   = y / D
 
-|A ∩ B| ≈ Ĵ × n̂∪
+    |A ∩ B| ≈ Ĵ × n̂∪
 ```
 
-Both reduce to exact values when the inputs are unsaturated, so small datasets
-get exact answers automatically.
+The `D == 0` case is normative and MUST NOT be left to the division. Two
+well-formed sketches of empty roles are a legitimate input — §1.2 makes an
+empty role ordinary, not an error — and `y / D` would otherwise be `0 / 0`.
+Consumers that leave it undefined disagree with each other or emit `NaN` into
+an overlap matrix. `Ĵ = 1` is chosen because two empty sets are identical; the
+estimated intersection is `0` either way, so a consumer that only reports
+absolute shared counts is unaffected by the choice.
+
+Both formulas reduce to exact values when the inputs are unsaturated, so small
+datasets get exact answers automatically.
 
 Consumers SHOULD report the absolute estimated intersection alongside `Ĵ`: a
 small Jaccard over a large union can still be a large and useful shared count.
@@ -570,15 +618,29 @@ does less than that, so that it survives header edits.
 
 A conforming **producer** MUST:
 
-1. Emit all four files for a dataset, or none of them. A consumer that finds one
-   role may reasonably expect the other.
+1. Emit each file so that it conforms on its own. Every file is independently
+   valid and independently usable; nothing in this format couples them.
 2. Derive keys exactly per §3, including the no-normalization rule.
 3. Deduplicate keys before construction (§3.3).
 4. Write zero to every reserved field.
 5. Emit `minima` strictly ascending.
-6. Emit a well-formed file for an empty role rather than omitting it.
+6. Emit a well-formed file for a role it covers whose qualifying set is empty,
+   rather than omitting the file (§1.2).
 7. Refuse a role exceeding the §5.3 key ceiling rather than emitting a filter
    with wrapped sizing.
+8. Evaluate all size and validation arithmetic exactly (§2).
+
+**Emitting a subset of the roles is conforming.** Each file stands alone, so a
+producer may emit one role's pair — to sketch only subjects for a routing-only
+use, or for experimentation — and those files are fully valid. What a producer
+MUST NOT do is emit a file that is individually malformed.
+
+A publisher distributing a dataset for general consumption SHOULD nonetheless
+emit all four files, because a consumer that finds one role has no way to tell
+"this role was not built" from "this dataset has no such IRIs", and the empty
+file in rule 6 exists precisely to make that distinction. This is a
+recommendation about publishing practice, not a property of the format, and a
+packaging layer that needs it enforced should state which roles it requires.
 
 A conforming **reader** MUST:
 
@@ -586,9 +648,11 @@ A conforming **reader** MUST:
 2. Reject unknown `magic`, `format_version`, `convention_id`, `hash_id`, or
    `role`, and reject any nonzero reserved field.
 3. Verify all §5.3 invariants before probing a filter, and all §6.2 invariants
-   before using a sketch.
+   before using a sketch, evaluating each in exact arithmetic (§2).
 4. Treat `source_digest` as advisory only.
 5. Never compare artifacts across differing `convention_id` or `hash_id`.
+6. Handle a missing role file as absent information, never as an empty role. An
+   empty role is stated by a file with `key_count = 0`, not by silence.
 
 A reader MAY memory-map a `.filter` and probe it in place; §5.1 guarantees
 alignment and §5.3 guarantees index safety, provided validation ran first.
@@ -674,11 +738,39 @@ SHA-256(fingerprints)= 4684db4089f6c89f7609e1cd00d8246e02835f64a1377ca14cc63ee49
 
 Total file size 292 bytes. Note `192 = 64 + 2 × 64`, satisfying §5.3 invariant 5.
 
+The complete 192-byte fingerprint array, in file order, 16 bytes per row with
+the row's starting index on the left:
+
+```text
+  0: 00 00 DA B1 4C 98 00 D9 00 00 00 72 00 00 00 19
+ 16: C7 00 00 00 00 00 A6 00 D0 00 03 88 EF 9F 99 00
+ 32: 00 B8 2D 00 00 00 BC EF FC 00 0D 00 00 3F 00 00
+ 48: 00 AD 00 00 40 00 00 39 00 D7 49 BB 2B 00 11 7E
+ 64: 00 00 00 00 00 00 03 4A 00 99 00 00 00 46 00 4D
+ 80: 00 9F AC 19 F7 00 00 21 00 C1 3B 53 00 00 9B 16
+ 96: 00 00 00 5B 4B 85 75 91 A3 00 00 33 00 17 8D 00
+112: 00 97 00 00 00 00 28 89 00 00 00 55 00 00 00 00
+128: CF 00 82 43 31 00 00 18 00 00 00 00 00 33 FB 10
+144: FD 00 59 50 00 DD 53 11 00 1B 00 81 00 00 99 00
+160: 84 D9 F0 35 A9 F0 36 CD 00 29 00 D5 D0 0F 00 9E
+176: 28 00 00 00 DB DA 00 A7 C2 69 B4 71 44 8B F4 00
+```
+
+These bytes, with the five header values above, are a complete filter: a
+reader-only implementation can construct the probe inputs from this section
+alone, with no builder and no source dataset. The many zero entries are unused
+slots, which is expected — the array is about 1.9 times the key count.
+
 Because construction is not normative (§5.4), an independent implementation is
-**not** required to reproduce `seed` or the fingerprint digest. It is required
-to reproduce the *behaviour*: for a filter it builds itself, the §5.2 probe must
-return `true` for all 100 member keys; and given the reference bytes above, its
-probe must agree with the trace in §9.4 and return `true` for all 100 members.
+**not** required to reproduce `seed`, the array, or its digest when building its
+own filter over the same 100 IRIs. It is required to reproduce the *behaviour*:
+
+- Probing **these** bytes must reproduce the §9.4 trace exactly, and must return
+  `true` for all 100 member keys of §9.2. This is the interoperability test, and
+  every conforming reader must pass it.
+- Probing a filter it built **itself** over those 100 keys must likewise return
+  `true` for all of them. This is the construction test, and its intermediate
+  values are free to differ from the trace.
 
 ### 9.4 Worked probe trace
 

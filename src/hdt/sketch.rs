@@ -1,10 +1,10 @@
 //! Role-specific membership filters and bottom-k overlap sketches.
 //!
 //! The emitted `.filter` and `.minhash` files are specified normatively in
-//! `docs/sketch-format.md`. That document, not this module, is
-//! the authority on the byte layouts, the term-to-key derivation, and the
-//! membership probe; keep them in step. The conformance vectors it freezes in
-//! §9 are pinned by the tests at the bottom of this file.
+//! `docs/sketch-format.md`. That document, not this module, is the authority on
+//! the byte layouts, the term-to-key derivation, and the membership probe; keep
+//! them in step. The conformance vectors it freezes in §9 are pinned by the
+//! tests at the bottom of this file.
 //!
 //! The command scans the shared, subject-only, and object-only PFC dictionary
 //! sections once. Qualifying IRI hashes are spooled to temporary files so the
@@ -37,9 +37,9 @@ const MINHASH_BYTES_PER_ENTRY_ESTIMATE: u64 = 32;
 /// 262,144-entry segment and holds the result in a `u32`. The largest usable
 /// array length is therefore `16_383 * 262_144 = 4_294_705_152`, and this is the
 /// largest key count whose rounded capacity stays at or below it. One key more
-/// rounds to 2^32 and overflows xorf's `u32` multiply — silently, since
-/// `[profile.dev.package.xorf]` turns off its overflow checks along with its
-/// debug assertions. See `binary_fuse_ceiling_keeps_capacity_in_u32`.
+/// rounds to 2^32 and overflows xorf's `u32` multiply — silently in release
+/// builds, where Cargo leaves overflow checks off. See
+/// `binary_fuse_ceiling_keeps_capacity_in_u32`.
 const MAX_BINARY_FUSE_KEYS: u64 = 3_817_515_691;
 
 /// Parameters for one sketch build.
@@ -573,7 +573,12 @@ fn write_minhash_file(
 ) -> Result<()> {
     let stored_count =
         u32::try_from(data.minima.len()).context("MinHash stored value count exceeds u32")?;
-    let saturated = u8::from(data.key_count >= u64::from(k));
+    // From stored_count, not key_count (docs/sketch-format.md §6.2). Under an
+    // XXH64 collision a role can have key_count >= k with fewer than k distinct
+    // keys; deriving this from key_count would then claim a full sketch that is
+    // not there, and a consumer taking the saturated branch would read
+    // minima[k - 1] past the end.
+    let saturated = u8::from(stored_count == k);
     let mut writer = Crc32cWriter::new(BufWriter::with_capacity(256 * 1024, file));
     writer.write_all(&common_header(
         b"KGFM",
@@ -714,6 +719,64 @@ path. The version pin, not this test, is the actual guard.";
             assert_eq!(term.len(), byte_len, "UTF-8 byte count for {term:?}");
             assert_eq!(xxh64(term.as_bytes(), 0), expected, "term {term:?}");
         }
+    }
+
+    /// §6.2: `saturated` is derived from `stored_count`, never from
+    /// `key_count`. A colliding role can have `key_count >= k` while storing
+    /// fewer than `k` distinct minima; claiming saturation there would send a
+    /// consumer into the §6.3 saturated branch to read `minima[k - 1]` off the
+    /// end of the array.
+    #[test]
+    fn saturation_follows_stored_minima_not_the_iri_count() {
+        let temp = tempfile::tempdir().unwrap();
+        let roles = [Role::Subjects];
+        let config = test_config(temp.path(), &roles);
+        let k = 4usize;
+
+        // Six IRIs whose hashes collide down to three distinct keys: key_count
+        // reaches k, stored_count cannot.
+        let mut accumulator = RoleAccumulator::new(Role::Subjects, config, u64::MAX, k).unwrap();
+        for hash in [10, 20, 10, 30, 20, 10] {
+            accumulator.add_hash(hash).unwrap();
+        }
+        let data = accumulator.finish().unwrap();
+        assert_eq!(data.key_count, 6, "six qualifying IRIs were scanned");
+        assert_eq!(data.minima, vec![10, 20, 30], "only three distinct keys");
+
+        let mut file = tempfile::tempfile().unwrap();
+        write_minhash_file(&mut file, &data, k as u32, &[0; 32]).unwrap();
+        let mut bytes = Vec::new();
+        file.rewind().unwrap();
+        file.read_to_end(&mut bytes).unwrap();
+
+        assert_eq!(
+            u32::from_le_bytes(bytes[56..60].try_into().unwrap()),
+            4,
+            "k"
+        );
+        assert_eq!(
+            u32::from_le_bytes(bytes[60..64].try_into().unwrap()),
+            3,
+            "stored_count"
+        );
+        assert_eq!(
+            bytes[64], 0,
+            "key_count >= k but the sketch is not full, so saturated must be 0"
+        );
+
+        // And the ordinary case still saturates.
+        let mut accumulator = RoleAccumulator::new(Role::Subjects, config, u64::MAX, k).unwrap();
+        for hash in [1, 2, 3, 4, 5] {
+            accumulator.add_hash(hash).unwrap();
+        }
+        let data = accumulator.finish().unwrap();
+        let mut file = tempfile::tempfile().unwrap();
+        write_minhash_file(&mut file, &data, k as u32, &[0; 32]).unwrap();
+        let mut bytes = Vec::new();
+        file.rewind().unwrap();
+        file.read_to_end(&mut bytes).unwrap();
+        assert_eq!(u32::from_le_bytes(bytes[60..64].try_into().unwrap()), 4);
+        assert_eq!(bytes[64], 1, "a full sketch is saturated");
     }
 
     /// §3.1: terms are hashed as exact codepoints, so the two Unicode normal
@@ -874,6 +937,27 @@ path. The version pin, not this test, is the actual guard.";
         assert_eq!(
             format!("{:x}", Sha256::digest(&filter.fingerprints)),
             "4684db4089f6c89f7609e1cd00d8246e02835f64a1377ca14cc63ee491df9960",
+            "{XORF_OUTPUT_CHANGED}"
+        );
+        // The first row and the three trace indices of the §9.3 hex dump. The
+        // digest above pins the array; these pin the transcription, so a typo
+        // in the published bytes fails here rather than in someone else's
+        // implementation.
+        assert_eq!(
+            &filter.fingerprints[..16],
+            &[
+                0x00, 0x00, 0xDA, 0xB1, 0x4C, 0x98, 0x00, 0xD9, 0x00, 0x00, 0x00, 0x72, 0x00, 0x00,
+                0x00, 0x19
+            ],
+            "{XORF_OUTPUT_CHANGED}"
+        );
+        assert_eq!(
+            (
+                filter.fingerprints[55],
+                filter.fingerprints[118],
+                filter.fingerprints[144]
+            ),
+            (0x39, 0x28, 0xFD),
             "{XORF_OUTPUT_CHANGED}"
         );
         check_filter_geometry(&descriptor, filter.fingerprints.len()).unwrap();
