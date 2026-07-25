@@ -22,11 +22,10 @@
 //! of any size builds at any limit.
 
 use super::artifacts::{
-    DuplicateKeys, KeyRunIter, KeySorter, SortedKeyRun, StagedArtifact, ensure_targets_absent,
-    iri_hash, prepare_output_directory, publish_artifacts,
+    DuplicateKeys, KeyRunIter, KeySorter, SortedKeyRun, SourceIdentity, StagedArtifact,
+    ensure_targets_absent, iri_hash, prepare_output_directory, publish_artifacts,
 };
 use super::input_adapter::HdtInputAdapter;
-use super::reader::hdt_data_digest;
 use crate::io::crc_utils::Crc32cWriter;
 use anyhow::{Context, Result, ensure};
 use std::fs::File;
@@ -189,8 +188,10 @@ pub fn create_keysets(config: KeysetConfig<'_>) -> Result<KeysetSummary> {
         .collect();
     ensure_targets_absent(&targets)?;
 
+    // Digest first, so every byte read afterwards is checked against this
+    // snapshot by the `ensure_unchanged` below.
+    let source = SourceIdentity::capture(config.hdt_path)?;
     let adapter = HdtInputAdapter::scan(config.hdt_path)?;
-    let source_digest = hdt_data_digest(config.hdt_path)?;
     // Every selected role buffers concurrently during the one dictionary pass,
     // so the limit is shared out rather than granted to each.
     let role_budget = role_sort_budget(config.memory_limit, config.roles.len());
@@ -252,7 +253,7 @@ pub fn create_keysets(config: KeysetConfig<'_>) -> Result<KeysetSummary> {
             role,
             config.encoding,
             &mut run,
-            &source_digest,
+            source.digest(),
         )?;
         file.as_file().sync_all()?;
         staged.push(StagedArtifact {
@@ -268,6 +269,9 @@ pub fn create_keysets(config: KeysetConfig<'_>) -> Result<KeysetSummary> {
     }
 
     let files_written = staged.len();
+    // Everything above read the source by path, several times over. Confirm it
+    // is still the file that was digested before these bytes become public.
+    source.ensure_unchanged(config.hdt_path)?;
     publish_artifacts(staged)?;
     Ok(KeysetSummary {
         files_written,

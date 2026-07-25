@@ -12,12 +12,11 @@
 //! reads one role's keys back at a time.
 
 use super::artifacts::{
-    DuplicateKeys, KeySpool, SpooledKeys, StagedArtifact, ensure_targets_absent, format_bytes,
-    iri_hash, prepare_output_directory, publish_artifacts,
+    DuplicateKeys, KeySpool, SourceIdentity, SpooledKeys, StagedArtifact, ensure_targets_absent,
+    format_bytes, iri_hash, prepare_output_directory, publish_artifacts,
 };
 use super::input_adapter::HdtInputAdapter;
 use super::pfc_reader::PfcSectionIterator;
-use super::reader::hdt_data_digest;
 use crate::io::crc_utils::Crc32cWriter;
 use anyhow::{Context, Result, ensure};
 use std::collections::BTreeSet;
@@ -225,7 +224,10 @@ pub fn create_sketches(config: SketchConfig<'_>) -> Result<SketchSummary> {
 
     let k = usize::try_from(config.k).context("MinHash k does not fit this platform")?;
     let max_keys = max_filter_keys(config.k, config.filter_bits, config.memory_limit);
-    let source_digest = hdt_data_digest(config.hdt_path)?;
+    // Digested up front and rechecked before publication: the source is opened
+    // by path again for every dictionary section, so a file replaced mid-build
+    // could otherwise pair new keys with the old digest.
+    let source = SourceIdentity::capture(config.hdt_path)?;
     let mut accumulators = config
         .roles
         .iter()
@@ -262,10 +264,11 @@ pub fn create_sketches(config: SketchConfig<'_>) -> Result<SketchSummary> {
 
     let mut staged = Vec::with_capacity(config.roles.len() * 2);
     for data in &mut role_data {
-        stage_role_artifacts(data, config, &source_digest, &mut staged)?;
+        stage_role_artifacts(data, config, source.digest(), &mut staged)?;
     }
 
     let files_written = staged.len();
+    source.ensure_unchanged(config.hdt_path)?;
     publish_artifacts(staged)?;
     Ok(SketchSummary {
         files_written,
@@ -344,7 +347,9 @@ fn write_filter_file(
     let key_count = data.key_count();
     // Shared, Subjects, and Objects are mutually disjoint, so any duplicate key
     // in a sketch role is a hash collision.
-    let keys = data.keys.read_sorted_distinct(DuplicateKeys::AreCollisions)?;
+    let keys = data
+        .keys
+        .read_sorted_distinct(DuplicateKeys::AreCollisions)?;
     let mut writer = Crc32cWriter::new(BufWriter::with_capacity(256 * 1024, file));
     writer.write_all(&common_header(b"KGFF", data.role, key_count, source_digest))?;
     writer.write_all(&[filter_bits])?;

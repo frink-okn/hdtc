@@ -355,9 +355,16 @@ hdtc keyset data.hdt --roles subjects,objects,terms
 ```
 
 `terms` is an hdtc extension, not part of the published role pair, and may be
-withdrawn. A reader must not compare it against `subjects` or `objects` — those
-are drawn from different term populations, so an intersection between them is
-not a meaningful overlap.
+withdrawn. It covers a larger population than either published role, so an
+intersection involving it answers a different question than the symmetric
+role-to-role overlap those report — worth keeping straight when interpreting a
+result, though roles never restrict what may be intersected.
+
+Comparing *different* roles is in fact one of the main things a key set is for:
+intersecting one dataset's `objects` with another's `subjects` gives the exact
+set of shared join keys — which of the things you mention that dataset actually
+describes. Files are comparable whenever their convention and hash agree; the
+role tells you how to read the answer, not whether you may ask.
 
 **Any role builds at any size.** Keys are externally sorted and both encoders
 stream, so `--memory-limit` bounds the sort buffers rather than the key count —

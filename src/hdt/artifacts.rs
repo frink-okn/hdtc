@@ -184,6 +184,100 @@ impl SpooledKeys {
 }
 
 // ---------------------------------------------------------------------------
+// Source binding
+// ---------------------------------------------------------------------------
+
+/// The source HDT's digest, together with enough identity to tell whether the
+/// file that was digested is still the file being read.
+///
+/// A build opens the source several times — to scan the dictionary layout, to
+/// digest it, and once per dictionary section — so an HDT replaced mid-build
+/// can contribute keys from the new bytes under a digest taken from the old.
+/// `source_digest` being advisory (docs/keyset-format.md §6) means it may be
+/// *stale*; it does not license it being *wrong about which bytes it covers*,
+/// which is the one thing that would make it actively misleading.
+///
+/// This does not make the build atomic — nothing short of holding the file
+/// open throughout would — but it converts a silently mislabelled artifact
+/// into a failed run, which is the outcome that matters for files other parties
+/// consume.
+#[derive(Debug, Clone)]
+pub(crate) struct SourceIdentity {
+    digest: [u8; 32],
+    marks: FileMarks,
+}
+
+/// Cheap identity of a file: what a `stat` can tell us.
+///
+/// On Unix the device and inode catch the common atomic replace (write a
+/// temporary, rename over the target) even when the replacement preserves
+/// length and timestamp, as `rsync -a` and `cp -p` do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileMarks {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+impl FileMarks {
+    fn read(path: &Path) -> Result<Self> {
+        let metadata = fs::metadata(path)
+            .with_context(|| format!("Failed to stat source HDT {}", path.display()))?;
+        Ok(Self {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            device: std::os::unix::fs::MetadataExt::dev(&metadata),
+            #[cfg(unix)]
+            inode: std::os::unix::fs::MetadataExt::ino(&metadata),
+        })
+    }
+}
+
+impl SourceIdentity {
+    /// Digest the source HDT and record which file was digested.
+    pub(crate) fn capture(path: &Path) -> Result<Self> {
+        // Marked on both sides of the digest, so a replacement *during* the
+        // digest — which would otherwise yield a hash of two different files
+        // spliced together — is caught here rather than at publication.
+        let before = FileMarks::read(path)?;
+        let digest = super::reader::hdt_data_digest(path)?;
+        let marks = FileMarks::read(path)?;
+        ensure!(
+            before == marks,
+            "Source HDT {} changed while it was being read; the digest cannot be trusted",
+            path.display()
+        );
+        Ok(Self { digest, marks })
+    }
+
+    pub(crate) fn digest(&self) -> &[u8; 32] {
+        &self.digest
+    }
+
+    /// Fail if the source is no longer the file that was digested.
+    ///
+    /// Call immediately before publishing: everything between [`capture`] and
+    /// here — the dictionary scan and every section read — is then known to
+    /// have come from one snapshot.
+    ///
+    /// [`capture`]: SourceIdentity::capture
+    pub(crate) fn ensure_unchanged(&self, path: &Path) -> Result<()> {
+        let now = FileMarks::read(path)?;
+        ensure!(
+            now == self.marks,
+            "Source HDT {} changed during the build; refusing to publish artifacts whose keys and \
+             source_digest may describe different bytes",
+            path.display()
+        );
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Externally sorted key runs
 // ---------------------------------------------------------------------------
 
@@ -475,6 +569,56 @@ mod tests {
                 .unwrap(),
             vec![10, 30, 40]
         );
+    }
+
+    /// A source replaced mid-build must fail the run, not publish an artifact
+    /// whose keys and `source_digest` describe different bytes.
+    #[test]
+    fn a_replaced_source_is_caught_before_publication() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("data.hdt");
+
+        // A real HDT is not needed: `capture` digests the dictionary-and-triples
+        // suffix, and any well-formed HDT prefix would do — but the identity
+        // marks are what this is about, so drive them directly.
+        let marks = |bytes: &[u8]| {
+            fs::write(&path, bytes).unwrap();
+            FileMarks::read(&path).unwrap()
+        };
+
+        let original = marks(b"first");
+        let identity = SourceIdentity {
+            digest: [0x11; 32],
+            marks: original.clone(),
+        };
+        identity.ensure_unchanged(&path).unwrap();
+
+        // Replaced with different content: length differs.
+        marks(b"second file");
+        let error = identity.ensure_unchanged(&path).unwrap_err();
+        assert!(
+            error.to_string().contains("changed during the build"),
+            "{error}"
+        );
+
+        // Replaced by rename with *identical* content and preserved timestamp,
+        // the case `rsync -a` and `cp -p` produce. On Unix the inode catches it.
+        fs::write(&path, b"first").unwrap();
+        let replacement = temp.path().join("replacement");
+        fs::write(&replacement, b"first").unwrap();
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+        fs::File::open(&replacement)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        fs::rename(&replacement, &path).unwrap();
+        let restated = FileMarks::read(&path).unwrap();
+        assert_eq!(restated.len, original.len);
+        #[cfg(unix)]
+        {
+            assert_ne!(restated.inode, original.inode, "rename changes the inode");
+            assert!(identity.ensure_unchanged(&path).is_err());
+        }
     }
 
     #[test]

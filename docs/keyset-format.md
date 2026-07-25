@@ -45,9 +45,16 @@ keysets/
 Each file is self-describing and independently readable, for the same reasons
 the sketch files are ([sketch-format.md](sketch-format.md) §1).
 
-A `terms` **view is not shipped as part of the published pair**: for the two
-published roles it is their dedup merge, which any consumer reconstructs in one
-linear pass.
+Two things that are *not* in that directory are worth distinguishing, because
+they sound alike and are not:
+
+- The **union of the published pair**, `subjects ∪ objects`, is not shipped. It
+  is their deduplicated merge, which any consumer reconstructs from the two
+  files in one linear pass, so shipping it would be redundant.
+- The **`terms` role** (§1.1) is not that union. It also carries predicate IRIs,
+  which appear in neither published role, so it **cannot** be reconstructed from
+  the pair. That is precisely why it is an emitted role rather than a derived
+  view.
 
 ### 1.1 Roles
 
@@ -68,9 +75,14 @@ pair.** It exists to measure what a whole-vocabulary key set costs and what it
 answers that the role split does not, and it MAY be withdrawn in a future
 version. Two consequences:
 
-- A reader MUST NOT compare a role-`2` file against a role-`0` or role-`1`
-  file. Their key sets are drawn from different term populations, so an
-  intersection between them is not a meaningful overlap.
+- Role `2` covers a larger population than either published role, so an
+  intersection involving it answers a **different question**, not an invalid
+  one: `terms` against `subjects` asks "which IRIs does this dataset use at all
+  that that dataset describes?", which is not the symmetric role-to-role
+  overlap the published pair reports. Containment and Jaccard computed across
+  the two are therefore not comparable with figures from the pair. This is a
+  caution about interpretation; it is not a restriction on what may be
+  intersected (§4.1).
 - Role `2` is the only role that includes **predicate** IRIs. The sketch
   convention gives predicates no role at all
   ([sketch-format.md](sketch-format.md) §1.1) because a dataset's predicate set
@@ -215,12 +227,27 @@ qualify, how a role is defined, and how a term becomes a key. It is separate
 from `format_version` because two files can share a byte layout and still be
 incomparable, which is the more dangerous mismatch (§9).
 
-Two files are **comparable** iff they have the same `convention_id`, the same
-`hash_id`, and the same `role`. Nothing else affects comparability — not
-`format_version`, not `encoding`, and in particular not `source_digest`. A
-`.keys` file is comparable in this sense with a `.filter` or `.minhash` of the
-same `convention_id`, `hash_id`, and `role`, which is what makes the three
-artifact families interoperate.
+Two files are **comparable** iff they have the same `convention_id` and the same
+`hash_id` — identical to [sketch-format.md](sketch-format.md) §4, because it is
+the same convention. Nothing else affects comparability: not `format_version`,
+not `encoding`, not `role`, and in particular not `source_digest`. A `.keys`
+file is comparable in this sense with a `.filter` or `.minhash`, which is what
+makes the three artifact families interoperate.
+
+**`role` describes which population a file's keys were drawn from; it does not
+restrict what may be intersected.** Cross-role comparison is a normal and
+important operation, not a defect: intersecting one dataset's `objects` with
+another's `subjects` answers *which of the things I mention does that dataset
+describe?*, which is the question a `void:Linkset` or an actual join is asking,
+and a key set answers it exactly. Requiring matching roles would rule out the
+capability §0 exists to provide.
+
+What a consumer must do is read the result in light of the roles involved. A
+same-role intersection is a symmetric overlap between comparable populations; a
+cross-role one is directional and its two operands have different sizes and
+meanings, so a Jaccard computed across them is not a dataset-similarity measure
+and should not be reported as one. Consumers SHOULD state the roles alongside
+any published overlap figure.
 
 `min_key` and `max_key` exist for the disjoint-range prefilter of §5. They carry
 no information when `key_count = 0`, and are specified as zero there so the
@@ -437,8 +464,10 @@ A conforming **reader** MUST:
 1. Verify the CRC32C before interpreting any field.
 2. Apply every §4.4 rule, in exact arithmetic, before decoding the payload.
 3. Treat `source_digest` as advisory only.
-4. Never compare artifacts across differing `convention_id`, `hash_id`, or
-   `role`.
+4. Never compare artifacts across differing `convention_id` or `hash_id`.
+   Differing `role` is comparable and often the point (§4.1); the reader is
+   responsible for interpreting a cross-role result as directional rather than
+   as a symmetric overlap.
 5. Handle a missing role file as absent information, never as an empty role. An
    empty role is stated by a file with `key_count = 0`, not by silence.
 
@@ -627,6 +656,14 @@ two commands share.
 Artifacts are written to temporary files in the output directory and published
 by atomic rename only after all of them succeed, so a failed run leaves no
 partial `keysets/` directory and never overwrites an existing artifact.
+
+hdtc opens the source HDT by path several times during a build — to scan the
+dictionary layout, to digest it, and once per dictionary section. It records the
+file's identity alongside the digest and rechecks it immediately before
+publishing, so an HDT replaced mid-build fails the run instead of yielding an
+artifact whose keys and `source_digest` describe different bytes. The digest
+being advisory (§6) means it may be *stale*; it does not license it being wrong
+about which bytes it covers.
 
 `--encoding raw` exists to measure Elias-Fano against the baseline of §5 on real
 data; `--roles terms` exists to measure the whole-vocabulary variant of §1.1.
