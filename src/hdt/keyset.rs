@@ -7,10 +7,10 @@
 //! rules; keep them in step. The conformance vectors it freezes in §8 are
 //! pinned by the tests at the bottom of this file and in `tests/keyset_test.rs`.
 //!
-//! A key set is the exact parent of both sketch artifacts: the `.minhash` is
-//! its bottom `k` values, and the `.filter` is built from it. It answers
-//! membership without a false-positive rate and overlap without an estimator,
-//! at roughly four times the filter's bytes.
+//! For the composite subject/object roles, a key set is the exact parent of
+//! both sketch artifacts: the `.minhash` is its bottom `k` values, and the
+//! `.filter` is built from it. Every key-set role answers membership without a
+//! false-positive rate and overlap without an estimator.
 //!
 //! The command shares `hdtc sketch`'s dictionary scan and term-to-key
 //! convention (see [`crate::hdt::artifacts`]) — no new hashing and no new pass
@@ -22,8 +22,8 @@
 //! of any size builds at any limit.
 
 use super::artifacts::{
-    DuplicateKeys, KeyRunIter, KeySorter, SortedKeyRun, SourceIdentity, StagedArtifact,
-    ensure_targets_absent, iri_hash, prepare_output_directory, publish_artifacts,
+    KeyRunIter, KeySorter, SortedKeyRun, SourceIdentity, StagedArtifact, ensure_targets_absent,
+    iri_hash, prepare_output_directory, publish_artifacts,
 };
 use super::input_adapter::HdtInputAdapter;
 use crate::io::crc_utils::Crc32cWriter;
@@ -62,12 +62,14 @@ pub enum KeyRole {
     Subjects,
     /// Qualifying IRIs in `Shared ∪ Objects`.
     Objects,
-    /// Every qualifying IRI in the dictionary, predicates included.
-    ///
-    /// Not part of the published role pair — see `docs/keyset-format.md` §1.1.
-    /// It exists to measure what a whole-vocabulary key set costs and what it
-    /// answers that the role split does not.
-    Terms,
+    /// Qualifying IRIs in the Predicates section.
+    Predicates,
+    /// Qualifying IRIs in the Shared section.
+    Shared,
+    /// Qualifying IRIs in the Subjects section.
+    SubjectsOnly,
+    /// Qualifying IRIs in the Objects section.
+    ObjectsOnly,
 }
 
 impl KeyRole {
@@ -75,7 +77,10 @@ impl KeyRole {
         match self {
             Self::Subjects => 0,
             Self::Objects => 1,
-            Self::Terms => 2,
+            Self::Predicates => 2,
+            Self::Shared => 3,
+            Self::SubjectsOnly => 4,
+            Self::ObjectsOnly => 5,
         }
     }
 
@@ -83,37 +88,31 @@ impl KeyRole {
         match self {
             Self::Subjects => "subjects",
             Self::Objects => "objects",
-            Self::Terms => "terms",
+            Self::Predicates => "predicates",
+            Self::Shared => "shared",
+            Self::SubjectsOnly => "subjects-only",
+            Self::ObjectsOnly => "objects-only",
         }
+    }
+
+    /// Whether the role draws from the shared dictionary section.
+    fn takes_shared_section(self) -> bool {
+        matches!(self, Self::Subjects | Self::Objects | Self::Shared)
     }
 
     /// Whether the role draws from the subject-only dictionary section.
     fn takes_subject_section(self) -> bool {
-        matches!(self, Self::Subjects | Self::Terms)
+        matches!(self, Self::Subjects | Self::SubjectsOnly)
     }
 
     /// Whether the role draws from the object-only dictionary section.
     fn takes_object_section(self) -> bool {
-        matches!(self, Self::Objects | Self::Terms)
+        matches!(self, Self::Objects | Self::ObjectsOnly)
     }
 
     /// Whether the role draws from the predicate dictionary section.
     fn takes_predicate_section(self) -> bool {
-        matches!(self, Self::Terms)
-    }
-
-    /// What a duplicate key means for this role.
-    ///
-    /// Shared, Subjects, and Objects are mutually disjoint, so a duplicate in
-    /// the published roles can only be a hash collision. `Terms` also reads the
-    /// Predicates section, which is a separate ID space that routinely repeats
-    /// IRIs already present as subjects or objects — 1129 of ubergraph's 1251
-    /// predicates do — so duplicates there are ordinary, not collisions.
-    fn duplicate_keys(self) -> DuplicateKeys {
-        match self {
-            Self::Subjects | Self::Objects => DuplicateKeys::AreCollisions,
-            Self::Terms => DuplicateKeys::AreExpected,
-        }
+        matches!(self, Self::Predicates)
     }
 }
 
@@ -202,25 +201,29 @@ pub fn create_keysets(config: KeysetConfig<'_>) -> Result<KeysetSummary> {
         .collect();
 
     tracing::info!("Scanning HDT dictionary for qualifying IRIs");
-    // The shared section belongs to every role, so it is read once and fanned
-    // out rather than re-read per role.
-    for term in adapter.shared_terms()? {
-        if let Some(hash) = iri_hash(&term?) {
-            for accumulator in &mut accumulators {
-                accumulator.add_hash(hash)?;
-            }
-        }
+    // Each dictionary section is read once and fanned out to the selected
+    // composite or section roles that draw from it.
+    if config.roles.iter().any(|role| role.takes_shared_section()) {
+        scan_section(
+            adapter.shared_terms()?,
+            &mut accumulators,
+            KeyRole::takes_shared_section,
+        )?;
     }
-    scan_section(
-        adapter.subject_terms()?,
-        &mut accumulators,
-        KeyRole::takes_subject_section,
-    )?;
-    scan_section(
-        adapter.object_terms()?,
-        &mut accumulators,
-        KeyRole::takes_object_section,
-    )?;
+    if config.roles.iter().any(|role| role.takes_subject_section()) {
+        scan_section(
+            adapter.subject_terms()?,
+            &mut accumulators,
+            KeyRole::takes_subject_section,
+        )?;
+    }
+    if config.roles.iter().any(|role| role.takes_object_section()) {
+        scan_section(
+            adapter.object_terms()?,
+            &mut accumulators,
+            KeyRole::takes_object_section,
+        )?;
+    }
     if config
         .roles
         .iter()
@@ -239,7 +242,9 @@ pub fn create_keysets(config: KeysetConfig<'_>) -> Result<KeysetSummary> {
         let role = accumulator.role;
         let scanned_iris = accumulator.keys.scanned();
         tracing::info!("Merging {} keys", role.file_stem());
-        let mut run = accumulator.keys.finish(role.duplicate_keys())?;
+        // No role draws from overlapping dictionary sections, so a duplicate
+        // within one role can only be a 64-bit hash collision.
+        let mut run = accumulator.keys.finish()?;
         tracing::info!(
             "Building {} key set from {} distinct keys ({} qualifying IRIs)",
             role.file_stem(),
@@ -784,7 +789,7 @@ mod tests {
         for &key in keys {
             sorter.push(key).unwrap();
         }
-        sorter.finish(DuplicateKeys::AreCollisions).unwrap()
+        sorter.finish().unwrap()
     }
 
     /// The §4.2 sizing rule, and the bytes-per-key model of §5 that follows
@@ -916,7 +921,7 @@ mod tests {
     fn header_has_stable_layout() {
         let digest = [0x5a; 32];
         let header = header(
-            KeyRole::Terms,
+            KeyRole::Predicates,
             KeysetEncoding::EliasFano,
             43,
             42,
@@ -929,7 +934,7 @@ mod tests {
         assert_eq!(u16::from_le_bytes(header[8..10].try_into().unwrap()), 1);
         assert_eq!(u16::from_le_bytes(header[10..12].try_into().unwrap()), 1);
         assert_eq!(header[12], 1, "hash_id");
-        assert_eq!(header[13], 2, "role = terms");
+        assert_eq!(header[13], 2, "role = predicates");
         assert_eq!(header[14], 1, "encoding = elias-fano");
         assert_eq!(header[15], 43, "low_width");
         assert_eq!(u64::from_le_bytes(header[16..24].try_into().unwrap()), 42);
@@ -982,7 +987,7 @@ mod tests {
             }
             assert_eq!(sorter.scanned(), 4_000);
 
-            let mut run = sorter.finish(DuplicateKeys::AreCollisions).unwrap();
+            let mut run = sorter.finish().unwrap();
             assert_eq!(run.key_count(), expected.len() as u64, "budget {budget}");
             assert_eq!(
                 run.range(),

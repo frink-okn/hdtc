@@ -12,8 +12,8 @@
 //! reads one role's keys back at a time.
 
 use super::artifacts::{
-    DuplicateKeys, KeySpool, SourceIdentity, SpooledKeys, StagedArtifact, ensure_targets_absent,
-    format_bytes, iri_hash, prepare_output_directory, publish_artifacts,
+    KeySpool, SourceIdentity, SpooledKeys, StagedArtifact, ensure_targets_absent, format_bytes,
+    iri_hash, prepare_output_directory, publish_artifacts,
 };
 use super::input_adapter::HdtInputAdapter;
 use super::pfc_reader::PfcSectionIterator;
@@ -347,9 +347,7 @@ fn write_filter_file(
     let key_count = data.key_count();
     // Shared, Subjects, and Objects are mutually disjoint, so any duplicate key
     // in a sketch role is a hash collision.
-    let keys = data
-        .keys
-        .read_sorted_distinct(DuplicateKeys::AreCollisions)?;
+    let keys = data.keys.read_sorted_distinct()?;
     let mut writer = Crc32cWriter::new(BufWriter::with_capacity(256 * 1024, file));
     writer.write_all(&common_header(b"KGFF", data.role, key_count, source_digest))?;
     writer.write_all(&[filter_bits])?;

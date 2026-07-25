@@ -21,16 +21,10 @@ const SUBJECT_IRIS: [&str; 3] = [
     "http://example.org/subject-only",
 ];
 const OBJECT_IRIS: [&str; 2] = ["http://example.org/object", "http://example.org/shared"];
-/// Every qualifying IRI in the dictionary, predicates included — and nothing
-/// else: the literal and both blank nodes are excluded by §1.2.
-const TERM_IRIS: [&str; 6] = [
-    "http://example.org/a",
-    "http://example.org/object",
-    "http://example.org/p",
-    "http://example.org/p2",
-    "http://example.org/shared",
-    "http://example.org/subject-only",
-];
+const SUBJECT_ONLY_IRIS: [&str; 2] = ["http://example.org/a", "http://example.org/subject-only"];
+const OBJECT_ONLY_IRIS: [&str; 1] = ["http://example.org/object"];
+const SHARED_IRIS: [&str; 1] = ["http://example.org/shared"];
+const PREDICATE_IRIS: [&str; 2] = ["http://example.org/p", "http://example.org/p2"];
 
 const HEADER_LEN: usize = 96;
 
@@ -85,7 +79,7 @@ fn read_keyset(path: &Path) -> Keyset {
     assert_eq!(u16::from_le_bytes(bytes[10..12].try_into().unwrap()), 1);
     assert_eq!(bytes[12], 1, "hash_id = XXH64 seed 0");
     let (role, encoding, low_width) = (bytes[13], bytes[14], bytes[15]);
-    assert!(role <= 2, "role");
+    assert!(role <= 5, "role");
     assert!(encoding <= 1, "encoding");
     let key_count = read_u64(&bytes, 16);
     let (min_key, max_key) = (read_u64(&bytes, 24), read_u64(&bytes, 32));
@@ -198,7 +192,7 @@ fn decode_elias_fano(payload: &[u8], key_count: u64, low_width: u8, payload_len:
 }
 
 #[test]
-fn keyset_writes_the_published_role_pair() {
+fn keyset_writes_the_disjoint_default_roles() {
     let temp = tempfile::tempdir().unwrap();
     let hdt = build_fixture(temp.path());
 
@@ -206,67 +200,82 @@ fn keyset_writes_the_published_role_pair() {
     assert!(output.status.success(), "{output:?}");
 
     let dir = temp.path().join("keysets");
-    assert!(dir.join("subjects.keys").exists());
-    assert!(dir.join("objects.keys").exists());
-    assert!(
-        !dir.join("terms.keys").exists(),
-        "terms is not part of the default role pair"
-    );
+    for role in ["subjects", "objects", "predicates", "terms"] {
+        assert!(!dir.join(format!("{role}.keys")).exists(), "{role}");
+    }
 
+    let subjects_only = read_keyset(&dir.join("subjects-only.keys"));
+    assert_eq!(subjects_only.role, 4);
+    assert_eq!(subjects_only.encoding, 1, "elias-fano is the default");
+    assert_eq!(subjects_only.keys, expected_keys(&SUBJECT_ONLY_IRIS));
+
+    let objects_only = read_keyset(&dir.join("objects-only.keys"));
+    assert_eq!(objects_only.role, 5);
+    assert_eq!(objects_only.keys, expected_keys(&OBJECT_ONLY_IRIS));
+
+    let shared = read_keyset(&dir.join("shared.keys"));
+    assert_eq!(shared.role, 3);
+    assert_eq!(shared.keys, expected_keys(&SHARED_IRIS));
+
+    // The three default sections are pairwise disjoint and bind to one build.
+    assert!(
+        subjects_only
+            .keys
+            .iter()
+            .all(|key| !objects_only.keys.contains(key) && !shared.keys.contains(key))
+    );
+    assert!(
+        objects_only
+            .keys
+            .iter()
+            .all(|key| !shared.keys.contains(key))
+    );
+    assert_eq!(subjects_only.source_digest, objects_only.source_digest);
+    assert_eq!(subjects_only.source_digest, shared.source_digest);
+
+    // The overlapping subject/object views are losslessly reconstructed.
+    let mut subjects = subjects_only.keys.clone();
+    subjects.extend_from_slice(&shared.keys);
+    subjects.sort_unstable();
+    assert_eq!(subjects, expected_keys(&SUBJECT_IRIS));
+    let mut objects = objects_only.keys.clone();
+    objects.extend_from_slice(&shared.keys);
+    objects.sort_unstable();
+    assert_eq!(objects, expected_keys(&OBJECT_IRIS));
+}
+
+#[test]
+fn composite_and_predicate_roles_have_the_documented_membership() {
+    let temp = tempfile::tempdir().unwrap();
+    let hdt = build_fixture(temp.path());
+
+    let output = run_keyset(&hdt, &["--roles", "subjects,objects,predicates"]);
+    assert!(output.status.success(), "{output:?}");
+
+    let dir = temp.path().join("keysets");
     let subjects = read_keyset(&dir.join("subjects.keys"));
     assert_eq!(subjects.role, 0);
-    assert_eq!(subjects.encoding, 1, "elias-fano is the default");
     assert_eq!(subjects.keys, expected_keys(&SUBJECT_IRIS));
-    assert_eq!(subjects.key_count, 3);
-
     let objects = read_keyset(&dir.join("objects.keys"));
     assert_eq!(objects.role, 1);
     assert_eq!(objects.keys, expected_keys(&OBJECT_IRIS));
-
-    // Both roles bind to the same HDT build.
-    assert_eq!(subjects.source_digest, objects.source_digest);
-
-    // The shared IRI is in both roles: that is the role-to-role overlap the
-    // artifact exists to compute, and here it is exact.
-    let shared: Vec<u64> = subjects
-        .keys
-        .iter()
-        .filter(|key| objects.keys.contains(key))
-        .copied()
-        .collect();
-    assert_eq!(shared, vec![xxh64(b"http://example.org/shared", 0)]);
+    let predicates = read_keyset(&dir.join("predicates.keys"));
+    assert_eq!(predicates.role, 2);
+    assert_eq!(predicates.keys, expected_keys(&PREDICATE_IRIS));
+    assert_eq!(predicates.key_count, 2);
 }
 
-/// The `terms` role covers every qualifying IRI in the dictionary — predicates
-/// included, literals and blank nodes still excluded (§1.1, §1.2).
 #[test]
-fn terms_role_covers_every_iri_including_predicates() {
+fn removed_terms_role_is_rejected() {
     let temp = tempfile::tempdir().unwrap();
     let hdt = build_fixture(temp.path());
 
     let output = run_keyset(&hdt, &["--roles", "terms"]);
-    assert!(output.status.success(), "{output:?}");
-
-    let terms = read_keyset(&temp.path().join("keysets/terms.keys"));
-    assert_eq!(terms.role, 2);
-    assert_eq!(terms.key_count, 6);
-    assert_eq!(terms.keys, expected_keys(&TERM_IRIS));
-
-    // It is a strict superset of both published roles, and the two predicate
-    // IRIs are exactly what it adds.
-    for iri in SUBJECT_IRIS.iter().chain(OBJECT_IRIS.iter()) {
-        assert!(terms.keys.contains(&xxh64(iri.as_bytes(), 0)), "{iri}");
-    }
-    for predicate in ["http://example.org/p", "http://example.org/p2"] {
-        assert!(terms.keys.contains(&xxh64(predicate.as_bytes(), 0)));
-    }
-    // No literal or blank node leaked in.
-    for excluded in ["\"literal\"", "_:subject-blank", "_:object-blank"] {
-        assert!(
-            !terms.keys.contains(&xxh64(excluded.as_bytes(), 0)),
-            "{excluded}"
-        );
-    }
+    assert!(!output.status.success(), "terms must no longer be accepted");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("invalid value 'terms'"),
+        "{output:?}"
+    );
 }
 
 #[test]
@@ -287,12 +296,12 @@ fn both_encodings_hold_the_same_key_set() {
             "--encoding",
             "raw",
             "--roles",
-            "subjects,objects,terms",
+            "subjects-only,objects-only,shared",
         ],
     );
     assert!(raw.status.success(), "{raw:?}");
 
-    for role in ["subjects", "objects"] {
+    for role in ["subjects-only", "objects-only", "shared"] {
         let ef = read_keyset(&temp.path().join(format!("ef/{role}.keys")));
         let raw = read_keyset(&temp.path().join(format!("raw/{role}.keys")));
         assert_eq!(ef.encoding, 1);
@@ -311,7 +320,7 @@ fn keyset_digest_ignores_header_rewrites() {
     let temp = tempfile::tempdir().unwrap();
     let hdt = build_fixture(temp.path());
     assert!(run_keyset(&hdt, &[]).status.success());
-    let before = read_keyset(&temp.path().join("keysets/subjects.keys")).source_digest;
+    let before = read_keyset(&temp.path().join("keysets/subjects-only.keys")).source_digest;
 
     let renamed = temp.path().join("renamed.hdt");
     let header = Command::new(env!("CARGO_BIN_EXE_hdtc"))
@@ -327,7 +336,7 @@ fn keyset_digest_ignores_header_rewrites() {
         &["-o", temp.path().join("after").to_str().unwrap()],
     );
     assert!(output.status.success(), "{output:?}");
-    let after = read_keyset(&temp.path().join("after/subjects.keys"));
+    let after = read_keyset(&temp.path().join("after/subjects-only.keys"));
     assert_eq!(after.source_digest, before, "header edits do not change it");
 }
 
@@ -339,7 +348,7 @@ fn keyset_agrees_with_the_sketch_of_the_same_role() {
     let temp = tempfile::tempdir().unwrap();
     let hdt = build_fixture(temp.path());
 
-    assert!(run_keyset(&hdt, &[]).status.success());
+    assert!(run_keyset(&hdt, &["--roles", "subjects"]).status.success());
     let sketch = Command::new(env!("CARGO_BIN_EXE_hdtc"))
         .args(["sketch", hdt.to_str().unwrap()])
         .args(["-o", temp.path().join("filters").to_str().unwrap()])
@@ -384,12 +393,12 @@ fn keyset_emits_a_well_formed_empty_role() {
                 "--encoding",
                 encoding,
                 "--roles",
-                "objects",
+                "objects-only",
             ],
         );
         assert!(output.status.success(), "{output:?}");
 
-        let objects = read_keyset(&dir.join("objects.keys"));
+        let objects = read_keyset(&dir.join("objects-only.keys"));
         assert_eq!(objects.key_count, 0, "an empty role is not an error");
         assert_eq!((objects.min_key, objects.max_key), (0, 0));
         assert_eq!(objects.low_width, 0);
@@ -404,15 +413,15 @@ fn keyset_refuses_to_replace_existing_artifacts() {
     let hdt = build_fixture(temp.path());
     assert!(run_keyset(&hdt, &[]).status.success());
 
-    let objects = temp.path().join("keysets/objects.keys");
-    let before = fs::read(&objects).unwrap();
+    let shared = temp.path().join("keysets/shared.keys");
+    let before = fs::read(&shared).unwrap();
     let output = run_keyset(&hdt, &[]);
     assert!(!output.status.success(), "a second run must fail");
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("Refusing to replace"),
         "{output:?}"
     );
-    assert_eq!(fs::read(&objects).unwrap(), before, "left untouched");
+    assert_eq!(fs::read(&shared).unwrap(), before, "left untouched");
 }
 
 /// The key set is built by an external sort, so `--memory-limit` bounds memory
@@ -442,7 +451,7 @@ fn a_tiny_memory_limit_spills_and_emits_identical_bytes() {
         assert!(output.status.success(), "at -m {limit}: {output:?}");
     }
 
-    for role in ["subjects", "objects"] {
+    for role in ["subjects-only", "objects-only"] {
         let small = read_keyset(&spilled.join(format!("{role}.keys")));
         let large = read_keyset(&resident.join(format!("{role}.keys")));
         assert_eq!(small.key_count, 200_000, "{role}");

@@ -116,22 +116,6 @@ pub(crate) struct SpooledKeys {
     key_count: u64,
 }
 
-/// What a duplicate key means for the role being read back, which decides how
-/// one is reported.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DuplicateKeys {
-    /// The role draws from mutually disjoint dictionary sections, so its terms
-    /// are distinct by construction and a duplicate key can only be an XXH64
-    /// collision — worth a warning.
-    AreCollisions,
-    /// The role draws from sections that can repeat an IRI, so duplicates are
-    /// ordinary. The HDT Predicates section is a separate ID space whose IRIs
-    /// may also appear as subjects or objects, and in real vocabularies they
-    /// routinely do. Reporting these as collisions would overstate the
-    /// collision rate by orders of magnitude.
-    AreExpected,
-}
-
 impl SpooledKeys {
     /// Number of qualifying IRIs scanned, before deduplication.
     pub(crate) fn key_count(&self) -> u64 {
@@ -144,7 +128,7 @@ impl SpooledKeys {
     /// defined for them, and a key set is by definition a set. Deduplicating
     /// here makes the input meet that precondition instead of leaving it to
     /// chance.
-    pub(crate) fn read_sorted_distinct(&mut self, duplicates: DuplicateKeys) -> Result<Vec<u64>> {
+    pub(crate) fn read_sorted_distinct(&mut self) -> Result<Vec<u64>> {
         let count =
             usize::try_from(self.key_count).context("Key count does not fit this platform")?;
         self.file.rewind()?;
@@ -163,21 +147,13 @@ impl SpooledKeys {
         keys.dedup();
         let removed = scanned - keys.len();
         if removed > 0 {
-            match duplicates {
-                DuplicateKeys::AreCollisions => tracing::warn!(
-                    "{} XXH64 collision(s) among {} {} IRIs; the colliding IRIs are \
-                     indistinguishable in the emitted artifacts",
-                    removed,
-                    scanned,
-                    self.label
-                ),
-                DuplicateKeys::AreExpected => tracing::debug!(
-                    "{} of {} {} IRIs occur in more than one dictionary section",
-                    removed,
-                    scanned,
-                    self.label
-                ),
-            }
+            tracing::warn!(
+                "{} XXH64 collision(s) among {} {} IRIs; the colliding IRIs are \
+                 indistinguishable in the emitted artifacts",
+                removed,
+                scanned,
+                self.label
+            );
         }
         Ok(keys)
     }
@@ -353,7 +329,7 @@ impl KeySorter {
     /// The run is stored uncompressed at 8 bytes per distinct key so that the
     /// encoder can stream it — twice, for Elias-Fano, which writes its low-bits
     /// array before its high-bits vector.
-    pub(crate) fn finish(mut self, duplicates: DuplicateKeys) -> Result<SortedKeyRun> {
+    pub(crate) fn finish(mut self) -> Result<SortedKeyRun> {
         let merged = self.sorter.finish(&mut self.buffer)?;
 
         let file = tempfile::tempfile_in(&self.temp_dir).with_context(|| {
@@ -382,21 +358,13 @@ impl KeySorter {
 
         let removed = self.scanned - key_count;
         if removed > 0 {
-            match duplicates {
-                DuplicateKeys::AreCollisions => tracing::warn!(
-                    "{} XXH64 collision(s) among {} {} IRIs; the colliding IRIs are \
-                     indistinguishable in the emitted artifacts",
-                    removed,
-                    self.scanned,
-                    self.label
-                ),
-                DuplicateKeys::AreExpected => tracing::debug!(
-                    "{} of {} {} IRIs occur in more than one dictionary section",
-                    removed,
-                    self.scanned,
-                    self.label
-                ),
-            }
+            tracing::warn!(
+                "{} XXH64 collision(s) among {} {} IRIs; the colliding IRIs are \
+                 indistinguishable in the emitted artifacts",
+                removed,
+                self.scanned,
+                self.label
+            );
         }
 
         Ok(SortedKeyRun {
@@ -564,11 +532,7 @@ mod tests {
         }
         let mut keys = spool.finish().unwrap();
         assert_eq!(keys.key_count(), 5, "occurrences, not distinct values");
-        assert_eq!(
-            keys.read_sorted_distinct(DuplicateKeys::AreCollisions)
-                .unwrap(),
-            vec![10, 30, 40]
-        );
+        assert_eq!(keys.read_sorted_distinct().unwrap(), vec![10, 30, 40]);
     }
 
     /// A source replaced mid-build must fail the run, not publish an artifact

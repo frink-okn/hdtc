@@ -84,8 +84,10 @@ pub enum SketchRole {
 pub enum KeysetRole {
     Subjects,
     Objects,
-    /// Every qualifying IRI in the dictionary, predicates included.
-    Terms,
+    Predicates,
+    Shared,
+    SubjectsOnly,
+    ObjectsOnly,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -398,15 +400,11 @@ pub struct KeysetArgs {
     pub encoding: KeysetEncoding,
 
     /// Dictionary roles to emit, as a comma-separated list
-    ///
-    /// `terms` is an hdtc extension covering every qualifying IRI in the
-    /// dictionary, predicates included; it is not part of the published role
-    /// pair and is not comparable against `subjects` or `objects`.
     #[arg(
         long,
         value_enum,
         value_delimiter = ',',
-        default_value = "subjects,objects",
+        default_value = "subjects-only,objects-only,shared",
         value_name = "ROLE,..."
     )]
     pub roles: Vec<KeysetRole>,

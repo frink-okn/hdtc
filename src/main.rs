@@ -726,7 +726,10 @@ fn create_keysets(args: cli::KeysetArgs, benchmark: bool) -> Result<()> {
         let role = match role {
             cli::KeysetRole::Subjects => hdt::KeyRole::Subjects,
             cli::KeysetRole::Objects => hdt::KeyRole::Objects,
-            cli::KeysetRole::Terms => hdt::KeyRole::Terms,
+            cli::KeysetRole::Predicates => hdt::KeyRole::Predicates,
+            cli::KeysetRole::Shared => hdt::KeyRole::Shared,
+            cli::KeysetRole::SubjectsOnly => hdt::KeyRole::SubjectsOnly,
+            cli::KeysetRole::ObjectsOnly => hdt::KeyRole::ObjectsOnly,
         };
         if !roles.contains(&role) {
             roles.push(role);

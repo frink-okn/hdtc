@@ -703,18 +703,30 @@ By default this creates a `keysets/` directory beside the HDT containing:
 
 ```text
 keysets/
-  subjects.keys
-  objects.keys
+  subjects-only.keys
+  objects-only.keys
+  shared.keys
 ```
 
-The roles are the same as the sketch roles, over the same qualifying IRIs, so a
-`.keys` file and a `.filter` for the same role describe the same set. What the key
-set adds is that it needs no probe list: two `.keys` files intersect in a linear
-merge of sorted integers, giving `|A ∩ B|` and the shared key set itself, with
-neither party's IRIs in hand. A filter can only be probed one key at a time, and a
+These are the HDT dictionary's disjoint subject/object sections. The familiar
+role views are reconstructed without loss by merging sorted files:
+
+```text
+subjects = shared ∪ subjects-only
+objects  = shared ∪ objects-only
+```
+
+This avoids writing every shared IRI twice while preserving directional overlap
+questions such as `objects_A × subjects_B`. The optional `subjects` and
+`objects` roles emit those overlapping views directly and describe the same sets
+as sketch artifacts of the same role.
+
+A key set needs no probe list: two `.keys` files intersect in a linear merge of
+sorted integers, giving `|A ∩ B|` and the shared key set itself, with neither
+party's IRIs in hand. A filter can only be probed one key at a time, and a
 MinHash estimates the overlap without identifying it. A `.minhash` is derivable
-from a key set (take the bottom `k`) and a `.filter` is built from one, so the key
-set is the exact parent of both.
+from a key set (take the bottom `k`) and a `.filter` is built from one, so the
+key set is the exact parent of both for the composite subject/object roles.
 
 Keys are XXH64 hashes and are not reversible. A shared key becomes an IRI on
 whichever side holds the terms: scan that HDT's dictionary once, hash each term,
@@ -742,17 +754,16 @@ search it. The encoding is a per-file choice recorded in the header and does not
 affect comparability: two files with different encodings hold the same kind of
 set and intersect normally.
 
-There is also an experimental `terms` role covering every qualifying IRI in the
-dictionary, predicates included:
+All six roles can be selected explicitly. For example, emit the overlapping
+sketch-compatible views and the predicate dictionary section:
 
 ```sh
-hdtc keyset data.hdt --roles subjects,objects,terms
+hdtc keyset data.hdt --roles subjects,objects,predicates
 ```
 
-`terms` is an hdtc extension, not part of the published role pair, and may be
-withdrawn. It covers a larger population than either published role, so an
-intersection involving it answers a different question than the symmetric
-role-to-role overlap those report.
+The supported roles are `subjects`, `objects`, `predicates`, `shared`,
+`subjects-only`, and `objects-only`. `predicates` contains qualifying IRIs from
+the predicate dictionary section only and has no sketch counterpart.
 
 Files are comparable whenever their convention and hash agree — the role tells
 you how to read the answer, not whether you may ask. Comparing *different* roles
@@ -777,17 +788,17 @@ untrusted files, and the frozen conformance vectors.
 
 #### Keyset: All options
 
-| Option                      | Default                | Description                                                          |
-| --------------------------- | ---------------------- | -------------------------------------------------------------------- |
-| `<HDT_FILE>`                | _(required)_           | Source HDT file                                                      |
-| `-o, --output-dir DIR`      | `keysets/` beside HDT  | Directory for generated artifacts                                    |
-| `--encoding ENCODING`       | `elias-fano`           | Payload encoding (`elias-fano` or `raw`)                             |
-| `--roles ROLE,...`          | `subjects,objects`     | Roles to emit (`subjects`, `objects`, and/or experimental `terms`)   |
-| `--temp-dir DIR`            | system temp            | Directory for temporary sort chunks and merged key runs              |
-| `-m, --memory-limit SIZE`   | `4G`                   | Soft budget for key sort buffers; bounds memory, not the key count   |
-| `--benchmark`               | off                    | Emit total keyset timing                                             |
-| `-v, --verbose`             | —                      | Increase log verbosity (`-v` debug, `-vv` trace)                     |
-| `-q, --quiet`               | —                      | Suppress all output except errors                                    |
+| Option                    | Default                               | Description                                                                                          |
+| ------------------------- | ------------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| `<HDT_FILE>`              | _(required)_                          | Source HDT file                                                                                      |
+| `-o, --output-dir DIR`    | `keysets/` beside HDT                 | Directory for generated artifacts                                                                    |
+| `--encoding ENCODING`     | `elias-fano`                          | Payload encoding (`elias-fano` or `raw`)                                                             |
+| `--roles ROLE,...`        | `subjects-only,objects-only,shared`   | Roles to emit (`subjects`, `objects`, `predicates`, `shared`, `subjects-only`, and `objects-only`)   |
+| `--temp-dir DIR`          | system temp                           | Directory for temporary sort chunks and merged key runs                                              |
+| `-m, --memory-limit SIZE` | `4G`                                  | Soft budget for key sort buffers; bounds memory, not the key count                                   |
+| `--benchmark`             | off                                   | Emit total keyset timing                                                                             |
+| `-v, --verbose`           | —                                     | Increase log verbosity (`-v` debug, `-vv` trace)                                                     |
+| `-q, --quiet`             | —                                     | Suppress all output except errors                                                                    |
 
 ## Architecture
 
@@ -839,9 +850,9 @@ docs/
 
 `hdtc sketch` and `hdtc keyset` derive their artifacts from one pass over an HDT
 dictionary and share a single term-to-key convention (`src/hdt/artifacts.rs`),
-which both formats assert by declaring `convention_id = 1`. Filters, sketches,
-and key sets of the same role are only comparable because that function has one
-definition.
+which both formats assert by declaring `convention_id = 1`. For the `subjects`
+and `objects` roles, filters, sketches, and key sets describe the same population
+because that function has one definition.
 
 ## Development
 
