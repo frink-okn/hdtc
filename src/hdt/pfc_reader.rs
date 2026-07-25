@@ -123,7 +123,11 @@ impl<R: Read> PfcSectionIterator<R> {
     ///
     /// The reader must be positioned at the start of the PFC string data buffer
     /// (i.e., right after the `PfcSectionHeader` has been read).
-    pub fn new(reader: R, header: &PfcSectionHeader, section_name: &str) -> Self {
+    ///
+    /// Takes the header by value: `offsets` holds one `u64` per block (0.5 bytes
+    /// per term at the default block size), so cloning it would double a
+    /// dictionary-sized allocation.
+    pub fn new(reader: R, header: PfcSectionHeader, section_name: &str) -> Self {
         let total_blocks = if header.string_count == 0 {
             0
         } else {
@@ -135,7 +139,7 @@ impl<R: Read> PfcSectionIterator<R> {
             section_name: section_name.to_string(),
             string_count: header.string_count,
             block_size: header.block_size,
-            offsets: header.offsets.clone(),
+            offsets: header.offsets,
             strings_yielded: 0,
             current_block: Vec::new(),
             current_block_index: 0,

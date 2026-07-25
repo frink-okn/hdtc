@@ -4,6 +4,7 @@
 // reader API even though these operations are part of the sidecar contract.
 #![allow(dead_code)]
 
+use crate::hdt::reader::sha256_to_end;
 use crate::io::crc_utils::{CRC32C_ALGO, crc8, crc32c};
 use crate::io::{ControlInfo, decode_vbyte, encode_vbyte, read_vbyte};
 use crate::quads::writer::canonical_sidecar_path;
@@ -11,7 +12,6 @@ use crate::sort::{ExternalSorter, Sortable};
 use anyhow::{Context, Result, bail, ensure};
 use oxrdf::NamedNode;
 use oxrdfio::{RdfFormat, RdfParser};
-use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -573,16 +573,7 @@ impl GraphSidecarReader {
     fn validate_identity_digest(&mut self) -> Result<()> {
         let mut file = File::open(&self.hdt_path)?;
         file.seek(SeekFrom::Start(self.hdt_data_offset))?;
-        let mut hasher = Sha256::new();
-        let mut bytes = [0u8; 256 * 1024];
-        loop {
-            let read = file.read(&mut bytes)?;
-            if read == 0 {
-                break;
-            }
-            hasher.update(&bytes[..read]);
-        }
-        let digest: [u8; 32] = hasher.finalize().into();
+        let digest = sha256_to_end(&mut BufReader::with_capacity(256 * 1024, file))?;
         ensure!(
             digest == self.header.source_digest,
             "graph sidecar is bound to a different HDT"

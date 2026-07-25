@@ -28,6 +28,10 @@ bitflags = "2"
 libc = "0.2"
 md5 = "0.8"
 sha2 = "0.10"
+xxhash-rust = { version = "0.8", features = ["xxh64"] }
+# Exact pin: see docs/sketch-format.md §5.5. Safe to move; `cargo test` says what
+# to do if the emitted bytes change.
+xorf = { version = "=0.12.0", default-features = false, features = ["binary-fuse"] }
 
 [dev-dependencies]
 hdt = "0.4"
@@ -40,3 +44,13 @@ harness = false
 [profile.release]
 lto = true
 codegen-units = 1
+
+# xorf's debug-only duplicate check builds an unbounded BTreeSet before the
+# bounded filter construction. `read_distinct_keys` in src/hdt/sketch.rs sorts
+# and deduplicates every key set before handing it over, so keep development
+# builds on the production memory path. This does not affect overflow checks,
+# which Cargo controls separately and leaves on for dev; release builds are why
+# the key ceiling is enforced in our code (MAX_BINARY_FUSE_KEYS,
+# docs/sketch-format.md §5.3) rather than left to a panic.
+[profile.dev.package.xorf]
+debug-assertions = false

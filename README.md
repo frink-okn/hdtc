@@ -14,44 +14,13 @@ Development of hdtc is done primarily through Claude Code.
 - **Scalable** — streaming, disk-backed pipeline with configurable memory limit (default 4 GB)
 - **Multiple inputs** — accepts any mix of RDF files, HDT files, and directories; recursively discovers RDF files
 - **Parallel NT/NQ parsing** — newline-safe chunk parsing for N-Triples/N-Quads (including `.gz`, `.bz2`, `.xz`) with bounded in-flight memory
-- **Named graphs** — optional packed `<data.hdt>.graphs` sidecars preserve N-Quads/TriG datasets while the standard HDT remains the deduplicated triples union
 - **Index generation** — optional `.hdt.index.v1-1` enables efficient `? P ?`, `? ? O`, and `? P O` queries
 - **VoID statistics** — compute dataset-level, property, and class partition statistics as N-Triples
+- **Structural validation** — walk an HDT's triple structures and checksums, and any graph sidecar, end to end
 - **Resilient parsing** — skips malformed triples with warnings, reports total skipped at the end
-
-## Named graphs
-
-hdtc preserves RDF datasets without changing the standard HDT triples format. In
-quads mode, the output is a pair of files:
-
-- `data.hdt` is an ordinary HDT containing the deduplicated union of all triples
-  in the dataset. It remains usable by existing HDT software that knows nothing
-  about named graphs.
-- `data.hdt.graphs` records which default or named graphs contain each union
-  triple. It has a sorted graph dictionary and one compressed membership layer
-  per graph. Graph ID 0 denotes the RDF default graph; named graphs receive
-  consecutive IDs starting at 1.
-
-The union and the default graph are distinct views. A triple may occur in the
-default graph, in one or more named graphs, or in both. Repeated copies of the
-same quad create one membership, while the same triple in different graphs
-creates one HDT triple with several memberships.
-
-Memberships refer to final SPO positions in the associated HDT. The sidecar is
-bound to the HDT's exact dictionary-and-triples bytes with a SHA-256 digest, so
-it cannot accidentally be used with another HDT. Each graph layer independently
-uses a dense chunk table, sparse chunk table, or Elias–Fano encoding according to
-its density. Readers can answer access, rank, select, iteration, and graph lookup
-directly from the file without loading a whole layer.
-
-Creation remains streaming and bounded by `--memory-limit`. hdtc deduplicates and
-sorts memberships on disk, then encodes one graph layer at a time using reusable
-scratch space. Merging HDTs reconstructs memberships by graph name and triple,
-instead of copying position-dependent bitmaps.
-
-See the normative [HDT graphs sidecar format, version 1](docs/graphs-sidecar-format.md)
-for the binary layout, checksums, identity rules, encodings, and validation
-requirements.
+- **[Named graphs](#named-graphs)** — optional packed `<data.hdt>.graphs` sidecars preserve N-Quads/TriG datasets while the standard HDT remains the deduplicated triples union
+- **[Membership and overlap sketches](#membership-and-overlap-sketches)** — build source-bound binary fuse filters and bottom-k MinHash files directly from an HDT dictionary
+- **[Exact key sets](#exact-key-sets)** — publish the complete distinct key set for a role, Elias-Fano encoded, for membership and overlap without approximation
 
 ## Installation
 
@@ -70,7 +39,9 @@ cargo build --release
 
 ## Usage
 
-hdtc supports these main commands:
+hdtc supports these main commands. The `sketch` and `keyset` commands, and the
+named-graph options of `create`, are covered in detail under
+[Beyond standard HDT](#beyond-standard-hdt).
 
 ### `hdtc create` — Convert RDF to HDT
 
@@ -96,10 +67,28 @@ hdtc dump [OPTIONS] <HDT_FILE>
 hdtc search [OPTIONS] --query <PATTERN> <HDT_FILE>
 ```
 
+### `hdtc validate` — Check HDT structures and any graph sidecar
+
+```
+hdtc validate [OPTIONS] <HDT_FILE>
+```
+
 ### `hdtc void` — Compute VoID statistics
 
 ```
 hdtc void [OPTIONS] <HDT_FILE>
+```
+
+### `hdtc sketch` — Build membership filters and overlap sketches
+
+```
+hdtc sketch [OPTIONS] <HDT_FILE>
+```
+
+### `hdtc keyset` — Build exact key sets
+
+```
+hdtc keyset [OPTIONS] <HDT_FILE>
 ```
 
 ### `hdtc header` — Dump or modify the embedded header triples
@@ -107,56 +96,6 @@ hdtc void [OPTIONS] <HDT_FILE>
 ```
 hdtc header <HDT_FILE> [--replace FILE | --add FILE] [--dataset-uri IRI] [--output PATH]
 ```
-
-With no flags, dumps the header N-Triples to stdout. With `--replace`/`--add`/
-`--dataset-uri`, writes a modified copy to `--output` (the original is never
-changed; the dictionary and triples are copied verbatim, so any
-`.hdt.index.v1-1` stays valid):
-
-- `--replace FILE` — swap the descriptive metadata for the triples in `FILE`,
-  keeping the data-derived statistics hdtc generated.
-- `--add FILE` — append the triples in `FILE` to the header.
-- `--dataset-uri IRI` — rename the dataset: rewrite every occurrence of the
-  current dataset IRI in the header (subject or object) to `IRI` (the post-hoc
-  counterpart to `create --dataset-uri`).
-
-`--replace`/`--add` reject any input triple that asserts an hdtc-managed
-predicate (the `void:` statistics and the `hdt:` namespace).
-
-### Create: Named graph options
-
-Use `-m quads` (or `--mode quads`) to write a standard triples HDT plus its
-packed graph sidecar. The default mode is `triples`, which drops graph
-information. In quads mode, the HDT contains the `N` unique union triples and
-the sidecar contains the `M` distinct default/named-graph memberships described
-in the [format specification](docs/graphs-sidecar-format.md).
-
-```sh
-hdtc create dataset.nq -o dataset.hdt -m quads
-# Creates dataset.hdt and dataset.hdt.graphs
-```
-
-`--graph-map PATH=URI` adds a source-level named graph, and `--default-graph URI`
-is the fallback for otherwise unassigned statements.
-
-When an input is itself an HDT file, hdtc looks beside it for
-`<input.hdt>.graphs`. `--input-sidecars` controls those input artifacts only; it
-does not affect graph names parsed directly from RDF inputs:
-
-- `preserve` — preserve and validate a sidecar when present, but allow an HDT
-  input without one. This is the default in quads mode.
-- `require` — require every HDT input to have a valid sidecar. This fail-closed
-  setting is useful for automated merges where a missing file must not silently
-  discard the input dataset's original graph memberships.
-- `drop` — ignore input sidecars even when present and use only each HDT's triples
-  union.
-
-For an HDT whose sidecar is absent or dropped, memberships come from a matching
-`--graph-map`, then `--default-graph`, or finally the RDF default graph. Graph
-construction and source-position remapping use bounded external sorts governed
-by `--memory-limit`. Graph maps, default graph assignment, and preserving or
-requiring input sidecars require `--mode quads`; triples mode always drops input
-sidecars.
 
 ### Create: Basic examples
 
@@ -369,6 +308,31 @@ uses a disk-backed position transpose governed by `--memory-limit` and
 `--temp-dir`, so memory remains bounded independently of dataset size. A
 four-position query requires `<HDT_FILE>.graphs`.
 
+### Validate: Checking structures and checksums
+
+Verify that an HDT decodes correctly and that its checksums match:
+
+```sh
+hdtc validate data.hdt
+```
+
+The check reads the control information, the header's triple count, and the four
+dictionary sections, then walks BitmapY, BitmapZ, ArrayY, and ArrayZ from end to
+end — rejecting term ID 0, a BitmapZ boundary count that disagrees with the
+`(S,P)` pair count, and truncated sections — and verifies each streamed section's
+CRC. It reports the triple count, the `(S,P)` pair count, and the ArrayZ object
+ID range. Memory is constant regardless of file size.
+
+If `<data.hdt>.graphs` is present it is validated too, strictly: the identity
+digest against the HDT, every CRC, graph dictionary ordering and IRI syntax,
+layer region ordering, and each layer's positions being strictly increasing and
+in range. That pass uses a bounded external sort, so `--temp-dir` and
+`--memory-limit` apply to it. A missing sidecar is not an error; hdtc checks one
+only if it finds one beside the HDT.
+
+Progress and results are logged at `info` level, and the command exits non-zero
+on the first failure.
+
 ### Void: Computing VoID statistics
 
 Compute [VoID](https://www.w3.org/TR/void/) (Vocabulary of Interlinked Datasets) statistics for an HDT file and output the results as N-Triples. This is useful for generating dataset metadata describing the structure and content of an RDF dataset.
@@ -408,6 +372,23 @@ The algorithm uses two sequential passes over the HDT triples plus a dictionary 
 
 Partition URIs are generated using MD5 hashes of the corresponding class, property, datatype, or language tag. Blank-node classes (common in OWL ontologies) are automatically filtered out and do not produce class partitions.
 
+### Header: Dumping or modifying header triples
+
+With no flags, `hdtc header` dumps the header N-Triples to stdout. With
+`--replace`/`--add`/`--dataset-uri`, it writes a modified copy to `--output` (the
+original is never changed; the dictionary and triples are copied verbatim, so any
+`.hdt.index.v1-1` stays valid):
+
+- `--replace FILE` — swap the descriptive metadata for the triples in `FILE`,
+  keeping the data-derived statistics hdtc generated.
+- `--add FILE` — append the triples in `FILE` to the header.
+- `--dataset-uri IRI` — rename the dataset: rewrite every occurrence of the
+  current dataset IRI in the header (subject or object) to `IRI` (the post-hoc
+  counterpart to `create --dataset-uri`).
+
+`--replace`/`--add` reject any input triple that asserts an hdtc-managed
+predicate (the `void:` statistics and the `hdt:` namespace).
+
 ### Create: All options
 
 | Option                             | Default                      | Description                                                 |
@@ -433,6 +414,9 @@ Partition URIs are generated using MD5 hashes of the corresponding class, proper
 
 Auto parser tuning is derived from `--memory-limit` (accepts `G`/`M` suffixes, e.g. `16G` or `2000M`): by default hdtc allocates a bounded parser budget, caps chunk-worker fanout, and computes chunk size / in-flight chunk bytes from that budget.
 
+Named-graph options (`-m quads`, `--graph-map`, `--default-graph`,
+`--input-sidecars`) are described under [Named graphs](#named-graphs).
+
 ### Index: All options
 
 | Option                | Default      | Description                                                   |
@@ -446,14 +430,16 @@ Auto parser tuning is derived from `--memory-limit` (accepts `G`/`M` suffixes, e
 
 ### Dump: All options
 
-| Option                | Default      | Description                                                 |
-| --------------------- | ------------ | ----------------------------------------------------------- |
-| `<HDT_FILE>`          | _(required)_ | Path to existing HDT file                                   |
-| `-o, --output PATH`   | stdout       | Write N-Triples to file instead of stdout                   |
-| `--memory-limit SIZE` | `4G`         | Soft memory limit for dictionary cache (e.g. `4G`, `2000M`) |
-| `--benchmark`         | off          | Emit stage timing and RSS high-water summary                |
-| `-v, --verbose`       | —            | Increase log verbosity (`-v` debug, `-vv` trace)            |
-| `-q, --quiet`         | —            | Suppress all output except errors                           |
+| Option                          | Default      | Description                                                     |
+| ------------------------------- | ------------ | --------------------------------------------------------------- |
+| `<HDT_FILE>`                    | _(required)_ | Path to existing HDT file                                       |
+| `-o, --output PATH`             | stdout       | Write results to file instead of stdout                         |
+| `--graph-view union\|dataset`   | `union`      | Export the triples union, or dataset memberships as N-Quads     |
+| `--temp-dir DIR`                | system temp  | Directory for dataset-export membership sorting                 |
+| `--memory-limit SIZE`           | `4G`         | Soft memory limit for dictionary cache (e.g. `4G`, `2000M`)     |
+| `--benchmark`                   | off          | Emit stage timing and RSS high-water summary                    |
+| `-v, --verbose`                 | —            | Increase log verbosity (`-v` debug, `-vv` trace)                |
+| `-q, --quiet`                   | —            | Suppress all output except errors                               |
 
 ### Search: All options
 
@@ -468,9 +454,20 @@ Auto parser tuning is derived from `--memory-limit` (accepts `G`/`M` suffixes, e
 | `--index PATH`        | `<HDT_FILE>.hdt.index.v1-1` | Index file path (used for `? P ?`, `? ? O`, and `? P O` queries)         |
 | `--no-index`          | off                         | Disable index use; fall back to sequential scan for all patterns         |
 | `--temp-dir DIR`      | system temp                 | Directory for wildcard-graph membership sorting                          |
-| `--memory-limit SIZE` | `4G`                        | Memory limit for dictionary caches and membership sorting                |
+| `-m, --memory-limit SIZE` | `4G`                    | Memory limit for dictionary caches and membership sorting                |
 | `-v, --verbose`       | —                           | Increase log verbosity (`-v` debug, `-vv` trace)                         |
 | `-q, --quiet`         | —                           | Suppress all output except errors                                        |
+
+### Validate: All options
+
+| Option                | Default      | Description                                                       |
+| --------------------- | ------------ | ----------------------------------------------------------------- |
+| `<HDT_FILE>`          | _(required)_ | Path to existing HDT file                                         |
+| `--temp-dir`          | system temp  | Directory for graph-sidecar validation sort files                 |
+| `--memory-limit SIZE` | `4G`         | Soft memory limit for graph-sidecar validation (e.g. `4G`, `2000M`) |
+| `--benchmark`         | off          | Emit total validation timing                                      |
+| `-v, --verbose`       | —            | Increase log verbosity (`-v` debug, `-vv` trace)                  |
+| `-q, --quiet`         | —            | Suppress all output except errors                                 |
 
 ### Void: All options
 
@@ -483,6 +480,22 @@ Auto parser tuning is derived from `--memory-limit` (accepts `G`/`M` suffixes, e
 | `-m, --memory-limit SIZE` | `4G`                         | Soft memory limit for dictionary caches (e.g. `4G`, `2000M`)        |
 | `-v, --verbose`           | —                            | Increase log verbosity (`-v` debug, `-vv` trace)                    |
 | `-q, --quiet`             | —                            | Suppress all output except errors                                   |
+
+### Header: All options
+
+| Option              | Default      | Description                                                          |
+| ------------------- | ------------ | -------------------------------------------------------------------- |
+| `<HDT_FILE>`        | _(required)_ | Path to existing HDT file                                            |
+| `--replace FILE`    | —            | Replace the descriptive metadata with the triples in `FILE`           |
+| `--add FILE`        | —            | Append the triples in `FILE` to the header                            |
+| `--dataset-uri IRI` | —            | Rewrite the current dataset IRI throughout the header                 |
+| `-o, --output PATH` | —            | Output path; required for any modification, rejected for a plain dump |
+| `--benchmark`       | off          | Emit total header timing                                              |
+| `-v, --verbose`     | —            | Increase log verbosity (`-v` debug, `-vv` trace)                      |
+| `-q, --quiet`       | —            | Suppress all output except errors                                    |
+
+`--replace` and `--add` are mutually exclusive; either may be combined with
+`--dataset-uri`.
 
 ## Resource requirements
 
@@ -502,9 +515,290 @@ The single-pass pipeline deduplicates terms early via per-batch hash maps, so te
 
 Actual usage varies with term uniqueness and compressibility (~6–10 bytes/triple after compression). Temporary files are automatically cleaned up after completion. Use `--temp-dir` to direct them to a disk with sufficient space.
 
+`hdtc sketch` additionally writes an uncompressed 8-byte hash for each
+qualifying IRI in every selected role while building the filters. An IRI in the
+shared dictionary is therefore present in both temporary role files when both
+roles are selected. These files are also cleaned up automatically.
+
+`hdtc keyset` sorts each role's keys on disk, so its temporary space is what
+lets it build a key set larger than memory. Peak usage is roughly **16 bytes per
+distinct key** per role — the compressed sort chunks plus the merged run the
+encoder streams from — released as soon as the artifact is published. Point
+`--temp-dir` at a disk with room for that.
+
 ### Output size
 
 HDT files are typically 10–20% of the equivalent uncompressed N-Triples.
+
+## Beyond standard HDT
+
+Everything above produces or reads plain HDT files. hdtc can also write optional
+sidecar artifacts that sit beside a `.hdt` and are bound to it by a SHA-256
+digest of its dictionary and triples: `.graphs` preserves the named graphs of an
+RDF dataset, `.filter` and `.minhash` answer membership and overlap
+approximately, and `.keys` answers both exactly. In every case the `.hdt` remains
+an ordinary HDT that software knowing nothing about these files can still read.
+
+Each of these formats is specified normatively in [`docs/`](docs/), because they
+are meant to be read by other tools, in other languages, built by other parties.
+
+### Named graphs
+
+hdtc preserves RDF datasets without changing the standard HDT triples format. In
+quads mode, the output is a pair of files:
+
+- `data.hdt` is an ordinary HDT containing the deduplicated union of all triples
+  in the dataset. It remains usable by existing HDT software that knows nothing
+  about named graphs.
+- `data.hdt.graphs` records which default or named graphs contain each union
+  triple. It has a sorted graph dictionary and one compressed membership layer
+  per graph. Graph ID 0 denotes the RDF default graph; named graphs receive
+  consecutive IDs starting at 1.
+
+The union and the default graph are distinct views. A triple may occur in the
+default graph, in one or more named graphs, or in both. Repeated copies of the
+same quad create one membership, while the same triple in different graphs
+creates one HDT triple with several memberships.
+
+Memberships refer to final SPO positions in the associated HDT, so a sidecar is
+bound to that HDT's exact bytes and cannot accidentally be used with another one.
+Each graph layer is encoded independently — a dense chunk table, a sparse chunk
+table, or Elias–Fano, according to its density — and readers can answer access,
+rank, select, iteration, and graph lookup directly from the file without loading
+a whole layer.
+
+Creation is streaming and bounded by `--memory-limit`: hdtc deduplicates and
+sorts memberships on disk, then encodes one layer at a time. Merging HDTs
+reconstructs memberships by graph name and triple, rather than copying
+position-dependent bitmaps.
+
+See the normative [HDT graphs sidecar format, version 1](docs/graphs-sidecar-format.md)
+for the binary layout, checksums, identity rules, encodings, and validation
+requirements.
+
+#### Create: Named graph options
+
+Use `-m quads` (or `--mode quads`) to write a standard triples HDT plus its
+packed graph sidecar. The default mode is `triples`, which drops graph
+information. In quads mode, the HDT contains the `N` unique union triples and
+the sidecar contains the `M` distinct default/named-graph memberships described
+in the [format specification](docs/graphs-sidecar-format.md).
+
+```sh
+hdtc create dataset.nq -o dataset.hdt -m quads
+# Creates dataset.hdt and dataset.hdt.graphs
+```
+
+`--graph-map PATH=URI` adds a source-level named graph, and `--default-graph URI`
+is the fallback for otherwise unassigned statements.
+
+When an input is itself an HDT file, hdtc looks beside it for
+`<input.hdt>.graphs`. `--input-sidecars` controls those input artifacts only; it
+does not affect graph names parsed directly from RDF inputs:
+
+- `preserve` — preserve and validate a sidecar when present, but allow an HDT
+  input without one. This is the default in quads mode.
+- `require` — require every HDT input to have a valid sidecar. This fail-closed
+  setting is useful for automated merges where a missing file must not silently
+  discard the input dataset's original graph memberships.
+- `drop` — ignore input sidecars even when present and use only each HDT's triples
+  union.
+
+For an HDT whose sidecar is absent or dropped, memberships come from a matching
+`--graph-map`, then `--default-graph`, or finally the RDF default graph. Graph
+construction and source-position remapping use bounded external sorts governed
+by `--memory-limit`. Graph maps, default graph assignment, and preserving or
+requiring input sidecars require `--mode quads`; triples mode always drops input
+sidecars.
+
+Reading a dataset back is covered under
+[Dump](#dump-exporting-the-union-or-dataset) (`--graph-view dataset`) and
+[Search](#search-querying-triples-and-graph-memberships) (four-position
+patterns).
+
+### Membership and overlap sketches
+
+Build the default subject and object artifacts from an existing HDT:
+
+```sh
+hdtc sketch data.hdt
+```
+
+By default this creates a `filters/` directory beside the HDT containing:
+
+```text
+filters/
+  subjects.filter
+  objects.filter
+  subjects.minhash
+  objects.minhash
+```
+
+Subject artifacts contain distinct IRIs from the HDT shared and subject-only
+dictionary sections. Object artifacts contain distinct IRIs from the shared and
+object-only sections. Literals and blank nodes are excluded. Shared IRIs belong
+to both roles. Predicates are not currently a supported sketch role.
+
+The `.filter` files use deterministic BinaryFuse16 by default; use
+`--filter-bits 8` to roughly halve the filter size at the cost of a higher
+false-positive rate. The `.minhash` files contain the smallest distinct XXH64
+hashes, with a default capacity of 65,536 (about 512 KiB per saturated role).
+Hashing uses seed 0 over the exact IRI UTF-8 bytes without normalization.
+
+Choose a larger MinHash or emit only one role:
+
+```sh
+hdtc sketch data.hdt --k 131072 --filter-bits 8
+hdtc sketch data.hdt --roles subjects --output-dir subject-filters
+```
+
+Each file is self-describing, protected by CRC32C, and bound to the source HDT
+with a SHA-256 digest. As with `.graphs` sidecars, that digest covers the
+dictionary and triples but not the header, so artifacts stay valid across
+`hdtc header` rewrites of the same data. Existing target artifacts are not
+overwritten.
+
+See the normative
+[HDT sketch artifact formats, version 1](docs/sketch-format.md) for the byte
+layouts, the term-to-key rule, the complete membership probe algorithm, the
+validation a reader must perform on untrusted files, and the frozen conformance
+vectors. Nothing in the format requires a particular library: an implementation
+can be written from that document alone.
+
+IRI hashes are streamed to temporary disk files, and each role's filter is built
+separately from its own file. `--memory-limit` bounds both phases: hdtc checks
+the combined MinHash budget for all selected roles before scanning, and during
+the scan each role stops as soon as its IRIs exceed what the binary fuse scratch
+arrays, fingerprints, keys, and retained MinHash values can hold — so an
+oversized input is refused while it is being read rather than after. If a role
+does not fit, reduce `--k` or raise the limit. Use `--temp-dir` to place the
+uncompressed hashed-key files on a disk with sufficient space.
+
+#### Sketch: All options
+
+| Option                    | Default                  | Description                                                        |
+| ------------------------- | ------------------------ | ------------------------------------------------------------------ |
+| `<HDT_FILE>`              | _(required)_             | Source HDT file                                                     |
+| `-o, --output-dir DIR`    | `filters/` beside HDT    | Directory for generated artifacts                                  |
+| `--k N`                   | `65536`                  | Bottom-k MinHash capacity (minimum 2)                               |
+| `--filter-bits 8\|16`     | `16`                     | Binary fuse fingerprint width                                      |
+| `--roles ROLE,...`        | `subjects,objects`       | Roles to emit (`subjects` and/or `objects`)                         |
+| `--temp-dir DIR`          | system temp              | Directory for uncompressed temporary hashed-key files              |
+| `-m, --memory-limit SIZE` | `4G`                     | Soft budget for combined MinHash and per-role filter construction  |
+| `--benchmark`             | off                      | Emit total sketch timing                                           |
+| `-v, --verbose`           | —                        | Increase log verbosity (`-v` debug, `-vv` trace)                    |
+| `-q, --quiet`             | —                        | Suppress all output except errors                                  |
+
+### Exact key sets
+
+Where `hdtc sketch` answers approximately, `hdtc keyset` answers exactly. It
+writes the complete, sorted set of distinct 64-bit term keys for a role, under
+the same term-to-key rule the sketches use:
+
+```sh
+hdtc keyset data.hdt
+```
+
+By default this creates a `keysets/` directory beside the HDT containing:
+
+```text
+keysets/
+  subjects-only.keys
+  objects-only.keys
+  shared.keys
+```
+
+These are the HDT dictionary's disjoint subject/object sections. The familiar
+role views are reconstructed without loss by merging sorted files:
+
+```text
+subjects = shared ∪ subjects-only
+objects  = shared ∪ objects-only
+```
+
+This avoids writing every shared IRI twice while preserving directional overlap
+questions such as `objects_A × subjects_B`. The optional `subjects` and
+`objects` roles emit those overlapping views directly and describe the same sets
+as sketch artifacts of the same role.
+
+A key set needs no probe list: two `.keys` files intersect in a linear merge of
+sorted integers, giving `|A ∩ B|` and the shared key set itself, with neither
+party's IRIs in hand. A filter can only be probed one key at a time, and a
+MinHash estimates the overlap without identifying it. A `.minhash` is derivable
+from a key set (take the bottom `k`) and a `.filter` is built from one, so the
+key set is the exact parent of both for the composite subject/object roles.
+
+Keys are XXH64 hashes and are not reversible. A shared key becomes an IRI on
+whichever side holds the terms: scan that HDT's dictionary once, hash each term,
+and keep those whose key is in the shared set. So a key set answers *how big is
+the join, and which of my terms are in it* — exactly, modulo the `n/2⁶⁴` hash
+collision the sketches already live with — without either party publishing its
+IRIs.
+
+The cost is size. Elias-Fano lands at 5.5 bytes/key on a 4-million-key role —
+about 2.4× a Fuse16 filter (~2.26 bytes/key) or 4.9× a Fuse8 one (~1.13),
+depending on the `--filter-bits` you would otherwise ship. The rate *falls* as a
+role grows, to about 4.4 bytes/key at 2.3 billion keys, so key sets suit small
+and mid-size datasets while the sketches keep their edge at the top end.
+
+Two encodings are available:
+
+```sh
+hdtc keyset data.hdt --encoding elias-fano   # default, ~4.4-5.8 bytes/key
+hdtc keyset data.hdt --encoding raw          # sorted u64 array, 8 bytes/key
+```
+
+Elias-Fano is near the information floor for uniformly random 64-bit keys; raw is
+the simplest possible decode — `mmap` the payload as a `u64` slice and binary
+search it. The encoding is a per-file choice recorded in the header and does not
+affect comparability: two files with different encodings hold the same kind of
+set and intersect normally.
+
+All six roles can be selected explicitly. For example, emit the overlapping
+sketch-compatible views and the predicate dictionary section:
+
+```sh
+hdtc keyset data.hdt --roles subjects,objects,predicates
+```
+
+The supported roles are `subjects`, `objects`, `predicates`, `shared`,
+`subjects-only`, and `objects-only`. `predicates` contains qualifying IRIs from
+the predicate dictionary section only and has no sketch counterpart.
+
+Files are comparable whenever their convention and hash agree — the role tells
+you how to read the answer, not whether you may ask. Comparing *different* roles
+is in fact one of the main things a key set is for: intersecting one dataset's
+`objects` with another's `subjects` gives the exact set of shared join keys —
+which of the things you mention that dataset actually describes.
+
+**Any role builds at any size.** Keys are externally sorted and both encoders
+stream, so `--memory-limit` bounds the sort buffers rather than the key count —
+it is a throughput knob, not a ceiling on what can be published. A 12.4-million-
+key build at a 1 MiB limit spills 95 chunks and emits bytes identical to the same
+build at 4 GiB. The [sketches](#membership-and-overlap-sketches) are the
+exception: binary fuse construction peels a hypergraph over the whole key set and
+has no streaming form, so it keeps its keys resident and enforces a ceiling.
+
+As with the sketches, each file is self-describing, protected by CRC32C, bound
+to the source HDT by the same SHA-256 digest, and never overwritten if the
+target already exists. See the normative
+[HDT key-set artifact format, version 1](docs/keyset-format.md) for the byte
+layout, the Elias-Fano sizing rule, the validation a reader must perform on
+untrusted files, and the frozen conformance vectors.
+
+#### Keyset: All options
+
+| Option                    | Default                               | Description                                                                                          |
+| ------------------------- | ------------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| `<HDT_FILE>`              | _(required)_                          | Source HDT file                                                                                      |
+| `-o, --output-dir DIR`    | `keysets/` beside HDT                 | Directory for generated artifacts                                                                    |
+| `--encoding ENCODING`     | `elias-fano`                          | Payload encoding (`elias-fano` or `raw`)                                                             |
+| `--roles ROLE,...`        | `subjects-only,objects-only,shared`   | Roles to emit (`subjects`, `objects`, `predicates`, `shared`, `subjects-only`, and `objects-only`)   |
+| `--temp-dir DIR`          | system temp                           | Directory for temporary sort chunks and merged key runs                                              |
+| `-m, --memory-limit SIZE` | `4G`                                  | Soft budget for key sort buffers; bounds memory, not the key count                                   |
+| `--benchmark`             | off                                   | Emit total keyset timing                                                                             |
+| `-v, --verbose`           | —                                     | Increase log verbosity (`-v` debug, `-vv` trace)                                                     |
+| `-q, --quiet`             | —                                     | Suppress all output except errors                                                                    |
 
 ## Architecture
 
@@ -537,7 +831,7 @@ src/
   rdf/               RDF parsing, format/compression detection, input discovery
   dictionary/        Dictionary construction, Plain Front Coding (PFC)
   triples/           BitmapTriples encoding
-  hdt/               HDT file serialization
+  hdt/               HDT serialization, reading, querying, statistics, sketches, and key sets
   index/             HDT index generation (.hdt.index.v1-1)
   io/                VByte, LogArray, Bitmap, CRC, Control Information
   pipeline/          6-stage pipelined architecture
@@ -545,8 +839,20 @@ src/
 tests/
   integration_test.rs   End-to-end pipeline tests
   compat_test.rs        Compatibility tests against the hdt crate
+  sketch_test.rs        Sketch envelope, role, filter, and edge-case tests
+  keyset_test.rs        Key-set envelope, role, encoding, and edge-case tests
   data/                 Sample RDF fixtures
+docs/
+  graphs-sidecar-format.md  Normative .graphs sidecar format
+  sketch-format.md          Normative .filter / .minhash formats
+  keyset-format.md          Normative .keys format
 ```
+
+`hdtc sketch` and `hdtc keyset` derive their artifacts from one pass over an HDT
+dictionary and share a single term-to-key convention (`src/hdt/artifacts.rs`),
+which both formats assert by declaring `convention_id = 1`. For the `subjects`
+and `objects` roles, filters, sketches, and key sets describe the same population
+because that function has one definition.
 
 ## Development
 

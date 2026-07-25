@@ -15,6 +15,7 @@ use crate::io::{
 };
 use anyhow::{Context, Result, bail};
 use oxrdfio::{RdfFormat, RdfParser};
+use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
@@ -24,6 +25,48 @@ use std::path::Path;
 const PFC_SECTION_TYPE: u8 = 0x02;
 const DICTIONARY_FOUR_FORMAT: &str = "<http://purl.org/HDT/hdt#dictionaryFour>";
 const TRIPLES_BITMAP_FORMAT: &str = "<http://purl.org/HDT/hdt#triplesBitmap>";
+
+// ---------------------------------------------------------------------------
+// HDT identity digest
+// ---------------------------------------------------------------------------
+
+/// Byte offset where an HDT file's dictionary begins: past the global control
+/// info, the header control info, and the header N-Triples blob.
+///
+/// Identity digests start here rather than at byte 0. `hdtc header` rewrites
+/// copy the dictionary and triples verbatim, so a digest that skips the header
+/// keeps derived artifacts (graph sidecars, sketches) bound to an HDT across
+/// header edits.
+pub(crate) fn hdt_data_offset<R: Read + Seek>(reader: &mut R) -> Result<u64> {
+    ControlInfo::read_from(reader).context("Failed to read HDT global control info")?;
+    let header = ControlInfo::read_from(reader).context("Failed to read HDT header control info")?;
+    let header_length: u64 = header
+        .get_property("length")
+        .context("HDT header is missing length")?
+        .parse()
+        .context("Invalid HDT header length")?;
+    reader.seek(SeekFrom::Current(
+        i64::try_from(header_length).context("HDT header is too large to seek")?,
+    ))?;
+    Ok(reader.stream_position()?)
+}
+
+/// SHA-256 over every remaining byte of `reader`.
+pub(crate) fn sha256_to_end<R: Read>(reader: &mut R) -> Result<[u8; 32]> {
+    let mut hasher = Sha256::new();
+    std::io::copy(reader, &mut hasher)?;
+    Ok(hasher.finalize().into())
+}
+
+/// SHA-256 identity digest of an HDT file's dictionary and triples, excluding
+/// the mutable header. See [`hdt_data_offset`].
+pub(crate) fn hdt_data_digest(path: &Path) -> Result<[u8; 32]> {
+    let file =
+        File::open(path).with_context(|| format!("Failed to open HDT file {}", path.display()))?;
+    let mut reader = BufReader::with_capacity(256 * 1024, file);
+    hdt_data_offset(&mut reader)?;
+    sha256_to_end(&mut reader)
+}
 
 // ---------------------------------------------------------------------------
 // HDT section offsets

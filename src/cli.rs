@@ -74,6 +74,47 @@ pub enum DumpGraphView {
     Dataset,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, ValueEnum)]
+pub enum SketchRole {
+    Subjects,
+    Objects,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, ValueEnum)]
+pub enum KeysetRole {
+    Subjects,
+    Objects,
+    Predicates,
+    Shared,
+    SubjectsOnly,
+    ObjectsOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum KeysetEncoding {
+    /// Elias-Fano, about 4.4-5.8 bytes per key
+    EliasFano,
+    /// Raw sorted u64 array, 8 bytes per key
+    Raw,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum SketchFilterBits {
+    #[value(name = "8")]
+    Eight,
+    #[value(name = "16")]
+    Sixteen,
+}
+
+impl SketchFilterBits {
+    pub fn as_u8(self) -> u8 {
+        match self {
+            Self::Eight => 8,
+            Self::Sixteen => 16,
+        }
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "hdtc",
@@ -118,6 +159,12 @@ pub enum Commands {
 
     /// Compute VoID statistics for an HDT file and output as N-Triples
     Void(VoidArgs),
+
+    /// Build role-specific membership filters and overlap sketches
+    Sketch(SketchArgs),
+
+    /// Build exact role-specific key sets
+    Keyset(KeysetArgs),
 
     /// Dump or modify the RDF triples embedded in an HDT file's header
     Header(HeaderArgs),
@@ -288,6 +335,88 @@ pub struct VoidArgs {
     /// The analysis data structures (subject→class index, partition statistics) use
     /// additional memory proportional to the number of typed subjects and class/property
     /// combinations in the dataset.
+    #[arg(short = 'm', long, value_name = "SIZE", default_value = "4G")]
+    pub memory_limit: MemorySize,
+}
+
+#[derive(Debug, Parser)]
+pub struct SketchArgs {
+    /// Path to the existing HDT file
+    pub hdt_file: PathBuf,
+
+    /// Output directory (defaults to a filters/ directory beside the HDT)
+    #[arg(short, long, value_name = "DIR")]
+    pub output_dir: Option<PathBuf>,
+
+    /// Bottom-k MinHash capacity
+    #[arg(long, value_name = "N", default_value_t = 65_536, value_parser = clap::value_parser!(u32).range(2..))]
+    pub k: u32,
+
+    /// Binary fuse fingerprint width
+    #[arg(long, value_enum, default_value = "16", value_name = "BITS")]
+    pub filter_bits: SketchFilterBits,
+
+    /// Dictionary roles to emit, as a comma-separated list
+    #[arg(
+        long,
+        value_enum,
+        value_delimiter = ',',
+        default_value = "subjects,objects",
+        value_name = "ROLE,..."
+    )]
+    pub roles: Vec<SketchRole>,
+
+    /// Directory for temporary hashed-key files
+    #[arg(long, value_name = "DIR")]
+    pub temp_dir: Option<PathBuf>,
+
+    /// Soft memory limit for binary fuse and MinHash construction (e.g. 4G, 2000M)
+    #[arg(short = 'm', long, value_name = "SIZE", default_value = "4G")]
+    pub memory_limit: MemorySize,
+}
+
+#[derive(Debug, Parser)]
+#[command(
+    long_about = "Writes the complete, sorted set of distinct 64-bit term keys for each selected \
+                  dictionary role, under the same term-to-key convention as `hdtc sketch`. Unlike \
+                  the sketches, a key set answers membership without false positives and overlap \
+                  without an estimator, at roughly four times the filter's bytes."
+)]
+pub struct KeysetArgs {
+    /// Path to the existing HDT file
+    pub hdt_file: PathBuf,
+
+    /// Output directory (defaults to a keysets/ directory beside the HDT)
+    #[arg(short, long, value_name = "DIR")]
+    pub output_dir: Option<PathBuf>,
+
+    /// Payload encoding
+    #[arg(
+        long,
+        value_enum,
+        default_value = "elias-fano",
+        value_name = "ENCODING"
+    )]
+    pub encoding: KeysetEncoding,
+
+    /// Dictionary roles to emit, as a comma-separated list
+    #[arg(
+        long,
+        value_enum,
+        value_delimiter = ',',
+        default_value = "subjects-only,objects-only,shared",
+        value_name = "ROLE,..."
+    )]
+    pub roles: Vec<KeysetRole>,
+
+    /// Directory for temporary sort chunks and merged key runs
+    #[arg(long, value_name = "DIR")]
+    pub temp_dir: Option<PathBuf>,
+
+    /// Soft memory limit for key sort buffers (e.g. 4G, 2000M)
+    ///
+    /// Keys are sorted externally, so this bounds memory but not the size of
+    /// the key set: any role builds at any limit, spilling to --temp-dir.
     #[arg(short = 'm', long, value_name = "SIZE", default_value = "4G")]
     pub memory_limit: MemorySize,
 }

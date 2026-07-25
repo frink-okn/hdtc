@@ -47,11 +47,7 @@ pub fn run_hdtc_to_path_with_args(
 
     // Build args with "create" subcommand as first argument
     let mut args: Vec<String> = vec!["create".to_string()];
-    args.extend(
-        inputs
-            .iter()
-            .map(|p| p.to_str().unwrap().to_string())
-    );
+    args.extend(inputs.iter().map(|p| p.to_str().unwrap().to_string()));
     args.extend([
         "-o".to_string(),
         hdt_path.to_str().unwrap().to_string(),
@@ -151,7 +147,11 @@ pub fn hdt_java_classpath(hdt_java_dir: &Path) -> String {
             }
         })
         .collect();
-    assert!(!jars.is_empty(), "No jar files found in {}", lib_dir.display());
+    assert!(
+        !jars.is_empty(),
+        "No jar files found in {}",
+        lib_dir.display()
+    );
     jars.join(":")
 }
 

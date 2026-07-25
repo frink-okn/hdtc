@@ -80,7 +80,7 @@ src/
   rdf/             - RDF parsing, input discovery, streaming, compressed input
   dictionary/      - Dictionary construction, PFC encoding
   triples/         - BitmapTriples encoding (streaming)
-  hdt/             - HDT file serialization (header, dictionary, triples sections)
+  hdt/             - HDT serialization, reading, querying, statistics, sketches, and key sets
   index/           - HDT index file generation (.hdt.index.v1-1)
   io/              - VByte, LogArray, Bitmap, CRC utilities, Control Information
   pipeline/        - 6-stage pipeline (batch vocab, partial vocab, merger, ID remapper)
@@ -89,8 +89,45 @@ src/
 tests/
   integration_test.rs - End-to-end pipeline tests
   compat_test.rs      - Compatibility tests against the hdt crate
+  sketch_test.rs      - Sketch envelope, role, filter, and edge-case tests
+  keyset_test.rs      - Key-set envelope, role, encoding, and edge-case tests
   data/               - Sample RDF fixtures
+docs/
+  graphs-sidecar-format.md - Normative .graphs sidecar format
+  sketch-format.md         - Normative .filter / .minhash formats
+  keyset-format.md         - Normative .keys format
 ```
+
+### Dictionary-derived sidecar artifacts
+
+`hdtc sketch` and `hdtc keyset` both publish per-role artifacts derived from one
+pass over an HDT's dictionary. They share a single term-to-key convention
+(`src/hdt/artifacts.rs`), which both formats assert by declaring
+`convention_id = 1` — filters, sketches, and key sets for the shared `subjects`
+and `objects` roles are only comparable because that function has one
+definition. Changing it is a convention break for both formats, not an
+implementation detail.
+
+- **`sketch`** → `.filter` (binary fuse membership, approximate) and `.minhash`
+  (bottom-k overlap, approximate). Roles: subjects, objects.
+- **`keyset`** → `.keys` (complete distinct key set, exact). Roles: subjects,
+  objects, predicates, shared, subjects-only, and objects-only; the disjoint
+  subjects-only/objects-only/shared trio is emitted by default. Encodings:
+  Elias-Fano (default) or raw sorted u64. Keys are externally sorted and the
+  encoders stream, so `--memory-limit` bounds memory without bounding the key
+  count — any role builds at any size.
+
+`sketch` is the exception to that last point: binary fuse construction peels a
+hypergraph over the whole key set, so it holds the role's keys resident and
+enforces a key ceiling. That is inherent to filter construction, not to the
+shared convention.
+
+## Published formats
+
+`docs/` holds normative wire-format specifications for the artifacts hdtc emits
+alongside standard HDT. They are consumed by other tools, in other languages,
+built by other parties, so they are the authority — code changes that alter
+emitted bytes must update the spec and its frozen conformance vectors together.
 
 ## Key Dependencies
 
@@ -108,6 +145,8 @@ tests/
 | `hashbrown` | High-performance hash maps (batch vocabulary) |
 | `bumpalo` | Arena allocator (per-batch term storage) |
 | `bitflags` | Type-safe role flags |
+| `xxhash-rust` | XXH64 term hashing for sketches |
+| `xorf` | Binary fuse membership filters (exact version pin — defines `.filter` bytes) |
 | `indicatif` | Progress bars and status reporting |
 | `flate2` | Gzip decompression |
 | `bzip2` | Bzip2 decompression |
