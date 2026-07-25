@@ -238,7 +238,10 @@ mod tests {
 
     #[test]
     fn test_crc_corruption() {
-        let ci = ControlInfo::new(ControlType::Dictionary, "<http://purl.org/HDT/hdt#dictionaryFour>");
+        let ci = ControlInfo::new(
+            ControlType::Dictionary,
+            "<http://purl.org/HDT/hdt#dictionaryFour>",
+        );
 
         let mut buf = Vec::new();
         ci.write_to(&mut buf).unwrap();

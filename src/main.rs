@@ -347,8 +347,10 @@ fn create_hdt(args: cli::CreateArgs, benchmark: bool) -> Result<()> {
     // new HDT next to stale graph data.
     let retired_sidecar = retire_existing_sidecar(&canonical_graphs_path, output_parent)?;
     if let Err(error) = hdt_temp.persist(&args.output) {
-        let publish_error = anyhow::Error::new(error.error)
-            .context(format!("Failed to publish HDT file {}", args.output.display()));
+        let publish_error = anyhow::Error::new(error.error).context(format!(
+            "Failed to publish HDT file {}",
+            args.output.display()
+        ));
         if let Some(retired) = retired_sidecar.as_ref()
             && let Err(restore_error) = retired.restore()
         {

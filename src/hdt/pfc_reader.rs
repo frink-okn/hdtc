@@ -38,14 +38,14 @@ impl PfcSectionHeader {
         }
         preamble.push(section_type[0]);
 
-        let string_count =
-            read_vbyte(reader).with_context(|| format!("Invalid string count for {section_name}"))?;
+        let string_count = read_vbyte(reader)
+            .with_context(|| format!("Invalid string count for {section_name}"))?;
         preamble.extend_from_slice(&encode_vbyte(string_count));
         let buffer_length = read_vbyte(reader)
             .with_context(|| format!("Invalid buffer length for {section_name}"))?;
         preamble.extend_from_slice(&encode_vbyte(buffer_length));
-        let block_size = read_vbyte(reader)
-            .with_context(|| format!("Invalid block size for {section_name}"))?;
+        let block_size =
+            read_vbyte(reader).with_context(|| format!("Invalid block size for {section_name}"))?;
         preamble.extend_from_slice(&encode_vbyte(block_size));
         if block_size == 0 {
             bail!("Invalid block size 0 in {section_name} section");
@@ -152,12 +152,16 @@ impl<R: Read> PfcSectionIterator<R> {
     /// Decode the next block from the reader.
     fn decode_next_block(&mut self) -> Result<Vec<Vec<u8>>> {
         let block_index = self.blocks_decoded;
-        let start = self.offsets.get(block_index as usize).copied().with_context(|| {
-            format!(
-                "Missing block offset {} in {}",
-                block_index, self.section_name
-            )
-        })?;
+        let start = self
+            .offsets
+            .get(block_index as usize)
+            .copied()
+            .with_context(|| {
+                format!(
+                    "Missing block offset {} in {}",
+                    block_index, self.section_name
+                )
+            })?;
         let end = self
             .offsets
             .get(block_index as usize + 1)
@@ -246,7 +250,6 @@ impl<R: Read> PfcSectionIterator<R> {
 
         Ok(entries)
     }
-
 }
 
 impl<R: Read> Iterator for PfcSectionIterator<R> {

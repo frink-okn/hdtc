@@ -1,14 +1,16 @@
-pub(crate) mod vbyte;
-pub(crate) mod crc_utils;
-pub(crate) mod log_array;
 pub(crate) mod bitmap;
 pub(crate) mod control;
+pub(crate) mod crc_utils;
+pub(crate) mod log_array;
+pub(crate) mod vbyte;
 
 #[allow(unused_imports)]
-pub use log_array::{LogArrayWriter, LogArrayReader, StreamingLogArrayEncoder, StreamingLogArrayDecoder};
-#[allow(unused_imports)]
-pub use bitmap::{BitmapWriter, BitmapReader, StreamingBitmapEncoder, StreamingBitmapDecoder};
+pub use bitmap::{BitmapReader, BitmapWriter, StreamingBitmapDecoder, StreamingBitmapEncoder};
 pub use control::{ControlInfo, ControlType};
+#[allow(unused_imports)]
+pub use log_array::{
+    LogArrayReader, LogArrayWriter, StreamingLogArrayDecoder, StreamingLogArrayEncoder,
+};
 pub use vbyte::{decode_vbyte, encode_vbyte, read_vbyte};
 
 use anyhow::Result;

@@ -139,7 +139,9 @@ impl StreamingBitmapResult {
             .len();
         // preamble: 1 (type) + vbyte_len(num_bits)
         let preamble_len = 1 + vbyte_encoded_len(self.num_bits);
-        Ok(preamble_len as u64 + 1 /* CRC8 */ + data_size + 4 /* CRC32C */)
+        Ok(
+            preamble_len as u64 + 1 /* CRC8 */ + data_size + 4, /* CRC32C */
+        )
     }
 }
 
@@ -159,7 +161,9 @@ impl StreamingLogArrayResult {
             .len();
         // preamble: 1 (type) + 1 (bits_per_entry) + vbyte_len(num_entries)
         let preamble_len = 2 + vbyte_encoded_len(self.num_entries);
-        Ok(preamble_len as u64 + 1 /* CRC8 */ + data_size + 4 /* CRC32C */)
+        Ok(
+            preamble_len as u64 + 1 /* CRC8 */ + data_size + 4, /* CRC32C */
+        )
     }
 }
 
@@ -193,10 +197,18 @@ impl BitmapTriplesFiles {
 
     /// Clean up temp files.
     pub fn cleanup(&self) {
-        for path in [&self.bitmap_y.path, &self.array_y.path,
-                     &self.bitmap_z.path, &self.array_z.path] {
+        for path in [
+            &self.bitmap_y.path,
+            &self.array_y.path,
+            &self.bitmap_z.path,
+            &self.array_z.path,
+        ] {
             if let Err(e) = std::fs::remove_file(path) {
-                tracing::warn!("Failed to delete triples temp file {}: {}", path.display(), e);
+                tracing::warn!(
+                    "Failed to delete triples temp file {}: {}",
+                    path.display(),
+                    e
+                );
             }
         }
     }
@@ -230,12 +242,12 @@ pub fn build_bitmap_triples_to_files(
     // The preamble + CRC32C framing is computed during HDT assembly when
     // the temp files are copied into the final output.
     let mut bitmap_y = StreamingBitmapEncoder::new(make_writer(&bitmap_y_path)?);
-    let mut array_y = StreamingLogArrayEncoder::for_max_value(
-        max_predicate.max(1), make_writer(&array_y_path)?);
+    let mut array_y =
+        StreamingLogArrayEncoder::for_max_value(max_predicate.max(1), make_writer(&array_y_path)?);
     let mut bitmap_z = StreamingBitmapEncoder::new(make_writer(&bitmap_z_path)?);
     let max_obj_or_shared = max_object.max(max_subject).max(1);
-    let mut array_z = StreamingLogArrayEncoder::for_max_value(
-        max_obj_or_shared, make_writer(&array_z_path)?);
+    let mut array_z =
+        StreamingLogArrayEncoder::for_max_value(max_obj_or_shared, make_writer(&array_z_path)?);
 
     let mut prev_subject: u64 = 0;
     let mut prev_predicate: u64 = 0;
@@ -358,10 +370,26 @@ mod tests {
         // S=1 P=2 O=3  (same S, new P)
         // S=2 P=1 O=1  (new S)
         let triples = vec![
-            Ok(IdTriple { subject: 1, predicate: 1, object: 1 }),
-            Ok(IdTriple { subject: 1, predicate: 1, object: 2 }),
-            Ok(IdTriple { subject: 1, predicate: 2, object: 3 }),
-            Ok(IdTriple { subject: 2, predicate: 1, object: 1 }),
+            Ok(IdTriple {
+                subject: 1,
+                predicate: 1,
+                object: 1,
+            }),
+            Ok(IdTriple {
+                subject: 1,
+                predicate: 1,
+                object: 2,
+            }),
+            Ok(IdTriple {
+                subject: 1,
+                predicate: 2,
+                object: 3,
+            }),
+            Ok(IdTriple {
+                subject: 2,
+                predicate: 1,
+                object: 1,
+            }),
         ];
 
         let result = build_bitmap_triples(triples.into_iter(), 2, 2, 3).unwrap();
@@ -372,9 +400,9 @@ mod tests {
         // S=2 has predicate at pos 2 -> pos 2 is last
         let by = BitmapReader::read_from(&mut Cursor::new(&result.bitmap_y)).unwrap();
         assert_eq!(by.len(), 3);
-        assert!(!by.get(0));  // S=1, P=1 (not last pred of S=1)
-        assert!(by.get(1));   // S=1, P=2 (last pred of S=1)
-        assert!(by.get(2));   // S=2, P=1 (last pred of S=2)
+        assert!(!by.get(0)); // S=1, P=1 (not last pred of S=1)
+        assert!(by.get(1)); // S=1, P=2 (last pred of S=1)
+        assert!(by.get(2)); // S=2, P=1 (last pred of S=2)
 
         // ArrayY: [1, 2, 1] (predicates)
         let ay = LogArrayReader::read_from(&mut Cursor::new(&result.array_y)).unwrap();
@@ -389,10 +417,10 @@ mod tests {
         // (2,1) has object at pos 3 -> pos 3 is last
         let bz = BitmapReader::read_from(&mut Cursor::new(&result.bitmap_z)).unwrap();
         assert_eq!(bz.len(), 4);
-        assert!(!bz.get(0));  // (1,1) O=1 (not last)
-        assert!(bz.get(1));   // (1,1) O=2 (last obj of (1,1))
-        assert!(bz.get(2));   // (1,2) O=3 (last obj of (1,2))
-        assert!(bz.get(3));   // (2,1) O=1 (last obj of (2,1))
+        assert!(!bz.get(0)); // (1,1) O=1 (not last)
+        assert!(bz.get(1)); // (1,1) O=2 (last obj of (1,1))
+        assert!(bz.get(2)); // (1,2) O=3 (last obj of (1,2))
+        assert!(bz.get(3)); // (2,1) O=1 (last obj of (2,1))
 
         // ArrayZ: [1, 2, 3, 1] (objects)
         let az = LogArrayReader::read_from(&mut Cursor::new(&result.array_z)).unwrap();
@@ -440,19 +468,37 @@ mod tests {
 
     #[test]
     fn test_streaming_matches_inmemory() {
-        let make_triples = || vec![
-            Ok(IdTriple { subject: 1, predicate: 1, object: 1 }),
-            Ok(IdTriple { subject: 1, predicate: 1, object: 2 }),
-            Ok(IdTriple { subject: 1, predicate: 2, object: 3 }),
-            Ok(IdTriple { subject: 2, predicate: 1, object: 1 }),
-        ];
+        let make_triples = || {
+            vec![
+                Ok(IdTriple {
+                    subject: 1,
+                    predicate: 1,
+                    object: 1,
+                }),
+                Ok(IdTriple {
+                    subject: 1,
+                    predicate: 1,
+                    object: 2,
+                }),
+                Ok(IdTriple {
+                    subject: 1,
+                    predicate: 2,
+                    object: 3,
+                }),
+                Ok(IdTriple {
+                    subject: 2,
+                    predicate: 1,
+                    object: 1,
+                }),
+            ]
+        };
 
         let inmem = build_bitmap_triples(make_triples().into_iter(), 2, 2, 3).unwrap();
 
         let temp_dir = tempfile::tempdir().unwrap();
-        let files = build_bitmap_triples_to_files(
-            make_triples().into_iter(), 2, 2, 3, temp_dir.path(),
-        ).unwrap();
+        let files =
+            build_bitmap_triples_to_files(make_triples().into_iter(), 2, 2, 3, temp_dir.path())
+                .unwrap();
 
         assert_eq!(files.num_triples, inmem.num_triples);
 
@@ -461,14 +507,20 @@ mod tests {
         assert_eq!(by, inmem.bitmap_y, "BitmapY mismatch");
 
         let ay = read_and_assemble_log_array(
-            &files.array_y.path, files.array_y.bits_per_entry, files.array_y.num_entries);
+            &files.array_y.path,
+            files.array_y.bits_per_entry,
+            files.array_y.num_entries,
+        );
         assert_eq!(ay, inmem.array_y, "ArrayY mismatch");
 
         let bz = read_and_assemble_bitmap(&files.bitmap_z.path, files.bitmap_z.num_bits);
         assert_eq!(bz, inmem.bitmap_z, "BitmapZ mismatch");
 
         let az = read_and_assemble_log_array(
-            &files.array_z.path, files.array_z.bits_per_entry, files.array_z.num_entries);
+            &files.array_z.path,
+            files.array_z.bits_per_entry,
+            files.array_z.num_entries,
+        );
         assert_eq!(az, inmem.array_z, "ArrayZ mismatch");
 
         files.cleanup();
@@ -476,14 +528,20 @@ mod tests {
 
     #[test]
     fn test_streaming_single_triple() {
-        let make_triple = || vec![Ok(IdTriple { subject: 1, predicate: 1, object: 1 })];
+        let make_triple = || {
+            vec![Ok(IdTriple {
+                subject: 1,
+                predicate: 1,
+                object: 1,
+            })]
+        };
 
         let inmem = build_bitmap_triples(make_triple().into_iter(), 1, 1, 1).unwrap();
 
         let temp_dir = tempfile::tempdir().unwrap();
-        let files = build_bitmap_triples_to_files(
-            make_triple().into_iter(), 1, 1, 1, temp_dir.path(),
-        ).unwrap();
+        let files =
+            build_bitmap_triples_to_files(make_triple().into_iter(), 1, 1, 1, temp_dir.path())
+                .unwrap();
 
         assert_eq!(files.num_triples, 1);
 
@@ -491,7 +549,10 @@ mod tests {
         assert_eq!(by, inmem.bitmap_y);
 
         let az = read_and_assemble_log_array(
-            &files.array_z.path, files.array_z.bits_per_entry, files.array_z.num_entries);
+            &files.array_z.path,
+            files.array_z.bits_per_entry,
+            files.array_z.num_entries,
+        );
         assert_eq!(az, inmem.array_z);
 
         files.cleanup();

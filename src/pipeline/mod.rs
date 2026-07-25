@@ -1036,10 +1036,9 @@ enum GraphMembershipSpool {
 
 impl GraphMembershipSpool {
     fn new(temp_dir: &Path, layer_count: u64, sort_budget: usize) -> Result<Self> {
-        let memory_layer_limit = u64::try_from(
-            (sort_budget / DIRECT_GRAPH_SPOOL_ESTIMATED_BYTES_PER_LAYER).max(1),
-        )
-        .unwrap_or(u64::MAX);
+        let memory_layer_limit =
+            u64::try_from((sort_budget / DIRECT_GRAPH_SPOOL_ESTIMATED_BYTES_PER_LAYER).max(1))
+                .unwrap_or(u64::MAX);
         let direct_layer_limit = DIRECT_GRAPH_SPOOL_MAX_LAYERS.min(memory_layer_limit);
         if layer_count <= direct_layer_limit {
             tracing::info!(layer_count, "Spooling graph memberships directly by layer");
@@ -1281,7 +1280,9 @@ pub fn run_pipeline(
 
     let temp_dir_owned = temp_dir.to_path_buf();
     let writer_handle = std::thread::spawn(move || {
-        if let Err(e) = vocab_writer_stage(processed_rx, complete_tx, temp_dir_owned, include_graphs) {
+        if let Err(e) =
+            vocab_writer_stage(processed_rx, complete_tx, temp_dir_owned, include_graphs)
+        {
             tracing::error!("Vocab writer stage failed: {}", e);
             return Err(e);
         }
@@ -1591,11 +1592,8 @@ pub fn run_pipeline(
 
     // Collect statements into the external sorter, tracking max IDs for
     // BitmapTriples bit widths.
-    let mut statements = StatementSorter::new(
-        temp_dir,
-        stage56_budget.sort_budget_bytes,
-        include_graphs,
-    );
+    let mut statements =
+        StatementSorter::new(temp_dir, stage56_budget.sort_budget_bytes, include_graphs);
     let mut mem_used: usize = 0;
     let mut triple_count = 0u64;
     let mut max_subject: u64 = 0;
@@ -1831,12 +1829,8 @@ mod tests {
     fn high_graph_count_keeps_sorted_spool_fallback() {
         let temp = tempfile::tempdir().unwrap();
         let output = temp.path().join("sorted.gmp.zst");
-        let mut spool = GraphMembershipSpool::new(
-            temp.path(),
-            DIRECT_GRAPH_SPOOL_MAX_LAYERS + 1,
-            64,
-        )
-        .unwrap();
+        let mut spool =
+            GraphMembershipSpool::new(temp.path(), DIRECT_GRAPH_SPOOL_MAX_LAYERS + 1, 64).unwrap();
         assert!(matches!(spool, GraphMembershipSpool::Sorted(_)));
         spool
             .push(GraphMembership {

@@ -327,7 +327,10 @@ fn add_with_relative_iri_input_stays_readable() {
     let header = dump_header(&out);
     assert!(header.contains("Relative subject"));
     // No empty/relative IRI leaked into the header.
-    assert!(!header.contains("<> "), "relative IRI should be resolved:\n{header}");
+    assert!(
+        !header.contains("<> "),
+        "relative IRI should be resolved:\n{header}"
+    );
     assert_readable(&out);
 }
 

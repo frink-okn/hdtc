@@ -51,7 +51,11 @@ mod tests {
     #[test]
     fn test_serialize_roundtrip() {
         let triples = vec![
-            nt("http://example.org/s", "http://example.org/p", iri("http://example.org/o")),
+            nt(
+                "http://example.org/s",
+                "http://example.org/p",
+                iri("http://example.org/o"),
+            ),
             nt(
                 "http://example.org/s",
                 "http://example.org/label",
@@ -59,7 +63,9 @@ mod tests {
             ),
         ];
         let text = serialize_triples(&triples).unwrap();
-        assert!(text.contains("<http://example.org/s> <http://example.org/p> <http://example.org/o> ."));
+        assert!(
+            text.contains("<http://example.org/s> <http://example.org/p> <http://example.org/o> .")
+        );
         assert!(text.contains("\"hi\""));
         assert_eq!(parse(&text), triples);
     }

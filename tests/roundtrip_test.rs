@@ -21,9 +21,7 @@
 
 mod common;
 
-use common::{
-    ensure_hdt_java, ensure_jena, hdt_java_classpath, run_hdtc_to_path, run_rdfcompare,
-};
+use common::{ensure_hdt_java, ensure_jena, hdt_java_classpath, run_hdtc_to_path, run_rdfcompare};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -65,7 +63,11 @@ fn collect_tests(dir: &Path) -> Vec<libtest_mimic::Trial> {
     files
         .into_iter()
         .map(|path| {
-            let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+            let name = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
             libtest_mimic::Trial::test(name, move || {
                 let hdt_java_dir = ensure_hdt_java();
                 let classpath = hdt_java_classpath(&hdt_java_dir);

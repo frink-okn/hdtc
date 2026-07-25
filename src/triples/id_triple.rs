@@ -60,10 +60,26 @@ mod tests {
 
     #[test]
     fn test_id_triple_ordering() {
-        let t1 = IdTriple { subject: 1, predicate: 1, object: 1 };
-        let t2 = IdTriple { subject: 1, predicate: 1, object: 2 };
-        let t3 = IdTriple { subject: 1, predicate: 2, object: 1 };
-        let t4 = IdTriple { subject: 2, predicate: 1, object: 1 };
+        let t1 = IdTriple {
+            subject: 1,
+            predicate: 1,
+            object: 1,
+        };
+        let t2 = IdTriple {
+            subject: 1,
+            predicate: 1,
+            object: 2,
+        };
+        let t3 = IdTriple {
+            subject: 1,
+            predicate: 2,
+            object: 1,
+        };
+        let t4 = IdTriple {
+            subject: 2,
+            predicate: 1,
+            object: 1,
+        };
 
         assert!(t1 < t2);
         assert!(t2 < t3);
@@ -72,7 +88,11 @@ mod tests {
 
     #[test]
     fn test_id_triple_roundtrip() {
-        let triple = IdTriple { subject: 42, predicate: 7, object: 100 };
+        let triple = IdTriple {
+            subject: 42,
+            predicate: 7,
+            object: 100,
+        };
         let mut buf = Vec::new();
         triple.write_to(&mut buf).unwrap();
         assert_eq!(buf.len(), 24);

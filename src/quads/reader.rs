@@ -1398,7 +1398,11 @@ impl GraphSidecarReader {
         // given the number of one bits in that same prefix.
         let upper_bits = header.upper_bits;
         let value_rank = move |ones: u64, bit: u64| -> u64 {
-            if one { ones } else { bit.min(upper_bits) - ones }
+            if one {
+                ones
+            } else {
+                bit.min(upper_bits) - ones
+            }
         };
 
         // Last 4096-bit superblock whose start rank is at or below `ordinal`.
@@ -1427,7 +1431,10 @@ impl GraphSidecarReader {
         let mut high = (low + 7).min(header.subrank_count - 1);
         while low < high {
             let mid = low + (high - low).div_ceil(2);
-            let relative = u64::from(read_u16_at(&mut self.file, header.subrank_offset + mid * 2)?);
+            let relative = u64::from(read_u16_at(
+                &mut self.file,
+                header.subrank_offset + mid * 2,
+            )?);
             if value_rank(superblock_ones + relative, mid * 512) <= ordinal {
                 low = mid;
             } else {
@@ -1435,8 +1442,10 @@ impl GraphSidecarReader {
             }
         }
         let subblock = low;
-        let relative =
-            u64::from(read_u16_at(&mut self.file, header.subrank_offset + subblock * 2)?);
+        let relative = u64::from(read_u16_at(
+            &mut self.file,
+            header.subrank_offset + subblock * 2,
+        )?);
         let mut rank = value_rank(superblock_ones + relative, subblock * 512);
 
         // At most eight words inside the subblock.
@@ -2462,16 +2471,7 @@ mod tests {
         // Scattered across several 65,536-position chunks and both sides of a
         // chunk boundary, including the last position in the universe.
         let sparse_positions: Vec<u64> = vec![
-            0,
-            1,
-            65_535,
-            65_536,
-            65_537,
-            131_072,
-            200_000,
-            499_999,
-            500_000,
-            999_999,
+            0, 1, 65_535, 65_536, 65_537, 131_072, 200_000, 499_999, 500_000, 999_999,
         ];
         // One dense run inside a single chunk: sparse chunk table + bitmap
         // container, far above the Elias-Fano density threshold.
@@ -2542,7 +2542,10 @@ mod tests {
         assert!(!reader.access(2, 65_536)?);
         assert_eq!(reader.rank(2, 20_000)?, 20_000);
         assert_eq!(reader.select(2, 19_999)?, 19_999);
-        assert_eq!(reader.layer_iter(2)?.collect::<Result<Vec<_>>>()?, clustered);
+        assert_eq!(
+            reader.layer_iter(2)?.collect::<Result<Vec<_>>>()?,
+            clustered
+        );
 
         assert_eq!(reader.graphs_of(0)?, vec![0, 1, 2]);
         assert_eq!(reader.graphs_of(65_535)?, vec![0, 1]);

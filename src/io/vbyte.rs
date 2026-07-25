@@ -115,7 +115,18 @@ mod tests {
 
     #[test]
     fn test_roundtrip_decode() {
-        for &value in &[0u64, 1, 127, 128, 255, 256, 16383, 16384, 1_000_000, u64::MAX] {
+        for &value in &[
+            0u64,
+            1,
+            127,
+            128,
+            255,
+            256,
+            16383,
+            16384,
+            1_000_000,
+            u64::MAX,
+        ] {
             let encoded = encode_vbyte(value);
             let (decoded, consumed) = decode_vbyte(&encoded).unwrap();
             assert_eq!(decoded, value, "roundtrip failed for {value}");

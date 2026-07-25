@@ -5,7 +5,7 @@
 //! - CRC16-ANSI (poly 0x8005): after Control Information blocks
 //! - CRC32C (poly 0x1EDC6F41): after data payloads
 
-use crc::{Crc, CRC_32_ISCSI};
+use crc::{CRC_32_ISCSI, Crc};
 use std::io::{self, Write};
 
 // CRC8-CCITT: polynomial 0x07
@@ -196,7 +196,8 @@ mod tests {
         assert_eq!(&buf[..data.len()], data);
         let crc_bytes = &buf[data.len()..];
         assert_eq!(crc_bytes.len(), 4);
-        let stored_crc = u32::from_le_bytes([crc_bytes[0], crc_bytes[1], crc_bytes[2], crc_bytes[3]]);
+        let stored_crc =
+            u32::from_le_bytes([crc_bytes[0], crc_bytes[1], crc_bytes[2], crc_bytes[3]]);
         assert_eq!(stored_crc, expected_crc);
     }
 

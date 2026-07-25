@@ -14,11 +14,7 @@ fn run_hdtc(temp_dir: &Path, inputs: &[&Path], hdt_name: &str) -> (bool, String,
 
     // Build args with "create" subcommand as first argument
     let mut args: Vec<String> = vec!["create".to_string()];
-    args.extend(
-        inputs
-            .iter()
-            .map(|p| p.to_str().unwrap().to_string())
-    );
+    args.extend(inputs.iter().map(|p| p.to_str().unwrap().to_string()));
     args.extend([
         "-o".to_string(),
         hdt_path.to_str().unwrap().to_string(),
@@ -173,7 +169,8 @@ fn test_dump_hdt_to_ntriples() {
     let parse_all = |path: &Path| -> HashSet<String> {
         let file = std::fs::File::open(path).unwrap();
         let reader = std::io::BufReader::new(file);
-        let parser = oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::NTriples).for_reader(reader);
+        let parser =
+            oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::NTriples).for_reader(reader);
         parser
             .map(|q| q.unwrap().to_string())
             .collect::<HashSet<_>>()
@@ -181,7 +178,10 @@ fn test_dump_hdt_to_ntriples() {
 
     let expected = parse_all(&input_nt);
     let actual = parse_all(&output_nt);
-    assert_eq!(expected, actual, "Dumped N-Triples should match input graph");
+    assert_eq!(
+        expected, actual,
+        "Dumped N-Triples should match input graph"
+    );
 }
 
 /// Comprehensive round-trip test for dump: create HDT from N-Triples, dump back,
@@ -532,8 +532,7 @@ ex:bob foaf:name "Bob" ;
 "#;
     write_file(&ttl_path, ttl_content.as_bytes());
 
-    let (success, stderr, hdt_bytes) =
-        run_hdtc(temp_dir.path(), &[ttl_path.as_path()], "test.hdt");
+    let (success, stderr, hdt_bytes) = run_hdtc(temp_dir.path(), &[ttl_path.as_path()], "test.hdt");
 
     assert!(success, "hdtc failed on Turtle input: {stderr}");
     assert!(hdt_bytes.starts_with(b"$HDT"));
@@ -563,8 +562,7 @@ fn test_rdfxml_format() {
 "#;
     write_file(&rdf_path, rdfxml_content.as_bytes());
 
-    let (success, stderr, hdt_bytes) =
-        run_hdtc(temp_dir.path(), &[rdf_path.as_path()], "test.hdt");
+    let (success, stderr, hdt_bytes) = run_hdtc(temp_dir.path(), &[rdf_path.as_path()], "test.hdt");
 
     assert!(success, "hdtc failed on RDF/XML input: {stderr}");
     assert!(hdt_bytes.starts_with(b"$HDT"));
@@ -586,8 +584,7 @@ fn test_nquads_triples_mode() {
 "#;
     write_file(&nq_path, nq_content.as_bytes());
 
-    let (success, stderr, hdt_bytes) =
-        run_hdtc(temp_dir.path(), &[nq_path.as_path()], "test.hdt");
+    let (success, stderr, hdt_bytes) = run_hdtc(temp_dir.path(), &[nq_path.as_path()], "test.hdt");
 
     assert!(success, "hdtc failed on N-Quads input: {stderr}");
     assert!(hdt_bytes.starts_with(b"$HDT"));
@@ -613,8 +610,7 @@ ex:bob ex:name "Bob" .
 "#;
     write_file(&n3_path, n3_content.as_bytes());
 
-    let (success, stderr, hdt_bytes) =
-        run_hdtc(temp_dir.path(), &[n3_path.as_path()], "test.hdt");
+    let (success, stderr, hdt_bytes) = run_hdtc(temp_dir.path(), &[n3_path.as_path()], "test.hdt");
 
     assert!(success, "hdtc failed on N3 input: {stderr}");
     assert!(hdt_bytes.starts_with(b"$HDT"));
@@ -631,8 +627,8 @@ ex:bob ex:name "Bob" .
 /// Test gzip-compressed N-Triples input.
 #[test]
 fn test_gzip_compressed_input() {
-    use flate2::write::GzEncoder;
     use flate2::Compression;
+    use flate2::write::GzEncoder;
 
     let temp_dir = tempfile::tempdir().unwrap();
     let gz_path = temp_dir.path().join("test.nt.gz");
@@ -647,8 +643,7 @@ fn test_gzip_compressed_input() {
     encoder.write_all(nt_content.as_bytes()).unwrap();
     encoder.finish().unwrap();
 
-    let (success, stderr, hdt_bytes) =
-        run_hdtc(temp_dir.path(), &[gz_path.as_path()], "test.hdt");
+    let (success, stderr, hdt_bytes) = run_hdtc(temp_dir.path(), &[gz_path.as_path()], "test.hdt");
 
     assert!(success, "hdtc failed on gzip input: {stderr}");
     assert!(hdt_bytes.starts_with(b"$HDT"));
@@ -661,8 +656,8 @@ fn test_gzip_compressed_input() {
 /// Test bzip2-compressed N-Triples input.
 #[test]
 fn test_bzip2_compressed_input() {
-    use bzip2::write::BzEncoder;
     use bzip2::Compression;
+    use bzip2::write::BzEncoder;
 
     let temp_dir = tempfile::tempdir().unwrap();
     let bz2_path = temp_dir.path().join("test.nt.bz2");
@@ -676,8 +671,7 @@ fn test_bzip2_compressed_input() {
     encoder.write_all(nt_content.as_bytes()).unwrap();
     encoder.finish().unwrap();
 
-    let (success, stderr, hdt_bytes) =
-        run_hdtc(temp_dir.path(), &[bz2_path.as_path()], "test.hdt");
+    let (success, stderr, hdt_bytes) = run_hdtc(temp_dir.path(), &[bz2_path.as_path()], "test.hdt");
 
     assert!(success, "hdtc failed on bzip2 input: {stderr}");
     assert!(hdt_bytes.starts_with(b"$HDT"));
@@ -704,8 +698,7 @@ fn test_xz_compressed_input() {
     encoder.write_all(nt_content.as_bytes()).unwrap();
     encoder.finish().unwrap();
 
-    let (success, stderr, hdt_bytes) =
-        run_hdtc(temp_dir.path(), &[xz_path.as_path()], "test.hdt");
+    let (success, stderr, hdt_bytes) = run_hdtc(temp_dir.path(), &[xz_path.as_path()], "test.hdt");
 
     assert!(success, "hdtc failed on xz input: {stderr}");
     assert!(hdt_bytes.starts_with(b"$HDT"));
@@ -760,8 +753,7 @@ fn test_duplicate_triple_elimination() {
 "#;
     write_file(&nt_path, nt_content.as_bytes());
 
-    let (success, stderr, hdt_bytes) =
-        run_hdtc(temp_dir.path(), &[nt_path.as_path()], "test.hdt");
+    let (success, stderr, hdt_bytes) = run_hdtc(temp_dir.path(), &[nt_path.as_path()], "test.hdt");
 
     assert!(success, "hdtc failed: {stderr}");
     assert!(hdt_bytes.starts_with(b"$HDT"));
@@ -818,10 +810,12 @@ another bad line here
 "#;
     write_file(&nt_path, nt_content.as_bytes());
 
-    let (success, stderr, hdt_bytes) =
-        run_hdtc(temp_dir.path(), &[nt_path.as_path()], "test.hdt");
+    let (success, stderr, hdt_bytes) = run_hdtc(temp_dir.path(), &[nt_path.as_path()], "test.hdt");
 
-    assert!(success, "hdtc should succeed despite malformed lines: {stderr}");
+    assert!(
+        success,
+        "hdtc should succeed despite malformed lines: {stderr}"
+    );
     assert!(hdt_bytes.starts_with(b"$HDT"));
     // Only 3 valid triples
     assert!(
@@ -846,8 +840,7 @@ fn test_single_triple() {
         b"<http://example.org/s> <http://example.org/p> <http://example.org/o> .\n",
     );
 
-    let (success, stderr, hdt_bytes) =
-        run_hdtc(temp_dir.path(), &[nt_path.as_path()], "test.hdt");
+    let (success, stderr, hdt_bytes) = run_hdtc(temp_dir.path(), &[nt_path.as_path()], "test.hdt");
 
     assert!(success, "hdtc failed on single triple: {stderr}");
     assert!(hdt_bytes.starts_with(b"$HDT"));
@@ -931,8 +924,7 @@ fn test_literal_types() {
 "#;
     write_file(&nt_path, nt_content.as_bytes());
 
-    let (success, stderr, hdt_bytes) =
-        run_hdtc(temp_dir.path(), &[nt_path.as_path()], "test.hdt");
+    let (success, stderr, hdt_bytes) = run_hdtc(temp_dir.path(), &[nt_path.as_path()], "test.hdt");
 
     assert!(success, "hdtc failed on literal types: {stderr}");
     assert!(hdt_bytes.starts_with(b"$HDT"));
@@ -960,8 +952,7 @@ fn test_hdt_section_structure() {
 "#;
     write_file(&nt_path, nt_content.as_bytes());
 
-    let (success, stderr, hdt_bytes) =
-        run_hdtc(temp_dir.path(), &[nt_path.as_path()], "test.hdt");
+    let (success, stderr, hdt_bytes) = run_hdtc(temp_dir.path(), &[nt_path.as_path()], "test.hdt");
 
     assert!(success, "hdtc failed: {stderr}");
 
@@ -1048,8 +1039,7 @@ fn test_header_void_metadata() {
 "#;
     write_file(&nt_path, nt_content.as_bytes());
 
-    let (success, stderr, hdt_bytes) =
-        run_hdtc(temp_dir.path(), &[nt_path.as_path()], "test.hdt");
+    let (success, stderr, hdt_bytes) = run_hdtc(temp_dir.path(), &[nt_path.as_path()], "test.hdt");
 
     assert!(success, "hdtc failed: {stderr}");
 
@@ -1064,9 +1054,10 @@ fn test_header_void_metadata() {
         .expect("Header CI should have length property");
     let header_length: usize = length_str.parse().unwrap();
 
-    let header_content =
-        String::from_utf8(hdt_bytes[header_content_start..header_content_start + header_length].to_vec())
-            .unwrap();
+    let header_content = String::from_utf8(
+        hdt_bytes[header_content_start..header_content_start + header_length].to_vec(),
+    )
+    .unwrap();
 
     // Verify VoID metadata
     assert!(
@@ -1106,8 +1097,7 @@ fn test_dictionary_pfc_type_bytes() {
 "#;
     write_file(&nt_path, nt_content.as_bytes());
 
-    let (success, stderr, hdt_bytes) =
-        run_hdtc(temp_dir.path(), &[nt_path.as_path()], "test.hdt");
+    let (success, stderr, hdt_bytes) = run_hdtc(temp_dir.path(), &[nt_path.as_path()], "test.hdt");
 
     assert!(success, "hdtc failed: {stderr}");
 
@@ -1152,8 +1142,8 @@ fn test_dictionary_pfc_type_bytes() {
 /// Verify that the compressed Turtle format combined with gzip works.
 #[test]
 fn test_compressed_turtle() {
-    use flate2::write::GzEncoder;
     use flate2::Compression;
+    use flate2::write::GzEncoder;
 
     let temp_dir = tempfile::tempdir().unwrap();
     let gz_path = temp_dir.path().join("test.ttl.gz");
@@ -1168,8 +1158,7 @@ ex:bob ex:knows ex:alice .
     encoder.write_all(ttl_content.as_bytes()).unwrap();
     encoder.finish().unwrap();
 
-    let (success, stderr, hdt_bytes) =
-        run_hdtc(temp_dir.path(), &[gz_path.as_path()], "test.hdt");
+    let (success, stderr, hdt_bytes) = run_hdtc(temp_dir.path(), &[gz_path.as_path()], "test.hdt");
 
     assert!(success, "hdtc failed on compressed Turtle: {stderr}");
     assert!(hdt_bytes.starts_with(b"$HDT"));
@@ -1192,8 +1181,7 @@ fn test_all_subjects_shared() {
 "#;
     write_file(&nt_path, nt_content.as_bytes());
 
-    let (success, stderr, hdt_bytes) =
-        run_hdtc(temp_dir.path(), &[nt_path.as_path()], "test.hdt");
+    let (success, stderr, hdt_bytes) = run_hdtc(temp_dir.path(), &[nt_path.as_path()], "test.hdt");
 
     assert!(success, "hdtc failed: {stderr}");
     assert!(hdt_bytes.starts_with(b"$HDT"));
@@ -1219,8 +1207,7 @@ fn test_many_predicates() {
     }
     write_file(&nt_path, content.as_bytes());
 
-    let (success, stderr, hdt_bytes) =
-        run_hdtc(temp_dir.path(), &[nt_path.as_path()], "test.hdt");
+    let (success, stderr, hdt_bytes) = run_hdtc(temp_dir.path(), &[nt_path.as_path()], "test.hdt");
 
     assert!(success, "hdtc failed with many predicates: {stderr}");
     assert!(hdt_bytes.starts_with(b"$HDT"));
@@ -1241,8 +1228,7 @@ fn test_unicode_literals() {
                       <http://example.org/s> <http://example.org/emoji> \"\u{1F600}\" .\n";
     write_file(&nt_path, nt_content.as_bytes());
 
-    let (success, stderr, hdt_bytes) =
-        run_hdtc(temp_dir.path(), &[nt_path.as_path()], "test.hdt");
+    let (success, stderr, hdt_bytes) = run_hdtc(temp_dir.path(), &[nt_path.as_path()], "test.hdt");
 
     assert!(success, "hdtc failed on Unicode input: {stderr}");
     assert!(hdt_bytes.starts_with(b"$HDT"));
@@ -1258,7 +1244,10 @@ fn test_single_triple_pipeline() {
     let temp_dir = tempfile::tempdir().unwrap();
     let nt_path = temp_dir.path().join("single.nt");
 
-    write_file(&nt_path, b"<http://example.org/s> <http://example.org/p> <http://example.org/o> .\n");
+    write_file(
+        &nt_path,
+        b"<http://example.org/s> <http://example.org/p> <http://example.org/o> .\n",
+    );
 
     let hdt_path = temp_dir.path().join("single.hdt");
     let work_dir = temp_dir.path().join("work");
@@ -1267,19 +1256,31 @@ fn test_single_triple_pipeline() {
         .args([
             "create",
             nt_path.to_str().unwrap(),
-            "-o", hdt_path.to_str().unwrap(),
-            "--base-uri", "http://example.org/dataset",
-            "--temp-dir", work_dir.to_str().unwrap(),
+            "-o",
+            hdt_path.to_str().unwrap(),
+            "--base-uri",
+            "http://example.org/dataset",
+            "--temp-dir",
+            work_dir.to_str().unwrap(),
         ])
         .output()
         .expect("Failed to execute hdtc");
 
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    assert!(output.status.success(), "hdtc failed with single triple: {stderr}");
+    assert!(
+        output.status.success(),
+        "hdtc failed with single triple: {stderr}"
+    );
 
     let hdt_bytes = std::fs::read(&hdt_path).expect("HDT file should exist");
-    assert!(hdt_bytes.starts_with(b"$HDT"), "Output should start with HDT magic");
-    assert!(stderr.contains("1 triple"), "Should report exactly 1 triple, got:\n{stderr}");
+    assert!(
+        hdt_bytes.starts_with(b"$HDT"),
+        "Output should start with HDT magic"
+    );
+    assert!(
+        stderr.contains("1 triple"),
+        "Should report exactly 1 triple, got:\n{stderr}"
+    );
 }
 
 /// Test pipeline edge case: many small batches to exercise backpressure.
@@ -1306,23 +1307,40 @@ fn test_many_small_batches_backpressure() {
         .args([
             "create",
             nt_path.to_str().unwrap(),
-            "-o", hdt_path.to_str().unwrap(),
-            "--base-uri", "http://example.org/dataset",
-            "--temp-dir", work_dir.to_str().unwrap(),
-            "--memory-limit", "10M",  // Small limit (10 MB) forces multiple batches
+            "-o",
+            hdt_path.to_str().unwrap(),
+            "--base-uri",
+            "http://example.org/dataset",
+            "--temp-dir",
+            work_dir.to_str().unwrap(),
+            "--memory-limit",
+            "10M", // Small limit (10 MB) forces multiple batches
         ])
         .output()
         .expect("Failed to execute hdtc");
 
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    assert!(output.status.success(), "hdtc failed with many small batches: {stderr}");
+    assert!(
+        output.status.success(),
+        "hdtc failed with many small batches: {stderr}"
+    );
 
     let hdt_bytes = std::fs::read(&hdt_path).expect("HDT file should exist");
-    assert!(hdt_bytes.starts_with(b"$HDT"), "Output should start with HDT magic");
-    assert!(stderr.contains("100 triples"), "Should report exactly 100 triples, got:\n{stderr}");
+    assert!(
+        hdt_bytes.starts_with(b"$HDT"),
+        "Output should start with HDT magic"
+    );
+    assert!(
+        stderr.contains("100 triples"),
+        "Should report exactly 100 triples, got:\n{stderr}"
+    );
 
     // Verify the result has the expected structure
-    assert_eq!(count_hdt_magic(&hdt_bytes), 4, "Should have 4 HDT magic blocks");
+    assert_eq!(
+        count_hdt_magic(&hdt_bytes),
+        4,
+        "Should have 4 HDT magic blocks"
+    );
 }
 
 /// Test pipeline with overlapping terms across multiple files (multi-file batching).
@@ -1354,19 +1372,31 @@ fn test_multi_file_term_overlap() {
             "create",
             file1.to_str().unwrap(),
             file2.to_str().unwrap(),
-            "-o", hdt_path.to_str().unwrap(),
-            "--base-uri", "http://example.org/dataset",
-            "--temp-dir", work_dir.to_str().unwrap(),
+            "-o",
+            hdt_path.to_str().unwrap(),
+            "--base-uri",
+            "http://example.org/dataset",
+            "--temp-dir",
+            work_dir.to_str().unwrap(),
         ])
         .output()
         .expect("Failed to execute hdtc");
 
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    assert!(output.status.success(), "hdtc failed with multi-file overlap: {stderr}");
+    assert!(
+        output.status.success(),
+        "hdtc failed with multi-file overlap: {stderr}"
+    );
 
     let hdt_bytes = std::fs::read(&hdt_path).expect("HDT file should exist");
-    assert!(hdt_bytes.starts_with(b"$HDT"), "Output should start with HDT magic");
-    assert!(stderr.contains("4 triples"), "Should report exactly 4 triples, got:\n{stderr}");
+    assert!(
+        hdt_bytes.starts_with(b"$HDT"),
+        "Output should start with HDT magic"
+    );
+    assert!(
+        stderr.contains("4 triples"),
+        "Should report exactly 4 triples, got:\n{stderr}"
+    );
 }
 
 // =============================================================================
@@ -1389,13 +1419,14 @@ fn run_hdtc_index(hdt_path: &Path, temp_dir: &Path) -> Vec<u8> {
 
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     eprintln!("hdtc index stderr:\n{stderr}");
-    assert!(
-        output.status.success(),
-        "hdtc index failed: {stderr}"
-    );
+    assert!(output.status.success(), "hdtc index failed: {stderr}");
 
     let index_path = hdt_path.with_extension("hdt.index.v1-1");
-    assert!(index_path.exists(), "Index file should exist at {}", index_path.display());
+    assert!(
+        index_path.exists(),
+        "Index file should exist at {}",
+        index_path.display()
+    );
     std::fs::read(&index_path).expect("Failed to read index file")
 }
 
@@ -1524,10 +1555,7 @@ fn test_index_creation_structural_and_semantic() {
         .expect("Failed to execute hdtc create");
 
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    assert!(
-        output.status.success(),
-        "hdtc create failed: {stderr}"
-    );
+    assert!(output.status.success(), "hdtc create failed: {stderr}");
 
     // Create index
     let index_bytes = run_hdtc_index(&hdt_path, temp_dir.path());
@@ -1610,17 +1638,23 @@ fn test_index_creation_structural_and_semantic() {
 
     // predicateIndex bitmap + sequence should have same length = num_sp_pairs
     assert_eq!(
-        pred_bitmap.len() as u64, num_sp_pairs,
+        pred_bitmap.len() as u64,
+        num_sp_pairs,
         "predicateIndex bitmap should have num_sp_pairs bits"
     );
     assert_eq!(
-        pred_seq.len() as u64, num_sp_pairs,
+        pred_seq.len() as u64,
+        num_sp_pairs,
         "predicateIndex sequence should have num_sp_pairs entries"
     );
 
     // predicateCount should have one entry per predicate
     // Our dataset has 2 predicates (p1, p2)
-    assert_eq!(pred_count.len(), 2, "predicateCount should have 2 entries (one per predicate)");
+    assert_eq!(
+        pred_count.len(),
+        2,
+        "predicateCount should have 2 entries (one per predicate)"
+    );
 
     // Sum of predicateCount should equal num_sp_pairs
     let count_sum: u64 = pred_count.iter().sum();
@@ -1639,18 +1673,27 @@ fn test_index_creation_structural_and_semantic() {
     // Bitmap: [false, false, true, false, true]
     //          ^^^^^^^^^^^^  ^^^^  ^^^^^^^^^^^
     //            pred 1             pred 2
-    assert_eq!(pred_bitmap, vec![false, false, true, false, true],
-        "predicateIndex bitmap should mark group boundaries at positions 2 and 4");
+    assert_eq!(
+        pred_bitmap,
+        vec![false, false, true, false, true],
+        "predicateIndex bitmap should mark group boundaries at positions 2 and 4"
+    );
 
     // predicateIndex sequence: Y-positions of S-P pairs grouped by predicate
     // pred 1 (at Y-positions 0, 2, 4 for s1-p1, s2-p1, s3-p1):
     //   seq[0..3] should be {0, 2, 4} in sorted order
     // pred 2 (at Y-positions 1, 3 for s1-p2, s2-p2):
     //   seq[3..5] should be {1, 3} in sorted order
-    assert_eq!(&pred_seq[0..3], &[0, 2, 4],
-        "predicate 1 Y-positions should be [0, 2, 4]");
-    assert_eq!(&pred_seq[3..5], &[1, 3],
-        "predicate 2 Y-positions should be [1, 3]");
+    assert_eq!(
+        &pred_seq[0..3],
+        &[0, 2, 4],
+        "predicate 1 Y-positions should be [0, 2, 4]"
+    );
+    assert_eq!(
+        &pred_seq[3..5],
+        &[1, 3],
+        "predicate 2 Y-positions should be [1, 3]"
+    );
 
     // Verify OPS index semantics:
     // Our SPO triples with dictionary IDs (subjects s1<s2<s3, predicates p1<p2, objects o1<o2<o3<o4):
@@ -1829,7 +1872,8 @@ fn test_index_creation_many_sort_chunks() {
     // Each predicate should have exactly num_subjects S-P pairs
     for (i, &count) in pred_count.iter().enumerate() {
         assert_eq!(
-            count, num_subjects as u64,
+            count,
+            num_subjects as u64,
             "predicate {} should have {} S-P pairs, got {}",
             i + 1,
             num_subjects,
@@ -1861,15 +1905,21 @@ fn create_hdt_from_ntriples(temp_dir: &Path, nt_content: &[u8], name: &str) -> s
         .args([
             "create",
             nt_path.to_str().unwrap(),
-            "-o", hdt_path.to_str().unwrap(),
-            "--base-uri", "http://example.org/dataset",
-            "--temp-dir", work_dir.to_str().unwrap(),
+            "-o",
+            hdt_path.to_str().unwrap(),
+            "--base-uri",
+            "http://example.org/dataset",
+            "--temp-dir",
+            work_dir.to_str().unwrap(),
         ])
         .output()
         .expect("Failed to execute hdtc");
 
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    assert!(output.status.success(), "hdtc create failed for {name}: {stderr}");
+    assert!(
+        output.status.success(),
+        "hdtc create failed for {name}: {stderr}"
+    );
     hdt_path
 }
 
@@ -1904,21 +1954,33 @@ fn test_hdt_input_sole_source() {
         .args([
             "create",
             source_hdt.to_str().unwrap(),
-            "-o", output_hdt.to_str().unwrap(),
-            "--base-uri", "http://example.org/dataset",
-            "--temp-dir", work_dir.to_str().unwrap(),
+            "-o",
+            output_hdt.to_str().unwrap(),
+            "--base-uri",
+            "http://example.org/dataset",
+            "--temp-dir",
+            work_dir.to_str().unwrap(),
         ])
         .output()
         .expect("Failed to execute hdtc");
 
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    assert!(output.status.success(), "hdtc failed with HDT input: {stderr}");
-    assert!(stderr.contains("HDT input"), "Should log HDT input scanning");
+    assert!(
+        output.status.success(),
+        "hdtc failed with HDT input: {stderr}"
+    );
+    assert!(
+        stderr.contains("HDT input"),
+        "Should log HDT input scanning"
+    );
 
     // Verify output has the same triples
     let source_triples = read_hdt_triples(&source_hdt);
     let output_triples = read_hdt_triples(&output_hdt);
-    assert_eq!(source_triples, output_triples, "HDT round-trip should preserve all triples");
+    assert_eq!(
+        source_triples, output_triples,
+        "HDT round-trip should preserve all triples"
+    );
     assert_eq!(output_triples.len(), 3);
 }
 
@@ -1952,25 +2014,39 @@ fn test_hdt_input_merged_with_ntriples() {
             "create",
             alice_hdt.to_str().unwrap(),
             bob_nt_path.to_str().unwrap(),
-            "-o", output_hdt.to_str().unwrap(),
-            "--base-uri", "http://example.org/dataset",
-            "--temp-dir", work_dir.to_str().unwrap(),
+            "-o",
+            output_hdt.to_str().unwrap(),
+            "--base-uri",
+            "http://example.org/dataset",
+            "--temp-dir",
+            work_dir.to_str().unwrap(),
         ])
         .output()
         .expect("Failed to execute hdtc");
 
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    assert!(output.status.success(), "hdtc failed merging HDT + NT: {stderr}");
+    assert!(
+        output.status.success(),
+        "hdtc failed merging HDT + NT: {stderr}"
+    );
 
     // Verify merged output
     let triples = read_hdt_triples(&output_hdt);
     assert_eq!(triples.len(), 4, "Merged output should have 4 triples");
 
     // Check specific triples exist from both sources
-    assert!(triples.iter().any(|(s, p, _)| s.contains("alice") && p.contains("knows")),
-        "Should contain alice-knows-bob from HDT");
-    assert!(triples.iter().any(|(s, p, _)| s.contains("bob") && p.contains("age")),
-        "Should contain bob-age from N-Triples");
+    assert!(
+        triples
+            .iter()
+            .any(|(s, p, _)| s.contains("alice") && p.contains("knows")),
+        "Should contain alice-knows-bob from HDT"
+    );
+    assert!(
+        triples
+            .iter()
+            .any(|(s, p, _)| s.contains("bob") && p.contains("age")),
+        "Should contain bob-age from N-Triples"
+    );
 }
 
 /// Test merging two HDT files together.
@@ -1998,15 +2074,21 @@ fn test_hdt_input_two_hdt_files() {
             "create",
             hdt1.to_str().unwrap(),
             hdt2.to_str().unwrap(),
-            "-o", output_hdt.to_str().unwrap(),
-            "--base-uri", "http://example.org/dataset",
-            "--temp-dir", work_dir.to_str().unwrap(),
+            "-o",
+            output_hdt.to_str().unwrap(),
+            "--base-uri",
+            "http://example.org/dataset",
+            "--temp-dir",
+            work_dir.to_str().unwrap(),
         ])
         .output()
         .expect("Failed to execute hdtc");
 
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    assert!(output.status.success(), "hdtc failed merging two HDTs: {stderr}");
+    assert!(
+        output.status.success(),
+        "hdtc failed merging two HDTs: {stderr}"
+    );
 
     let triples = read_hdt_triples(&output_hdt);
     assert_eq!(triples.len(), 2, "Merged output should have 2 triples");
@@ -2038,9 +2120,12 @@ fn test_hdt_input_deduplication() {
             "create",
             hdt_path.to_str().unwrap(),
             nt_path.to_str().unwrap(),
-            "-o", output_hdt.to_str().unwrap(),
-            "--base-uri", "http://example.org/dataset",
-            "--temp-dir", work_dir.to_str().unwrap(),
+            "-o",
+            output_hdt.to_str().unwrap(),
+            "--base-uri",
+            "http://example.org/dataset",
+            "--temp-dir",
+            work_dir.to_str().unwrap(),
         ])
         .output()
         .expect("Failed to execute hdtc");
@@ -2049,7 +2134,11 @@ fn test_hdt_input_deduplication() {
     assert!(output.status.success(), "hdtc failed with dedup: {stderr}");
 
     let triples = read_hdt_triples(&output_hdt);
-    assert_eq!(triples.len(), 2, "Duplicate triple should be deduplicated, expected 2 unique triples");
+    assert_eq!(
+        triples.len(),
+        2,
+        "Duplicate triple should be deduplicated, expected 2 unique triples"
+    );
 }
 
 /// Test blank node disambiguation across two HDT inputs.
@@ -2078,25 +2167,38 @@ fn test_hdt_input_blank_node_disambiguation() {
             "create",
             hdt1.to_str().unwrap(),
             hdt2.to_str().unwrap(),
-            "-o", output_hdt.to_str().unwrap(),
-            "--base-uri", "http://example.org/dataset",
-            "--temp-dir", work_dir.to_str().unwrap(),
+            "-o",
+            output_hdt.to_str().unwrap(),
+            "--base-uri",
+            "http://example.org/dataset",
+            "--temp-dir",
+            work_dir.to_str().unwrap(),
         ])
         .output()
         .expect("Failed to execute hdtc");
 
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    assert!(output.status.success(), "hdtc failed merging HDTs with blank nodes: {stderr}");
+    assert!(
+        output.status.success(),
+        "hdtc failed merging HDTs with blank nodes: {stderr}"
+    );
 
     let triples = read_hdt_triples(&output_hdt);
     // The two _:b1 nodes should be disambiguated into two distinct blank nodes,
     // resulting in 2 triples (not 1 if they were incorrectly merged).
-    assert_eq!(triples.len(), 2,
+    assert_eq!(
+        triples.len(),
+        2,
         "Blank nodes from different HDT files should be disambiguated, expected 2 triples but got: {:?}",
-        triples);
+        triples
+    );
 
     // Verify the two subjects are different blank nodes
     let subjects: HashSet<_> = triples.iter().map(|(s, _, _)| s.clone()).collect();
-    assert_eq!(subjects.len(), 2,
-        "Should have 2 distinct blank node subjects, got: {:?}", subjects);
+    assert_eq!(
+        subjects.len(),
+        2,
+        "Should have 2 distinct blank node subjects, got: {:?}",
+        subjects
+    );
 }
