@@ -715,6 +715,31 @@ fn test_xz_compressed_input() {
     );
 }
 
+/// Test Zstandard-compressed N-Triples input.
+#[test]
+fn test_zstd_compressed_input() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let zst_path = temp_dir.path().join("test.nt.zst");
+
+    let nt_content = r#"<http://example.org/alice> <http://example.org/name> "Alice" .
+<http://example.org/bob> <http://example.org/name> "Bob" .
+"#;
+
+    let f = std::fs::File::create(&zst_path).unwrap();
+    let mut encoder = zstd::Encoder::new(f, 3).unwrap();
+    encoder.write_all(nt_content.as_bytes()).unwrap();
+    encoder.finish().unwrap();
+
+    let (success, stderr, hdt_bytes) = run_hdtc(temp_dir.path(), &[zst_path.as_path()], "test.hdt");
+
+    assert!(success, "hdtc failed on Zstandard input: {stderr}");
+    assert!(hdt_bytes.starts_with(b"$HDT"));
+    assert!(
+        stderr.contains("2 triples"),
+        "Expected 2 triples from Zstandard input, got:\n{stderr}"
+    );
+}
+
 // =============================================================================
 // Edge case tests
 // =============================================================================
