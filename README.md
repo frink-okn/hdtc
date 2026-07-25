@@ -18,6 +18,7 @@ Development of hdtc is done primarily through Claude Code.
 - **Index generation** — optional `.hdt.index.v1-1` enables efficient `? P ?`, `? ? O`, and `? P O` queries
 - **VoID statistics** — compute dataset-level, property, and class partition statistics as N-Triples
 - **Membership and overlap sketches** — build source-bound binary fuse filters and bottom-k MinHash files directly from an HDT dictionary
+- **Exact key sets** — publish the complete distinct key set for a role, Elias-Fano encoded, for membership and overlap without approximation
 - **Resilient parsing** — skips malformed triples with warnings, reports total skipped at the end
 
 ## Named graphs
@@ -107,6 +108,12 @@ hdtc void [OPTIONS] <HDT_FILE>
 
 ```
 hdtc sketch [OPTIONS] <HDT_FILE>
+```
+
+### `hdtc keyset` — Build exact key sets
+
+```
+hdtc keyset [OPTIONS] <HDT_FILE>
 ```
 
 ### `hdtc header` — Dump or modify the embedded header triples
@@ -292,6 +299,80 @@ fuse scratch arrays, fingerprints, keys, and retained MinHash values can fit —
 so an oversized input is refused while it is being read rather than after. If a
 role does not fit, reduce `--k` or increase the limit. Use `--temp-dir` to place
 the uncompressed hashed-key files on a disk with sufficient space.
+
+### Keyset: Building exact key sets
+
+Where `hdtc sketch` answers approximately, `hdtc keyset` answers exactly. It
+writes the complete, sorted set of distinct 64-bit term keys for a role, under
+the same term-to-key rule the sketches use:
+
+```sh
+hdtc keyset data.hdt
+```
+
+By default this creates a `keysets/` directory beside the HDT containing:
+
+```text
+keysets/
+  subjects.keys
+  objects.keys
+```
+
+The roles are the same as the sketch roles, over the same qualifying IRIs, so a
+`.keys` file and a `.filter` for the same role describe the same set. From the
+key set, membership is a lookup with no false positives, overlap `|A ∩ B|` is an
+integer merge with no estimator, and — unlike either sketch — **the shared keys
+themselves can be enumerated**, which is what performing a join actually needs.
+A `.minhash` is derivable from it (take the bottom `k`) and a `.filter` is built
+from it, so the key set is the exact parent of both.
+
+The cost is size. On a 4-million-key role, Elias-Fano lands at 5.5 bytes/key —
+about 4.9× a Fuse8 filter (~1.13 bytes/key) or 2.4× a Fuse16 one (~2.26), so
+which multiple applies depends on the `--filter-bits` you would otherwise ship.
+The rate *falls* as a role grows, to about 4.4 bytes/key at 2.3 billion keys, so
+key sets are attractive for small and mid-size datasets while the sketches keep
+earning their approximation at the top end.
+
+Two encodings are available:
+
+```sh
+hdtc keyset data.hdt --encoding elias-fano   # default, ~4.4-5.8 bytes/key
+hdtc keyset data.hdt --encoding raw          # sorted u64 array, 8 bytes/key
+```
+
+Elias-Fano is near the information floor for uniformly random 64-bit keys. Raw
+is the simplest possible decode — `mmap` the payload as a `u64` slice and binary
+search it — and is the baseline the Elias-Fano saving is measured against. The
+encoding is a per-file choice recorded in the header and does not affect
+comparability: two files with different encodings hold the same kind of set and
+intersect normally.
+
+There is also an experimental `terms` role covering every qualifying IRI in the
+dictionary, predicates included:
+
+```sh
+hdtc keyset data.hdt --roles subjects,objects,terms
+```
+
+`terms` is an hdtc extension, not part of the published role pair, and may be
+withdrawn. A reader must not compare it against `subjects` or `objects` — those
+are drawn from different term populations, so an intersection between them is
+not a meaningful overlap.
+
+**Any role builds at any size.** Keys are externally sorted and both encoders
+stream, so `--memory-limit` bounds the sort buffers rather than the key count —
+it is a throughput knob, not a ceiling on what can be published. A 12.4-million-
+key build at a 1 MiB limit spills 95 chunks and emits bytes identical to the
+same build at 4 GiB. (`hdtc sketch` is the exception: binary fuse construction
+peels a hypergraph over the whole key set and has no streaming form, so it keeps
+its keys resident and enforces a key ceiling.)
+
+As with the sketches, each file is self-describing, protected by CRC32C, bound
+to the source HDT by the same SHA-256 digest, and never overwritten if the
+target already exists. See the normative
+[HDT key-set artifact format, version 1](docs/keyset-format.md) for the byte
+layout, the Elias-Fano sizing rule, the validation a reader must perform on
+untrusted files, and the frozen conformance vectors.
 
 ### Dump: Exporting the union or dataset
 
@@ -525,6 +606,20 @@ Auto parser tuning is derived from `--memory-limit` (accepts `G`/`M` suffixes, e
 | `-v, --verbose`           | —                        | Increase log verbosity (`-v` debug, `-vv` trace)                    |
 | `-q, --quiet`             | —                        | Suppress all output except errors                                  |
 
+### Keyset: All options
+
+| Option                      | Default                | Description                                                          |
+| --------------------------- | ---------------------- | -------------------------------------------------------------------- |
+| `<HDT_FILE>`                | _(required)_           | Source HDT file                                                      |
+| `-o, --output-dir DIR`      | `keysets/` beside HDT  | Directory for generated artifacts                                    |
+| `--encoding ENCODING`       | `elias-fano`           | Payload encoding (`elias-fano` or `raw`)                             |
+| `--roles ROLE,...`          | `subjects,objects`     | Roles to emit (`subjects`, `objects`, and/or experimental `terms`)   |
+| `--temp-dir DIR`            | system temp            | Directory for temporary sort chunks and merged key runs              |
+| `-m, --memory-limit SIZE`   | `4G`                   | Soft budget for key sort buffers; bounds memory, not the key count   |
+| `--benchmark`               | off                    | Emit total keyset timing                                             |
+| `-v, --verbose`             | —                      | Increase log verbosity (`-v` debug, `-vv` trace)                     |
+| `-q, --quiet`               | —                      | Suppress all output except errors                                    |
+
 ### Dump: All options
 
 | Option                | Default      | Description                                                 |
@@ -588,6 +683,12 @@ qualifying IRI in every selected role while building the filters. An IRI in the
 shared dictionary is therefore present in both temporary role files when both
 roles are selected. These files are also cleaned up automatically.
 
+`hdtc keyset` sorts each role's keys on disk, so its temporary space is what
+lets it build a key set larger than memory. Peak usage is roughly **16 bytes per
+distinct key** per role — the compressed sort chunks plus the merged run the
+encoder streams from — released as soon as the artifact is published. Point
+`--temp-dir` at a disk with room for that.
+
 ### Output size
 
 HDT files are typically 10–20% of the equivalent uncompressed N-Triples.
@@ -623,7 +724,7 @@ src/
   rdf/               RDF parsing, format/compression detection, input discovery
   dictionary/        Dictionary construction, Plain Front Coding (PFC)
   triples/           BitmapTriples encoding
-  hdt/               HDT serialization, reading, querying, statistics, and sketches
+  hdt/               HDT serialization, reading, querying, statistics, sketches, and key sets
   index/             HDT index generation (.hdt.index.v1-1)
   io/                VByte, LogArray, Bitmap, CRC, Control Information
   pipeline/          6-stage pipelined architecture
@@ -632,11 +733,19 @@ tests/
   integration_test.rs   End-to-end pipeline tests
   compat_test.rs        Compatibility tests against the hdt crate
   sketch_test.rs        Sketch envelope, role, filter, and edge-case tests
+  keyset_test.rs        Key-set envelope, role, encoding, and edge-case tests
   data/                 Sample RDF fixtures
 docs/
   graphs-sidecar-format.md  Normative .graphs sidecar format
   sketch-format.md          Normative .filter / .minhash formats
+  keyset-format.md          Normative .keys format
 ```
+
+`hdtc sketch` and `hdtc keyset` derive their artifacts from one pass over an HDT
+dictionary and share a single term-to-key convention (`src/hdt/artifacts.rs`),
+which both formats assert by declaring `convention_id = 1`. Filters, sketches,
+and key sets of the same role are only comparable because that function has one
+definition.
 
 ## Development
 
