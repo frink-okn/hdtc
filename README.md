@@ -10,10 +10,10 @@ Development of hdtc is done primarily through Claude Code.
 
 - **All standard RDF formats** — N-Triples, N-Quads, Turtle, TriG, RDF/XML, JSON-LD, N3
 - **HDT inputs** — existing HDT files can be used as inputs, enabling merging of HDT files with each other or with RDF files
-- **Transparent decompression** — `.gz`, `.bz2`, `.xz` inputs handled automatically
+- **Transparent decompression** — `.gz`, `.bz2`, `.xz`, `.zst` inputs handled automatically
 - **Scalable** — streaming, disk-backed pipeline with configurable memory limit (default 4 GB)
 - **Multiple inputs** — accepts any mix of RDF files, HDT files, and directories; recursively discovers RDF files
-- **Parallel NT/NQ parsing** — newline-safe chunk parsing for N-Triples/N-Quads (including `.gz`, `.bz2`, `.xz`) with bounded in-flight memory
+- **Parallel NT/NQ parsing** — newline-safe chunk parsing for N-Triples/N-Quads (including `.gz`, `.bz2`, `.xz`, `.zst`) with bounded in-flight memory
 - **Index generation** — optional `.hdt.index.v1-1` enables efficient `? P ?`, `? ? O`, and `? P O` queries
 - **VoID statistics** — compute dataset-level, property, and class partition statistics as N-Triples
 - **Structural validation** — walk an HDT's triple structures and checksums, and any graph sidecar, end to end

@@ -157,6 +157,14 @@ fn open_input(input: &RdfInput) -> Result<Box<dyn Read>> {
         Compression::Gzip => Box::new(flate2::read::MultiGzDecoder::new(buf_reader)),
         Compression::Bzip2 => Box::new(bzip2::read::MultiBzDecoder::new(buf_reader)),
         Compression::Xz => Box::new(xz2::read::XzDecoder::new_multi_decoder(buf_reader)),
+        Compression::Zstd => {
+            Box::new(zstd::Decoder::with_buffer(buf_reader).with_context(|| {
+                format!(
+                    "Failed to initialize Zstandard decoder for {}",
+                    input.path.display()
+                )
+            })?)
+        }
     };
 
     Ok(reader)

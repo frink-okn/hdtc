@@ -16,7 +16,7 @@ Converts input RDF files (any standard format) to HDT binary format, optimized f
 - **Index**: Standard `.hdt.index.v1-1` (OPS order), implemented after core HDT generation is solid
 - **Quads**: HDTQ approach (ESWC 2018) - standard BitmapTriples + graph dictionary + compressed graph membership bitmaps
 - **Single-Pass Pipeline**: QLever-inspired architecture — per-batch hash maps assign local IDs during a single parse, partial vocabularies are k-way merged to build the global dictionary, local IDs are remapped to global IDs in parallel. No second parse needed.
-- **Compressed Input**: Transparently handle .gz, .bz2, .xz based on file extension
+- **Compressed Input**: Transparently handle .gz, .bz2, .xz, .zst based on file extension
 - **Error Handling**: Skip malformed RDF with warning, report total skipped count at end
 - **All RDF formats**: N-Triples, N-Quads, Turtle, TriG, RDF/XML, JSON-LD, N3
 
@@ -151,4 +151,4 @@ emitted bytes must update the spec and its frozen conformance vectors together.
 | `flate2` | Gzip decompression |
 | `bzip2` | Bzip2 decompression |
 | `xz2` / `liblzma` | XZ/LZMA decompression |
-| `zstd` | Zstandard compression for temp files |
+| `zstd` | Zstandard input decompression and temp-file compression |

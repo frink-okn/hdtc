@@ -29,6 +29,7 @@ pub enum Compression {
     Gzip,
     Bzip2,
     Xz,
+    Zstd,
 }
 
 /// A discovered RDF input file with its detected format and compression.
@@ -52,6 +53,7 @@ fn detect_compression(path: &Path) -> (Compression, PathBuf) {
         "gz" => (Compression::Gzip, path.with_extension("")),
         "bz2" => (Compression::Bzip2, path.with_extension("")),
         "xz" => (Compression::Xz, path.with_extension("")),
+        "zst" => (Compression::Zstd, path.with_extension("")),
         _ => (Compression::None, path.to_path_buf()),
     }
 }
@@ -208,6 +210,10 @@ mod tests {
         assert_eq!(comp, Compression::Xz);
         assert_eq!(base, Path::new("data.nq"));
 
+        let (comp, base) = detect_compression(Path::new("data.nt.zst"));
+        assert_eq!(comp, Compression::Zstd);
+        assert_eq!(base, Path::new("data.nt"));
+
         let (comp, base) = detect_compression(Path::new("data.nt"));
         assert_eq!(comp, Compression::None);
         assert_eq!(base, Path::new("data.nt"));
@@ -222,6 +228,10 @@ mod tests {
         let input = classify_file(Path::new("data.trig.xz")).unwrap();
         assert_eq!(input.format, RdfFormat::TriG);
         assert_eq!(input.compression, Compression::Xz);
+
+        let input = classify_file(Path::new("data.ttl.zst")).unwrap();
+        assert_eq!(input.format, RdfFormat::Turtle);
+        assert_eq!(input.compression, Compression::Zstd);
     }
 
     #[test]
