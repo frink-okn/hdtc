@@ -220,8 +220,7 @@ impl<W: Write> StreamingLogArrayEncoder<W> {
     /// Flush the final partial word and return (num_entries, bits_per_entry, inner_writer).
     pub fn finish(mut self) -> io::Result<(u64, u8, W)> {
         if self.bits_per_entry > 0 && self.num_entries > 0 {
-            let total_data_bytes =
-                bytes_needed(self.num_entries, self.bits_per_entry) as usize;
+            let total_data_bytes = bytes_needed(self.num_entries, self.bits_per_entry) as usize;
             let bytes_already_written = self.word_index as usize * 8;
             let remaining = total_data_bytes - bytes_already_written;
             if remaining > 0 {
@@ -277,7 +276,10 @@ impl<R: Read> StreamingLogArrayDecoder<R> {
         if type_byte[0] != TYPE_LOG {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("Expected LogArray type byte {TYPE_LOG}, got {}", type_byte[0]),
+                format!(
+                    "Expected LogArray type byte {TYPE_LOG}, got {}",
+                    type_byte[0]
+                ),
             ));
         }
         preamble_buf.push(type_byte[0]);
@@ -466,7 +468,10 @@ impl LogArrayReader {
         if type_byte[0] != TYPE_LOG {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("Expected LogArray type byte {TYPE_LOG}, got {}", type_byte[0]),
+                format!(
+                    "Expected LogArray type byte {TYPE_LOG}, got {}",
+                    type_byte[0]
+                ),
             ));
         }
         preamble_buf.push(type_byte[0]);
@@ -508,7 +513,9 @@ impl LogArrayReader {
         if stored_crc != computed_crc {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("LogArray data CRC32C mismatch: expected {computed_crc:#010x}, got {stored_crc:#010x}"),
+                format!(
+                    "LogArray data CRC32C mismatch: expected {computed_crc:#010x}, got {stored_crc:#010x}"
+                ),
             ));
         }
 
@@ -574,7 +581,6 @@ impl LogArrayReader {
     pub fn is_empty(&self) -> bool {
         self.num_entries == 0
     }
-
 }
 
 /// Read a VByte value from a reader, appending raw bytes to a tracking buffer.
@@ -760,7 +766,10 @@ mod tests {
         let (data_crc, data_buf) = crc_writer.finalize();
         let assembled = assemble_log_array(num_entries, bits, &data_buf, data_crc);
 
-        assert_eq!(assembled, expected, "streaming log array differs from in-memory");
+        assert_eq!(
+            assembled, expected,
+            "streaming log array differs from in-memory"
+        );
     }
 
     #[test]
@@ -861,7 +870,11 @@ mod tests {
         for (i, &expected) in values.iter().enumerate() {
             let val = decoder.next_entry().unwrap().unwrap();
             assert_eq!(val, expected, "decoder mismatch at index {i}");
-            assert_eq!(val, reader.get(i as u64), "decoder vs reader mismatch at {i}");
+            assert_eq!(
+                val,
+                reader.get(i as u64),
+                "decoder vs reader mismatch at {i}"
+            );
         }
 
         assert!(decoder.next_entry().unwrap().is_none());
@@ -973,12 +986,12 @@ mod tests {
         let values: Vec<u64> = (0..n)
             .map(|i| match i % 7 {
                 0 => 0,                           // zero
-                1 => max_val,                      // max
-                2 => 1,                            // min nonzero
-                3 => i * 839_471 % (max_val + 1),  // pseudo-random
-                4 => max_val - (i % 100),          // near-max
-                5 => (i * i) % (max_val + 1),      // quadratic
-                _ => (max_val / 2) + (i % 1000),   // mid-range
+                1 => max_val,                     // max
+                2 => 1,                           // min nonzero
+                3 => i * 839_471 % (max_val + 1), // pseudo-random
+                4 => max_val - (i % 100),         // near-max
+                5 => (i * i) % (max_val + 1),     // quadratic
+                _ => (max_val / 2) + (i % 1000),  // mid-range
             })
             .collect();
 
@@ -1056,7 +1069,11 @@ mod tests {
     #[test]
     fn test_streaming_decoder_all_bpe_values() {
         for bpe in 1..=64u8 {
-            let max_val = if bpe == 64 { u64::MAX } else { (1u64 << bpe) - 1 };
+            let max_val = if bpe == 64 {
+                u64::MAX
+            } else {
+                (1u64 << bpe) - 1
+            };
             // 200 entries exercises ~3 full 64-entry cycles for any bpe
             let values: Vec<u64> = (0..200u64)
                 .map(|i| (i * 7919 + 1) % (max_val.min(1_000_000) + 1))

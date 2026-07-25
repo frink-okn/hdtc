@@ -7,9 +7,11 @@
 //! 4. Triples (Control Info + BitmapY + ArrayY + BitmapZ + ArrayZ)
 
 use crate::dictionary::DictCounts;
+use crate::hdt::header_vocab::{
+    HDT_DATASET, HDT_NS, RDF_TYPE, VOID_DATASET, VOID_NS, VOID_STAT_LOCALS,
+};
 use crate::io::crc_utils::crc8;
 use crate::io::vbyte::encode_vbyte;
-use crate::hdt::header_vocab::{HDT_DATASET, HDT_NS, RDF_TYPE, VOID_DATASET, VOID_NS, VOID_STAT_LOCALS};
 use crate::io::{ControlInfo, ControlType};
 use crate::rdf::serialize_triples;
 use crate::triples::BitmapTriplesFiles;
@@ -85,14 +87,28 @@ pub fn write_hdt_streaming(
 
     // Write each component: preamble + CRC8 + data (from temp file) + CRC32C
     // Order: BitmapY, BitmapZ, ArrayY (SeqY), ArrayZ (SeqZ) — matching hdt-java
-    write_bitmap_from_file(&mut writer, &triples.bitmap_y.path, triples.bitmap_y.num_bits)?;
-    write_bitmap_from_file(&mut writer, &triples.bitmap_z.path, triples.bitmap_z.num_bits)?;
+    write_bitmap_from_file(
+        &mut writer,
+        &triples.bitmap_y.path,
+        triples.bitmap_y.num_bits,
+    )?;
+    write_bitmap_from_file(
+        &mut writer,
+        &triples.bitmap_z.path,
+        triples.bitmap_z.num_bits,
+    )?;
     write_log_array_from_file(
-        &mut writer, &triples.array_y.path,
-        triples.array_y.bits_per_entry, triples.array_y.num_entries)?;
+        &mut writer,
+        &triples.array_y.path,
+        triples.array_y.bits_per_entry,
+        triples.array_y.num_entries,
+    )?;
     write_log_array_from_file(
-        &mut writer, &triples.array_z.path,
-        triples.array_z.bits_per_entry, triples.array_z.num_entries)?;
+        &mut writer,
+        &triples.array_z.path,
+        triples.array_z.bits_per_entry,
+        triples.array_z.num_entries,
+    )?;
 
     writer.flush()?;
 
@@ -103,7 +119,11 @@ pub fn write_hdt_streaming(
 
 /// Write a Bitmap section from a temp file containing raw packed data.
 /// Writes: preamble (type + VByte(num_bits)) + CRC8 + data + CRC32C
-pub(crate) fn write_bitmap_from_file<W: Write>(writer: &mut W, path: &Path, num_bits: u64) -> Result<()> {
+pub(crate) fn write_bitmap_from_file<W: Write>(
+    writer: &mut W,
+    path: &Path,
+    num_bits: u64,
+) -> Result<()> {
     // Preamble
     let mut preamble = Vec::new();
     preamble.push(1u8); // TYPE_BITMAP
@@ -121,7 +141,10 @@ pub(crate) fn write_bitmap_from_file<W: Write>(writer: &mut W, path: &Path, num_
 /// Write a LogArray section from a temp file containing raw packed data.
 /// Writes: preamble (type + bits_per_entry + VByte(num_entries)) + CRC8 + data + CRC32C
 pub(crate) fn write_log_array_from_file<W: Write>(
-    writer: &mut W, path: &Path, bits_per_entry: u8, num_entries: u64,
+    writer: &mut W,
+    path: &Path,
+    bits_per_entry: u8,
+    num_entries: u64,
 ) -> Result<()> {
     // Preamble
     let mut preamble = Vec::new();
@@ -140,8 +163,8 @@ pub(crate) fn write_log_array_from_file<W: Write>(
 
 /// Copy a file's contents to a writer, computing CRC32C over the data.
 fn copy_file_with_crc<W: Write>(writer: &mut W, path: &Path) -> Result<u32> {
-    let file = File::open(path)
-        .with_context(|| format!("Failed to open temp file {}", path.display()))?;
+    let file =
+        File::open(path).with_context(|| format!("Failed to open temp file {}", path.display()))?;
     let mut reader = BufReader::with_capacity(256 * 1024, file);
 
     let mut buf = [0u8; 64 * 1024];
@@ -217,24 +240,80 @@ fn build_header_ntriples(
 
     triples.extend([
         // Format information: _:format links to the dictionary and triples nodes
-        Triple::new(dataset.clone(), iri(&format!("{HDT_NS}formatInformation")), term_blank("format")),
-        Triple::new(blank("format"), iri(&format!("{HDT_NS}dictionary")), term_blank("dictionary")),
-        Triple::new(blank("format"), iri(&format!("{HDT_NS}triples")), term_blank("triples")),
+        Triple::new(
+            dataset.clone(),
+            iri(&format!("{HDT_NS}formatInformation")),
+            term_blank("format"),
+        ),
+        Triple::new(
+            blank("format"),
+            iri(&format!("{HDT_NS}dictionary")),
+            term_blank("dictionary"),
+        ),
+        Triple::new(
+            blank("format"),
+            iri(&format!("{HDT_NS}triples")),
+            term_blank("triples"),
+        ),
         // _:dictionary — format, shared subject/object count, encoded size in bytes
-        Triple::new(blank("dictionary"), iri(&format!("{dcterms}format")), term_iri(&format!("{HDT_NS}dictionaryFour"))),
-        Triple::new(blank("dictionary"), iri(&format!("{HDT_NS}dictionarynumSharedSubjectObject")), lit(counts.shared.to_string())),
-        Triple::new(blank("dictionary"), iri(&format!("{HDT_NS}dictionarysizeStrings")), lit(dict_size.to_string())),
+        Triple::new(
+            blank("dictionary"),
+            iri(&format!("{dcterms}format")),
+            term_iri(&format!("{HDT_NS}dictionaryFour")),
+        ),
+        Triple::new(
+            blank("dictionary"),
+            iri(&format!("{HDT_NS}dictionarynumSharedSubjectObject")),
+            lit(counts.shared.to_string()),
+        ),
+        Triple::new(
+            blank("dictionary"),
+            iri(&format!("{HDT_NS}dictionarysizeStrings")),
+            lit(dict_size.to_string()),
+        ),
         // _:triples — format, triple count, ordering
-        Triple::new(blank("triples"), iri(&format!("{dcterms}format")), term_iri(&format!("{HDT_NS}triplesBitmap"))),
-        Triple::new(blank("triples"), iri(&format!("{HDT_NS}triplesnumTriples")), lit(num_triples.to_string())),
-        Triple::new(blank("triples"), iri(&format!("{HDT_NS}triplesOrder")), lit("SPO".to_string())),
+        Triple::new(
+            blank("triples"),
+            iri(&format!("{dcterms}format")),
+            term_iri(&format!("{HDT_NS}triplesBitmap")),
+        ),
+        Triple::new(
+            blank("triples"),
+            iri(&format!("{HDT_NS}triplesnumTriples")),
+            lit(num_triples.to_string()),
+        ),
+        Triple::new(
+            blank("triples"),
+            iri(&format!("{HDT_NS}triplesOrder")),
+            lit("SPO".to_string()),
+        ),
         // Statistical information: _:statistics — HDT data size and original N-Triples size in bytes
-        Triple::new(dataset.clone(), iri(&format!("{HDT_NS}statisticalInformation")), term_blank("statistics")),
-        Triple::new(blank("statistics"), iri(&format!("{HDT_NS}hdtSize")), lit(hdt_data_size.to_string())),
-        Triple::new(blank("statistics"), iri(&format!("{HDT_NS}originalSize")), lit(ntriples_size.to_string())),
+        Triple::new(
+            dataset.clone(),
+            iri(&format!("{HDT_NS}statisticalInformation")),
+            term_blank("statistics"),
+        ),
+        Triple::new(
+            blank("statistics"),
+            iri(&format!("{HDT_NS}hdtSize")),
+            lit(hdt_data_size.to_string()),
+        ),
+        Triple::new(
+            blank("statistics"),
+            iri(&format!("{HDT_NS}originalSize")),
+            lit(ntriples_size.to_string()),
+        ),
         // Publication information: _:publicationInformation — issue timestamp (ISO 8601)
-        Triple::new(dataset.clone(), iri(&format!("{HDT_NS}publicationInformation")), term_blank("publicationInformation")),
-        Triple::new(blank("publicationInformation"), iri(&format!("{dcterms}issued")), lit(timestamp)),
+        Triple::new(
+            dataset.clone(),
+            iri(&format!("{HDT_NS}publicationInformation")),
+            term_blank("publicationInformation"),
+        ),
+        Triple::new(
+            blank("publicationInformation"),
+            iri(&format!("{dcterms}issued")),
+            lit(timestamp),
+        ),
     ]);
 
     serialize_triples(&triples)
@@ -328,7 +407,7 @@ mod tests {
         // Check counts (now untyped literals)
         assert!(header.contains("\"100\""));
         assert!(header.contains("\"15\"")); // distinct subjects = 10 + 5
-        assert!(header.contains("\"3\""));  // predicates
+        assert!(header.contains("\"3\"")); // predicates
         assert!(header.contains("\"17\"")); // distinct objects = 10 + 7
 
         // Check blank node structures

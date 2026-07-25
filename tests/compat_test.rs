@@ -6,13 +6,8 @@
 mod common;
 
 use common::{
-    ensure_hdt_java,
-    hdt_java_classpath,
-    run_hdtc_to_path,
-    run_hdtc_to_path_with_args,
-    write_file,
-    REPRESENTATIVE_NT,
-    REPRESENTATIVE_TRIPLE_COUNT,
+    REPRESENTATIVE_NT, REPRESENTATIVE_TRIPLE_COUNT, ensure_hdt_java, hdt_java_classpath,
+    run_hdtc_to_path, run_hdtc_to_path_with_args, write_file,
 };
 use std::io::BufReader;
 use std::path::PathBuf;
@@ -67,7 +62,11 @@ fn test_hdt_crate_specific_uri_triple() {
             Some("http://example.org/bob"),
         )
         .collect();
-    assert_eq!(results.len(), 1, "alice-knows-bob should return exactly 1 triple");
+    assert_eq!(
+        results.len(),
+        1,
+        "alice-knows-bob should return exactly 1 triple"
+    );
 }
 
 /// Query a plain literal: alice's name is "Alice".
@@ -84,7 +83,11 @@ fn test_hdt_crate_plain_literal() {
             Some("\"Alice\""),
         )
         .collect();
-    assert_eq!(results.len(), 1, "alice-name-Alice should return exactly 1 triple");
+    assert_eq!(
+        results.len(),
+        1,
+        "alice-name-Alice should return exactly 1 triple"
+    );
 }
 
 /// Query a typed literal: alice's age is "30"^^xsd:integer.
@@ -101,7 +104,11 @@ fn test_hdt_crate_typed_literal() {
             Some("\"30\"^^<http://www.w3.org/2001/XMLSchema#integer>"),
         )
         .collect();
-    assert_eq!(results.len(), 1, "alice-age-30^^xsd:integer should return 1 triple");
+    assert_eq!(
+        results.len(),
+        1,
+        "alice-age-30^^xsd:integer should return 1 triple"
+    );
 }
 
 /// Query a language-tagged literal: alice's label is "Alice"@en.
@@ -118,7 +125,11 @@ fn test_hdt_crate_language_tagged_literal() {
             Some("\"Alice\"@en"),
         )
         .collect();
-    assert_eq!(results.len(), 1, "alice-label-Alice@en should return 1 triple");
+    assert_eq!(
+        results.len(),
+        1,
+        "alice-label-Alice@en should return 1 triple"
+    );
 }
 
 /// Query a blank node triple.
@@ -166,18 +177,46 @@ fn test_hdt_crate_all_triples_content() {
     triples.sort();
 
     let mut expected = [
-        ["http://example.org/alice", "http://example.org/name", "\"Alice\""],
-        ["http://example.org/alice", "http://example.org/knows", "http://example.org/bob"],
-        ["http://example.org/bob", "http://example.org/name", "\"Bob\""],
-        ["http://example.org/bob", "http://example.org/knows", "http://example.org/alice"],
+        [
+            "http://example.org/alice",
+            "http://example.org/name",
+            "\"Alice\"",
+        ],
+        [
+            "http://example.org/alice",
+            "http://example.org/knows",
+            "http://example.org/bob",
+        ],
+        [
+            "http://example.org/bob",
+            "http://example.org/name",
+            "\"Bob\"",
+        ],
+        [
+            "http://example.org/bob",
+            "http://example.org/knows",
+            "http://example.org/alice",
+        ],
         [
             "http://example.org/alice",
             "http://example.org/age",
             "\"30\"^^<http://www.w3.org/2001/XMLSchema#integer>",
         ],
-        ["http://example.org/alice", "http://example.org/label", "\"Alice\"@en"],
-        ["http://example.org/alice", "http://example.org/label", "\"Alicia\"@es"],
-        ["_:b1", "http://example.org/type", "http://example.org/Thing"],
+        [
+            "http://example.org/alice",
+            "http://example.org/label",
+            "\"Alice\"@en",
+        ],
+        [
+            "http://example.org/alice",
+            "http://example.org/label",
+            "\"Alicia\"@es",
+        ],
+        [
+            "_:b1",
+            "http://example.org/type",
+            "http://example.org/Thing",
+        ],
     ];
     expected.sort();
 
@@ -199,7 +238,12 @@ use std::path::Path;
 use std::process::Command;
 
 /// Run hdt-java's rdf2hdt conversion using the downloaded distribution.
-fn run_hdt_java_rdf2hdt(hdt_java_dir: &Path, input_rdf: &Path, output_hdt: &Path, with_index: bool) {
+fn run_hdt_java_rdf2hdt(
+    hdt_java_dir: &Path,
+    input_rdf: &Path,
+    output_hdt: &Path,
+    with_index: bool,
+) {
     let script = hdt_java_dir.join("bin").join("rdf2hdt.sh");
 
     let mut cmd = Command::new("bash");
@@ -211,9 +255,7 @@ fn run_hdt_java_rdf2hdt(hdt_java_dir: &Path, input_rdf: &Path, output_hdt: &Path
         cmd.arg("-index");
     }
 
-    let output = cmd
-        .output()
-        .expect("Failed to run hdt-java rdf2hdt.sh");
+    let output = cmd.output().expect("Failed to run hdt-java rdf2hdt.sh");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -303,7 +345,10 @@ fn decode_vbyte_at(bytes: &[u8], start: usize) -> (u64, usize) {
 }
 
 fn parse_logarray_len_at(bytes: &[u8], start: usize) -> usize {
-    assert!(start + 3 <= bytes.len(), "truncated LogArray at offset {start}");
+    assert!(
+        start + 3 <= bytes.len(),
+        "truncated LogArray at offset {start}"
+    );
     let _type_byte = bytes[start];
     let bits_per_entry = bytes[start + 1] as usize;
     let (num_entries, num_entries_len) = decode_vbyte_at(bytes, start + 2);
@@ -311,7 +356,10 @@ fn parse_logarray_len_at(bytes: &[u8], start: usize) -> usize {
     let data_bits = (num_entries as usize) * bits_per_entry;
     let data_len = data_bits.div_ceil(8);
     let total_len = preamble_len + data_len + 4;
-    assert!(start + total_len <= bytes.len(), "truncated LogArray payload at offset {start}");
+    assert!(
+        start + total_len <= bytes.len(),
+        "truncated LogArray payload at offset {start}"
+    );
     total_len
 }
 
@@ -327,7 +375,10 @@ fn decode_logarray_values(bytes: &[u8]) -> Vec<u64> {
     let data_len = (num_entries * bits_per_entry).div_ceil(8);
     let data_start = preamble_len;
     let data_end = data_start + data_len;
-    assert!(data_end + 4 <= bytes.len(), "truncated LogArray component bytes");
+    assert!(
+        data_end + 4 <= bytes.len(),
+        "truncated LogArray component bytes"
+    );
 
     let data = &bytes[data_start..data_end];
 
@@ -366,7 +417,10 @@ fn decode_bitmap_bits(bytes: &[u8]) -> Vec<bool> {
     let data_len = num_bits.div_ceil(8);
     let data_start = preamble_len;
     let data_end = data_start + data_len;
-    assert!(data_end + 4 <= bytes.len(), "truncated Bitmap component bytes");
+    assert!(
+        data_end + 4 <= bytes.len(),
+        "truncated Bitmap component bytes"
+    );
 
     let data = &bytes[data_start..data_end];
     let mut bits = Vec::with_capacity(num_bits);
@@ -393,7 +447,10 @@ fn decode_pfc_strings(bytes: &[u8]) -> Vec<String> {
     let log_array_len = parse_logarray_len_at(bytes, log_array_start);
     let payload_start = log_array_start + log_array_len;
     let payload_end = payload_start + buffer_len;
-    assert!(payload_end + 4 <= bytes.len(), "truncated PFC payload bytes");
+    assert!(
+        payload_end + 4 <= bytes.len(),
+        "truncated PFC payload bytes"
+    );
 
     let buf = &bytes[payload_start..payload_end];
     let mut strings = Vec::with_capacity(count);
@@ -419,8 +476,8 @@ fn decode_pfc_strings(bytes: &[u8]) -> Vec<String> {
                 .iter()
                 .position(|&b| b == 0)
                 .expect("missing null terminator in PFC suffix");
-            let suffix = std::str::from_utf8(&buf[pos..pos + end])
-                .expect("PFC suffix not valid UTF-8");
+            let suffix =
+                std::str::from_utf8(&buf[pos..pos + end]).expect("PFC suffix not valid UTF-8");
             pos += end + 1;
 
             let shared = shared as usize;
@@ -436,23 +493,33 @@ fn decode_pfc_strings(bytes: &[u8]) -> Vec<String> {
 }
 
 fn parse_bitmap_len_at(bytes: &[u8], start: usize) -> usize {
-    assert!(start + 2 <= bytes.len(), "truncated Bitmap at offset {start}");
+    assert!(
+        start + 2 <= bytes.len(),
+        "truncated Bitmap at offset {start}"
+    );
     let _type_byte = bytes[start];
     let (num_bits, num_bits_len) = decode_vbyte_at(bytes, start + 1);
     let preamble_len = 1 + num_bits_len + 1;
     let data_len = (num_bits as usize).div_ceil(8);
     let total_len = preamble_len + data_len + 4;
-    assert!(start + total_len <= bytes.len(), "truncated Bitmap payload at offset {start}");
+    assert!(
+        start + total_len <= bytes.len(),
+        "truncated Bitmap payload at offset {start}"
+    );
     total_len
 }
 
 fn parse_pfc_len_at(bytes: &[u8], start: usize) -> usize {
-    assert!(start + 2 <= bytes.len(), "truncated PFC section at offset {start}");
+    assert!(
+        start + 2 <= bytes.len(),
+        "truncated PFC section at offset {start}"
+    );
     let _type_byte = bytes[start];
 
     let (_count, count_len) = decode_vbyte_at(bytes, start + 1);
     let (buffer_len, buffer_len_len) = decode_vbyte_at(bytes, start + 1 + count_len);
-    let (_block_size, block_size_len) = decode_vbyte_at(bytes, start + 1 + count_len + buffer_len_len);
+    let (_block_size, block_size_len) =
+        decode_vbyte_at(bytes, start + 1 + count_len + buffer_len_len);
 
     let preamble_len = 1 + count_len + buffer_len_len + block_size_len + 1;
     let log_array_start = start + preamble_len;
@@ -461,13 +528,23 @@ fn parse_pfc_len_at(bytes: &[u8], start: usize) -> usize {
     let payload_start = log_array_start + log_array_len;
     let payload_len = buffer_len as usize + 4;
     let total_len = preamble_len + log_array_len + payload_len;
-    assert!(payload_start + payload_len <= bytes.len(), "truncated PFC payload at offset {start}");
+    assert!(
+        payload_start + payload_len <= bytes.len(),
+        "truncated PFC payload at offset {start}"
+    );
     total_len
 }
 
 fn parse_control_info_at(bytes: &[u8], start: usize) -> ControlInfoView {
-    assert!(bytes.len() >= start + 7, "truncated HDT control info at offset {start}");
-    assert_eq!(&bytes[start..start + 4], b"$HDT", "missing $HDT magic at offset {start}");
+    assert!(
+        bytes.len() >= start + 7,
+        "truncated HDT control info at offset {start}"
+    );
+    assert_eq!(
+        &bytes[start..start + 4],
+        b"$HDT",
+        "missing $HDT magic at offset {start}"
+    );
 
     let control_type = bytes[start + 4];
     let (format, idx_after_format) = parse_null_terminated_utf8(bytes, start + 5);
@@ -505,7 +582,10 @@ fn read_header_length(bytes: &[u8], header_ci_start: usize) -> usize {
 
 fn locate_dict_and_triples(bytes: &[u8]) -> HdtSectionRanges {
     let (global_type, global_len) = parse_control_info_len(bytes, 0);
-    assert_eq!(global_type, 1, "expected global control type at start of file");
+    assert_eq!(
+        global_type, 1,
+        "expected global control type at start of file"
+    );
 
     let header_ci_start = global_len;
     let (header_type, header_ci_len) = parse_control_info_len(bytes, header_ci_start);
@@ -627,7 +707,10 @@ fn parse_dictionary_components(bytes: &[u8], dict_start: usize, triples_start: u
         pos += len;
     }
 
-    assert_eq!(pos, triples_start, "dictionary component boundaries do not reach triples marker exactly");
+    assert_eq!(
+        pos, triples_start,
+        "dictionary component boundaries do not reach triples marker exactly"
+    );
     spans
 }
 
@@ -654,7 +737,11 @@ fn parse_triples_components(bytes: &[u8], triples_start: usize) -> Vec<Span> {
         pos += len;
     }
 
-    assert_eq!(pos, bytes.len(), "triples component boundaries do not reach file end exactly");
+    assert_eq!(
+        pos,
+        bytes.len(),
+        "triples component boundaries do not reach file end exactly"
+    );
     spans
 }
 
@@ -687,7 +774,11 @@ fn parse_index_components(bytes: &[u8]) -> Vec<Span> {
         pos += len;
     }
 
-    assert_eq!(pos, bytes.len(), "index component boundaries do not reach file end exactly");
+    assert_eq!(
+        pos,
+        bytes.len(),
+        "index component boundaries do not reach file end exactly"
+    );
     spans
 }
 
@@ -766,17 +857,11 @@ fn test_hdtjava_roundtrip_ntriples() {
 
     // Read and sort actual output lines
     let actual_content = std::fs::read_to_string(&output_nt).expect("read roundtrip output");
-    let mut actual_lines: Vec<&str> = actual_content
-        .lines()
-        .filter(|l| !l.is_empty())
-        .collect();
+    let mut actual_lines: Vec<&str> = actual_content.lines().filter(|l| !l.is_empty()).collect();
     actual_lines.sort();
 
     let expected_nt = REPRESENTATIVE_NT.to_string();
-    let mut expected_lines: Vec<&str> = expected_nt
-        .lines()
-        .filter(|l| !l.is_empty())
-        .collect();
+    let mut expected_lines: Vec<&str> = expected_nt.lines().filter(|l| !l.is_empty()).collect();
     expected_lines.sort();
 
     // hdt-java may output blank nodes with its own prefix, so normalize blank node IDs.
@@ -793,8 +878,10 @@ fn test_hdtjava_roundtrip_ntriples() {
         result
     };
 
-    let mut actual_normalized: Vec<String> = actual_lines.iter().map(|l| normalize_bnode(l)).collect();
-    let mut expected_normalized: Vec<String> = expected_lines.iter().map(|l| normalize_bnode(l)).collect();
+    let mut actual_normalized: Vec<String> =
+        actual_lines.iter().map(|l| normalize_bnode(l)).collect();
+    let mut expected_normalized: Vec<String> =
+        expected_lines.iter().map(|l| normalize_bnode(l)).collect();
     actual_normalized.sort();
     expected_normalized.sort();
 
@@ -835,8 +922,16 @@ fn test_hdtjava_exact_dictionary_and_triples_bytes() {
     let hdtc_ranges = locate_dict_and_triples(&hdtc_bytes);
     let java_ranges = locate_dict_and_triples(&java_bytes);
 
-    let hdtc_dict_components = parse_dictionary_components(&hdtc_bytes, hdtc_ranges.dict_start, hdtc_ranges.triples_start);
-    let java_dict_components = parse_dictionary_components(&java_bytes, java_ranges.dict_start, java_ranges.triples_start);
+    let hdtc_dict_components = parse_dictionary_components(
+        &hdtc_bytes,
+        hdtc_ranges.dict_start,
+        hdtc_ranges.triples_start,
+    );
+    let java_dict_components = parse_dictionary_components(
+        &java_bytes,
+        java_ranges.dict_start,
+        java_ranges.triples_start,
+    );
     let hdtc_triples_components = parse_triples_components(&hdtc_bytes, hdtc_ranges.triples_start);
     let java_triples_components = parse_triples_components(&java_bytes, java_ranges.triples_start);
 
@@ -845,7 +940,10 @@ fn test_hdtjava_exact_dictionary_and_triples_bytes() {
         let jc = find_component(&java_dict_components, component);
         let left = decode_pfc_strings(&hdtc_bytes[hc.start..hc.end]);
         let right = decode_pfc_strings(&java_bytes[jc.start..jc.end]);
-        assert_eq!(left, right, "Decoded dictionary component {component} differs");
+        assert_eq!(
+            left, right,
+            "Decoded dictionary component {component} differs"
+        );
     }
 
     for component in ["BitmapY", "BitmapZ"] {
@@ -896,8 +994,16 @@ fn test_hdtjava_exact_dictionary_and_triples_diagnostics() {
     let hdtc_triples = &hdtc_bytes[hdtc_ranges.triples_start..];
     let java_triples = &java_bytes[java_ranges.triples_start..];
 
-    let hdtc_dict_components = parse_dictionary_components(&hdtc_bytes, hdtc_ranges.dict_start, hdtc_ranges.triples_start);
-    let java_dict_components = parse_dictionary_components(&java_bytes, java_ranges.dict_start, java_ranges.triples_start);
+    let hdtc_dict_components = parse_dictionary_components(
+        &hdtc_bytes,
+        hdtc_ranges.dict_start,
+        hdtc_ranges.triples_start,
+    );
+    let java_dict_components = parse_dictionary_components(
+        &java_bytes,
+        java_ranges.dict_start,
+        java_ranges.triples_start,
+    );
     let hdtc_triples_components = parse_triples_components(&hdtc_bytes, hdtc_ranges.triples_start);
     let java_triples_components = parse_triples_components(&java_bytes, java_ranges.triples_start);
 
@@ -987,7 +1093,10 @@ fn test_hdtjava_exact_dictionary_and_triples_diagnostics() {
     }
 
     if reports.is_empty() && !notes.is_empty() {
-        eprintln!("HDT diagnostics notes (non-semantic differences):\n{}", notes.join("\n\n"));
+        eprintln!(
+            "HDT diagnostics notes (non-semantic differences):\n{}",
+            notes.join("\n\n")
+        );
     }
 
     assert!(
@@ -1024,9 +1133,15 @@ fn test_hdtjava_exact_index_bytes() {
 
     let hdtc_ci = parse_control_info_at(&hdtc_bytes, 0);
     let java_ci = parse_control_info_at(&java_bytes, 0);
-    assert_eq!(hdtc_ci.control_type, java_ci.control_type, "Index control type differs");
+    assert_eq!(
+        hdtc_ci.control_type, java_ci.control_type,
+        "Index control type differs"
+    );
     assert_eq!(hdtc_ci.format, java_ci.format, "Index format URI differs");
-    assert_eq!(hdtc_ci.properties, java_ci.properties, "Index properties differ");
+    assert_eq!(
+        hdtc_ci.properties, java_ci.properties,
+        "Index properties differ"
+    );
 
     for component in ["BitmapIndexZ", "PredicateIndexBitmap"] {
         let hc = find_component(&hdtc_components, component);
@@ -1074,7 +1189,13 @@ fn test_hdtjava_exact_index_diagnostics() {
     let java_components = parse_index_components(&java_bytes);
 
     let mut reports = Vec::new();
-    if let Some(r) = section_diff_report("Index section", &hdtc_bytes, &java_bytes, &hdtc_ci, &java_ci) {
+    if let Some(r) = section_diff_report(
+        "Index section",
+        &hdtc_bytes,
+        &java_bytes,
+        &hdtc_ci,
+        &java_ci,
+    ) {
         reports.push(r);
     }
 

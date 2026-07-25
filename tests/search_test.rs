@@ -166,8 +166,7 @@ fn test_search_offset_past_end() {
 fn test_search_subject_bound() {
     let temp = tempfile::tempdir().unwrap();
     let hdt = make_representative_hdt(temp.path());
-    let (ok, stdout, stderr) =
-        run_search(&hdt, "<http://example.org/alice> ? ?", &[]);
+    let (ok, stdout, stderr) = run_search(&hdt, "<http://example.org/alice> ? ?", &[]);
     assert!(ok, "hdtc search failed: {stderr}");
     let triples = parse_tab_triples(&stdout);
     assert_eq!(
@@ -253,9 +252,11 @@ fn test_search_exact() {
 fn test_search_subject_not_found() {
     let temp = tempfile::tempdir().unwrap();
     let hdt = make_representative_hdt(temp.path());
-    let (ok, stdout, stderr) =
-        run_search(&hdt, "<http://example.org/nobody> ? ?", &[]);
-    assert!(ok, "hdtc search should succeed even with zero results: {stderr}");
+    let (ok, stdout, stderr) = run_search(&hdt, "<http://example.org/nobody> ? ?", &[]);
+    assert!(
+        ok,
+        "hdtc search should succeed even with zero results: {stderr}"
+    );
     let triples = parse_tab_triples(&stdout);
     assert_eq!(
         triples.len(),
@@ -269,12 +270,11 @@ fn test_search_subject_not_found() {
 fn test_search_subject_not_found_count_outputs_zero() {
     let temp = tempfile::tempdir().unwrap();
     let hdt = make_representative_hdt(temp.path());
-    let (ok, stdout, stderr) = run_search(
-        &hdt,
-        "<http://example.org/nobody> ? ?",
-        &["--count"],
+    let (ok, stdout, stderr) = run_search(&hdt, "<http://example.org/nobody> ? ?", &["--count"]);
+    assert!(
+        ok,
+        "hdtc search should succeed even with zero results: {stderr}"
     );
-    assert!(ok, "hdtc search should succeed even with zero results: {stderr}");
     assert_eq!(
         stdout.trim(),
         "0",
@@ -292,7 +292,10 @@ fn test_search_predicate_not_found_returns_zero() {
         "<http://example.org/alice> <http://example.org/unknown> ?",
         &[],
     );
-    assert!(ok, "hdtc search should succeed even with zero results: {stderr}");
+    assert!(
+        ok,
+        "hdtc search should succeed even with zero results: {stderr}"
+    );
     let triples = parse_tab_triples(&stdout);
     assert_eq!(
         triples.len(),
@@ -311,7 +314,10 @@ fn test_search_exact_not_found() {
         "<http://example.org/alice> <http://example.org/knows> <http://example.org/alice>",
         &[],
     );
-    assert!(ok, "hdtc search should succeed even with zero results: {stderr}");
+    assert!(
+        ok,
+        "hdtc search should succeed even with zero results: {stderr}"
+    );
     let triples = parse_tab_triples(&stdout);
     assert_eq!(
         triples.len(),
@@ -326,8 +332,7 @@ fn test_search_subject_literal_object() {
     let temp = tempfile::tempdir().unwrap();
     let hdt = make_representative_hdt(temp.path());
     // alice ? "Alice"@en — subject+object bound (S?O)
-    let (ok, stdout, stderr) =
-        run_search(&hdt, "<http://example.org/alice> ? \"Alice\"@en", &[]);
+    let (ok, stdout, stderr) = run_search(&hdt, "<http://example.org/alice> ? \"Alice\"@en", &[]);
     assert!(ok, "hdtc search failed: {stderr}");
     let triples = parse_tab_triples(&stdout);
     assert_eq!(
@@ -381,9 +386,14 @@ fn test_search_count_with_limit_warns() {
     assert!(ok, "hdtc search failed: {stderr}");
     let count: u64 = stdout.trim().parse().expect("Expected a number");
     // count should be total (8), not limited
-    assert_eq!(count, 8, "Expected count=8 regardless of --limit when --count is set");
+    assert_eq!(
+        count, 8,
+        "Expected count=8 regardless of --limit when --count is set"
+    );
     assert!(
-        stderr.contains("ignored") || stderr.contains("warn") || stderr.to_lowercase().contains("limit"),
+        stderr.contains("ignored")
+            || stderr.contains("warn")
+            || stderr.to_lowercase().contains("limit"),
         "Expected warning about --limit being ignored with --count: {stderr}"
     );
 }
@@ -396,9 +406,14 @@ fn test_search_count_with_offset_warns() {
     let (ok, stdout, stderr) = run_search(&hdt, "? ? ?", &["--count", "--offset", "3"]);
     assert!(ok, "hdtc search failed: {stderr}");
     let count: u64 = stdout.trim().parse().expect("Expected a number");
-    assert_eq!(count, 8, "Expected count=8 regardless of --offset when --count is set");
+    assert_eq!(
+        count, 8,
+        "Expected count=8 regardless of --offset when --count is set"
+    );
     assert!(
-        stderr.contains("ignored") || stderr.contains("warn") || stderr.to_lowercase().contains("offset"),
+        stderr.contains("ignored")
+            || stderr.contains("warn")
+            || stderr.to_lowercase().contains("offset"),
         "Expected warning about --offset being ignored with --count: {stderr}"
     );
 }
@@ -416,11 +431,18 @@ fn test_search_output_to_file() {
         &["--output", out.to_str().unwrap()],
     );
     assert!(ok, "hdtc search failed: {stderr}");
-    assert!(stdout.is_empty(), "Expected no stdout output when --output is given");
+    assert!(
+        stdout.is_empty(),
+        "Expected no stdout output when --output is given"
+    );
 
     let content = std::fs::read_to_string(&out).unwrap();
     let triples = parse_tab_triples(&content);
-    assert_eq!(triples.len(), 5, "Expected 5 triples in output file, got {triples:#?}");
+    assert_eq!(
+        triples.len(),
+        5,
+        "Expected 5 triples in output file, got {triples:#?}"
+    );
 }
 
 /// `--count --output` writes the count to the file; stdout is empty.
@@ -436,10 +458,16 @@ fn test_search_count_output_to_file() {
         &["--count", "--output", out.to_str().unwrap()],
     );
     assert!(ok, "hdtc search failed: {stderr}");
-    assert!(stdout.is_empty(), "Expected no stdout when --count --output is set");
+    assert!(
+        stdout.is_empty(),
+        "Expected no stdout when --count --output is set"
+    );
 
     let content = std::fs::read_to_string(&out).unwrap();
-    let count: u64 = content.trim().parse().expect("Expected a number in output file");
+    let count: u64 = content
+        .trim()
+        .parse()
+        .expect("Expected a number in output file");
     assert_eq!(count, 8, "Expected count=8 in output file, got {count}");
 }
 
@@ -622,8 +650,7 @@ fn test_search_predicate_bound_name() {
 fn test_search_predicate_bound_unknown() {
     let temp = tempfile::tempdir().unwrap();
     let hdt = make_representative_hdt_with_index(temp.path());
-    let (ok, stdout, stderr) =
-        run_search(&hdt, "? <http://example.org/nonexistent> ?", &[]);
+    let (ok, stdout, stderr) = run_search(&hdt, "? <http://example.org/nonexistent> ?", &[]);
     assert!(ok, "hdtc search should succeed with 0 results: {stderr}");
     let triples = parse_tab_triples(&stdout);
     assert_eq!(
@@ -638,8 +665,7 @@ fn test_search_predicate_bound_unknown() {
 fn test_search_predicate_bound_count() {
     let temp = tempfile::tempdir().unwrap();
     let hdt = make_representative_hdt_with_index(temp.path());
-    let (ok, stdout, stderr) =
-        run_search(&hdt, "? <http://example.org/knows> ?", &["--count"]);
+    let (ok, stdout, stderr) = run_search(&hdt, "? <http://example.org/knows> ?", &["--count"]);
     assert!(ok, "hdtc search ?P? --count failed: {stderr}");
     let count: u64 = stdout.trim().parse().expect("Expected a number in stdout");
     assert_eq!(count, 2, "Expected count=2 for ?-knows-?, got {count}");
@@ -685,8 +711,7 @@ fn test_search_predicate_bound_no_index_fallback() {
     let temp = tempfile::tempdir().unwrap();
     // Note: no index created here — --no-index forces sequential fallback.
     let hdt = make_representative_hdt(temp.path());
-    let (ok, stdout, stderr) =
-        run_search(&hdt, "? <http://example.org/knows> ?", &["--no-index"]);
+    let (ok, stdout, stderr) = run_search(&hdt, "? <http://example.org/knows> ?", &["--no-index"]);
     assert!(ok, "hdtc search ?P? --no-index failed: {stderr}");
     let triples = parse_tab_triples(&stdout);
     assert_eq!(
@@ -719,8 +744,7 @@ fn test_search_predicate_bound_requires_index() {
 fn test_search_object_bound_shared_uri() {
     let temp = tempfile::tempdir().unwrap();
     let hdt = make_representative_hdt_with_index(temp.path());
-    let (ok, stdout, stderr) =
-        run_search(&hdt, "? ? <http://example.org/alice>", &[]);
+    let (ok, stdout, stderr) = run_search(&hdt, "? ? <http://example.org/alice>", &[]);
     assert!(ok, "hdtc search ??O failed: {stderr}");
     let triples = parse_tab_triples(&stdout);
     assert_eq!(
@@ -742,8 +766,7 @@ fn test_search_object_bound_shared_uri() {
 fn test_search_object_bound_uri_only() {
     let temp = tempfile::tempdir().unwrap();
     let hdt = make_representative_hdt_with_index(temp.path());
-    let (ok, stdout, stderr) =
-        run_search(&hdt, "? ? <http://example.org/Thing>", &[]);
+    let (ok, stdout, stderr) = run_search(&hdt, "? ? <http://example.org/Thing>", &[]);
     assert!(ok, "hdtc search ??O failed: {stderr}");
     let triples = parse_tab_triples(&stdout);
     assert_eq!(
@@ -795,8 +818,7 @@ fn test_search_object_bound_typed_literal() {
 fn test_search_object_bound_unknown() {
     let temp = tempfile::tempdir().unwrap();
     let hdt = make_representative_hdt_with_index(temp.path());
-    let (ok, stdout, stderr) =
-        run_search(&hdt, "? ? <http://example.org/nonexistent>", &[]);
+    let (ok, stdout, stderr) = run_search(&hdt, "? ? <http://example.org/nonexistent>", &[]);
     assert!(ok, "hdtc search should succeed with 0 results: {stderr}");
     let triples = parse_tab_triples(&stdout);
     assert_eq!(
@@ -811,8 +833,7 @@ fn test_search_object_bound_unknown() {
 fn test_search_object_bound_count() {
     let temp = tempfile::tempdir().unwrap();
     let hdt = make_representative_hdt_with_index(temp.path());
-    let (ok, stdout, stderr) =
-        run_search(&hdt, "? ? <http://example.org/alice>", &["--count"]);
+    let (ok, stdout, stderr) = run_search(&hdt, "? ? <http://example.org/alice>", &["--count"]);
     assert!(ok, "hdtc search ??O --count failed: {stderr}");
     let count: u64 = stdout.trim().parse().expect("Expected a number in stdout");
     assert_eq!(count, 1, "Expected count=1 for ??-alice, got {count}");
@@ -823,8 +844,7 @@ fn test_search_object_bound_count() {
 fn test_search_object_bound_no_index_fallback() {
     let temp = tempfile::tempdir().unwrap();
     let hdt = make_representative_hdt(temp.path());
-    let (ok, stdout, stderr) =
-        run_search(&hdt, "? ? <http://example.org/alice>", &["--no-index"]);
+    let (ok, stdout, stderr) = run_search(&hdt, "? ? <http://example.org/alice>", &["--no-index"]);
     assert!(ok, "hdtc search ??O --no-index failed: {stderr}");
     let triples = parse_tab_triples(&stdout);
     assert_eq!(
@@ -864,11 +884,7 @@ fn test_search_predicate_object_bound() {
 fn test_search_predicate_object_bound_literal() {
     let temp = tempfile::tempdir().unwrap();
     let hdt = make_representative_hdt_with_index(temp.path());
-    let (ok, stdout, stderr) = run_search(
-        &hdt,
-        "? <http://example.org/name> \"Alice\"",
-        &[],
-    );
+    let (ok, stdout, stderr) = run_search(&hdt, "? <http://example.org/name> \"Alice\"", &[]);
     assert!(ok, "hdtc search ?PO failed: {stderr}");
     let triples = parse_tab_triples(&stdout);
     assert_eq!(
@@ -971,7 +987,10 @@ fn test_search_object_bound_large_group_chunked() {
 
     let query = format!("? ? {common_object}");
     let (ok, stdout, stderr) = run_search(&hdt, &query, &["--count"]);
-    assert!(ok, "hdtc search ??O --count failed on skewed data: {stderr}");
+    assert!(
+        ok,
+        "hdtc search ??O --count failed on skewed data: {stderr}"
+    );
 
     let count: u64 = stdout.trim().parse().expect("Expected numeric count");
     assert_eq!(
@@ -981,7 +1000,10 @@ fn test_search_object_bound_large_group_chunked() {
 
     // Also verify limit path on same large group.
     let (ok, stdout, stderr) = run_search(&hdt, &query, &["--limit", "25"]);
-    assert!(ok, "hdtc search ??O --limit failed on skewed data: {stderr}");
+    assert!(
+        ok,
+        "hdtc search ??O --limit failed on skewed data: {stderr}"
+    );
     let triples = parse_tab_triples(&stdout);
     assert_eq!(
         triples.len(),
@@ -1000,7 +1022,10 @@ fn test_search_predicate_object_bound_skewed_selectivity() {
 
     let query = format!("? {hot_predicate} {common_object}");
     let (ok, stdout, stderr) = run_search(&hdt, &query, &["--count"]);
-    assert!(ok, "hdtc search ?PO --count failed on skewed data: {stderr}");
+    assert!(
+        ok,
+        "hdtc search ?PO --count failed on skewed data: {stderr}"
+    );
 
     let count: u64 = stdout.trim().parse().expect("Expected numeric count");
     assert_eq!(

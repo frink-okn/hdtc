@@ -8,9 +8,9 @@
 //! type_byte(0x02) + VByte(string_count) + VByte(buffer_length) + VByte(block_size) + CRC8
 //! + LogArray(block_offsets) + Buffer(encoded_strings) + CRC32C
 
-use crate::io::crc_utils::{crc8, Crc32cWriter, CRC32C_ALGO};
 #[cfg(test)]
 use crate::io::crc_utils::crc32c;
+use crate::io::crc_utils::{CRC32C_ALGO, Crc32cWriter, crc8};
 use crate::io::log_array::{LogArrayWriter, StreamingLogArrayEncoder};
 use crate::io::vbyte::encode_vbyte;
 use std::fs::File;
@@ -53,7 +53,9 @@ impl PfcEncoder {
     pub fn push(&mut self, s: impl Into<String>) {
         let s = s.into();
         debug_assert!(
-            self.strings.last().is_none_or(|prev| prev.as_str() < s.as_str()),
+            self.strings
+                .last()
+                .is_none_or(|prev| prev.as_str() < s.as_str()),
             "Strings must be added in sorted order"
         );
         self.strings.push(s);
@@ -205,7 +207,9 @@ impl StreamingPfcEncoder {
     /// Strings MUST be added in sorted order.
     pub fn push(&mut self, s: &str) -> io::Result<()> {
         debug_assert!(
-            self.last_string.as_ref().is_none_or(|prev| prev.as_str() < s),
+            self.last_string
+                .as_ref()
+                .is_none_or(|prev| prev.as_str() < s),
             "Strings must be added in sorted order"
         );
 
@@ -426,15 +430,11 @@ mod tests {
                 let is_block_start = is_at_block_offset(&block_offsets, pos as u64);
 
                 if is_block_start || i == 0 {
-                    let end = buffer[pos..]
-                        .iter()
-                        .position(|&b| b == 0)
-                        .ok_or_else(|| {
-                            io::Error::new(io::ErrorKind::InvalidData, "Missing null terminator in PFC")
-                        })?;
-                    let s = String::from_utf8(buffer[pos..pos + end].to_vec()).map_err(|e| {
-                        io::Error::new(io::ErrorKind::InvalidData, e)
+                    let end = buffer[pos..].iter().position(|&b| b == 0).ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "Missing null terminator in PFC")
                     })?;
+                    let s = String::from_utf8(buffer[pos..pos + end].to_vec())
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                     pos += end + 1;
                     prev_string = s.clone();
                     strings.push(s);
@@ -442,12 +442,9 @@ mod tests {
                     let (shared_len, vbyte_size) = decode_vbyte(&buffer[pos..])?;
                     pos += vbyte_size;
 
-                    let end = buffer[pos..]
-                        .iter()
-                        .position(|&b| b == 0)
-                        .ok_or_else(|| {
-                            io::Error::new(io::ErrorKind::InvalidData, "Missing null terminator in PFC")
-                        })?;
+                    let end = buffer[pos..].iter().position(|&b| b == 0).ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "Missing null terminator in PFC")
+                    })?;
                     let suffix = &buffer[pos..pos + end];
                     pos += end + 1;
 
@@ -681,7 +678,8 @@ mod tests {
         let streaming_buf = std::fs::read(&section_file.path).unwrap();
 
         assert_eq!(
-            inmem_buf, streaming_buf,
+            inmem_buf,
+            streaming_buf,
             "Streaming encoder output differs from in-memory encoder (len {} vs {})",
             inmem_buf.len(),
             streaming_buf.len()

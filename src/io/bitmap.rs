@@ -232,7 +232,10 @@ impl<R: Read> StreamingBitmapDecoder<R> {
         if type_byte[0] != TYPE_BITMAP {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("Expected Bitmap type byte {TYPE_BITMAP}, got {}", type_byte[0]),
+                format!(
+                    "Expected Bitmap type byte {TYPE_BITMAP}, got {}",
+                    type_byte[0]
+                ),
             ));
         }
         preamble_buf.push(type_byte[0]);
@@ -352,7 +355,10 @@ impl BitmapReader {
         if type_byte[0] != TYPE_BITMAP {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("Expected Bitmap type byte {TYPE_BITMAP}, got {}", type_byte[0]),
+                format!(
+                    "Expected Bitmap type byte {TYPE_BITMAP}, got {}",
+                    type_byte[0]
+                ),
             ));
         }
         preamble_buf.push(type_byte[0]);
@@ -552,7 +558,9 @@ mod tests {
 
     #[test]
     fn test_mixed_bits() {
-        let pattern = [true, false, true, true, false, false, true, false, true, true];
+        let pattern = [
+            true, false, true, true, false, false, true, false, true, true,
+        ];
         let mut writer = BitmapWriter::new();
         for &b in &pattern {
             writer.push(b);
@@ -633,16 +641,18 @@ mod tests {
         assert_eq!(reader.select1(3), Some(3)); // third 1 at position 3
         assert_eq!(reader.select1(4), Some(5)); // fourth 1 at position 5
         assert_eq!(reader.select1(5), Some(8)); // fifth 1 at position 8
-        assert_eq!(reader.select1(6), None);    // no sixth 1
+        assert_eq!(reader.select1(6), None); // no sixth 1
     }
 
     #[test]
     fn test_streaming_matches_inmemory() {
         // Verify StreamingBitmapEncoder produces identical data bytes to BitmapWriter
-        use crate::io::crc_utils::{crc8, Crc32cWriter};
+        use crate::io::crc_utils::{Crc32cWriter, crc8};
         use crate::io::vbyte::encode_vbyte;
 
-        let pattern = [true, false, true, true, false, false, true, false, true, true];
+        let pattern = [
+            true, false, true, true, false, false, true, false, true, true,
+        ];
 
         // In-memory version
         let mut writer = BitmapWriter::new();
@@ -672,12 +682,15 @@ mod tests {
         assembled.extend_from_slice(&data_buf);
         assembled.extend_from_slice(&data_crc.to_le_bytes());
 
-        assert_eq!(assembled, expected, "streaming bitmap output differs from in-memory");
+        assert_eq!(
+            assembled, expected,
+            "streaming bitmap output differs from in-memory"
+        );
     }
 
     #[test]
     fn test_streaming_cross_word_boundary() {
-        use crate::io::crc_utils::{crc8, Crc32cWriter};
+        use crate::io::crc_utils::{Crc32cWriter, crc8};
         use crate::io::vbyte::encode_vbyte;
 
         // 200 bits — crosses multiple 64-bit word boundaries
@@ -712,7 +725,7 @@ mod tests {
 
     #[test]
     fn test_streaming_set_last() {
-        use crate::io::crc_utils::{crc8, Crc32cWriter};
+        use crate::io::crc_utils::{Crc32cWriter, crc8};
         use crate::io::vbyte::encode_vbyte;
 
         // Simulate BitmapTriples pattern: push(false), then later set_last(true)
@@ -756,7 +769,9 @@ mod tests {
     #[test]
     fn test_streaming_decoder_matches_reader() {
         // Verify StreamingBitmapDecoder produces the same bits as BitmapReader
-        let pattern = [true, false, true, true, false, false, true, false, true, true];
+        let pattern = [
+            true, false, true, true, false, false, true, false, true, true,
+        ];
         let mut writer = BitmapWriter::new();
         for &b in &pattern {
             writer.push(b);
@@ -774,7 +789,11 @@ mod tests {
         for (i, &expected) in pattern.iter().enumerate() {
             let bit = decoder.next_bit().unwrap().unwrap();
             assert_eq!(bit, expected, "decoder mismatch at index {i}");
-            assert_eq!(bit, reader.get(i as u64), "decoder vs reader mismatch at {i}");
+            assert_eq!(
+                bit,
+                reader.get(i as u64),
+                "decoder vs reader mismatch at {i}"
+            );
         }
 
         // Should return None after all bits

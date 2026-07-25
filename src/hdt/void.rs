@@ -17,8 +17,8 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 use super::reader::{
-    BitmapTriplesScanner, DictionaryResolver, HdtSectionOffsets, find_literal_boundary, make_writer,
-    open_hdt,
+    BitmapTriplesScanner, DictionaryResolver, HdtSectionOffsets, find_literal_boundary,
+    make_writer, open_hdt,
 };
 
 // ---------------------------------------------------------------------------
@@ -386,8 +386,7 @@ fn filter_non_iri_classes(
     let mut new_combo_map: HashMap<Vec<u64>, u32> = HashMap::new();
     let mut new_combo_to_classes: Vec<Vec<u64>> = Vec::new();
     // combo_remap[i] = new combo_id for old combo_id (i+1). 0 = became untyped.
-    let mut combo_remap: Vec<u32> =
-        Vec::with_capacity(class_combo_index.combo_to_classes.len());
+    let mut combo_remap: Vec<u32> = Vec::with_capacity(class_combo_index.combo_to_classes.len());
 
     for classes in &class_combo_index.combo_to_classes {
         let filtered: Vec<u64> = classes
@@ -574,7 +573,10 @@ fn run_stats_pass(
     nb_shared: u64,
     class_combo_index: &ClassComboIndex,
     datatype_index: &DatatypeIndex,
-) -> Result<(HashMap<u64, DatasetPropData>, HashMap<u64, ClassPartitionData>)> {
+) -> Result<(
+    HashMap<u64, DatasetPropData>,
+    HashMap<u64, ClassPartitionData>,
+)> {
     let mut dataset_prop_data: HashMap<u64, DatasetPropData> = HashMap::new();
     let mut class_partitions: HashMap<u64, ClassPartitionData> = HashMap::new();
 
@@ -752,7 +754,12 @@ fn write_datatype_partitions(
             let lang_part_node =
                 make_partition_node(use_blank_nodes, &lang_part_uri, bnode_counter);
 
-            nt(w, &dt_part_node, VOIDEXT_LANGUAGE_PARTITION, &lang_part_node)?;
+            nt(
+                w,
+                &dt_part_node,
+                VOIDEXT_LANGUAGE_PARTITION,
+                &lang_part_node,
+            )?;
             written += 1;
             nt(w, &lang_part_node, RDF_TYPE, &format!("<{VOID_DATASET}>"))?;
             written += 1;
@@ -796,11 +803,26 @@ fn write_void_triples(
     written += 1;
     nt(w, &dataset_node, VOID_TRIPLES, &int_node(stats.num_triples))?;
     written += 1;
-    nt(w, &dataset_node, VOID_DISTINCT_SUBJECTS, &int_node(stats.nb_subjects))?;
+    nt(
+        w,
+        &dataset_node,
+        VOID_DISTINCT_SUBJECTS,
+        &int_node(stats.nb_subjects),
+    )?;
     written += 1;
-    nt(w, &dataset_node, VOID_PROPERTIES, &int_node(stats.nb_predicates))?;
+    nt(
+        w,
+        &dataset_node,
+        VOID_PROPERTIES,
+        &int_node(stats.nb_predicates),
+    )?;
     written += 1;
-    nt(w, &dataset_node, VOID_DISTINCT_OBJECTS, &int_node(stats.nb_objects))?;
+    nt(
+        w,
+        &dataset_node,
+        VOID_DISTINCT_OBJECTS,
+        &int_node(stats.nb_objects),
+    )?;
     written += 1;
 
     // -----------------------------------------------------------------------
@@ -859,9 +881,19 @@ fn write_void_triples(
         written += 1;
         nt(w, &class_part_node, VOID_CLASS, &format!("<{class_iri}>"))?;
         written += 1;
-        nt(w, &class_part_node, VOID_ENTITIES, &int_node(cp.entity_count))?;
+        nt(
+            w,
+            &class_part_node,
+            VOID_ENTITIES,
+            &int_node(cp.entity_count),
+        )?;
         written += 1;
-        nt(w, &class_part_node, VOID_TRIPLES, &int_node(cp.total_triples()))?;
+        nt(
+            w,
+            &class_part_node,
+            VOID_TRIPLES,
+            &int_node(cp.total_triples()),
+        )?;
         written += 1;
 
         // Nested property partitions within this class.
@@ -881,7 +913,12 @@ fn write_void_triples(
             let prop_part_node =
                 make_partition_node(use_blank_nodes, &prop_part_uri, &mut bnode_counter);
 
-            nt(w, &class_part_node, VOID_PROPERTY_PARTITION, &prop_part_node)?;
+            nt(
+                w,
+                &class_part_node,
+                VOID_PROPERTY_PARTITION,
+                &prop_part_node,
+            )?;
             written += 1;
             nt(w, &prop_part_node, RDF_TYPE, &format!("<{VOID_DATASET}>"))?;
             written += 1;
@@ -913,12 +950,16 @@ fn write_void_triples(
                 };
 
                 let hash_input = target_iri_opt.as_deref().unwrap_or(UNTYPED_HASH_INPUT);
-                let target_part_uri =
-                    format!("{prop_part_uri}/target/{}", md5_hex(hash_input));
+                let target_part_uri = format!("{prop_part_uri}/target/{}", md5_hex(hash_input));
                 let target_part_node =
                     make_partition_node(use_blank_nodes, &target_part_uri, &mut bnode_counter);
 
-                nt(w, &prop_part_node, VOIDEXT_OBJECT_CLASS_PARTITION, &target_part_node)?;
+                nt(
+                    w,
+                    &prop_part_node,
+                    VOIDEXT_OBJECT_CLASS_PARTITION,
+                    &target_part_node,
+                )?;
                 written += 1;
                 nt(w, &target_part_node, RDF_TYPE, &format!("<{VOID_DATASET}>"))?;
                 written += 1;
@@ -1022,8 +1063,13 @@ pub fn compute_void(
 
     // Pass 2: full triple scan — dataset-level property counts and class partitions.
     tracing::info!("Pass 2: scanning all triples for statistics...");
-    let (dataset_prop_data, mut class_partitions) =
-        run_stats_pass(hdt_path, &offsets, nb_shared, &class_combo_index, &datatype_index)?;
+    let (dataset_prop_data, mut class_partitions) = run_stats_pass(
+        hdt_path,
+        &offsets,
+        nb_shared,
+        &class_combo_index,
+        &datatype_index,
+    )?;
 
     // Release the class combo index (no longer needed).
     drop(class_combo_index);

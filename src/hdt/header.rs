@@ -24,7 +24,9 @@
 //!
 //! Any modification writes to `--output`; the original file is never changed.
 
-use crate::hdt::header_vocab::{HDT_DATASET, HDT_NS, RDF_TYPE, VOID_DATASET, VOID_NS, VOID_STAT_LOCALS};
+use crate::hdt::header_vocab::{
+    HDT_DATASET, HDT_NS, RDF_TYPE, VOID_DATASET, VOID_NS, VOID_STAT_LOCALS,
+};
 use crate::io::{ControlInfo, ControlType};
 use crate::rdf::parser::parse_rdf_to_triples;
 use crate::rdf::{discover_inputs, serialize_triples};
@@ -50,10 +52,14 @@ pub fn run_header_command(
     let modifying = replace.is_some() || add.is_some() || dataset_uri.is_some();
     match (modifying, output) {
         (true, None) => {
-            bail!("--output is required when modifying the header (the original file is never changed)")
+            bail!(
+                "--output is required when modifying the header (the original file is never changed)"
+            )
         }
         (false, Some(_)) => {
-            bail!("--output is only used when modifying the header; with no modification flags the header is dumped to stdout")
+            bail!(
+                "--output is only used when modifying the header; with no modification flags the header is dumped to stdout"
+            )
         }
         _ => {}
     }
@@ -75,8 +81,8 @@ pub fn run_header_command(
     // Parse the existing header into triples, apply the requested edits, and
     // re-serialize. Everything that can fail (IRI validation, reserved-predicate
     // rejection) happens here, before any output file is created.
-    let existing =
-        parse_ntriples_text(&header_text).context("Failed to parse existing header as N-Triples")?;
+    let existing = parse_ntriples_text(&header_text)
+        .context("Failed to parse existing header as N-Triples")?;
     let new_triples = build_new_header(existing, replace, add, dataset_uri)?;
     let new_header = serialize_triples(&new_triples)?;
 
@@ -134,7 +140,11 @@ fn build_new_header(
     // `--replace` keeps only the hdtc-managed (data-derived) triples; `--add`
     // and a bare `--dataset-uri` keep the whole existing header.
     let mut triples: Vec<Triple> = if replace.is_some() {
-        existing.iter().filter(|t| is_managed(t, &managed)).cloned().collect()
+        existing
+            .iter()
+            .filter(|t| is_managed(t, &managed))
+            .cloned()
+            .collect()
     } else {
         existing.clone()
     };
@@ -241,8 +251,8 @@ fn write_modified_hdt<R: Read>(
 /// surfaced as an error rather than silently dropped, so a rewrite can never
 /// quietly discard header content it failed to understand.
 fn parse_ntriples_text(text: &str) -> Result<Vec<Triple>> {
-    let parser = oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::NTriples)
-        .for_reader(text.as_bytes());
+    let parser =
+        oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::NTriples).for_reader(text.as_bytes());
 
     let mut triples = Vec::new();
     for quad in parser {
@@ -403,7 +413,9 @@ mod tests {
     }
 
     fn triple(s: &str, p: &str, o: &str) -> Triple {
-        parse_ntriples_text(&format!("{s} {p} {o} .\n")).unwrap().remove(0)
+        parse_ntriples_text(&format!("{s} {p} {o} .\n"))
+            .unwrap()
+            .remove(0)
     }
 
     #[test]
@@ -436,7 +448,10 @@ mod tests {
     #[test]
     fn finds_dataset_iri() {
         let triples = sample_header("http://example.org/ds");
-        assert_eq!(dataset_iris(&triples), vec!["http://example.org/ds".to_string()]);
+        assert_eq!(
+            dataset_iris(&triples),
+            vec!["http://example.org/ds".to_string()]
+        );
     }
 
     #[test]
@@ -463,13 +478,18 @@ mod tests {
         ));
         assert_eq!(
             dataset_iris(&two),
-            vec!["http://example.org/a".to_string(), "http://example.org/b".to_string()]
+            vec![
+                "http://example.org/a".to_string(),
+                "http://example.org/b".to_string()
+            ]
         );
     }
 
     #[test]
     fn reserved_predicate_detection() {
-        assert!(is_reserved_predicate("http://purl.org/HDT/hdt#triplesnumTriples"));
+        assert!(is_reserved_predicate(
+            "http://purl.org/HDT/hdt#triplesnumTriples"
+        ));
         assert!(is_reserved_predicate("http://rdfs.org/ns/void#triples"));
         assert!(!is_reserved_predicate("http://purl.org/dc/terms/title"));
         assert!(!is_reserved_predicate(RDF_TYPE));
@@ -495,7 +515,10 @@ mod tests {
         reroot_triples(&mut triples, old, &NamedNode::new_unchecked(new_iri));
         let out = serialize_triples(&triples).unwrap();
 
-        assert!(!out.contains(&format!("<{old}>")), "no old IRI should remain");
+        assert!(
+            !out.contains(&format!("<{old}>")),
+            "no old IRI should remain"
+        );
         // Managed and descriptive subject-position triples are re-rooted.
         assert!(out.contains(&format!("<{new_iri}> <{VOID_NS}triples> \"100\" .")));
         assert!(out.contains(&format!(
@@ -546,7 +569,14 @@ mod tests {
         let kept: Vec<&Triple> = triples.iter().filter(|t| is_managed(t, &bnodes)).collect();
 
         // The descriptive title is dropped; the managed triple count is kept.
-        assert!(!kept.iter().any(|t| t.predicate.as_str().contains("dc/terms/title")));
-        assert!(kept.iter().any(|t| t.predicate.as_str() == format!("{VOID_NS}triples")));
+        assert!(
+            !kept
+                .iter()
+                .any(|t| t.predicate.as_str().contains("dc/terms/title"))
+        );
+        assert!(
+            kept.iter()
+                .any(|t| t.predicate.as_str() == format!("{VOID_NS}triples"))
+        );
     }
 }

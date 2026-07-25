@@ -275,7 +275,11 @@ pub(crate) fn parse_rdf_to_triples(
             Err(e) => {
                 out.errors += 1;
                 if out.errors <= 10 {
-                    tracing::warn!("Skipping malformed input in {}: {}", input.path.display(), e);
+                    tracing::warn!(
+                        "Skipping malformed input in {}: {}",
+                        input.path.display(),
+                        e
+                    );
                 } else if out.errors == 11 {
                     tracing::warn!(
                         "Further parse errors in {} will be suppressed",
@@ -358,10 +362,7 @@ where
                 );
                 stats.original_ntriples_size += original_size;
 
-                let subject = term_to_hdt_string(
-                    &Term::from(quad.subject),
-                    &blank_prefix,
-                );
+                let subject = term_to_hdt_string(&Term::from(quad.subject), &blank_prefix);
                 let predicate = quad.predicate.as_str().to_string();
                 let object = term_to_hdt_string(&quad.object, &blank_prefix);
                 let graph = extract_graph_name(&quad.graph_name, &blank_prefix)
@@ -736,15 +737,15 @@ fn literal_ntriples_size(l: &Literal) -> u64 {
     let value_len = l.value().len() as u64;
     if let Some(lang) = l.language() {
         // "value"@lang
-        2 + value_len + 1 + lang.len() as u64  // 2 quotes + value + @ + language
+        2 + value_len + 1 + lang.len() as u64 // 2 quotes + value + @ + language
     } else {
         let dt = l.datatype().as_str();
         if dt == "http://www.w3.org/2001/XMLSchema#string" {
             // "value"
-            2 + value_len  // 2 quotes
+            2 + value_len // 2 quotes
         } else {
             // "value"^^<type>
-            2 + value_len + 4 + dt.len() as u64  // 2 quotes + ^^ + < + type + >
+            2 + value_len + 4 + dt.len() as u64 // 2 quotes + ^^ + < + type + >
         }
     }
 }
@@ -854,7 +855,10 @@ mod tests {
     }
 
     fn make_temp_nt_gz(content: &str) -> (tempfile::NamedTempFile, RdfInput) {
-        let mut f = tempfile::Builder::new().suffix(".nt.gz").tempfile().unwrap();
+        let mut f = tempfile::Builder::new()
+            .suffix(".nt.gz")
+            .tempfile()
+            .unwrap();
         {
             let mut encoder = GzEncoder::new(&mut f, GzipLevel::default());
             encoder.write_all(content.as_bytes()).unwrap();
@@ -936,8 +940,7 @@ mod tests {
 _:b1 <http://example.org/type> <http://example.org/Thing> .
 "#;
         let (_f, input) = make_temp_nt(content);
-        let stats = stream_quads(&input, 0, true, None, |_q| Ok(()))
-            .unwrap();
+        let stats = stream_quads(&input, 0, true, None, |_q| Ok(())).unwrap();
 
         assert_eq!(stats.quads, 8);
         assert_eq!(stats.errors, 0);
@@ -955,8 +958,7 @@ _:b1 <http://example.org/type> <http://example.org/Thing> .
 <http://example.org/subject3> <http://example.org/predicate1> <http://example.org/object3> .
 "#;
         let (_f, input) = make_temp_nt(content);
-        let stats = stream_quads(&input, 0, true, None, |_q| Ok(()))
-            .unwrap();
+        let stats = stream_quads(&input, 0, true, None, |_q| Ok(())).unwrap();
 
         assert_eq!(stats.quads, 5);
         assert_eq!(stats.errors, 0);
@@ -969,8 +971,7 @@ _:b1 <http://example.org/type> <http://example.org/Thing> .
         // Test that blank node size is calculated WITHOUT the file prefix
         let content = "_:b1 <http://example.org/p> <http://example.org/o> .\n";
         let (_f, input) = make_temp_nt(content);
-        let stats = stream_quads(&input, 0, true, None, |_q| Ok(()))
-            .unwrap();
+        let stats = stream_quads(&input, 0, true, None, |_q| Ok(())).unwrap();
 
         assert_eq!(stats.quads, 1);
         assert_eq!(stats.errors, 0);
@@ -1033,7 +1034,10 @@ _:b1 <http://example.org/type> <http://example.org/Thing> .
 
         assert_eq!(seq_stats.quads, par_stats.quads);
         assert_eq!(seq_stats.errors, par_stats.errors);
-        assert_eq!(seq_stats.original_ntriples_size, par_stats.original_ntriples_size);
+        assert_eq!(
+            seq_stats.original_ntriples_size,
+            par_stats.original_ntriples_size
+        );
         assert_eq!(seq_quads, par_quads);
     }
 

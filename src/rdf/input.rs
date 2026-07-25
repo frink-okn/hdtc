@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
@@ -184,13 +184,28 @@ mod tests {
 
     #[test]
     fn test_detect_format() {
-        assert_eq!(detect_format(Path::new("data.nt")), Some(RdfFormat::NTriples));
+        assert_eq!(
+            detect_format(Path::new("data.nt")),
+            Some(RdfFormat::NTriples)
+        );
         assert_eq!(detect_format(Path::new("data.nq")), Some(RdfFormat::NQuads));
-        assert_eq!(detect_format(Path::new("data.ttl")), Some(RdfFormat::Turtle));
+        assert_eq!(
+            detect_format(Path::new("data.ttl")),
+            Some(RdfFormat::Turtle)
+        );
         assert_eq!(detect_format(Path::new("data.trig")), Some(RdfFormat::TriG));
-        assert_eq!(detect_format(Path::new("data.rdf")), Some(RdfFormat::RdfXml));
-        assert_eq!(detect_format(Path::new("data.xml")), Some(RdfFormat::RdfXml));
-        assert_eq!(detect_format(Path::new("data.jsonld")), Some(RdfFormat::JsonLd));
+        assert_eq!(
+            detect_format(Path::new("data.rdf")),
+            Some(RdfFormat::RdfXml)
+        );
+        assert_eq!(
+            detect_format(Path::new("data.xml")),
+            Some(RdfFormat::RdfXml)
+        );
+        assert_eq!(
+            detect_format(Path::new("data.jsonld")),
+            Some(RdfFormat::JsonLd)
+        );
         assert_eq!(detect_format(Path::new("data.n3")), Some(RdfFormat::N3));
         assert_eq!(detect_format(Path::new("data.txt")), None);
         assert_eq!(detect_format(Path::new("data")), None);

@@ -45,10 +45,7 @@ mod tests {
         let result = write_to_string(|w| {
             write_nt_object(w, b"\"30\"^^<http://www.w3.org/2001/XMLSchema#integer>")
         });
-        assert_eq!(
-            result,
-            "\"30\"^^<http://www.w3.org/2001/XMLSchema#integer>"
-        );
+        assert_eq!(result, "\"30\"^^<http://www.w3.org/2001/XMLSchema#integer>");
     }
 
     #[test]
@@ -112,8 +109,7 @@ mod tests {
 
     #[test]
     fn test_write_literal_unicode() {
-        let result =
-            write_to_string(|w| write_nt_object(w, "\"èpsilon\"".as_bytes()));
+        let result = write_to_string(|w| write_nt_object(w, "\"èpsilon\"".as_bytes()));
         assert_eq!(result, "\"èpsilon\"");
     }
 

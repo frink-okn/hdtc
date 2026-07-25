@@ -55,8 +55,7 @@ pub fn open_index(index_path: &Path) -> Result<IndexSectionOffsets> {
         .with_context(|| format!("Failed to open index file {}", index_path.display()))?;
     let mut reader = BufReader::with_capacity(64 * 1024, file);
 
-    let ci = ControlInfo::read_from(&mut reader)
-        .context("Failed to read index control info")?;
+    let ci = ControlInfo::read_from(&mut reader).context("Failed to read index control info")?;
 
     if ci.control_type != ControlType::Index {
         bail!(
@@ -78,29 +77,25 @@ pub fn open_index(index_path: &Path) -> Result<IndexSectionOffsets> {
     let bitmap_index_z_start = reader
         .stream_position()
         .context("Failed to get bitmapIndexZ section offset")?;
-    skip_bitmap_section(&mut reader)
-        .context("Failed to skip bitmapIndexZ section")?;
+    skip_bitmap_section(&mut reader).context("Failed to skip bitmapIndexZ section")?;
 
     // Record start of indexZ, then skip past it
     let index_z_start = reader
         .stream_position()
         .context("Failed to get indexZ section offset")?;
-    skip_log_array_section(&mut reader)
-        .context("Failed to skip indexZ section")?;
+    skip_log_array_section(&mut reader).context("Failed to skip indexZ section")?;
 
     // Record start of predicateIndex.bitmap
     let pred_bitmap_start = reader
         .stream_position()
         .context("Failed to get pred bitmap section offset")?;
-    skip_bitmap_section(&mut reader)
-        .context("Failed to skip predicateIndex.bitmap section")?;
+    skip_bitmap_section(&mut reader).context("Failed to skip predicateIndex.bitmap section")?;
 
     // Record start of predicateIndex.seq
     let pred_seq_start = reader
         .stream_position()
         .context("Failed to get pred seq section offset")?;
-    skip_log_array_section(&mut reader)
-        .context("Failed to skip predicateIndex.seq section")?;
+    skip_log_array_section(&mut reader).context("Failed to skip predicateIndex.seq section")?;
 
     // Record start of predicateCount
     let pred_count_start = reader
@@ -120,10 +115,7 @@ pub fn open_index(index_path: &Path) -> Result<IndexSectionOffsets> {
 ///
 /// Returns a `LogArrayReader` with `len() == |P|` entries, where
 /// `get(i)` returns the number of (S,P) pairs for predicate `i+1`.
-pub fn read_predicate_count(
-    index_path: &Path,
-    pred_count_start: u64,
-) -> Result<LogArrayReader> {
+pub fn read_predicate_count(index_path: &Path, pred_count_start: u64) -> Result<LogArrayReader> {
     let mut reader = open_index_section(index_path, pred_count_start)?;
     LogArrayReader::read_from(&mut reader)
         .map_err(|e| anyhow::anyhow!(e))
@@ -343,10 +335,7 @@ pub fn read_index_z_range(
 }
 
 /// BufReader positioned at a given offset in the index file.
-pub(crate) fn open_index_section(
-    index_path: &Path,
-    offset: u64,
-) -> Result<BufReader<File>> {
+pub(crate) fn open_index_section(index_path: &Path, offset: u64) -> Result<BufReader<File>> {
     let mut f = File::open(index_path)
         .with_context(|| format!("Failed to open index file {}", index_path.display()))?;
     f.seek(SeekFrom::Start(offset))

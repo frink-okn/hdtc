@@ -39,7 +39,8 @@ const TRIPLES_BITMAP_FORMAT: &str = "<http://purl.org/HDT/hdt#triplesBitmap>";
 /// header edits.
 pub(crate) fn hdt_data_offset<R: Read + Seek>(reader: &mut R) -> Result<u64> {
     ControlInfo::read_from(reader).context("Failed to read HDT global control info")?;
-    let header = ControlInfo::read_from(reader).context("Failed to read HDT header control info")?;
+    let header =
+        ControlInfo::read_from(reader).context("Failed to read HDT header control info")?;
     let header_length: u64 = header
         .get_property("length")
         .context("HDT header is missing length")?
@@ -520,8 +521,7 @@ pub fn open_hdt(
     reader
         .read_exact(&mut header_buf)
         .context("Failed to read header section")?;
-    let header_text =
-        String::from_utf8(header_buf).context("Header content is not valid UTF-8")?;
+    let header_text = String::from_utf8(header_buf).context("Header content is not valid UTF-8")?;
     let num_triples = parse_num_triples_from_header(&header_text)
         .context("Failed to parse triple count from header metadata")?;
 
@@ -587,8 +587,7 @@ pub fn open_hdt(
         );
     }
 
-    let (by_start, by_bits) =
-        skip_bitmap_section(&mut reader).context("Failed to scan BitmapY")?;
+    let (by_start, by_bits) = skip_bitmap_section(&mut reader).context("Failed to scan BitmapY")?;
     let (bz_start, _bz_bits) =
         skip_bitmap_section(&mut reader).context("Failed to scan BitmapZ")?;
     let (ay_start, ay_entries, _ay_bpe) =
@@ -712,9 +711,7 @@ impl BitmapTriplesScanner {
 
         // Pre-load the first predicate (index 0 in ArrayY).
         let initial_predicate = if offsets.num_sp_pairs > 0 {
-            array_y
-                .next_entry()?
-                .context("ArrayY unexpectedly empty")?
+            array_y.next_entry()?.context("ArrayY unexpectedly empty")?
         } else {
             0
         };
@@ -748,10 +745,7 @@ impl BitmapTriplesScanner {
             bail!("Invalid object ID 0 at triple position {}", self.pos_z);
         }
         if self.current_predicate == 0 {
-            bail!(
-                "Invalid predicate ID 0 at triple position {}",
-                self.pos_z
-            );
+            bail!("Invalid predicate ID 0 at triple position {}", self.pos_z);
         }
 
         let triple = (self.current_subject, self.current_predicate, object);
@@ -1046,10 +1040,7 @@ mod tests {
         let result = write_to_string(|w| {
             write_nt_object(w, b"\"30\"^^<http://www.w3.org/2001/XMLSchema#integer>")
         });
-        assert_eq!(
-            result,
-            "\"30\"^^<http://www.w3.org/2001/XMLSchema#integer>"
-        );
+        assert_eq!(result, "\"30\"^^<http://www.w3.org/2001/XMLSchema#integer>");
     }
 
     #[test]

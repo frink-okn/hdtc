@@ -23,5 +23,9 @@ pub(crate) const VOID_DATASET: &str = "http://rdfs.org/ns/void#Dataset";
 /// reserved: they are preserved on `--replace` and may not be set from user
 /// input. The writer builds its statistic triples by iterating this list, so it
 /// cannot emit a void statistic the `header` command doesn't know about.
-pub(crate) const VOID_STAT_LOCALS: &[&str] =
-    &["triples", "properties", "distinctSubjects", "distinctObjects"];
+pub(crate) const VOID_STAT_LOCALS: &[&str] = &[
+    "triples",
+    "properties",
+    "distinctSubjects",
+    "distinctObjects",
+];
