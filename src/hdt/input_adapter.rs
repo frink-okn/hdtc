@@ -228,6 +228,15 @@ impl HdtInputAdapter {
         self.open_dictionary_terms(self.objects_section_offset, self.objects_count, "objects")
     }
 
+    /// Stream the predicate dictionary section without materializing it.
+    pub(crate) fn predicate_terms(&self) -> Result<PfcSectionIterator<BufReader<File>>> {
+        self.open_dictionary_terms(
+            self.predicates_section_offset,
+            self.predicates_count,
+            "predicates",
+        )
+    }
+
     /// Create a factory closure that produces a sorted vocabulary stream.
     ///
     /// The stream is a streaming 4-way merge of PFC sections (shared, subjects,

@@ -80,7 +80,7 @@ src/
   rdf/             - RDF parsing, input discovery, streaming, compressed input
   dictionary/      - Dictionary construction, PFC encoding
   triples/         - BitmapTriples encoding (streaming)
-  hdt/             - HDT serialization, reading, querying, statistics, and sketches
+  hdt/             - HDT serialization, reading, querying, statistics, sketches, and key sets
   index/           - HDT index file generation (.hdt.index.v1-1)
   io/              - VByte, LogArray, Bitmap, CRC utilities, Control Information
   pipeline/        - 6-stage pipeline (batch vocab, partial vocab, merger, ID remapper)
@@ -90,11 +90,35 @@ tests/
   integration_test.rs - End-to-end pipeline tests
   compat_test.rs      - Compatibility tests against the hdt crate
   sketch_test.rs      - Sketch envelope, role, filter, and edge-case tests
+  keyset_test.rs      - Key-set envelope, role, encoding, and edge-case tests
   data/               - Sample RDF fixtures
 docs/
   graphs-sidecar-format.md - Normative .graphs sidecar format
   sketch-format.md         - Normative .filter / .minhash formats
+  keyset-format.md         - Normative .keys format
 ```
+
+### Dictionary-derived sidecar artifacts
+
+`hdtc sketch` and `hdtc keyset` both publish per-role artifacts derived from one
+pass over an HDT's dictionary. They share a single term-to-key convention
+(`src/hdt/artifacts.rs`), which both formats assert by declaring
+`convention_id = 1` — filters, sketches, and key sets of the same role are only
+comparable because that function has one definition. Changing it is a convention
+break for both formats, not an implementation detail.
+
+- **`sketch`** → `.filter` (binary fuse membership, approximate) and `.minhash`
+  (bottom-k overlap, approximate). Roles: subjects, objects.
+- **`keyset`** → `.keys` (complete distinct key set, exact). Roles: subjects,
+  objects, and the experimental `terms` (every qualifying IRI including
+  predicates). Encodings: Elias-Fano (default) or raw sorted u64. Keys are
+  externally sorted and the encoders stream, so `--memory-limit` bounds memory
+  without bounding the key count — any role builds at any size.
+
+`sketch` is the exception to that last point: binary fuse construction peels a
+hypergraph over the whole key set, so it holds the role's keys resident and
+enforces a key ceiling. That is inherent to filter construction, not to the
+shared convention.
 
 ## Published formats
 

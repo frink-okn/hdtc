@@ -11,18 +11,21 @@
 //! roles do not need to be resident together; binary fuse construction then
 //! reads one role's keys back at a time.
 
+use super::artifacts::{
+    DuplicateKeys, KeySpool, SpooledKeys, StagedArtifact, ensure_targets_absent, format_bytes,
+    iri_hash, prepare_output_directory, publish_artifacts,
+};
 use super::input_adapter::HdtInputAdapter;
 use super::pfc_reader::PfcSectionIterator;
 use super::reader::hdt_data_digest;
 use crate::io::crc_utils::Crc32cWriter;
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use std::collections::BTreeSet;
-use std::fs::{self, File};
-use std::io::{BufReader, BufWriter, Read, Seek, Write};
+use std::fs::File;
+use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
 use xorf::{BinaryFuse8, BinaryFuse16, DmaSerializable};
-use xxhash_rust::xxh64::xxh64;
 
 const FORMAT_VERSION: u16 = 1;
 const CONVENTION_ID: u16 = 1;
@@ -106,8 +109,7 @@ impl Role {
 
 struct RoleAccumulator {
     role: Role,
-    key_file: BufWriter<File>,
-    key_count: u64,
+    keys: KeySpool,
     /// Largest key count whose filter build still fits `memory_limit`.
     max_keys: u64,
     memory_limit: usize,
@@ -117,17 +119,9 @@ struct RoleAccumulator {
 
 impl RoleAccumulator {
     fn new(role: Role, config: SketchConfig<'_>, max_keys: u64, k: usize) -> Result<Self> {
-        let file = tempfile::tempfile_in(config.temp_dir).with_context(|| {
-            format!(
-                "Failed to create temporary {} key file in {}",
-                role.file_stem(),
-                config.temp_dir.display()
-            )
-        })?;
         Ok(Self {
             role,
-            key_file: BufWriter::with_capacity(256 * 1024, file),
-            key_count: 0,
+            keys: KeySpool::new(config.temp_dir, role.file_stem())?,
             max_keys,
             memory_limit: config.memory_limit,
             k,
@@ -136,16 +130,12 @@ impl RoleAccumulator {
     }
 
     fn add_hash(&mut self, hash: u64) -> Result<()> {
-        self.key_file.write_all(&hash.to_le_bytes())?;
-        self.key_count = self
-            .key_count
-            .checked_add(1)
-            .context("IRI key count exceeds u64")?;
+        self.keys.push(hash)?;
         // Checked per key rather than once at the end: the budget then fails as
         // soon as the input is known to be too large, instead of after a full
         // dictionary scan, and it never rejects a role on an over-estimate.
         ensure!(
-            self.key_count <= self.max_keys,
+            self.keys.key_count() <= self.max_keys,
             "{} role has more than {} qualifying IRIs, the most a binary fuse filter can be built from within --memory-limit ({}); increase the limit or reduce --k",
             self.role.file_stem(),
             self.max_keys,
@@ -163,25 +153,13 @@ impl RoleAccumulator {
         Ok(())
     }
 
-    fn finish(mut self) -> Result<RoleData> {
-        self.key_file.flush()?;
-        let key_file = self
-            .key_file
-            .into_inner()
-            .map_err(|error| error.into_error())?;
-        let expected_bytes = self
-            .key_count
-            .checked_mul(8)
-            .context("Temporary key file length exceeds u64")?;
-        ensure!(
-            key_file.metadata()?.len() == expected_bytes,
-            "Temporary {} key file has an unexpected length",
-            self.role.file_stem()
-        );
+    fn finish(self) -> Result<RoleData> {
+        let key_count = self.keys.key_count();
+        let keys = self.keys.finish()?;
 
         // BTreeSet iterates in ascending order.
         let minima: Vec<u64> = self.minima.into_iter().collect();
-        let expected_minima = self.key_count.min(self.k as u64) as usize;
+        let expected_minima = key_count.min(self.k as u64) as usize;
         if minima.len() != expected_minima {
             tracing::warn!(
                 "{} XXH64 collision(s) among the smallest {} hashes; overlap estimates from this \
@@ -192,8 +170,7 @@ impl RoleAccumulator {
         }
         Ok(RoleData {
             role: self.role,
-            key_file,
-            key_count: self.key_count,
+            keys,
             minima,
         })
     }
@@ -201,14 +178,15 @@ impl RoleAccumulator {
 
 struct RoleData {
     role: Role,
-    key_file: File,
-    key_count: u64,
+    keys: SpooledKeys,
     minima: Vec<u64>,
 }
 
-struct StagedArtifact {
-    file: NamedTempFile,
-    target: PathBuf,
+impl RoleData {
+    /// Distinct qualifying IRIs in the role — the `key_count` header field.
+    fn key_count(&self) -> u64 {
+        self.keys.key_count()
+    }
 }
 
 /// Generate the selected role artifacts and publish them only after every file
@@ -279,7 +257,7 @@ pub fn create_sketches(config: SketchConfig<'_>) -> Result<SketchSummary> {
         .collect::<Result<Vec<_>>>()?;
     let role_counts = role_data
         .iter()
-        .map(|data| (data.role, data.key_count))
+        .map(|data| (data.role, data.key_count()))
         .collect();
 
     let mut staged = Vec::with_capacity(config.roles.len() * 2);
@@ -295,24 +273,6 @@ pub fn create_sketches(config: SketchConfig<'_>) -> Result<SketchSummary> {
     })
 }
 
-fn prepare_output_directory(output_dir: &Path) -> Result<()> {
-    if output_dir.exists() {
-        ensure!(
-            output_dir.is_dir(),
-            "Sketch output path is not a directory: {}",
-            output_dir.display()
-        );
-    } else {
-        fs::create_dir_all(output_dir).with_context(|| {
-            format!(
-                "Failed to create sketch output directory {}",
-                output_dir.display()
-            )
-        })?;
-    }
-    Ok(())
-}
-
 /// The `(filter, minhash)` paths for one role. The single place artifact names
 /// are formed, so the no-clobber precheck and publication cannot diverge.
 fn artifact_paths(output_dir: &Path, role: Role) -> (PathBuf, PathBuf) {
@@ -320,24 +280,6 @@ fn artifact_paths(output_dir: &Path, role: Role) -> (PathBuf, PathBuf) {
         output_dir.join(format!("{}.filter", role.file_stem())),
         output_dir.join(format!("{}.minhash", role.file_stem())),
     )
-}
-
-fn ensure_targets_absent(targets: &[PathBuf]) -> Result<()> {
-    for target in targets {
-        match fs::symlink_metadata(target) {
-            Ok(_) => bail!(
-                "Refusing to replace existing sketch artifact: {}",
-                target.display()
-            ),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("Failed to inspect sketch target {}", target.display())
-                });
-            }
-        }
-    }
-    Ok(())
 }
 
 fn stage_role_artifacts(
@@ -349,7 +291,7 @@ fn stage_role_artifacts(
     tracing::info!(
         "Building {} artifacts from {} distinct IRIs",
         data.role.file_stem(),
-        data.key_count
+        data.key_count()
     );
     let (filter_target, minhash_target) = artifact_paths(config.output_dir, data.role);
 
@@ -376,40 +318,6 @@ fn stage_role_artifacts(
     Ok(())
 }
 
-fn publish_artifacts(staged: Vec<StagedArtifact>) -> Result<()> {
-    let mut published = Vec::<PathBuf>::new();
-    for artifact in staged {
-        let target = artifact.target;
-        if let Err(error) = artifact.file.persist_noclobber(&target) {
-            for path in published.iter().rev() {
-                if let Err(rollback_error) = fs::remove_file(path) {
-                    tracing::warn!(
-                        "Failed to roll back sketch artifact {}: {}",
-                        path.display(),
-                        rollback_error
-                    );
-                }
-            }
-            return Err(error.error).with_context(|| {
-                format!("Failed to publish sketch artifact {}", target.display())
-            });
-        }
-        published.push(target);
-    }
-    Ok(())
-}
-
-fn iri_hash(term: &[u8]) -> Option<u64> {
-    // HDT stores IRIs as their raw UTF-8 bytes, blank nodes with "_:", and
-    // literals with a leading quote. Current hdtc output retains blank nodes;
-    // a future documented skolem prefix can be excluded here as well.
-    if term.starts_with(b"_:") || term.starts_with(b"\"") {
-        None
-    } else {
-        Some(xxh64(term, 0))
-    }
-}
-
 fn common_header(
     magic: &[u8; 4],
     role: Role,
@@ -427,54 +335,18 @@ fn common_header(
     header
 }
 
-/// Read one role's spooled keys back, sorted and deduplicated.
-///
-/// A 64-bit hash over a billion-IRI dictionary collides with non-trivial
-/// probability, and binary fuse construction is only defined for distinct keys:
-/// a duplicate leaves it to an internal heuristic that can burn hundreds of
-/// full passes before failing. Deduplicating here makes the input meet the
-/// precondition instead.
-fn read_distinct_keys(data: &mut RoleData) -> Result<Vec<u64>> {
-    let count = usize::try_from(data.key_count).context("Key count does not fit this platform")?;
-    data.key_file.rewind()?;
-    let mut reader = BufReader::with_capacity(256 * 1024, &mut data.key_file);
-    let mut keys = Vec::with_capacity(count);
-    let mut bytes = [0u8; 8];
-    for _ in 0..count {
-        reader
-            .read_exact(&mut bytes)
-            .with_context(|| format!("Truncated temporary {} key file", data.role.file_stem()))?;
-        keys.push(u64::from_le_bytes(bytes));
-    }
-
-    keys.sort_unstable();
-    let scanned = keys.len();
-    keys.dedup();
-    if keys.len() != scanned {
-        tracing::warn!(
-            "{} XXH64 collision(s) among {} {} IRIs; the filter treats the colliding IRIs as one",
-            scanned - keys.len(),
-            scanned,
-            data.role.file_stem()
-        );
-    }
-    Ok(keys)
-}
-
 fn write_filter_file(
     file: &mut File,
     data: &mut RoleData,
     filter_bits: u8,
     source_digest: &[u8; 32],
 ) -> Result<()> {
-    let keys = read_distinct_keys(data)?;
+    let key_count = data.key_count();
+    // Shared, Subjects, and Objects are mutually disjoint, so any duplicate key
+    // in a sketch role is a hash collision.
+    let keys = data.keys.read_sorted_distinct(DuplicateKeys::AreCollisions)?;
     let mut writer = Crc32cWriter::new(BufWriter::with_capacity(256 * 1024, file));
-    writer.write_all(&common_header(
-        b"KGFF",
-        data.role,
-        data.key_count,
-        source_digest,
-    ))?;
+    writer.write_all(&common_header(b"KGFF", data.role, key_count, source_digest))?;
     writer.write_all(&[filter_bits])?;
     writer.write_all(&[0u8; 7])?;
 
@@ -583,7 +455,7 @@ fn write_minhash_file(
     writer.write_all(&common_header(
         b"KGFM",
         data.role,
-        data.key_count,
+        data.key_count(),
         source_digest,
     ))?;
     writer.write_all(&k.to_le_bytes())?;
@@ -595,20 +467,6 @@ fn write_minhash_file(
     }
     writer.finalize_and_write()?.flush()?;
     Ok(())
-}
-
-fn format_bytes(bytes: u64) -> String {
-    for (suffix, scale) in [
-        ("GiB", 1u64 << 30),
-        ("MiB", 1 << 20),
-        ("KiB", 1 << 10),
-        ("B", 1),
-    ] {
-        if bytes >= scale {
-            return format!("{:.2} {suffix}", bytes as f64 / scale as f64);
-        }
-    }
-    "0 B".to_string()
 }
 
 /// `dictionary_counts` holds each selected role's upper bound on distinct
@@ -647,6 +505,8 @@ fn max_filter_keys(k: u32, filter_bits: u8, memory_limit: usize) -> u64 {
 mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
+    use std::io::{Read, Seek};
+    use xxhash_rust::xxh64::xxh64;
 
     /// Shown when the bytes xorf produces for a fixed key set stop matching the
     /// published vectors — the situation the exact version pin in Cargo.toml
@@ -740,7 +600,7 @@ path. The version pin, not this test, is the actual guard.";
             accumulator.add_hash(hash).unwrap();
         }
         let data = accumulator.finish().unwrap();
-        assert_eq!(data.key_count, 6, "six qualifying IRIs were scanned");
+        assert_eq!(data.key_count(), 6, "six qualifying IRIs were scanned");
         assert_eq!(data.minima, vec![10, 20, 30], "only three distinct keys");
 
         let mut file = tempfile::tempfile().unwrap();
@@ -802,22 +662,8 @@ path. The version pin, not this test, is the actual guard.";
             accumulator.add_hash(hash).unwrap();
         }
         let data = accumulator.finish().unwrap();
-        assert_eq!(data.key_count, 6);
+        assert_eq!(data.key_count(), 6);
         assert_eq!(data.minima, vec![1, 2, 7]);
-    }
-
-    #[test]
-    fn duplicate_keys_are_removed_before_filter_construction() {
-        let temp = tempfile::tempdir().unwrap();
-        let roles = [Role::Subjects];
-        let config = test_config(temp.path(), &roles);
-        let mut accumulator = RoleAccumulator::new(Role::Subjects, config, u64::MAX, 3).unwrap();
-        for hash in [40, 10, 40, 30, 10] {
-            accumulator.add_hash(hash).unwrap();
-        }
-        let mut data = accumulator.finish().unwrap();
-        assert_eq!(data.key_count, 5);
-        assert_eq!(read_distinct_keys(&mut data).unwrap(), vec![10, 30, 40]);
     }
 
     #[test]
@@ -864,14 +710,6 @@ path. The version pin, not this test, is the actual guard.";
 
         ensure_minhash_accumulator_memory(&[30], 100, 960).unwrap();
         ensure_minhash_accumulator_memory(&[30, 40], 5, 320).unwrap();
-    }
-
-    #[test]
-    fn byte_sizes_stay_readable_below_a_gibibyte() {
-        assert_eq!(format_bytes(0), "0 B");
-        assert_eq!(format_bytes(2_239), "2.19 KiB");
-        assert_eq!(format_bytes(8 << 20), "8.00 MiB");
-        assert_eq!(format_bytes(4 << 30), "4.00 GiB");
     }
 
     #[test]

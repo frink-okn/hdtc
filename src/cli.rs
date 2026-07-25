@@ -80,6 +80,22 @@ pub enum SketchRole {
     Objects,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, ValueEnum)]
+pub enum KeysetRole {
+    Subjects,
+    Objects,
+    /// Every qualifying IRI in the dictionary, predicates included.
+    Terms,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum KeysetEncoding {
+    /// Elias-Fano, about 4.4-5.8 bytes per key
+    EliasFano,
+    /// Raw sorted u64 array, 8 bytes per key
+    Raw,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum SketchFilterBits {
     #[value(name = "8")]
@@ -144,6 +160,9 @@ pub enum Commands {
 
     /// Build role-specific membership filters and overlap sketches
     Sketch(SketchArgs),
+
+    /// Build exact role-specific key sets
+    Keyset(KeysetArgs),
 
     /// Dump or modify the RDF triples embedded in an HDT file's header
     Header(HeaderArgs),
@@ -350,6 +369,56 @@ pub struct SketchArgs {
     pub temp_dir: Option<PathBuf>,
 
     /// Soft memory limit for binary fuse and MinHash construction (e.g. 4G, 2000M)
+    #[arg(short = 'm', long, value_name = "SIZE", default_value = "4G")]
+    pub memory_limit: MemorySize,
+}
+
+#[derive(Debug, Parser)]
+#[command(
+    long_about = "Writes the complete, sorted set of distinct 64-bit term keys for each selected \
+                  dictionary role, under the same term-to-key convention as `hdtc sketch`. Unlike \
+                  the sketches, a key set answers membership without false positives and overlap \
+                  without an estimator, at roughly four times the filter's bytes."
+)]
+pub struct KeysetArgs {
+    /// Path to the existing HDT file
+    pub hdt_file: PathBuf,
+
+    /// Output directory (defaults to a keysets/ directory beside the HDT)
+    #[arg(short, long, value_name = "DIR")]
+    pub output_dir: Option<PathBuf>,
+
+    /// Payload encoding
+    #[arg(
+        long,
+        value_enum,
+        default_value = "elias-fano",
+        value_name = "ENCODING"
+    )]
+    pub encoding: KeysetEncoding,
+
+    /// Dictionary roles to emit, as a comma-separated list
+    ///
+    /// `terms` is an hdtc extension covering every qualifying IRI in the
+    /// dictionary, predicates included; it is not part of the published role
+    /// pair and is not comparable against `subjects` or `objects`.
+    #[arg(
+        long,
+        value_enum,
+        value_delimiter = ',',
+        default_value = "subjects,objects",
+        value_name = "ROLE,..."
+    )]
+    pub roles: Vec<KeysetRole>,
+
+    /// Directory for temporary sort chunks and merged key runs
+    #[arg(long, value_name = "DIR")]
+    pub temp_dir: Option<PathBuf>,
+
+    /// Soft memory limit for key sort buffers (e.g. 4G, 2000M)
+    ///
+    /// Keys are sorted externally, so this bounds memory but not the size of
+    /// the key set: any role builds at any limit, spilling to --temp-dir.
     #[arg(short = 'm', long, value_name = "SIZE", default_value = "4G")]
     pub memory_limit: MemorySize,
 }

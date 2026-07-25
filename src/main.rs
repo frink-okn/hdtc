@@ -180,6 +180,7 @@ fn main() -> Result<()> {
         cli::Commands::Validate(args) => validate_hdt_file(args, benchmark),
         cli::Commands::Void(args) => compute_void(args, benchmark),
         cli::Commands::Sketch(args) => create_sketches(args, benchmark),
+        cli::Commands::Keyset(args) => create_keysets(args, benchmark),
         cli::Commands::Header(args) => run_header(args, benchmark),
     }
 }
@@ -704,6 +705,91 @@ fn create_sketches(args: cli::SketchArgs, benchmark: bool) -> Result<()> {
             .map(|(role, count)| format!("{}: {count} IRIs", role.file_stem()))
             .collect::<Vec<_>>()
             .join(", ")
+    );
+    Ok(())
+}
+
+/// Build exact role-specific key sets.
+fn create_keysets(args: cli::KeysetArgs, benchmark: bool) -> Result<()> {
+    if !args.hdt_file.is_file() {
+        anyhow::bail!("HDT file not found: {}", args.hdt_file.display());
+    }
+
+    let output_dir = args.output_dir.unwrap_or_else(|| {
+        args.hdt_file
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("keysets")
+    });
+    let mut roles: Vec<hdt::KeyRole> = Vec::with_capacity(args.roles.len());
+    for role in &args.roles {
+        let role = match role {
+            cli::KeysetRole::Subjects => hdt::KeyRole::Subjects,
+            cli::KeysetRole::Objects => hdt::KeyRole::Objects,
+            cli::KeysetRole::Terms => hdt::KeyRole::Terms,
+        };
+        if !roles.contains(&role) {
+            roles.push(role);
+        }
+    }
+    let encoding = match args.encoding {
+        cli::KeysetEncoding::EliasFano => hdt::KeysetEncoding::EliasFano,
+        cli::KeysetEncoding::Raw => hdt::KeysetEncoding::Raw,
+    };
+
+    let temp_dir = match &args.temp_dir {
+        Some(dir) => {
+            std::fs::create_dir_all(dir)
+                .with_context(|| format!("Failed to create temp dir {}", dir.display()))?;
+            dir.clone()
+        }
+        None => make_default_temp_dir()?,
+    };
+
+    tracing::info!("Building key sets: {}", args.hdt_file.display());
+    tracing::info!("Output directory: {}", output_dir.display());
+    tracing::info!("Temp directory: {}", temp_dir.display());
+    tracing::info!(
+        "Roles: {}",
+        roles
+            .iter()
+            .map(|role| role.file_stem())
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    tracing::info!("Encoding: {}", encoding.label());
+
+    let start = std::time::Instant::now();
+    let summary = hdt::create_keysets(hdt::KeysetConfig {
+        hdt_path: &args.hdt_file,
+        output_dir: &output_dir,
+        temp_dir: &temp_dir,
+        roles: &roles,
+        encoding,
+        memory_limit: args.memory_limit.as_bytes(),
+    })?;
+
+    if benchmark {
+        tracing::info!(
+            "Benchmark summary (keyset): total {:.3}s",
+            start.elapsed().as_secs_f64()
+        );
+    }
+    tracing::info!(
+        "Done! {} file(s) written ({})",
+        summary.files_written,
+        summary
+            .roles
+            .iter()
+            .map(|role| format!(
+                "{}: {} keys, {} bytes, {:.2} B/key",
+                role.role.file_stem(),
+                role.key_count,
+                role.file_bytes,
+                role.bytes_per_key()
+            ))
+            .collect::<Vec<_>>()
+            .join("; ")
     );
     Ok(())
 }
