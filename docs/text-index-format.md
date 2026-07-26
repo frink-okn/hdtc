@@ -1,4 +1,4 @@
-# HDT text index format, version 2
+# HDT text index format, version 1
 
 `hdtc text` publishes a full-text index over the literals of an HDT dictionary,
 and `hdtc search --text` queries it. This document is normative for what that
@@ -19,8 +19,8 @@ some query text, without requiring the caller to enumerate every literal.
 
 The common case begins with a name or phrase and asks what in the graph carries
 that text. Plain triple-pattern access offers no way to find "atrazine" except
-by paging every literal in the dataset. hdtc therefore supplies whole-value,
-partial-token and language-aware stemmed matching, then resolves each ranked
+by paging every literal in the dataset. hdtc therefore supplies plain-token
+and language-aware stemmed matching, then resolves each ranked
 literal back to the statements that use it. Application-specific grouping and
 presentation remain outside this format.
 
@@ -143,11 +143,10 @@ not terminate it; the closing quote is found from the end of the term.
 
 ### 3.2 Tokenization
 
-Every indexed literal is analyzed into **three** forms: the plain tokens, the
-stemmed tokens (§3.6), and — when short enough — a single whole-literal key
-(§3.7). Each goes to its own field (§5.1). This section describes the plain
-chain, which is also what a query string is tokenized by, and which the other
-two are derived from.
+Every indexed literal is analyzed into **two** forms: the plain tokens and the
+stemmed tokens (§3.6). Each goes to its own field (§5.1). This section describes
+the plain chain, which is also what a query string is tokenized by and what the
+stemmed form is derived from.
 
 The value is tokenized by, in order:
 
@@ -297,40 +296,6 @@ designed away — and it already exists without stemming, since lowercasing alon
 collides German `Gift` with English `gift`. A language filter (§7.2) excludes
 what a caller does not want; ranking keeps the rest harmless.
 
-### 3.7 The whole-literal key
-
-A literal short enough to be a name also gets a **whole-literal key**: its plain
-tokens joined by single spaces. `"Body"`, `"body"` and `"BODY"` share the key
-`body`; `"Body structure (body structure)"` has the key
-`body structure body structure`.
-
-The key exists to answer a different question from the one the other fields
-answer. `text` and `text_stemmed` find literals that *contain* the query; the
-key finds literals that *are* the query — the exact-name lookup described in
-§0.
-
-**Why this is not just ranking.** BM25 cannot express it. Scoring `body` against
-Ubergraph puts `"Body structure (body structure)"` *above* the three resources
-literally named `"body"`, because the term occurs twice in four tokens and term
-frequency outweighs the length penalty. That is textbook BM25 and it is the
-wrong answer: a literal that repeats itself beat the literals that are the
-query. No boost factor fixes it in general, because the two are not on a common
-scale — it has to be a separate class (§6).
-
-The key is built from tokens, not from the raw lexical form, so case and
-punctuation do not decide identity — the same normalization that makes `body`
-match `"Body"` inside a sentence makes it match `"Body."` as a whole.
-
-**Length cap.** A literal whose key would exceed **256 bytes** does not get one.
-Nobody types a definition out in full, and a term dictionary holding every one
-of them grows by the size of the corpus text. Such literals remain fully
-searchable through the other two fields; they just cannot be matched as a whole.
-The cap is generous enough for the long strings that *are* pasted whole —
-systematic chemical names, full taxonomic labels. On Ubergraph it covers 98.1%
-of indexed literals (10 268 968 of 10 470 056); tightening it to 96 bytes would
-save 60 MiB of a 677 MiB index and give up exactly the long names.
-`whole_literal_keys` in the manifest publishes the coverage per index.
-
 ## 4. The manifest (`hdtc-text.meta`)
 
 Every index directory contains a file named `hdtc-text.meta`: UTF-8, one record
@@ -342,7 +307,7 @@ Keys, each at most once except where noted:
 
 | key | fields | meaning |
 |---|---|---|
-| `hdtc-text` | version | Manifest schema version. `2` for this document. **Required, must be first-known.** |
+| `hdtc-text` | version | Manifest schema version. `1` for this document. **Required, must be first-known.** |
 | `analyzer` | id | §3's convention ID. Required. |
 | `schema` | id | §5.1's hdtc field-schema convention. `1` for this document. Required. |
 | `tantivy_writer` | version | Tantivy release that wrote the segments (§5), as that release reports itself. Informational but required. |
@@ -352,7 +317,6 @@ Keys, each at most once except where noted:
 | `untagged_language` | tag or `none` | Language untagged literals were stemmed as (§3.6). |
 | `literals_scanned` | count | Literals seen in the object section, indexed or not. |
 | `indexed_docs` | count | Documents in the index. |
-| `whole_literal_keys` | count | Documents carrying a whole-literal key (§3.7). |
 | `excluded_oversize` | count | Literals excluded by §3.4 rule 2. |
 | `excluded_datatype` | count | Literals excluded by §3.4 rule 1. |
 | `excluded_no_tokens` | count | Literals excluded by §3.4 rule 3. |
@@ -374,12 +338,15 @@ Reader rules:
 - A reader **must ignore** keys it does not recognize, so that a later version
   may add lines without invalidating this one.
 
-### 4.1 Legacy version 1
+### 4.1 Developmental manifests
 
-Version 1 has no `schema` or `tantivy_index_format` line and records the writer
-release as `tantivy`. A version-2 reader treats it as hdtc schema 1, preserves
-the writer release for diagnostics, and lets Tantivy decide whether it can open
-the segments. This is the only supported legacy manifest version.
+Earlier developmental manifests have the same version number but no `schema`
+or `tantivy_index_format` line and record the writer release as `tantivy`. A
+reader treats them as hdtc schema 1, preserves the writer release for
+diagnostics, and lets Tantivy decide whether it can open the segments.
+Developmental schema-1 indexes may also contain an additional
+`text_exact` field and a `whole_literal_keys` manifest value; current readers
+ignore both, so those indexes use the same two-phase query semantics.
 
 ### 4.2 Why the exclusions are counted
 
@@ -403,23 +370,17 @@ to read an older supported format without hdtc rejecting it first.
 
 ### 5.1 Schema
 
-Five fields, in this order:
+Four fields, in this order:
 
 | field | type | options |
 |---|---|---|
 | `text` | text | indexed, tokenizer `hdtc`, positions and frequencies, **not** stored |
 | `text_stemmed` | text | indexed, tokenizer `raw`, positions and frequencies, **not** stored |
-| `text_exact` | text | indexed, tokenizer `raw`, no frequencies or positions, **not** stored |
 | `object` | u64 | fast, **not** indexed, **not** stored |
 | `lang` | text | indexed raw (one token, no tokenization), **not** fast, **not** stored |
 
 `text` holds the literal's value (§3.1), `text_stemmed` its stemmed form (§3.6),
-`text_exact` its whole-literal key (§3.7), `object` its object dictionary ID
-(§2.2), `lang` its language value (§2.3).
-
-`text_exact` holds exactly one term per document, so it records neither
-frequency nor position: a query either is the whole literal or is not. It is
-absent for documents over the §3.7 cap.
+`object` its object dictionary ID (§2.2), and `lang` its language value (§2.3).
 
 `text_stemmed` is written as an **already-tokenized value**, and its declared
 tokenizer is `raw` because no chain ever runs over it. This is forced by the
@@ -468,13 +429,12 @@ Two properties a consumer may rely on:
   indexing they also have different duplication profiles. Merging results across
   datasets belongs to the client, by rank rather than by raw score.
 
-**Three classes, in order.** A query is run as three phases, and every hit from
+**Two classes, in order.** A query is run as two phases, and every hit from
 an earlier phase ranks above every hit from a later one, with duplicates
 attributed to the earliest:
 
-1. **whole-literal** — the literal *is* the query (`text_exact`, §3.7);
-2. **exact** — the query's tokens appear as written (`text`);
-3. **stemmed** — they appear only after stemming (`text_stemmed`, §3.6).
+1. **plain-token** — the query's tokens appear as written (`text`);
+2. **stemmed** — they appear only after stemming (`text_stemmed`, §3.6).
 
 This is a guarantee, not a tendency: BM25 scores from different fields are not
 comparable, so no set of boost factors could promise it. hdtc therefore treats
@@ -505,10 +465,8 @@ The query string is tokenized by §3.2. The tokens combine as:
 - **any** — any token may match; more matching tokens rank higher.
 - **phrase** — the tokens must be adjacent and in order.
 
-The whole-literal phase (§6) ignores the mode: a query either is the literal or
-is not, so there is nothing for `all`, `any` or `phrase` to vary, and fuzzy and
-prefix widening do not apply to it either. The remaining phases evaluate the
-mode against the plain field and then the stemmed one. In the stemmed phase a query token is reduced by *every* stemmer the index
+Both phases evaluate the mode, first against the plain field and then the
+stemmed one. In the stemmed phase a query token is reduced by *every* stemmer the index
 contains — the query carries no language of its own — and the resulting stems
 are unioned. Most stemmers leave a short word untouched, so this is typically one
 or two distinct terms. Under `all`, a token that no stemmer changes still has to
@@ -558,7 +516,7 @@ and no occurrences are collapsed by subject. A subject therefore appears once
 for each matching triple, preserving the same statement-oriented semantics as
 an ordinary pattern search.
 
-Ordering follows the whole-literal, exact, and stemmed class order of §6. Within
+Ordering follows the plain-token and stemmed class order of §6. Within
 a class it is by descending score, with ties broken by ascending object
 dictionary ID, then by the OPS order of a literal's occurrences. Every
 occurrence of one literal carries the same score. The tie-break is normative:

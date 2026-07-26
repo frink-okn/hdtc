@@ -3,13 +3,13 @@
 //! `docs/text-index-format.md` §5 is normative for the field names, types and
 //! options here. They are part of the published contract rather than an
 //! implementation detail: a consumer opening the index directory with its own
-//! Tantivy build reads documents through exactly these three fields.
+//! Tantivy build reads documents through exactly these four fields.
 
 use super::analyzer::{TOKENIZER_NAME, tokenizer};
 use tantivy::Index;
 use tantivy::schema::{FAST, IndexRecordOption, STRING, Schema, TextFieldIndexing, TextOptions};
 
-/// The hdtc field schema convention recorded in every version-2 manifest.
+/// The hdtc field schema convention recorded in every manifest.
 ///
 /// This is independent of the analyzer convention: changing field names,
 /// types, or indexing options increments this ID even when tokenization stays
@@ -20,8 +20,6 @@ pub const SCHEMA_ID: u32 = 1;
 pub const FIELD_TEXT: &str = "text";
 /// The same lexical form, stemmed for the literal's own language.
 pub const FIELD_TEXT_STEMMED: &str = "text_stemmed";
-/// The whole normalized literal as a single term, for short literals.
-pub const FIELD_TEXT_EXACT: &str = "text_exact";
 /// The HDT object dictionary ID this document stands for.
 pub const FIELD_OBJECT: &str = "object";
 /// The literal's normalized language tag, or `und` when it carries none.
@@ -29,7 +27,7 @@ pub const FIELD_LANG: &str = "lang";
 
 /// The schema every hdtc text index is built with.
 ///
-/// Five fields, and deliberately no stored text: the literal is already in the
+/// Four fields, and deliberately no stored text: the literal is already in the
 /// HDT dictionary, addressed by the `object` ID, so storing it again would
 /// duplicate the dataset's largest component to save one dictionary read.
 ///
@@ -59,11 +57,6 @@ pub fn text_schema() -> Schema {
             .set_index_option(IndexRecordOption::WithFreqsAndPositions),
     );
     builder.add_text_field(FIELD_TEXT_STEMMED, stemmed_options);
-    // One term per document and nothing else: a query either is the whole
-    // literal or is not, so there is no frequency to weigh and no position to
-    // record. `STRING` is raw-tokenized and index-option Basic, which is
-    // exactly that. Absent for literals over the length cap (§3.7).
-    builder.add_text_field(FIELD_TEXT_EXACT, STRING);
     // FAST, not STORED: retrieving a hit's object ID is a columnar read rather
     // than a document-store fetch.
     builder.add_u64_field(FIELD_OBJECT, FAST);
@@ -90,30 +83,13 @@ mod tests {
     use tantivy::schema::Type;
 
     #[test]
-    fn the_schema_has_exactly_the_five_published_fields() {
+    fn the_schema_has_exactly_the_four_published_fields() {
         let schema = text_schema();
         let fields: Vec<&str> = schema.fields().map(|(_, entry)| entry.name()).collect();
         assert_eq!(
             fields,
-            [
-                FIELD_TEXT,
-                FIELD_TEXT_STEMMED,
-                FIELD_TEXT_EXACT,
-                FIELD_OBJECT,
-                FIELD_LANG
-            ]
+            [FIELD_TEXT, FIELD_TEXT_STEMMED, FIELD_OBJECT, FIELD_LANG]
         );
-
-        // One term, no frequencies, no positions: a query either is the whole
-        // literal or is not.
-        let exact = schema.get_field_entry(schema.get_field(FIELD_TEXT_EXACT).unwrap());
-        let tantivy::schema::FieldType::Str(options) = exact.field_type() else {
-            panic!("whole-literal field is not a string field");
-        };
-        let indexing = options.get_indexing_options().unwrap();
-        assert_eq!(indexing.tokenizer(), "raw");
-        assert_eq!(indexing.index_option(), IndexRecordOption::Basic);
-        assert!(!exact.is_stored());
 
         let object = schema.get_field(FIELD_OBJECT).unwrap();
         let entry = schema.get_field_entry(object);

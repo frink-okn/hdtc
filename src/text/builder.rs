@@ -13,12 +13,12 @@
 
 use super::analyzer::{
     self, DatatypeExclusions, Exclusion, UNDETERMINED_LANGUAGE, collect_tokens, normalize_language,
-    parse_literal, stemmer_language, stemming_tokenizer, tokenizer, whole_literal_key,
+    parse_literal, stemmer_language, stemming_tokenizer,
 };
 use super::manifest::{LanguageCount, TextManifest, linked_tantivy_version};
 use super::schema::{
-    FIELD_LANG, FIELD_OBJECT, FIELD_TEXT, FIELD_TEXT_EXACT, FIELD_TEXT_STEMMED, SCHEMA_ID,
-    register_tokenizer, text_schema,
+    FIELD_LANG, FIELD_OBJECT, FIELD_TEXT, FIELD_TEXT_STEMMED, SCHEMA_ID, register_tokenizer,
+    text_schema,
 };
 use crate::hdt::artifacts::SourceIdentity;
 use crate::hdt::input_adapter::HdtInputAdapter;
@@ -93,11 +93,9 @@ pub fn create_text_index(config: &TextConfig) -> Result<TextSummary> {
     let schema = index.schema();
     let text_field = schema.get_field(FIELD_TEXT)?;
     let stemmed_field = schema.get_field(FIELD_TEXT_STEMMED)?;
-    let exact_field = schema.get_field(FIELD_TEXT_EXACT)?;
     let object_field = schema.get_field(FIELD_OBJECT)?;
     let lang_field = schema.get_field(FIELD_LANG)?;
     let mut stemmers = Stemmers::new(config.untagged_language.as_deref())?;
-    let mut plain = tokenizer();
 
     let (threads, budget) = writer_budget(config.memory_limit, config.threads);
     tracing::info!(
@@ -153,14 +151,6 @@ pub fn create_text_index(config: &TextConfig) -> Result<TextSummary> {
         let mut document = TantivyDocument::new();
         document.add_u64(object_field, object_id);
         document.add_text(lang_field, &language);
-        // The whole-literal key comes from the same plain tokens the `text`
-        // field is built from, so "which resource is named this" is asked in
-        // the terms the index actually holds.
-        let plain_tokens = collect_tokens(&mut plain, &value);
-        if let Some(key) = whole_literal_key(plain_tokens.iter().map(|token| token.text.as_str())) {
-            document.add_text(exact_field, &key);
-            counts.whole_literal_keys += 1;
-        }
         // A literal in a language with no Snowball algorithm — or under
         // `--untagged-language none` — is simply left out of the stemmed field.
         // It stays exactly searchable; only the extra recall is unavailable.
@@ -187,11 +177,9 @@ pub fn create_text_index(config: &TextConfig) -> Result<TextSummary> {
     }
 
     tracing::info!(
-        "Committing {} documents ({} literals scanned, {} short enough for whole-literal \
-         matching)",
+        "Committing {} documents ({} literals scanned)",
         counts.indexed_docs,
-        counts.literals_scanned,
-        counts.whole_literal_keys
+        counts.literals_scanned
     );
     writer.commit().context("Failed to commit the text index")?;
     merge_to_one_segment(&index, &mut writer)?;
@@ -216,7 +204,6 @@ pub fn create_text_index(config: &TextConfig) -> Result<TextSummary> {
         untagged_language: config.untagged_language.clone(),
         literals_scanned: counts.literals_scanned,
         indexed_docs: counts.indexed_docs,
-        whole_literal_keys: counts.whole_literal_keys,
         excluded_oversize: counts.excluded_oversize,
         excluded_datatype: counts.excluded_datatype,
         excluded_no_tokens: counts.excluded_no_tokens,
@@ -291,7 +278,6 @@ struct ScanCounts {
     excluded_oversize: u64,
     excluded_datatype: u64,
     excluded_no_tokens: u64,
-    whole_literal_keys: u64,
 }
 
 /// Merge every segment into one, so the published index is a compact artifact

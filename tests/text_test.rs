@@ -184,8 +184,8 @@ fn frozen_version_one_index_remains_queryable() {
     assert_eq!(manifest_value(&hdt, "hdtc-text"), "1");
     assert!(!manifest(&hdt).contains_key("schema"));
 
-    let whole = objects(&hdt, &["--text", "alice", "--no-index"]);
-    assert_eq!(whole, [r#""Alice""#, r#""Alice"@en"#]);
+    let plain = objects(&hdt, &["--text", "alice", "--no-index"]);
+    assert_eq!(plain, [r#""Alice""#, r#""Alice"@en"#]);
 
     let prefix = objects(&hdt, &["--text", "ali", "--prefix", "--no-index"]);
     assert!(prefix.contains(&r#""Alice""#.to_string()));
@@ -201,7 +201,7 @@ fn the_manifest_accounts_for_every_literal() {
     let temp = tempfile::tempdir().unwrap();
     let hdt = fixture(temp.path());
 
-    assert_eq!(manifest_value(&hdt, "hdtc-text"), "2");
+    assert_eq!(manifest_value(&hdt, "hdtc-text"), "1");
     assert_eq!(manifest_value(&hdt, "analyzer"), "1");
     assert_eq!(manifest_value(&hdt, "schema"), "1");
     assert_eq!(
@@ -234,11 +234,10 @@ fn the_manifest_accounts_for_every_literal() {
         "§4: the counts partition the scanned literals"
     );
 
-    // §3.7: whole-literal coverage is published, since a literal over the cap
-    // is findable but cannot be matched as a whole.
-    let whole: u64 = manifest_value(&hdt, "whole_literal_keys").parse().unwrap();
-    assert!(whole <= indexed);
-    assert_eq!(whole, indexed, "every fixture literal is short enough");
+    assert!(
+        !manifest(&hdt).contains_key("whole_literal_keys"),
+        "the text index has no whole-literal layer to account for"
+    );
 
     // §4: the language counts sum to the document count, and untagged literals
     // are counted under `und`.
@@ -930,7 +929,7 @@ fn an_index_from_another_convention_is_refused() {
         (original.replace("analyzer\t1", "analyzer\t9"), "analyzer 9"),
         (original.replace("schema\t1", "schema\t9"), "schema 9"),
         (
-            original.replace("hdtc-text\t2", "hdtc-text\t4"),
+            original.replace("hdtc-text\t1", "hdtc-text\t4"),
             "version 4",
         ),
     ] {

@@ -66,45 +66,6 @@ pub fn tokenizer() -> TextAnalyzer {
         .build()
 }
 
-/// Byte cap on a whole-literal key (§3.7).
-///
-/// Whole-literal matching answers "which resource is *named* this", so it only
-/// has to cover the strings that name things — labels, synonyms, identifiers.
-/// A definition is never typed out in full as a query, and indexing every one
-/// of them as a single term would grow the term dictionary by the size of the
-/// corpus text for no reachable benefit.
-///
-/// 256 rather than something tighter because the strings people *do* paste
-/// whole are sometimes long: systematic chemical names, full taxonomic labels.
-/// On Ubergraph, dropping to 96 bytes saves 60 MiB of a 677 MiB index and
-/// gives up exactly those. A literal over the cap is still findable — it just
-/// cannot be matched as a whole.
-pub const WHOLE_LITERAL_MAX_BYTES: usize = 256;
-
-/// The whole-literal key for a token sequence, or `None` when there is none.
-///
-/// The key is the plain tokens joined by single spaces, so it matches on the
-/// same terms the index is built from: `"BODY"`, `"body"` and `"Body."` share
-/// one key, and a query for `body` finds all three. Comparing raw lexical
-/// forms instead would make punctuation and case decide identity, which is
-/// exactly what tokenization exists to normalize away.
-///
-/// `None` for an empty token sequence, or one whose key exceeds
-/// [`WHOLE_LITERAL_MAX_BYTES`].
-pub fn whole_literal_key<'a>(tokens: impl IntoIterator<Item = &'a str>) -> Option<String> {
-    let mut key = String::new();
-    for token in tokens {
-        if !key.is_empty() {
-            key.push(' ');
-        }
-        key.push_str(token);
-        if key.len() > WHOLE_LITERAL_MAX_BYTES {
-            return None;
-        }
-    }
-    (!key.is_empty()).then_some(key)
-}
-
 /// The default language assumed for literals carrying no tag.
 ///
 /// Untagged literals are stemmed as if they were English unless a build says

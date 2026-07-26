@@ -7,12 +7,9 @@
 
 use super::analyzer::{
     TOKENIZER_NAME, UNDETERMINED_LANGUAGE, language_matches, stemmer_language, stemming_tokenizer,
-    whole_literal_key,
 };
 use super::manifest::TextManifest;
-use super::schema::{
-    FIELD_LANG, FIELD_OBJECT, FIELD_TEXT, FIELD_TEXT_EXACT, FIELD_TEXT_STEMMED, register_tokenizer,
-};
+use super::schema::{FIELD_LANG, FIELD_OBJECT, FIELD_TEXT, FIELD_TEXT_STEMMED, register_tokenizer};
 use anyhow::{Context, Result, ensure};
 use std::collections::HashSet;
 use std::path::Path;
@@ -50,9 +47,6 @@ pub struct TextQuery {
 /// How a hit matched, used to keep broader analysis below literal matches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum MatchKind {
-    /// The literal *is* the query: same tokens, in order, and nothing else.
-    /// Searching `body` and finding the resource named `"Body"`.
-    WholeLiteral,
     /// The query's tokens appear in the literal as written, among others.
     Exact,
     /// They appear only after stemming — `run` finding `running`.
@@ -74,8 +68,6 @@ pub struct TextHit {
 /// Which field a query phase targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Target {
-    /// The whole literal as one term — the query names the thing.
-    Whole,
     /// The literal as written — exact matching, and where fuzzy and prefix
     /// widening apply.
     Plain,
@@ -90,7 +82,6 @@ pub struct TextSearcher {
     manifest: TextManifest,
     text_field: Field,
     stemmed_field: Field,
-    exact_field: Field,
     lang_field: Field,
     /// One analyzer per stemming algorithm the index actually used, so a query
     /// token is stemmed the same way the documents were. Empty when the index
@@ -127,7 +118,6 @@ impl TextSearcher {
         let schema = index.schema();
         let text_field = schema.get_field(FIELD_TEXT)?;
         let stemmed_field = schema.get_field(FIELD_TEXT_STEMMED)?;
-        let exact_field = schema.get_field(FIELD_TEXT_EXACT)?;
         let lang_field = schema.get_field(FIELD_LANG)?;
         let stemmers = build_stemmers(&manifest);
         // Read through the fast-field column by name, so the schema is only
@@ -147,7 +137,6 @@ impl TextSearcher {
             manifest,
             text_field,
             stemmed_field,
-            exact_field,
             lang_field,
             stemmers,
         })
@@ -170,7 +159,7 @@ impl TextSearcher {
     /// Number of documents matching `query` in either form, without ranking.
     pub fn count(&self, query: &TextQuery) -> Result<usize> {
         let mut clauses = Vec::new();
-        for target in [Target::Whole, Target::Plain, Target::Stemmed] {
+        for target in [Target::Plain, Target::Stemmed] {
             if let Some(built) = self.build_query(query, target)? {
                 clauses.push((Occur::Should, built));
             }
@@ -203,7 +192,6 @@ impl TextSearcher {
         let mut seen: HashSet<u64> = HashSet::new();
 
         for (target, kind) in [
-            (Target::Whole, MatchKind::WholeLiteral),
             (Target::Plain, MatchKind::Exact),
             (Target::Stemmed, MatchKind::Stemmed),
         ] {
@@ -267,25 +255,6 @@ impl TextSearcher {
             return Ok(None);
         }
 
-        // The whole-literal phase is a single term lookup: either the query is
-        // this literal or it is not, so neither the match mode nor fuzzy and
-        // prefix widening have anything to vary. A query too long to have a
-        // key cannot name anything (§3.7).
-        if target == Target::Whole {
-            let Some(key) = whole_literal_key(tokens.iter().map(String::as_str)) else {
-                return Ok(None);
-            };
-            let term = Term::from_field_text(self.exact_field, &key);
-            let whole: Box<dyn Query> = Box::new(TermQuery::new(term, IndexRecordOption::Basic));
-            return Ok(Some(match self.language_query(&query.languages) {
-                Some(language_query) => Box::new(BooleanQuery::new(vec![
-                    (Occur::Must, whole),
-                    (Occur::Must, language_query),
-                ])),
-                None => whole,
-            }));
-        }
-
         let text_query: Box<dyn Query> = if query.mode == MatchMode::Phrase {
             match self.phrase_query(&tokens, target) {
                 Some(built) => built,
@@ -300,8 +269,7 @@ impl TextSearcher {
             let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::with_capacity(tokens.len());
             for (position, token) in tokens.iter().enumerate() {
                 match target {
-                    // The whole-literal phase returned above.
-                    Target::Whole | Target::Plain => {
+                    Target::Plain => {
                         clauses.push((occur, self.token_query(token, query, position == last)))
                     }
                     // A token has one stem per language the index holds, and
@@ -348,7 +316,7 @@ impl TextSearcher {
         };
 
         match target {
-            Target::Whole | Target::Plain => Some(phrase_of(
+            Target::Plain => Some(phrase_of(
                 tokens
                     .iter()
                     .map(|token| Term::from_field_text(self.text_field, token))

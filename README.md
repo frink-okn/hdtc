@@ -874,15 +874,6 @@ through the `.hdt.index.v1-1` index turns it into every `(subject, predicate)`
 that uses it. `hdtc text` therefore reads no triples — one pass over the object
 dictionary is the whole build.
 
-**A literal that *is* your query wins.** Searching `body` returns the resources
-*named* "body" before those that merely contain the word — including before a
-short literal that repeats it, which plain BM25 would otherwise rank first
-(`"Body structure (body structure)"` scores above `"body"` on term frequency
-alone). Results come in three classes, in order: whole-literal, then exact, then
-stemmed. Literals up to 256 bytes get a whole-literal key; longer ones stay
-findable but cannot be matched as a whole, and the manifest publishes how many
-are covered.
-
 **Stemming.** Every literal is indexed twice — as written, and stemmed for its
 language — so `run` finds `running`, and `process` finds `processes`. Exact
 matches always rank above stemmed ones, as a class, so widening recall never
@@ -918,11 +909,12 @@ the counts plus the exact datatype set are published in the index's manifest:
 $ cat data.hdt.text/hdtc-text.meta
 hdtc-text	1
 analyzer	1
-tantivy	0.26.1
+schema	1
+tantivy_writer	0.26.1
+tantivy_index_format	7
 untagged_language	en
 literals_scanned	12
 indexed_docs	9
-whole_literal_keys	9
 excluded_oversize	0
 excluded_datatype	2
 excluded_no_tokens	1

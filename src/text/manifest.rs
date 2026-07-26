@@ -22,10 +22,7 @@ use std::path::Path;
 pub const MANIFEST_FILE: &str = "hdtc-text.meta";
 
 /// Manifest schema version, bumped when a line's meaning changes.
-pub const MANIFEST_VERSION: u32 = 2;
-/// The original manifest, accepted for indexes published before compatibility
-/// metadata was separated from the Tantivy writer release.
-pub const LEGACY_MANIFEST_VERSION: u32 = 1;
+pub const MANIFEST_VERSION: u32 = 1;
 
 /// The compatibility metadata reported by the linked Tantivy release.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,7 +67,7 @@ pub struct TextManifest {
     /// Informational writer release. Tantivy's segment footer, not this string,
     /// decides whether the linked reader can open the bytes.
     pub tantivy_writer: String,
-    /// `None` only for a legacy version-1 manifest, which did not record it.
+    /// `None` only for a developmental manifest that did not record it.
     pub tantivy_index_format: Option<u32>,
     /// SHA-256 over the source HDT's dictionary-and-triples suffix, as
     /// `SourceIdentity` computes it for every dictionary-derived artifact.
@@ -85,10 +82,6 @@ pub struct TextManifest {
     pub literals_scanned: u64,
     /// Documents in the index — one per indexed distinct literal.
     pub indexed_docs: u64,
-    /// Documents short enough to carry a whole-literal key (§3.7). The rest are
-    /// findable but cannot be matched as a whole, so the count is published
-    /// rather than left to be inferred.
-    pub whole_literal_keys: u64,
     pub excluded_oversize: u64,
     pub excluded_datatype: u64,
     pub excluded_no_tokens: u64,
@@ -116,7 +109,6 @@ impl TextManifest {
         );
         let _ = writeln!(out, "literals_scanned\t{}", self.literals_scanned);
         let _ = writeln!(out, "indexed_docs\t{}", self.indexed_docs);
-        let _ = writeln!(out, "whole_literal_keys\t{}", self.whole_literal_keys);
         let _ = writeln!(out, "excluded_oversize\t{}", self.excluded_oversize);
         let _ = writeln!(out, "excluded_datatype\t{}", self.excluded_datatype);
         let _ = writeln!(out, "excluded_no_tokens\t{}", self.excluded_no_tokens);
@@ -141,7 +133,6 @@ impl TextManifest {
         let mut untagged_language = None;
         let mut literals_scanned = 0u64;
         let mut indexed_docs = 0u64;
-        let mut whole_literal_keys = 0u64;
         let mut excluded_oversize = 0u64;
         let mut excluded_datatype = 0u64;
         let mut excluded_no_tokens = 0u64;
@@ -178,7 +169,6 @@ impl TextManifest {
                 }
                 "literals_scanned" => literals_scanned = number_value(value)?,
                 "indexed_docs" => indexed_docs = number_value(value)?,
-                "whole_literal_keys" => whole_literal_keys = number_value(value)?,
                 "excluded_oversize" => excluded_oversize = number_value(value)?,
                 "excluded_datatype" => excluded_datatype = number_value(value)?,
                 "excluded_no_tokens" => excluded_no_tokens = number_value(value)?,
@@ -201,11 +191,10 @@ impl TextManifest {
         let version =
             version.context("Not an hdtc text index: no hdtc-text line in the manifest")?;
         ensure!(
-            version == u64::from(LEGACY_MANIFEST_VERSION) || version == u64::from(MANIFEST_VERSION),
-            "Unsupported text index manifest version {version} (this build reads versions \
-             {LEGACY_MANIFEST_VERSION} and {MANIFEST_VERSION})"
+            version == u64::from(MANIFEST_VERSION),
+            "Unsupported text index manifest version {version} (this build reads version \
+             {MANIFEST_VERSION})"
         );
-        let legacy = version == u64::from(LEGACY_MANIFEST_VERSION);
         let analyzer_id = analyzer_id.context("Text index manifest declares no analyzer")?;
         let analyzer_id = u32::try_from(analyzer_id).unwrap_or(u32::MAX);
         ensure!(
@@ -215,24 +204,18 @@ impl TextManifest {
         );
         let schema_id = match schema_id {
             Some(schema_id) => u32::try_from(schema_id).unwrap_or(u32::MAX),
-            None if legacy => SCHEMA_ID,
-            None => bail!("Text index manifest declares no hdtc schema"),
+            None => SCHEMA_ID,
         };
         ensure!(
             schema_id == SCHEMA_ID,
             "Text index uses hdtc schema {schema_id}, which this build cannot query (it \
              implements schema {SCHEMA_ID})"
         );
-        let tantivy_writer = if legacy {
-            legacy_writer.context("Legacy text index manifest declares no Tantivy version")?
-        } else {
-            tantivy_writer.context("Text index manifest declares no Tantivy writer")?
-        };
-        let tantivy_index_format = match tantivy_index_format {
-            Some(index_format) => Some(u32::try_from(index_format).unwrap_or(u32::MAX)),
-            None if legacy => None,
-            None => bail!("Text index manifest declares no Tantivy index format"),
-        };
+        let tantivy_writer = tantivy_writer
+            .or(legacy_writer)
+            .context("Text index manifest declares no Tantivy writer")?;
+        let tantivy_index_format = tantivy_index_format
+            .map(|index_format| u32::try_from(index_format).unwrap_or(u32::MAX));
         languages.sort_by(|a, b| a.tag.cmp(&b.tag));
 
         Ok(Self {
@@ -245,7 +228,6 @@ impl TextManifest {
             untagged_language,
             literals_scanned,
             indexed_docs,
-            whole_literal_keys,
             excluded_oversize,
             excluded_datatype,
             excluded_no_tokens,
@@ -317,7 +299,6 @@ mod tests {
             untagged_language: Some("en".to_string()),
             literals_scanned: 120,
             indexed_docs: 100,
-            whole_literal_keys: 95,
             excluded_oversize: 3,
             excluded_datatype: 15,
             excluded_no_tokens: 2,
@@ -349,7 +330,7 @@ mod tests {
     fn manifest_round_trips_through_its_text_form() {
         let manifest = sample();
         let text = manifest.to_text();
-        assert!(text.starts_with("hdtc-text\t2\n"));
+        assert!(text.starts_with("hdtc-text\t1\n"));
         assert!(text.contains("schema\t1\n"));
         assert!(text.contains("tantivy_writer\t"));
         assert!(text.contains("tantivy_index_format\t"));
@@ -359,13 +340,12 @@ mod tests {
     }
 
     #[test]
-    fn legacy_version_one_manifest_is_still_readable() {
+    fn developmental_manifest_shape_is_still_readable() {
         let current = sample();
         let format = current.tantivy_index_format.unwrap();
         let legacy = current
             .to_text()
-            .replace("hdtc-text\t2", "hdtc-text\t1")
-            .replace("schema\t1\n", "")
+            .replace(&format!("schema\t{SCHEMA_ID}\n"), "")
             .replace(
                 &format!("tantivy_writer\t{}\n", current.tantivy_writer),
                 &format!("tantivy\t{}\n", current.tantivy_writer),
@@ -407,7 +387,9 @@ mod tests {
                 .contains("analyzer 7")
         );
 
-        let bad_schema = sample().to_text().replace("schema\t1", "schema\t7");
+        let bad_schema = sample()
+            .to_text()
+            .replace(&format!("schema\t{SCHEMA_ID}"), "schema\t7");
         assert!(
             TextManifest::parse(&bad_schema)
                 .unwrap_err()
@@ -415,7 +397,7 @@ mod tests {
                 .contains("schema 7")
         );
 
-        let bad_version = sample().to_text().replace("hdtc-text\t2", "hdtc-text\t9");
+        let bad_version = sample().to_text().replace("hdtc-text\t1", "hdtc-text\t9");
         assert!(
             TextManifest::parse(&bad_version)
                 .unwrap_err()

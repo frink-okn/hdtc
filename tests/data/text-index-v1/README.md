@@ -6,7 +6,7 @@ version-1 manifest. `legacy.hdt` is the exact source HDT named by its manifest.
 
 This fixture must not be regenerated during ordinary test maintenance. It is a
 compatibility artifact: every supported Tantivy upgrade must still open it and
-return the expected whole-literal, prefix, and stemmed results. Add a new frozen
+return the expected plain-token, prefix, and stemmed results. Add a new frozen
 fixture when a new hdtc schema is published.
 
 Tantivy's empty lock files are deliberately omitted. The integration test copies
