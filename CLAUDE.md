@@ -15,6 +15,7 @@ Converts input RDF files (any standard format) to HDT binary format, optimized f
 - **Triples**: BitmapTriples encoding in SPO order
 - **Index**: Standard `.hdt.index.v1-1` (OPS order), implemented after core HDT generation is solid
 - **Quads**: HDTQ approach (ESWC 2018) - standard BitmapTriples + graph dictionary + compressed graph membership bitmaps
+- **Text search**: Tantivy (exact version pin) over the distinct literals of the object dictionary; hdtc specifies the convention, not the segment bytes (`docs/text-index-format.md` §1.1). Text is indexed three ways — plain, stemmed per the literal's language, and (for short literals) as a single whole-literal key — so results rank in classes: whole-literal, exact, stemmed
 - **Single-Pass Pipeline**: QLever-inspired architecture — per-batch hash maps assign local IDs during a single parse, partial vocabularies are k-way merged to build the global dictionary, local IDs are remapped to global IDs in parallel. No second parse needed.
 - **Compressed Input**: Transparently handle .gz, .bz2, .xz, .zst based on file extension
 - **Error Handling**: Skip malformed RDF with warning, report total skipped count at end
@@ -82,6 +83,7 @@ src/
   dictionary/      - Dictionary construction, PFC encoding
   triples/         - BitmapTriples encoding (streaming)
   hdt/             - HDT serialization, reading, querying, statistics, sketches, and key sets
+  text/            - Full-text index over literals (analyzer, build, manifest, query)
   index/           - HDT index file generation (.hdt.index.v1-1)
   io/              - VByte, LogArray, Bitmap, CRC utilities, Control Information
   pipeline/        - 6-stage pipeline (batch vocab, partial vocab, merger, ID remapper)
@@ -92,11 +94,13 @@ tests/
   compat_test.rs      - Compatibility tests against the hdt crate
   sketch_test.rs      - Sketch envelope, role, filter, and edge-case tests
   keyset_test.rs      - Key-set envelope, role, encoding, and edge-case tests
+  text_test.rs        - Text index build, manifest, ranking, and query-filter tests
   data/               - Sample RDF fixtures
 docs/
   graphs-sidecar-format.md - Normative .graphs sidecar format
   sketch-format.md         - Normative .filter / .minhash formats
   keyset-format.md         - Normative .keys format
+  text-index-format.md     - Normative .text index convention
 ```
 
 ### Dictionary-derived sidecar artifacts
@@ -123,6 +127,25 @@ hypergraph over the whole key set, so it holds the role's keys resident and
 enforces a key ceiling. That is inherent to filter construction, not to the
 shared convention.
 
+### The text index
+
+`hdtc text` also derives from one dictionary pass, but stands apart from the
+three above. Its documents are the **distinct literals** of the object section,
+identified by object dictionary ID, and it shares neither the term-to-key
+convention (it indexes literals, which `iri_hash` rejects) nor the byte-level
+specification discipline: the segment files are Tantivy's under an exact version
+pin, and `docs/text-index-format.md` specifies the convention around them — the
+schema, the analyzer, the exclusion rules, and the `hdtc-text.meta` manifest.
+§1.1 of that document states why, and what it costs. The index stores no subject
+and no predicate; `hdtc search --text` resolves each ranked literal through the
+`? ? O` path of the HDT-FoQ index.
+
+Untagged literals are stemmed as a declared default language (`en` unless
+`--untagged-language` says otherwise) rather than left unstemmed. RDF tagging is
+inconsistent *within* a merged graph — Ubergraph has untagged UBERON labels and
+`@en` GO labels — so the cautious-looking rule would make recall depend on a
+term's source ontology. The assumption is recorded in every manifest.
+
 ## Published formats
 
 `docs/` holds normative wire-format specifications for the artifacts hdtc emits
@@ -148,6 +171,7 @@ emitted bytes must update the spec and its frozen conformance vectors together.
 | `bitflags` | Type-safe role flags |
 | `xxhash-rust` | XXH64 term hashing for sketches |
 | `xorf` | Binary fuse membership filters (exact version pin — defines `.filter` bytes) |
+| `tantivy` | Full-text index (exact version pin — defines `.text` segment bytes) |
 | `indicatif` | Progress bars and status reporting |
 | `flate2` | Gzip decompression |
 | `bzip2` | Bzip2 decompression |

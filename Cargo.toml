@@ -32,6 +32,13 @@ xxhash-rust = { version = "0.8", features = ["xxh64"] }
 # Exact pin: see docs/sketch-format.md §5.5. Safe to move; `cargo test` says what
 # to do if the emitted bytes change.
 xorf = { version = "=0.12.0", default-features = false, features = ["binary-fuse"] }
+# Exact pin: see docs/text-index-format.md §1.1. Unlike the other artifacts, a
+# text index's bytes are the dependency's own segment format, so the version is
+# part of the published contract and is recorded in every index manifest —
+# `tantivy_version()` reads it back out of the crate, so this pin cannot drift
+# from what indexes are labelled with. Moving it makes every existing index
+# refuse to open rather than fail obscurely; `cargo test` says so.
+tantivy = "=0.26.1"
 
 [dev-dependencies]
 hdt = "0.4"

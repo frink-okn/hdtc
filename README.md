@@ -91,6 +91,12 @@ hdtc sketch [OPTIONS] <HDT_FILE>
 hdtc keyset [OPTIONS] <HDT_FILE>
 ```
 
+### `hdtc text` — Build a full-text index over the literals
+
+```
+hdtc text [OPTIONS] <HDT_FILE>
+```
+
 ### `hdtc header` — Dump or modify the embedded header triples
 
 ```
@@ -446,7 +452,8 @@ Named-graph options (`-m quads`, `--graph-map`, `--default-graph`,
 | Option                | Default                     | Description                                                              |
 | --------------------- | --------------------------- | ------------------------------------------------------------------------ |
 | `<HDT_FILE>`          | _(required)_                | Path to existing HDT file                                                |
-| `--query PATTERN`     | _(required)_                | Three-position triple or four-position quad pattern                      |
+| `--query PATTERN`     | _(one of)_                  | Three-position triple or four-position quad pattern                      |
+| `--text TEXT`         | _(one of)_                  | Ranked full-text search over the index built by `hdtc text`              |
 | `-o, --output PATH`   | stdout                      | Write results to file instead of stdout                                  |
 | `--count`             | off                         | Print only the count of matching triples                                 |
 | `--limit N`           | unlimited                   | Stop after N results (ignored when combined with `--count`)              |
@@ -454,9 +461,33 @@ Named-graph options (`-m quads`, `--graph-map`, `--default-graph`,
 | `--index PATH`        | `<HDT_FILE>.hdt.index.v1-1` | Index file path (used for `? P ?`, `? ? O`, and `? P O` queries)         |
 | `--no-index`          | off                         | Disable index use; fall back to sequential scan for all patterns         |
 | `--temp-dir DIR`      | system temp                 | Directory for wildcard-graph membership sorting                          |
+| `--text-match MODE`   | `all`                       | `--text` only: how query tokens combine (`all`, `any`, `phrase`)         |
+| `--fuzzy N`           | `0`                         | `--text` only: maximum edit distance per token (0-2)                     |
+| `--prefix`            | off                         | `--text` only: match the final query token as a prefix                   |
+| `--lang LANG,...`     | all                         | `--text` only: BCP 47 ranges; untagged literals stay eligible            |
+| `--predicate IRI`     | all                         | `--text` only: keep only matches occurring on this predicate             |
+| `--no-dedupe`         | off                         | `--text` only: emit every occurrence instead of one row per subject      |
+| `--scores`            | off                         | `--text` only: prefix each row with its relevance score                  |
+| `--text-index DIR`    | `<HDT_FILE>.text`           | `--text` only: text index directory                                      |
 | `-m, --memory-limit SIZE` | `4G`                    | Memory limit for dictionary caches and membership sorting                |
 | `-v, --verbose`       | —                           | Increase log verbosity (`-v` debug, `-vv` trace)                         |
 | `-q, --quiet`         | —                           | Suppress all output except errors                                        |
+
+### Text: All options
+
+| Option                    | Default           | Description                                                        |
+| ------------------------- | ----------------- | ------------------------------------------------------------------ |
+| `<HDT_FILE>`              | _(required)_      | Path to existing HDT file                                          |
+| `-o, --output DIR`        | `<HDT_FILE>.text` | Output index directory                                             |
+| `--max-literal-bytes N`   | `4096`            | Skip literals whose lexical form is longer than this               |
+| `--exclude-datatype IRI`  | —                 | Skip this datatype in addition to the defaults (repeatable)        |
+| `--index-all-datatypes`   | off               | Index every datatype, dropping the default value-space exclusions  |
+| `--untagged-language LANG`| `en`              | Language to stem untagged literals as, or `none` to leave them unstemmed |
+| `--threads N`             | auto              | Number of indexing threads                                         |
+| `-m, --memory-limit SIZE` | `4G`              | Soft memory limit for the indexing arena (e.g. `4G`, `2000M`)      |
+| `--benchmark`             | off               | Emit total indexing timing                                         |
+| `-v, --verbose`           | —                 | Increase log verbosity (`-v` debug, `-vv` trace)                   |
+| `-q, --quiet`             | —                 | Suppress all output except errors                                  |
 
 ### Validate: All options
 
@@ -799,6 +830,121 @@ untrusted files, and the frozen conformance vectors.
 | `--benchmark`             | off                                   | Emit total keyset timing                                                                             |
 | `-v, --verbose`           | —                                     | Increase log verbosity (`-v` debug, `-vv` trace)                                                     |
 | `-q, --quiet`             | —                                     | Suppress all output except errors                                                                    |
+
+### Full-text search over literals
+
+`hdtc text` builds a full-text index over an HDT's literals, and
+`hdtc search --text` queries it. It answers the question a triple pattern cannot:
+*which resources are named or described by a string like this?*
+
+```sh
+hdtc text data.hdt
+hdtc search data.hdt --text "atrazine degradation" --limit 20
+```
+
+The index lands in `data.hdt.text/` beside the HDT.
+
+**Every literal is indexed.** There is no list of "label predicates" to
+configure, and deliberately so: a predicate nobody thought to configure produces
+resources that a search cannot find, and nothing in the result says so. Across
+many independently published datasets, such a configuration is a guess that is
+wrong somewhere and undiagnosable everywhere.
+
+What that configuration was approximating comes free from ranking. BM25
+normalizes by document length, so a one-word `rdfs:label` outranks a
+two-hundred-word `rdfs:comment` for the same query term, with nothing declared
+anywhere:
+
+```console
+$ hdtc search data.hdt --text atrazine --scores
+1.1420  <…/chebi/38769>  <…rdf-schema#label>    "atrazine"@en                    .
+0.9889  <…/gene/2>       <…rdf-schema#label>    "Atrazine chlorohydrolase"@en    .
+0.8719  <…/gene/1>       <…rdf-schema#label>    "atrazine degradation pathway"@en .
+```
+
+Results are entity-level: one row per subject, represented by its highest-ranked
+matching literal. `--no-dedupe` restores the occurrence view.
+
+**The unit of indexing is the distinct literal**, identified by its object
+dictionary ID, so the index scales with distinct strings rather than with
+triples — in annotation-heavy graphs, repeated type labels and boilerplate
+definitions make that difference large. It also means the index stores **no
+subject and no predicate at all**: a hit is an HDT ID, and the `? ? O` path
+through the `.hdt.index.v1-1` index turns it into every `(subject, predicate)`
+that uses it. `hdtc text` therefore reads no triples — one pass over the object
+dictionary is the whole build.
+
+**A literal that *is* your query wins.** Searching `body` returns the resources
+*named* "body" before those that merely contain the word — including before a
+short literal that repeats it, which plain BM25 would otherwise rank first
+(`"Body structure (body structure)"` scores above `"body"` on term frequency
+alone). Results come in three classes, in order: whole-literal, then exact, then
+stemmed. Literals up to 256 bytes get a whole-literal key; longer ones stay
+findable but cannot be matched as a whole, and the manifest publishes how many
+are covered.
+
+**Stemming.** Every literal is indexed twice — as written, and stemmed for its
+language — so `run` finds `running`, and `process` finds `processes`. Exact
+matches always rank above stemmed ones, as a class, so widening recall never
+displaces a literal hit. Untagged literals are stemmed as English by default
+(`--untagged-language`), because tagging is inconsistent across source
+ontologies within a single merged graph: in Ubergraph, `rdfs:label` is untagged
+on UBERON terms and `@en` on GO terms, and leaving untagged text unstemmed would
+make search quality depend on which ontology a term came from. Stemming covers
+the 18 languages Snowball implements; others stay exactly searchable.
+
+Query options beyond plain token matching:
+
+```sh
+hdtc search data.hdt --text "atrazine" --predicate http://www.w3.org/2000/01/rdf-schema#label
+hdtc search data.hdt --text "atrazine" --lang en          # untagged literals stay eligible
+hdtc search data.hdt --text "atrasine" --fuzzy 1          # typo tolerance
+hdtc search data.hdt --text "atraz" --prefix              # typeahead
+hdtc search data.hdt --text "atrazine degradation" --text-match phrase
+```
+
+`--lang` filters by BCP 47 basic filtering (`en` selects `en-GB`), and untagged
+literals are always eligible: an untagged string asserts no language, and in
+practice is often language-neutral by nature — a chemical name, a gene symbol,
+an accession — which is exactly what a cross-language client is looking for.
+
+**What is left out, and how you know.** Three kinds of literal are skipped:
+values above `--max-literal-bytes` (default 4 KiB), values whose datatype has an
+ordered value space (`xsd:integer`, `xsd:date` and friends — text search over
+them is noise), and values with no alphanumeric character. Each is *counted*, and
+the counts plus the exact datatype set are published in the index's manifest:
+
+```console
+$ cat data.hdt.text/hdtc-text.meta
+hdtc-text	1
+analyzer	3
+tantivy	0.26.1
+untagged_language	en
+literals_scanned	12
+indexed_docs	9
+whole_literal_keys	9
+excluded_oversize	0
+excluded_datatype	2
+excluded_no_tokens	1
+language	de	2
+language	en	5
+language	und	2
+```
+
+An index that silently omits some fraction of a dataset's literals makes every
+search over it quietly wrong about coverage. Publishing the counts turns an
+invisible gap into a readable one.
+
+**One caveat worth stating plainly.** Unlike the sketches and key sets, the
+published bytes here are [Tantivy](https://github.com/quickwit-oss/tantivy)'s,
+not hdtc's. hdtc pins an exact Tantivy release and specifies the *convention*
+around the index — the schema, the analyzer, the exclusion rules, the manifest —
+rather than the byte layout, so in practice a text index is readable only by a
+program linking the same release. The alternative was a hand-written term
+dictionary and scorer that still could not do bounded-cost fuzzy matching. See
+[HDT text index format, version 1](docs/text-index-format.md) §1.1 for the full
+trade and the migration path.
+
 
 ## Architecture
 

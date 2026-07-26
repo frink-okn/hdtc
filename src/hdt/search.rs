@@ -15,14 +15,15 @@
 //! - `?PO`  — predicate + object bound, auto-routes via selectivity
 
 use crate::hdt::index_reader::{
-    ObjectGroupStats, bitmap_index_z_group_stats, open_index, open_index_section,
-    read_index_z_range, read_predicate_count,
+    IndexSectionOffsets, ObjectGroupStats, bitmap_index_z_group_stats, bitmap_index_z_groups,
+    open_index, open_index_section, read_index_z_range, read_predicate_count,
 };
 use crate::hdt::reader::{
     BitmapTriplesScanner, DictionaryResolver, HdtSectionOffsets, open_hdt, write_triple_tab,
 };
 use crate::io::{StreamingBitmapDecoder, StreamingLogArrayDecoder};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::Seek;
 use std::io::{BufReader, SeekFrom, Write};
@@ -396,7 +397,7 @@ fn push_codepoint(buf: &mut Vec<u8>, codepoint: u32) -> Result<()> {
 // Index path resolution
 // ---------------------------------------------------------------------------
 
-fn resolve_index_path(hdt_path: &Path, explicit: Option<&Path>) -> PathBuf {
+pub(crate) fn resolve_index_path(hdt_path: &Path, explicit: Option<&Path>) -> PathBuf {
     if let Some(p) = explicit {
         p.to_path_buf()
     } else {
@@ -658,12 +659,93 @@ fn search_object_bound(
     let idx = open_index(index_path)
         .with_context(|| format!("Failed to read index file {}", index_path.display()))?;
 
+    let mut count = 0u64;
+    let mut remaining_offset = offset.unwrap_or(0);
+    let mut s_buf = Vec::new();
+    let mut p_buf = Vec::new();
+    let mut o_buf = Vec::new();
+    let mut prev_s = 0u64;
+    let mut o_resolved = false;
+
+    scan_object_occurrences(
+        hdt_path,
+        index_path,
+        &idx,
+        obj_id,
+        subject_filter,
+        pred_filter,
+        offsets,
+        memory_limit,
+        precomputed_group,
+        &mut |subject, pred| {
+            if remaining_offset > 0 {
+                remaining_offset -= 1;
+                return Ok(Visit::Continue);
+            }
+
+            count += 1;
+            if !count_only {
+                if !o_resolved {
+                    dictionary
+                        .object_term(obj_id, &mut o_buf)
+                        .with_context(|| format!("Failed to resolve object ID {obj_id}"))?;
+                    o_resolved = true;
+                }
+                if subject != prev_s {
+                    dictionary
+                        .subject_term(subject, &mut s_buf)
+                        .with_context(|| format!("Failed to resolve subject ID {subject}"))?;
+                    prev_s = subject;
+                }
+                dictionary
+                    .predicate_term(pred, &mut p_buf)
+                    .with_context(|| format!("Failed to resolve predicate ID {pred}"))?;
+                write_triple_tab(writer, &s_buf, &p_buf, &o_buf)?;
+            }
+
+            if limit.is_some_and(|lim| count >= lim) {
+                return Ok(Visit::Stop);
+            }
+            Ok(Visit::Continue)
+        },
+    )?;
+
+    Ok(count)
+}
+
+/// Whether an occurrence visitor wants the scan to carry on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Visit {
+    Continue,
+    Stop,
+}
+
+/// Enumerate the `(subject, predicate)` pairs of one object group in OPS order,
+/// calling `visit` for each.
+///
+/// This is the shared core of the `??O` pattern search and of text search's hit
+/// resolution: both need every occurrence of one object, and the coordinated
+/// scan below — with its decoder resets across predicate boundaries — is
+/// delicate enough that a second copy of it would be a second set of bugs.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn scan_object_occurrences(
+    hdt_path: &Path,
+    index_path: &Path,
+    idx: &IndexSectionOffsets,
+    obj_id: u64,
+    subject_filter: Option<u64>,
+    pred_filter: Option<u64>,
+    offsets: &HdtSectionOffsets,
+    memory_limit: usize,
+    precomputed_group: Option<ObjectGroupStats>,
+    visit: &mut dyn FnMut(u64, u64) -> Result<Visit>,
+) -> Result<()> {
     // Step 1–2: Find object group boundaries in bitmapIndexZ.
     let group = match precomputed_group {
         Some(g) => g,
         None => match bitmap_index_z_group_stats(index_path, idx.bitmap_index_z_start, obj_id)? {
             Some(g) => g,
-            None => return Ok(0), // object group doesn't exist
+            None => return Ok(()), // object group doesn't exist
         },
     };
 
@@ -677,33 +759,37 @@ fn search_object_bound(
         Ok(BufReader::with_capacity(256 * 1024, f))
     };
 
+    // Step 4: Coordinated streaming scan over indexZ entries.
+    // indexZ is OPS-ordered within each object group, so pos_y can decrease
+    // when the predicate changes, and the forward-only decoders must then be
+    // reset and rescanned from the beginning.
+    //
+    // A group small enough to hold resident avoids that entirely by sorting
+    // its positions first — see `scan_object_group_sorted`. Only groups above
+    // the memory budget take the chunked path below, where each reset costs a
+    // rescan of BitmapY from the start: for a group with K predicate
+    // sub-groups that is O(K × n_sp / 8) bytes.
+    let entries_per_chunk = (memory_limit / std::mem::size_of::<u64>()).clamp(4096, 262_144) as u64;
+    if group.size <= entries_per_chunk {
+        return scan_object_group_sorted(
+            &open_at,
+            index_path,
+            idx,
+            group,
+            subject_filter,
+            pred_filter,
+            offsets,
+            visit,
+        );
+    }
+
     let mut bitmap_y = StreamingBitmapDecoder::new(open_at(offsets.by_start)?)
         .context("Failed to open BitmapY decoder")?;
     let mut array_y = StreamingLogArrayDecoder::new(open_at(offsets.ay_start)?)
         .context("Failed to open ArrayY decoder")?;
 
-    // Step 4: Coordinated streaming scan over indexZ entries.
-    // indexZ is OPS-ordered within each object group, so pos_y can decrease
-    // when predicate changes. We process in chunks and reset the forward scan
-    // only when necessary, keeping memory bounded by chunk size.
-    //
-    // PERF: Each reset rescans BitmapY from the start up to the new pos_y.
-    // For a group with K predicate sub-groups, there are K-1 resets; worst-case
-    // work is O(K × n_sp / 8) bytes. The alternative — load all pos_y values,
-    // sort them, do one forward scan — uses O(group_size) memory, which violates
-    // the streaming budget for large groups. For typical data the predicate
-    // sub-groups are large enough that resets are rare.
-    let entries_per_chunk = (memory_limit / std::mem::size_of::<u64>()).clamp(4096, 262_144) as u64;
-
     let mut by_pos = 0u64;
     let mut subject = 1u64;
-    let mut count = 0u64;
-    let mut remaining_offset = offset.unwrap_or(0);
-    let mut s_buf = Vec::new();
-    let mut p_buf = Vec::new();
-    let mut o_buf = Vec::new();
-    let mut prev_s = 0u64;
-    let mut o_resolved = false;
     let mut read_offset = 0u64;
 
     'scan: while read_offset < group.size {
@@ -771,39 +857,7 @@ fn search_object_bound(
                 continue;
             }
 
-            // Handle offset
-            if remaining_offset > 0 {
-                remaining_offset -= 1;
-                if by_bit {
-                    subject += 1;
-                }
-                continue;
-            }
-
-            // Emit triple
-            count += 1;
-            if !count_only {
-                if !o_resolved {
-                    dictionary
-                        .object_term(obj_id, &mut o_buf)
-                        .with_context(|| format!("Failed to resolve object ID {obj_id}"))?;
-                    o_resolved = true;
-                }
-                if subject != prev_s {
-                    dictionary
-                        .subject_term(subject, &mut s_buf)
-                        .with_context(|| format!("Failed to resolve subject ID {subject}"))?;
-                    prev_s = subject;
-                }
-                dictionary
-                    .predicate_term(pred, &mut p_buf)
-                    .with_context(|| format!("Failed to resolve predicate ID {pred}"))?;
-                write_triple_tab(writer, &s_buf, &p_buf, &o_buf)?;
-            }
-
-            if let Some(lim) = limit
-                && count >= lim
-            {
+            if visit(subject, pred)? == Visit::Stop {
                 break 'scan;
             }
 
@@ -813,7 +867,215 @@ fn search_object_bound(
         }
     }
 
-    Ok(count)
+    Ok(())
+}
+
+/// Resolve one object group in a single forward pass, for groups that fit the
+/// memory budget.
+///
+/// The chunked path above rescans BitmapY from the beginning every time
+/// `pos_y` moves backwards, which the OPS ordering of `indexZ` makes it do at
+/// every predicate boundary. That is affordable when a group has a few large
+/// predicate sub-groups; it is ruinous when it has many tiny ones — which is
+/// exactly the shape of a *literal* object, and text search resolves nothing
+/// else. On Ubergraph the difference is 0.15 s per occurrence versus one scan
+/// for the whole group.
+///
+/// Positions are sorted, but a permutation is sorted rather than the entries
+/// themselves, so results are still handed to `visit` in the group's original
+/// OPS order. Callers of `? ? O` see the same rows in the same order as before.
+#[allow(clippy::too_many_arguments)]
+fn scan_object_group_sorted(
+    open_at: &dyn Fn(u64) -> Result<BufReader<File>>,
+    index_path: &Path,
+    idx: &IndexSectionOffsets,
+    group: ObjectGroupStats,
+    subject_filter: Option<u64>,
+    pred_filter: Option<u64>,
+    offsets: &HdtSectionOffsets,
+    visit: &mut dyn FnMut(u64, u64) -> Result<Visit>,
+) -> Result<()> {
+    let entries = read_index_z_range(index_path, idx.index_z_start, group.start, group.size)?;
+    if entries.is_empty() {
+        return Ok(());
+    }
+
+    let mut order: Vec<u32> = (0..entries.len() as u32).collect();
+    order.sort_unstable_by_key(|&position| entries[position as usize]);
+
+    let mut bitmap_y = StreamingBitmapDecoder::new(open_at(offsets.by_start)?)
+        .context("Failed to open BitmapY decoder")?;
+    let mut array_y = StreamingLogArrayDecoder::new(open_at(offsets.ay_start)?)
+        .context("Failed to open ArrayY decoder")?;
+
+    let mut resolved = vec![(0u64, 0u64); entries.len()];
+    let mut by_pos = 0u64;
+    let mut subject = 1u64;
+    let mut previous: Option<u64> = None;
+
+    for &position in &order {
+        let target_pos_y = entries[position as usize];
+        // Each pos_y is one (subject, predicate) pair, and a pair cannot hold
+        // the same object twice, so positions within a group are distinct. A
+        // repeat would mean the forward scan has already consumed that bit and
+        // would silently resolve the *next* entry instead.
+        ensure!(
+            previous.is_none_or(|seen| seen < target_pos_y),
+            "Object group for the query holds a repeated indexZ position ({target_pos_y})"
+        );
+        previous = Some(target_pos_y);
+
+        while by_pos < target_pos_y {
+            let by_bit = bitmap_y.next_bit()?.with_context(|| {
+                format!("BitmapY ended early advancing to pos_y {target_pos_y} (at {by_pos})")
+            })?;
+            array_y.next_entry()?.with_context(|| {
+                format!("ArrayY ended early advancing to pos_y {target_pos_y} (at {by_pos})")
+            })?;
+            if by_bit {
+                subject += 1;
+            }
+            by_pos += 1;
+        }
+
+        let pred = array_y
+            .next_entry()?
+            .with_context(|| format!("ArrayY ended early at target pos_y {target_pos_y}"))?;
+        let by_bit = bitmap_y
+            .next_bit()?
+            .with_context(|| format!("BitmapY ended early at target pos_y {target_pos_y}"))?;
+        by_pos += 1;
+
+        resolved[position as usize] = (subject, pred);
+        if by_bit {
+            subject += 1;
+        }
+    }
+
+    for (subject, pred) in resolved {
+        if subject_filter.is_some_and(|target| subject != target) {
+            continue;
+        }
+        if pred_filter.is_some_and(|target| pred != target) {
+            continue;
+        }
+        if visit(subject, pred)? == Visit::Stop {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Resolve every occurrence of a whole page of objects in one forward pass.
+///
+/// Resolving objects one at a time costs two scans each — one over
+/// bitmapIndexZ to locate the group, one over BitmapY to reach its positions —
+/// and both start from the beginning of a structure sized by the dataset, not
+/// by the answer. A ranked text page asks about tens of objects at once, so the
+/// scans are shared: one pass locates every group, and one pass resolves every
+/// position. Cost stops scaling with the page size.
+///
+/// Objects whose group is larger than the memory budget are left out of the
+/// returned map; the caller resolves those individually, where the chunked
+/// path's bounded memory matters more than the extra scan.
+///
+/// Each object's pairs come back in the group's OPS order, as
+/// [`scan_object_occurrences`] would have produced them.
+pub(crate) fn resolve_object_page(
+    hdt_path: &Path,
+    index_path: &Path,
+    idx: &IndexSectionOffsets,
+    object_ids: &[u64],
+    offsets: &HdtSectionOffsets,
+    memory_limit: usize,
+) -> Result<HashMap<u64, Vec<(u64, u64)>>> {
+    let mut resolved: HashMap<u64, Vec<(u64, u64)>> = HashMap::new();
+    if object_ids.is_empty() {
+        return Ok(resolved);
+    }
+
+    let mut sorted: Vec<u64> = object_ids.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let groups = bitmap_index_z_groups(index_path, idx.bitmap_index_z_start, &sorted)?;
+
+    // (pos_y, which object, which entry within that object's group)
+    let entries_per_chunk = (memory_limit / std::mem::size_of::<u64>()).clamp(4096, 262_144) as u64;
+    let mut targets: Vec<(u64, u32, u32)> = Vec::new();
+    let mut objects: Vec<u64> = Vec::new();
+    for (object_id, group) in sorted.iter().zip(groups) {
+        let Some(group) = group else { continue };
+        if group.size > entries_per_chunk {
+            continue; // too large to hold resident; caller falls back
+        }
+        let positions = read_index_z_range(index_path, idx.index_z_start, group.start, group.size)?;
+        let slot = objects.len() as u32;
+        objects.push(*object_id);
+        resolved.insert(*object_id, vec![(0, 0); positions.len()]);
+        for (entry, pos_y) in positions.into_iter().enumerate() {
+            targets.push((pos_y, slot, entry as u32));
+        }
+    }
+    if targets.is_empty() {
+        return Ok(resolved);
+    }
+    targets.sort_unstable_by_key(|(pos_y, _, _)| *pos_y);
+
+    let open_at = |section_offset: u64| -> Result<BufReader<File>> {
+        let mut f = File::open(hdt_path)
+            .with_context(|| format!("Failed to open {}", hdt_path.display()))?;
+        f.seek(SeekFrom::Start(section_offset))?;
+        Ok(BufReader::with_capacity(256 * 1024, f))
+    };
+    let mut bitmap_y = StreamingBitmapDecoder::new(open_at(offsets.by_start)?)
+        .context("Failed to open BitmapY decoder")?;
+    let mut array_y = StreamingLogArrayDecoder::new(open_at(offsets.ay_start)?)
+        .context("Failed to open ArrayY decoder")?;
+
+    let mut by_pos = 0u64;
+    let mut subject = 1u64;
+    let mut previous: Option<u64> = None;
+    // Two objects can share a pos_y only if one (subject, predicate) pair holds
+    // both objects, which is exactly what happens for distinct objects — so
+    // unlike within a single group, repeats here are legitimate and the
+    // already-decoded values are reused.
+    let mut last_decoded: Option<(u64, u64)> = None;
+
+    for (pos_y, slot, entry) in targets {
+        if previous != Some(pos_y) {
+            while by_pos < pos_y {
+                let by_bit = bitmap_y.next_bit()?.with_context(|| {
+                    format!("BitmapY ended early advancing to pos_y {pos_y} (at {by_pos})")
+                })?;
+                array_y.next_entry()?.with_context(|| {
+                    format!("ArrayY ended early advancing to pos_y {pos_y} (at {by_pos})")
+                })?;
+                if by_bit {
+                    subject += 1;
+                }
+                by_pos += 1;
+            }
+            let pred = array_y
+                .next_entry()?
+                .with_context(|| format!("ArrayY ended early at target pos_y {pos_y}"))?;
+            let by_bit = bitmap_y
+                .next_bit()?
+                .with_context(|| format!("BitmapY ended early at target pos_y {pos_y}"))?;
+            by_pos += 1;
+            last_decoded = Some((subject, pred));
+            if by_bit {
+                subject += 1;
+            }
+            previous = Some(pos_y);
+        }
+        let pair = last_decoded.expect("a pos_y is decoded before it is used");
+        let object_id = objects[slot as usize];
+        if let Some(pairs) = resolved.get_mut(&object_id) {
+            pairs[entry as usize] = pair;
+        }
+    }
+
+    Ok(resolved)
 }
 
 // ---------------------------------------------------------------------------

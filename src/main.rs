@@ -7,6 +7,7 @@ mod pipeline;
 mod quads;
 mod rdf;
 mod sort;
+mod text;
 mod triples;
 
 use anyhow::{Context, Result};
@@ -181,6 +182,7 @@ fn main() -> Result<()> {
         cli::Commands::Void(args) => compute_void(args, benchmark),
         cli::Commands::Sketch(args) => create_sketches(args, benchmark),
         cli::Commands::Keyset(args) => create_keysets(args, benchmark),
+        cli::Commands::Text(args) => create_text_index(args, benchmark),
         cli::Commands::Header(args) => run_header(args, benchmark),
     }
 }
@@ -545,20 +547,30 @@ fn search_hdt(args: cli::SearchArgs, benchmark: bool) -> Result<()> {
     }
 
     tracing::info!("Searching HDT: {}", args.hdt_file.display());
-    tracing::info!("Query: {}", args.query);
-
     let start = std::time::Instant::now();
     let memory_limit = args.memory_limit.as_bytes();
-    let query = hdt::parse_search_query(&args.query)
-        .with_context(|| format!("Invalid query: {:?}", args.query))?;
-    let is_quad_query = matches!(query, hdt::SearchQuery::Quad(_));
     let limit = if args.count { None } else { args.limit };
     let offset = if args.count { None } else { args.offset };
+
+    // `--text` and `--query` are one required, mutually exclusive group, so a
+    // text query means there is no pattern to parse.
+    if let Some(text) = &args.text {
+        return search_text(&args, text, limit, offset, memory_limit, start, benchmark);
+    }
+    let pattern = args
+        .query
+        .as_deref()
+        .expect("clap requires --query when --text is absent");
+    tracing::info!("Query: {pattern}");
+
+    let query =
+        hdt::parse_search_query(pattern).with_context(|| format!("Invalid query: {pattern:?}"))?;
+    let is_quad_query = matches!(query, hdt::SearchQuery::Quad(_));
 
     let count = match query {
         hdt::SearchQuery::Triple(_) => hdt::search_hdt_streaming(
             &args.hdt_file,
-            &args.query,
+            pattern,
             args.output.as_deref(),
             args.count,
             limit,
@@ -593,6 +605,120 @@ fn search_hdt(args: cli::SearchArgs, benchmark: bool) -> Result<()> {
         } else {
             "triple(s)"
         }
+    );
+    Ok(())
+}
+
+/// Ranked full-text search over the index built by `hdtc text`.
+#[allow(clippy::too_many_arguments)]
+fn search_text(
+    args: &cli::SearchArgs,
+    text: &str,
+    limit: Option<u64>,
+    offset: Option<u64>,
+    memory_limit: usize,
+    start: std::time::Instant,
+    benchmark: bool,
+) -> Result<()> {
+    tracing::info!("Text query: {text:?}");
+    let mode = match args.text_match.unwrap_or(cli::TextMatchMode::All) {
+        cli::TextMatchMode::All => text::MatchMode::All,
+        cli::TextMatchMode::Any => text::MatchMode::Any,
+        cli::TextMatchMode::Phrase => text::MatchMode::Phrase,
+    };
+    let languages: Vec<String> = args
+        .lang
+        .iter()
+        .map(|range| text::normalize_language(range.as_bytes()))
+        .collect();
+
+    let count = hdt::search_text_streaming(&hdt::TextSearchOptions {
+        hdt_path: &args.hdt_file,
+        text_index: args.text_index.as_deref(),
+        query: text,
+        mode,
+        fuzzy: args.fuzzy.unwrap_or(0),
+        prefix: args.prefix,
+        languages: &languages,
+        predicate: args.predicate.as_deref(),
+        dedupe: !args.no_dedupe,
+        scores: args.scores,
+        output: args.output.as_deref(),
+        count_only: args.count,
+        limit,
+        offset,
+        memory_limit,
+        index_path: args.index.as_deref(),
+        no_index: args.no_index,
+    })?;
+
+    if benchmark {
+        tracing::info!(
+            "Benchmark summary (search --text): total {:.3}s",
+            start.elapsed().as_secs_f64()
+        );
+    }
+    tracing::info!(
+        "Done! {count} matching {}",
+        if args.no_dedupe {
+            "occurrence(s)"
+        } else {
+            "subject(s)"
+        }
+    );
+    Ok(())
+}
+
+/// Build a full-text index over an HDT's literals.
+fn create_text_index(args: cli::TextArgs, benchmark: bool) -> Result<()> {
+    if !args.hdt_file.is_file() {
+        anyhow::bail!("HDT file not found: {}", args.hdt_file.display());
+    }
+
+    let output_dir = args
+        .output
+        .unwrap_or_else(|| text::default_text_index_path(&args.hdt_file));
+    let exclusions = if args.index_all_datatypes {
+        text::DatatypeExclusions::default()
+    } else {
+        text::DatatypeExclusions::with_defaults(&args.exclude_datatype)
+    };
+
+    tracing::info!("Building text index: {}", args.hdt_file.display());
+    tracing::info!("Output directory: {}", output_dir.display());
+    tracing::info!("Maximum literal size: {} bytes", args.max_literal_bytes);
+    tracing::info!("Excluded datatypes: {}", exclusions.iris().len());
+    tracing::info!("Untagged literals stemmed as: {}", args.untagged_language);
+
+    let start = std::time::Instant::now();
+    let summary = text::create_text_index(&text::TextConfig {
+        hdt_path: args.hdt_file.clone(),
+        output_dir,
+        max_literal_bytes: args.max_literal_bytes,
+        exclusions,
+        untagged_language: (args.untagged_language != "none").then_some(args.untagged_language),
+        memory_limit: args.memory_limit.as_bytes(),
+        threads: args.threads,
+    })?;
+
+    if benchmark {
+        tracing::info!(
+            "Benchmark summary (text): total {:.3}s",
+            start.elapsed().as_secs_f64()
+        );
+    }
+    let manifest = &summary.manifest;
+    tracing::info!(
+        "Done! {} literal(s) indexed of {} scanned ({} bytes); excluded {} \
+         (oversize {}, datatype {}, no tokens {}); {} language(s)",
+        manifest.indexed_docs,
+        manifest.literals_scanned,
+        summary.index_bytes,
+        manifest.excluded_total(),
+        manifest.excluded_oversize,
+        manifest.excluded_datatype,
+        manifest.excluded_no_tokens,
+        manifest.languages.len()
     );
     Ok(())
 }

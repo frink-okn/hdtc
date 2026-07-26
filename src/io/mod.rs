@@ -1,4 +1,5 @@
 pub(crate) mod bitmap;
+pub(crate) mod bitpack;
 pub(crate) mod control;
 pub(crate) mod crc_utils;
 pub(crate) mod log_array;
@@ -6,6 +7,7 @@ pub(crate) mod vbyte;
 
 #[allow(unused_imports)]
 pub use bitmap::{BitmapReader, BitmapWriter, StreamingBitmapDecoder, StreamingBitmapEncoder};
+pub use bitpack::BitPacker;
 pub use control::{ControlInfo, ControlType};
 #[allow(unused_imports)]
 pub use log_array::{

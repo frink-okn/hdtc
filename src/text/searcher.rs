@@ -1,0 +1,516 @@
+//! Querying a published text index.
+//!
+//! A search returns ranked **object dictionary IDs** and nothing else — the
+//! index holds no subject and no predicate (doc 19 §19.2.2). Turning those IDs
+//! into (subject, predicate, literal) rows is the caller's job, done through
+//! HDT itself; see [`crate::hdt::search`].
+
+use super::analyzer::{
+    TOKENIZER_NAME, UNDETERMINED_LANGUAGE, language_matches, stemmer_language, stemming_tokenizer,
+    whole_literal_key,
+};
+use super::manifest::TextManifest;
+use super::schema::{
+    FIELD_LANG, FIELD_OBJECT, FIELD_TEXT, FIELD_TEXT_EXACT, FIELD_TEXT_STEMMED, register_tokenizer,
+};
+use anyhow::{Context, Result, ensure};
+use std::collections::HashSet;
+use std::path::Path;
+use tantivy::collector::{Count, TopDocs};
+use tantivy::query::{BooleanQuery, FuzzyTermQuery, Occur, PhraseQuery, Query, TermQuery};
+use tantivy::schema::{Field, IndexRecordOption};
+use tantivy::tokenizer::{Language, TextAnalyzer, TokenStream};
+use tantivy::{Index, IndexReader, Term};
+
+/// How the tokens of a query must combine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MatchMode {
+    /// Every token must be present — the entity-resolution default.
+    #[default]
+    All,
+    /// Any token may match; more matching tokens rank higher.
+    Any,
+    /// The tokens must appear adjacently and in order.
+    Phrase,
+}
+
+/// One query against a text index.
+#[derive(Debug, Clone, Default)]
+pub struct TextQuery {
+    pub text: String,
+    pub mode: MatchMode,
+    /// Maximum Levenshtein distance per token; 0 disables fuzzy matching.
+    pub fuzzy: u8,
+    /// Treat the final token as a prefix, for typeahead-style lookup.
+    pub prefix: bool,
+    /// BCP 47 language ranges to restrict to; empty means no restriction.
+    pub languages: Vec<String>,
+}
+
+/// How a hit matched — the CLI half of doc 03 §3.4.5's `match_kind`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MatchKind {
+    /// The literal *is* the query: same tokens, in order, and nothing else.
+    /// Searching `body` and finding the resource named `"Body"`.
+    WholeLiteral,
+    /// The query's tokens appear in the literal as written, among others.
+    Exact,
+    /// They appear only after stemming — `run` finding `running`.
+    Stemmed,
+}
+
+/// One ranked literal.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TextHit {
+    /// HDT object dictionary ID — the document's identity.
+    pub object_id: u64,
+    /// BM25-derived score. Comparable within one index and **not** across
+    /// indexes, which have different collection statistics (doc 03 §3.4.5).
+    /// Comparable *within* a [`MatchKind`], not across two of them.
+    pub score: f32,
+    pub kind: MatchKind,
+}
+
+/// Which field a query phase targets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Target {
+    /// The whole literal as one term — the query names the thing.
+    Whole,
+    /// The literal as written — exact matching, and where fuzzy and prefix
+    /// widening apply.
+    Plain,
+    /// The stemmed form, for the extra recall stemming buys.
+    Stemmed,
+}
+
+/// An opened text index, ready to answer queries.
+pub struct TextSearcher {
+    reader: IndexReader,
+    analyzer: TextAnalyzer,
+    manifest: TextManifest,
+    text_field: Field,
+    stemmed_field: Field,
+    exact_field: Field,
+    lang_field: Field,
+    /// One analyzer per stemming algorithm the index actually used, so a query
+    /// token is stemmed the same way the documents were. Empty when the index
+    /// stems nothing, which skips the stemmed phase entirely.
+    stemmers: Vec<TextAnalyzer>,
+}
+
+impl TextSearcher {
+    /// Open the index published at `dir`.
+    ///
+    /// The manifest is read first: it is what says this index is hdtc's, which
+    /// analyzer its terms follow, and which Tantivy wrote its segments. All
+    /// three have to hold before the segment files are worth opening.
+    pub fn open(dir: &Path) -> Result<Self> {
+        ensure!(
+            dir.is_dir(),
+            "Text index not found: {} (run `hdtc text` to build one)",
+            dir.display()
+        );
+        let manifest = TextManifest::read(dir)?;
+        let index = Index::open_in_dir(dir)
+            .with_context(|| format!("Failed to open text index {}", dir.display()))?;
+        register_tokenizer(&index);
+
+        let schema = index.schema();
+        let text_field = schema.get_field(FIELD_TEXT)?;
+        let stemmed_field = schema.get_field(FIELD_TEXT_STEMMED)?;
+        let exact_field = schema.get_field(FIELD_TEXT_EXACT)?;
+        let lang_field = schema.get_field(FIELD_LANG)?;
+        let stemmers = build_stemmers(&manifest);
+        // Read through the fast-field column by name, so the schema is only
+        // consulted for the two fields queries are built against.
+        schema.get_field(FIELD_OBJECT)?;
+        let analyzer = index
+            .tokenizers()
+            .get(TOKENIZER_NAME)
+            .context("hdtc tokenizer was not registered")?;
+        let reader = index
+            .reader()
+            .with_context(|| format!("Failed to open text index reader {}", dir.display()))?;
+
+        Ok(Self {
+            reader,
+            analyzer,
+            manifest,
+            text_field,
+            stemmed_field,
+            exact_field,
+            lang_field,
+            stemmers,
+        })
+    }
+
+    /// Analyze a query string into tokens, using the index's own chain.
+    ///
+    /// Build and query go through the same [`TextAnalyzer`], which is what
+    /// keeps a query token comparable with an indexed one.
+    pub fn analyze(&self, text: &str) -> Vec<String> {
+        let mut analyzer = self.analyzer.clone();
+        let mut stream = analyzer.token_stream(text);
+        let mut tokens = Vec::new();
+        while stream.advance() {
+            tokens.push(stream.token().text.clone());
+        }
+        tokens
+    }
+
+    /// Number of documents matching `query` in either form, without ranking.
+    pub fn count(&self, query: &TextQuery) -> Result<usize> {
+        let mut clauses = Vec::new();
+        for target in [Target::Whole, Target::Plain, Target::Stemmed] {
+            if let Some(built) = self.build_query(query, target)? {
+                clauses.push((Occur::Should, built));
+            }
+        }
+        if clauses.is_empty() {
+            return Ok(0);
+        }
+        let searcher = self.reader.searcher();
+        // A document matching both forms is one document; the union query
+        // counts it once, which is what a `--count` has to report.
+        Ok(searcher.search(&BooleanQuery::new(clauses), &Count)?)
+    }
+
+    /// The `top_k` highest-scoring literals, best first.
+    ///
+    /// Exact matches come first as a class, then stemmed-only ones — the
+    /// ordering doc 03 §3.4.5 asks for when it makes `match_kind` a class
+    /// rather than a score component. Running the two as separate phases makes
+    /// that a guarantee rather than something a boost factor usually achieves:
+    /// BM25 scores from two fields are not comparable, so no single weighting
+    /// could promise an exact hit outranks a stemmed one.
+    ///
+    /// Within a class, ties are broken by ascending object ID, so two runs of
+    /// the same query over the same index return the same page in the same
+    /// order.
+    pub fn search(&self, query: &TextQuery, top_k: usize) -> Result<Vec<TextHit>> {
+        if top_k == 0 {
+            return Ok(Vec::new());
+        }
+        let mut hits: Vec<TextHit> = Vec::new();
+        let mut seen: HashSet<u64> = HashSet::new();
+
+        for (target, kind) in [
+            (Target::Whole, MatchKind::WholeLiteral),
+            (Target::Plain, MatchKind::Exact),
+            (Target::Stemmed, MatchKind::Stemmed),
+        ] {
+            if hits.len() >= top_k {
+                break;
+            }
+            let Some(built) = self.build_query(query, target)? else {
+                continue;
+            };
+            for mut hit in self.run(&built, top_k, kind)? {
+                // A stemmed hit for a document already found exactly is the
+                // same document; the exact classification is the truthful one.
+                if seen.insert(hit.object_id) {
+                    hit.kind = kind;
+                    hits.push(hit);
+                }
+            }
+        }
+        hits.truncate(top_k);
+        Ok(hits)
+    }
+
+    /// Collect one phase's hits, ordered by score then object ID.
+    fn run(&self, query: &dyn Query, top_k: usize, kind: MatchKind) -> Result<Vec<TextHit>> {
+        let searcher = self.reader.searcher();
+        let collected = searcher.search(query, &TopDocs::with_limit(top_k).order_by_score())?;
+
+        let mut hits = Vec::with_capacity(collected.len());
+        for (score, address) in collected {
+            let segment = searcher.segment_reader(address.segment_ord);
+            let object_id = segment
+                .fast_fields()
+                .u64(FIELD_OBJECT)
+                .context("Text index has no object ID column")?
+                .first(address.doc_id)
+                .context("Text index document carries no object ID")?;
+            hits.push(TextHit {
+                object_id,
+                score,
+                kind,
+            });
+        }
+        hits.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.object_id.cmp(&b.object_id))
+        });
+        Ok(hits)
+    }
+
+    /// Assemble one phase's query, or `None` when that phase cannot match —
+    /// a query with no tokens, or a stemmed phase over an index that stems
+    /// nothing.
+    fn build_query(&self, query: &TextQuery, target: Target) -> Result<Option<Box<dyn Query>>> {
+        let tokens = self.analyze(&query.text);
+        if tokens.is_empty() {
+            return Ok(None);
+        }
+        if target == Target::Stemmed && self.stemmers.is_empty() {
+            return Ok(None);
+        }
+
+        // The whole-literal phase is a single term lookup: either the query is
+        // this literal or it is not, so neither the match mode nor fuzzy and
+        // prefix widening have anything to vary. A query too long to have a
+        // key cannot name anything (§3.7).
+        if target == Target::Whole {
+            let Some(key) = whole_literal_key(tokens.iter().map(String::as_str)) else {
+                return Ok(None);
+            };
+            let term = Term::from_field_text(self.exact_field, &key);
+            let whole: Box<dyn Query> = Box::new(TermQuery::new(term, IndexRecordOption::Basic));
+            return Ok(Some(match self.language_query(&query.languages) {
+                Some(language_query) => Box::new(BooleanQuery::new(vec![
+                    (Occur::Must, whole),
+                    (Occur::Must, language_query),
+                ])),
+                None => whole,
+            }));
+        }
+
+        let text_query: Box<dyn Query> = if query.mode == MatchMode::Phrase {
+            match self.phrase_query(&tokens, target) {
+                Some(built) => built,
+                None => return Ok(None),
+            }
+        } else {
+            let occur = match query.mode {
+                MatchMode::Any => Occur::Should,
+                _ => Occur::Must,
+            };
+            let last = tokens.len() - 1;
+            let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::with_capacity(tokens.len());
+            for (position, token) in tokens.iter().enumerate() {
+                match target {
+                    // The whole-literal phase returned above.
+                    Target::Whole | Target::Plain => {
+                        clauses.push((occur, self.token_query(token, query, position == last)))
+                    }
+                    // A token has one stem per language the index holds, and
+                    // any of them may be the one that matches.
+                    Target::Stemmed => match self.stem_query(token) {
+                        Some(built) => clauses.push((occur, built)),
+                        // Under `all`, a token with no stem cannot be required
+                        // of the stemmed field, so the phase is dropped rather
+                        // than silently weakened to the remaining tokens.
+                        None if query.mode != MatchMode::Any => return Ok(None),
+                        None => {}
+                    },
+                }
+            }
+            if clauses.is_empty() {
+                return Ok(None);
+            }
+            Box::new(BooleanQuery::new(clauses))
+        };
+
+        let Some(language_query) = self.language_query(&query.languages) else {
+            return Ok(Some(text_query));
+        };
+        Ok(Some(Box::new(BooleanQuery::new(vec![
+            (Occur::Must, text_query),
+            (Occur::Must, language_query),
+        ]))))
+    }
+
+    /// A phrase query needs at least two tokens; one token is just a term.
+    ///
+    /// The stemmed field keeps each token's original position, so a phrase
+    /// works there too — but one stemmer at a time, since a phrase needs a
+    /// single term per position. The per-language phrases are unioned.
+    fn phrase_query(&self, tokens: &[String], target: Target) -> Option<Box<dyn Query>> {
+        let phrase_of = |terms: Vec<Term>| -> Box<dyn Query> {
+            if terms.len() < 2 {
+                return Box::new(TermQuery::new(
+                    terms.into_iter().next().expect("tokens is non-empty"),
+                    IndexRecordOption::WithFreqs,
+                ));
+            }
+            Box::new(PhraseQuery::new(terms))
+        };
+
+        match target {
+            Target::Whole | Target::Plain => Some(phrase_of(
+                tokens
+                    .iter()
+                    .map(|token| Term::from_field_text(self.text_field, token))
+                    .collect(),
+            )),
+            Target::Stemmed => {
+                let clauses: Vec<(Occur, Box<dyn Query>)> = self
+                    .stemmers
+                    .iter()
+                    .map(|analyzer| {
+                        let terms = tokens
+                            .iter()
+                            .map(|token| {
+                                Term::from_field_text(
+                                    self.stemmed_field,
+                                    &stem_with(&mut analyzer.clone(), token),
+                                )
+                            })
+                            .collect();
+                        (Occur::Should, phrase_of(terms))
+                    })
+                    .collect();
+                (!clauses.is_empty())
+                    .then(|| Box::new(BooleanQuery::new(clauses)) as Box<dyn Query>)
+            }
+        }
+    }
+
+    /// One token against the stemmed field: a union over the stem each of the
+    /// index's languages produces for it.
+    ///
+    /// Most stemmers leave a short word alone, so this is usually one or two
+    /// distinct terms. It is also where a cross-language coincidence can enter
+    /// — German *Gift* and English *gift* share a stem — which is contained by
+    /// the stemmed phase ranking below every exact hit.
+    fn stem_query(&self, token: &str) -> Option<Box<dyn Query>> {
+        let mut stems: Vec<String> = self
+            .stemmers
+            .iter()
+            .map(|analyzer| stem_with(&mut analyzer.clone(), token))
+            .collect();
+        stems.sort();
+        stems.dedup();
+        if stems.is_empty() {
+            return None;
+        }
+        let clauses: Vec<(Occur, Box<dyn Query>)> = stems
+            .into_iter()
+            .map(|stem| {
+                let term = Term::from_field_text(self.stemmed_field, &stem);
+                let query: Box<dyn Query> =
+                    Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs));
+                (Occur::Should, query)
+            })
+            .collect();
+        Some(Box::new(BooleanQuery::new(clauses)))
+    }
+
+    fn token_query(&self, token: &str, query: &TextQuery, is_last: bool) -> Box<dyn Query> {
+        let term = Term::from_field_text(self.text_field, token);
+        let widened = query.fuzzy > 0 || (query.prefix && is_last);
+        if !widened {
+            return Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs));
+        }
+
+        // Automaton queries — fuzzy and prefix alike — score every matching
+        // document the same, so on their own they rank by nothing. Union the
+        // widened query with the exact term query, which does carry BM25: an
+        // exact match then outranks an approximate one, and exact matches keep
+        // their usual short-literal-first ordering among themselves.
+        let widened: Box<dyn Query> = if query.prefix && is_last {
+            // Transpositions count as one edit: the common typo is two adjacent
+            // letters swapped, and charging it two edits puts it out of reach
+            // at distance 1.
+            Box::new(FuzzyTermQuery::new_prefix(term.clone(), query.fuzzy, true))
+        } else {
+            Box::new(FuzzyTermQuery::new(term.clone(), query.fuzzy, true))
+        };
+        Box::new(BooleanQuery::new(vec![
+            (
+                Occur::Should,
+                Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs)) as Box<dyn Query>,
+            ),
+            (Occur::Should, widened),
+        ]))
+    }
+
+    /// A disjunction over the indexed language tags the requested ranges match.
+    ///
+    /// Untagged literals are always included. Doc 19 §19.4.2 ranks an untagged
+    /// literal *above* a wrong-language one, on the grounds that `@de`
+    /// positively asserts a language the client did not ask for while an
+    /// untagged literal asserts nothing and is often language-neutral by nature
+    /// — a chemical name, a gene symbol, an accession. Excluding those from a
+    /// language-filtered search would hide exactly the strings a cross-language
+    /// client most wants.
+    ///
+    /// That inclusion is unconditional, and deliberately so. Suppressing
+    /// untagged documents when no requested range names an indexed tag would
+    /// make an untagged literal's visibility depend on whether some *unrelated*
+    /// language happens to be in the index — `--lang de` and `--lang fr` would
+    /// answer differently about a chemical formula that is neither.
+    fn language_query(&self, ranges: &[String]) -> Option<Box<dyn Query>> {
+        if ranges.is_empty() {
+            return None;
+        }
+        let mut tags: Vec<&str> = self
+            .manifest
+            .languages
+            .iter()
+            .map(|language| language.tag.as_str())
+            .filter(|tag| {
+                *tag == UNDETERMINED_LANGUAGE
+                    || ranges.iter().any(|range| language_matches(range, tag))
+            })
+            .collect();
+        tags.sort_unstable();
+
+        let clauses: Vec<(Occur, Box<dyn Query>)> = tags
+            .into_iter()
+            .map(|tag| {
+                let term = Term::from_field_text(self.lang_field, tag);
+                let query: Box<dyn Query> =
+                    Box::new(TermQuery::new(term, IndexRecordOption::Basic));
+                (Occur::Should, query)
+            })
+            .collect();
+        Some(Box::new(BooleanQuery::new(clauses)))
+    }
+}
+
+/// The stemming analyzers an index's documents were built with, derived from
+/// the languages its manifest records.
+///
+/// A query carries no language of its own, so it is stemmed by every algorithm
+/// present in the index and the results unioned. The alternative — asking the
+/// user which language they are typing — would be a worse trade: the set is
+/// small, and most stemmers leave a short word untouched.
+fn build_stemmers(manifest: &TextManifest) -> Vec<TextAnalyzer> {
+    let mut languages: Vec<Language> = manifest
+        .languages
+        .iter()
+        .filter_map(|language| {
+            if language.tag == UNDETERMINED_LANGUAGE {
+                // Untagged documents were stemmed as whatever the build
+                // assumed, which the manifest records precisely so that a
+                // query can reproduce it rather than guess.
+                manifest
+                    .untagged_language
+                    .as_deref()
+                    .and_then(stemmer_language)
+            } else {
+                stemmer_language(&language.tag)
+            }
+        })
+        .collect();
+    languages.sort_by_key(|language| format!("{language:?}"));
+    languages.dedup();
+    languages.into_iter().map(stemming_tokenizer).collect()
+}
+
+/// Reduce one already-analyzed token to its stem.
+///
+/// Run through the full chain rather than the bare stemmer, so a query token
+/// takes exactly the path an indexed token took.
+fn stem_with(analyzer: &mut TextAnalyzer, token: &str) -> String {
+    let mut stream = analyzer.token_stream(token);
+    if stream.advance() {
+        stream.token().text.clone()
+    } else {
+        token.to_string()
+    }
+}
