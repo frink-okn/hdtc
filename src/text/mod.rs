@@ -2,9 +2,10 @@
 //!
 //! `hdtc text` builds an index whose documents are the **distinct literals** of
 //! an HDT's object dictionary, identified by their object dictionary ID, and
-//! `hdtc search --text` queries it. `docs/text-index-format.md` is the normative
-//! description of what gets published; doc 19 of the KGF design docs is where
-//! the design comes from.
+//! `hdtc search --text` queries it. `docs/text-index-format.md` is the
+//! self-contained, normative description of what gets published and how hdtc
+//! queries it. Downstream applications may compose those results into their own
+//! entity-oriented APIs without changing this artifact.
 //!
 //! Two properties shape everything here:
 //!

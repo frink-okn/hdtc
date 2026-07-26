@@ -34,8 +34,7 @@ pub const FIELD_LANG: &str = "lang";
 /// first, and stemming only ever adds results below it.
 pub fn text_schema() -> Schema {
     let mut builder = Schema::builder();
-    // Positions cost space but are what phrase queries need, and a phrase is
-    // how a client asks for the `exact` match kind of doc 03 §3.4.5.
+    // Positions cost space but are what phrase queries need.
     let text_options = TextOptions::default().set_indexing_options(
         TextFieldIndexing::default()
             .set_tokenizer(TOKENIZER_NAME)

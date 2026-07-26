@@ -3,11 +3,10 @@
 //!
 //! `docs/text-index-format.md` §4 is normative for this file. It carries the
 //! three things a consumer cannot get from the segment files: which HDT the
-//! index was built from, which analyzer convention its terms follow, and — the
-//! honesty requirement of doc 19 §19.2.4 — exactly what was left out and how
-//! much of it there was. An index that silently omits 3% of literals makes a
-//! search quietly wrong about coverage, so the omissions are counted and
-//! published rather than inferred.
+//! index was built from, which analyzer convention its terms follow, and exactly
+//! what was left out and how much of it there was. An index that silently omits
+//! 3% of literals makes a search quietly wrong about coverage, so the omissions
+//! are counted and published rather than inferred.
 //!
 //! The encoding is tab-separated lines rather than JSON so that the file stays
 //! greppable and diffable, and so that reading it needs no serialization

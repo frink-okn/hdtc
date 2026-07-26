@@ -6,21 +6,23 @@ artifact contains and what a consumer may rely on. Where this document and the
 hdtc implementation disagree, this document is the specification and the
 implementation is in error — with the one large exception §1.1 sets out.
 
-The design comes from the KGF design docs, doc 19 ("Literals: text search and
-label resolution"). Where this document restates a rationale from there it is
-for the reader's benefit; doc 19 governs the *design*, this document governs the
-*artifact*.
+This document is self-contained. KGF is a prospective consumer of the index,
+but its API and storage designs are exploratory and do not govern hdtc's
+artifact or query semantics. A downstream service may add entity grouping,
+preferred-label selection, predicate roles or a different HDT access path
+without changing the text index described here.
 
 ## 0. Purpose
 
-Given an HDT file, answer "which resources are named, described or otherwise
-labelled by a string like this?" in bounded time, without the caller enumerating
-literals.
+Given an HDT file, return ranked RDF statements whose object literal resembles
+some query text, without requiring the caller to enumerate every literal.
 
-That is the operation an agent reaches for first when it holds a name and needs
-an IRI, and it is the capability with the largest gap between an HDT server and
-plain triple-pattern access: pattern enumeration alone offers no way to find
-"atrazine" except paging every literal in the dataset.
+The common case begins with a name or phrase and asks what in the graph carries
+that text. Plain triple-pattern access offers no way to find "atrazine" except
+by paging every literal in the dataset. hdtc therefore supplies whole-value,
+partial-token and language-aware stemmed matching, then resolves each ranked
+literal back to the statements that use it. Application-specific grouping and
+presentation remain outside this format.
 
 ## 1. Relationship to the other hdtc artifacts
 
@@ -52,15 +54,15 @@ It was accepted because the alternative is worse in the specific case. A binary
 fuse probe is thirty lines of normative text; a Lucene-class inverted index is
 not, and specifying one exhaustively would buy a cross-language guarantee at the
 price of a hand-written term dictionary, posting lists and scorer — and would
-still not deliver bounded-cost fuzzy matching, which needs an automaton
-intersected with an FST term dictionary. `GET /search` (KGF doc 03 §3.4.5)
-requires `match_kind ∈ exact | normalized | prefix | fuzzy`, so that capability
-is in the contract, not optional.
+still not deliver Tantivy's established fuzzy and prefix search machinery,
+which uses an automaton intersected with an FST term dictionary. hdtc exposes
+those operations directly, alongside ordinary token and phrase matching.
 
 **Migration path.** If a non-Rust consumer appears, the exit is not a rewrite of
-this format but an export: every document is `(object_id, text, lang)`, all
-three recoverable from the index, so a dump-and-rebuild into another engine is
-mechanical. Nothing in §2, §3 or §4 depends on Tantivy; only §5 and §6 do.
+this format but an export: every document is `(object_id, text, lang)`, with the
+ID and language in the index and the text recoverable from the source HDT, so a
+dump-and-rebuild into another engine is mechanical. Nothing in §2, §3 or §4
+depends on Tantivy; only §5 and §6 do.
 
 ## 2. Data model
 
@@ -103,13 +105,12 @@ Every document carries a language value: the literal's language tag, normalized
 to lower case, or `und` (BCP 47's registered "undetermined") when the literal
 carries no tag.
 
-Untagged is a *value*, not an absence, because it has to be selectable. Doc 19
-§19.4.2 ranks an untagged literal above a wrong-language one: `@de` positively
-asserts a language the client did not ask for, whereas an untagged literal
-asserts nothing and is frequently language-neutral by nature — a chemical name,
-a gene symbol, a species binomial, an accession, a product code. Those are
-exactly the strings a cross-language client most wants, and a language filter
-that dropped them would hide them.
+Untagged is a *value*, not an absence, because it has to be selectable and has
+defined filtering behavior (§7.2). `@de` positively asserts a language, whereas
+an untagged literal asserts nothing and is frequently language-neutral by
+nature — a chemical name, a gene symbol, a species binomial, an accession, a
+product code. A language filter that dropped such values would hide many of the
+strings a cross-language caller most wants.
 
 A literal whose actual language tag is `und` is indistinguishable from an
 untagged one. This is accepted: the two make the same claim.
@@ -296,8 +297,8 @@ tokens joined by single spaces. `"Body"`, `"body"` and `"BODY"` share the key
 
 The key exists to answer a different question from the one the other fields
 answer. `text` and `text_stemmed` find literals that *contain* the query; the
-key finds literals that *are* the query — "which resource is named this", which
-is the entity-resolution operation §0 opens with.
+key finds literals that *are* the query — the exact-name lookup described in
+§0.
 
 **Why this is not just ranking.** BM25 cannot express it. Scoring `body` against
 Ubergraph puts `"Body structure (body structure)"` *above* the three resources
@@ -380,7 +381,7 @@ answer.
 
 ### 5.1 Schema
 
-Three fields, in this order:
+Five fields, in this order:
 
 | field | type | options |
 |---|---|---|
@@ -415,8 +416,8 @@ addressed by `object`; storing it again would duplicate the dataset's largest
 component to save one dictionary read. A consumer reads `object` from the fast
 field and resolves the text through HDT.
 
-Positions are recorded because phrase queries need them, and a phrase is how a
-client asks for the `exact` match kind.
+Positions are recorded so phrase mode works against both the plain and stemmed
+fields.
 
 ### 5.2 The `hdtc` tokenizer
 
@@ -454,9 +455,8 @@ attributed to the earliest:
 3. **stemmed** — they appear only after stemming (`text_stemmed`, §3.6).
 
 This is a guarantee, not a tendency: BM25 scores from different fields are not
-comparable, so no set of boost factors could promise it. It is doc 03 §3.4.5's
-`match_kind` treated as a class rather than a score component, which is how that
-document says results should be merged.
+comparable, so no set of boost factors could promise it. hdtc therefore treats
+the match kind as an ordered class rather than as another score component.
 
 Scores are therefore comparable *within* a class and not across two of them.
 
@@ -478,7 +478,8 @@ same answers.
 
 The query string is tokenized by §3.2. The tokens combine as:
 
-- **all** (default) — every token must be present. The entity-resolution mode.
+- **all** (default) — every token must be present. This is the focused
+  multi-token lookup mode.
 - **any** — any token may match; more matching tokens rank higher.
 - **phrase** — the tokens must be adjacent and in order.
 
@@ -521,11 +522,11 @@ literals whose occurrences all fail the filter. Cost is bounded per literal —
 one OPS descent — but the number of literals examined is not bounded by the page
 size.
 
-A conforming implementation should report how far it walked. Doc 19 §19.2.3
-proposes a predicate-ID → object-ID sidecar that would make this filtering
-pre-rank; §19.7 makes building it conditional on measuring the over-fetch factor
-first. Version 1 of this format has no such sidecar. Adding one is additive — a
-new file beside this index — and is not a change to this format.
+A conforming implementation should report how far it walked so the over-fetch
+cost can be measured. A future predicate-ID → object-ID sidecar could make this
+filtering pre-rank, but version 1 of this format has no such sidecar. Adding one
+would be additive — a new file beside this index — and would not change this
+format.
 
 ### 7.4 Results
 

@@ -2,8 +2,8 @@
 //!
 //! The claims under test are the ones `docs/text-index-format.md` makes to a
 //! consumer: what the manifest says was indexed and left out (§3.4, §4), how
-//! results rank and deduplicate (§6, §7.4), and that the filters mean what §7
-//! says they mean.
+//! results rank without repeating a literal across match classes (§6, §7.4),
+//! and that the filters mean what §7 says they mean.
 
 mod common;
 

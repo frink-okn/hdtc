@@ -14,10 +14,8 @@
 //! and nothing else; the stemmed chain adds the Snowball stemmer for the
 //! literal's own language. They feed two separate fields, which is what lets an
 //! exact match be told apart from — and ranked above — a match found only by
-//! stemming. Doc 19 §19.2.5 asks for "language-aware analyzers where a tag is
-//! declared", and the same clause's warning about stemming surprises is met by
-//! that separation rather than by declining to stem: a stemmed hit is never
-//! mistaken for an exact one.
+//! stemming. The separation makes language-aware expansion explicit: a stemmed
+//! hit is never mistaken for an exact one.
 //!
 //! Still deliberately absent: stopwords and ASCII folding, both of which
 //! discard information a client cannot recover.
@@ -36,7 +34,7 @@ pub const ANALYZER_ID: u32 = 1;
 /// against the text field.
 pub const TOKENIZER_NAME: &str = "hdtc";
 
-/// Default byte cap on a literal's lexical form (doc 19 §19.2.4).
+/// Default byte cap on a literal's lexical form (§3.4 of the format document).
 pub const DEFAULT_MAX_LITERAL_BYTES: usize = 4096;
 
 /// Tokens longer than this are dropped rather than truncated.
@@ -50,9 +48,9 @@ pub const MAX_TOKEN_BYTES: usize = 128;
 /// Language value stored for literals carrying no language tag.
 ///
 /// BCP 47's registered tag for "undetermined". Every document carries a
-/// language value so that an untagged literal can be asked for positively — doc
-/// 19 §19.4.2 ranks untagged *above* a wrong-language match, which is only
-/// expressible if untagged is a value rather than an absence.
+/// language value so that an untagged literal can be asked for positively and
+/// kept eligible under the language-filtering rules in §7.2 of the format
+/// document.
 pub const UNDETERMINED_LANGUAGE: &str = "und";
 
 /// The tokenizer chain, built fresh for each index instance.
@@ -236,8 +234,8 @@ pub fn normalize_language(tag: &[u8]) -> String {
 /// BCP 47 basic filtering (RFC 4647 §3.3.1): does `tag` fall under `range`?
 ///
 /// `en` matches `en` and `en-gb` but not `english`. Both arguments must already
-/// be normalized. Doc 19 §19.4.2 requires range matches to rank *with* the
-/// range they matched, which callers get by testing ranges in request order.
+/// be normalized. Callers can preserve request order by testing ranges in that
+/// order.
 pub fn language_matches(range: &str, tag: &str) -> bool {
     if range == "*" {
         return true;
@@ -248,14 +246,15 @@ pub fn language_matches(range: &str, tag: &str) -> bool {
             && tag.as_bytes()[range.len()] == b'-')
 }
 
-/// Datatypes excluded from the text index by default (doc 19 §19.2.4).
+/// Datatypes excluded from the text index by default (§3.5 of the format
+/// document).
 ///
 /// These are the XSD datatypes with an ordered value space — numbers, dates,
 /// durations, binary blobs. Indexing their lexical forms as text produces
 /// tokens nobody searches for and duplicates what a range index does properly.
 /// Everything else is indexed, including `xsd:string`, `rdf:langString`,
-/// `xsd:anyURI` and the string-derived types, which is the exhaustive-by-default
-/// stance of §19.2.1.
+/// `xsd:anyURI` and the string-derived types, which preserves the format's
+/// exhaustive-by-default stance.
 pub const DEFAULT_EXCLUDED_DATATYPES: &[&str] = &[
     "http://www.w3.org/2001/XMLSchema#base64Binary",
     "http://www.w3.org/2001/XMLSchema#boolean",

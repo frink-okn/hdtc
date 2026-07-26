@@ -1,7 +1,7 @@
 //! `hdtc search --text` — ranked text search, resolved back to triples.
 //!
 //! The text index answers with object dictionary IDs and a score, and nothing
-//! else: it holds no subject and no predicate (doc 19 §19.2.2). This module is
+//! else: it holds no subject and no predicate. This module is
 //! the other half of that bargain — it turns each ranked literal into the
 //! `(subject, predicate)` pairs that use it, by running the same `? ? <object>`
 //! resolution the `??O` pattern search uses.
@@ -9,8 +9,8 @@
 //! The cost this design trades for its small index is **over-fetch**: a filter
 //! the index cannot apply — `--predicate` — is applied after ranking, so
 //! filling a page can require walking past many ranked literals. Every run
-//! reports how far it walked, which is the measurement doc 19 §19.7 asks for
-//! before deciding whether a predicate sidecar is worth building.
+//! reports how far it walked so the cost can be measured before deciding
+//! whether a predicate sidecar is worth building.
 
 use crate::hdt::index_reader::open_index;
 use crate::hdt::reader::{

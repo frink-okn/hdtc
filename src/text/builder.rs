@@ -1,7 +1,7 @@
 //! Building a text index from one pass over an HDT's object dictionary.
 //!
 //! The unit of indexing is a **distinct literal**, not an occurrence, and a
-//! document's identity is its HDT object dictionary ID (doc 19 §19.2.2). The
+//! document's identity is its HDT object dictionary ID. The
 //! consequence worth restating, because it is what makes indexing every literal
 //! affordable: the index stores no subject and no predicate at all. A hit is an
 //! object ID, and `? ? <that object>` through the OPS index turns it into every

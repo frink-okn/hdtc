@@ -1,7 +1,7 @@
 //! Querying a published text index.
 //!
 //! A search returns ranked **object dictionary IDs** and nothing else — the
-//! index holds no subject and no predicate (doc 19 §19.2.2). Turning those IDs
+//! index holds no subject and no predicate. Turning those IDs
 //! into (subject, predicate, literal) rows is the caller's job, done through
 //! HDT itself; see [`crate::hdt::search`].
 
@@ -25,7 +25,7 @@ use tantivy::{Index, IndexReader, Term};
 /// How the tokens of a query must combine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MatchMode {
-    /// Every token must be present — the entity-resolution default.
+    /// Every token must be present — the focused multi-token default.
     #[default]
     All,
     /// Any token may match; more matching tokens rank higher.
@@ -47,7 +47,7 @@ pub struct TextQuery {
     pub languages: Vec<String>,
 }
 
-/// How a hit matched — the CLI half of doc 03 §3.4.5's `match_kind`.
+/// How a hit matched, used to keep broader analysis below literal matches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum MatchKind {
     /// The literal *is* the query: same tokens, in order, and nothing else.
@@ -65,7 +65,7 @@ pub struct TextHit {
     /// HDT object dictionary ID — the document's identity.
     pub object_id: u64,
     /// BM25-derived score. Comparable within one index and **not** across
-    /// indexes, which have different collection statistics (doc 03 §3.4.5).
+    /// indexes, which have different collection statistics.
     /// Comparable *within* a [`MatchKind`], not across two of them.
     pub score: f32,
     pub kind: MatchKind,
@@ -177,12 +177,11 @@ impl TextSearcher {
 
     /// The `top_k` highest-scoring literals, best first.
     ///
-    /// Exact matches come first as a class, then stemmed-only ones — the
-    /// ordering doc 03 §3.4.5 asks for when it makes `match_kind` a class
-    /// rather than a score component. Running the two as separate phases makes
-    /// that a guarantee rather than something a boost factor usually achieves:
-    /// BM25 scores from two fields are not comparable, so no single weighting
-    /// could promise an exact hit outranks a stemmed one.
+    /// Exact matches come first as a class, then stemmed-only ones. Running the
+    /// two as separate phases makes that a guarantee rather than something a
+    /// boost factor usually achieves: BM25 scores from two fields are not
+    /// comparable, so no single weighting could promise an exact hit outranks a
+    /// stemmed one.
     ///
     /// Within a class, ties are broken by ascending object ID, so two runs of
     /// the same query over the same index return the same page in the same
@@ -430,11 +429,10 @@ impl TextSearcher {
 
     /// A disjunction over the indexed language tags the requested ranges match.
     ///
-    /// Untagged literals are always included. Doc 19 §19.4.2 ranks an untagged
-    /// literal *above* a wrong-language one, on the grounds that `@de`
-    /// positively asserts a language the client did not ask for while an
-    /// untagged literal asserts nothing and is often language-neutral by nature
-    /// — a chemical name, a gene symbol, an accession. Excluding those from a
+    /// Untagged literals are always included. A tag such as `@de` positively
+    /// asserts a language the client did not ask for, while an untagged literal
+    /// asserts nothing and is often language-neutral by nature — a chemical
+    /// name, a gene symbol, an accession. Excluding those from a
     /// language-filtered search would hide exactly the strings a cross-language
     /// client most wants.
     ///
