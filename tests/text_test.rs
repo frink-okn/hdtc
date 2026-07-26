@@ -160,7 +160,7 @@ fn the_manifest_accounts_for_every_literal() {
     let hdt = fixture(temp.path());
 
     assert_eq!(manifest_value(&hdt, "hdtc-text"), "1");
-    assert_eq!(manifest_value(&hdt, "analyzer"), "3");
+    assert_eq!(manifest_value(&hdt, "analyzer"), "1");
     assert_eq!(
         manifest_value(&hdt, "untagged_language"),
         "en",
@@ -867,7 +867,7 @@ fn an_index_from_another_convention_is_refused() {
     let original = std::fs::read_to_string(&manifest_path).unwrap();
 
     for (broken, expected) in [
-        (original.replace("analyzer\t3", "analyzer\t9"), "analyzer 9"),
+        (original.replace("analyzer\t1", "analyzer\t9"), "analyzer 9"),
         (
             original.replace("tantivy\t0.26.1", "tantivy\t0.21.0"),
             "0.21.0",

@@ -114,7 +114,7 @@ that dropped them would hide them.
 A literal whose actual language tag is `und` is indistinguishable from an
 untagged one. This is accepted: the two make the same claim.
 
-## 3. The analyzer (`analyzer_id = 3`)
+## 3. The analyzer (`analyzer_id = 1`)
 
 Every index records an `analyzer_id`. It asserts every rule in this section. A
 reader whose analyzer ID differs from an index's **must refuse the index**
@@ -585,17 +585,6 @@ failure `source_digest` exists to make detectable.
 
 - Adding a manifest key is a compatible change; readers ignore unknown keys.
 - Changing any §3 rule is a new `analyzer_id`.
-
-**`analyzer_id` 1 and 2 were never published**, and both numbers are burned
-rather than reused, so that an index built from the development branch refuses
-to open instead of matching under rules its terms were not indexed by.
-
-- **1** described a single conservative chain with no stemming anywhere, on a
-  misreading of doc 19 §19.2.5: that clause asks for "language-aware analyzers
-  where a tag is declared", and its warning about stemming surprises attaches to
-  the *untagged* branch, not to all text.
-- **2** added stemming but no whole-literal key, so a literal that repeats the
-  query outranked the literals that were the query (§3.7).
 - Changing the §5.1 schema, or moving to a Tantivy release whose segments the
   pinned one cannot read, is a new `hdtc-text` manifest version.
 - Adding a sidecar beside the index (§7.3) changes neither.

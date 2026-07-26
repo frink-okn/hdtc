@@ -30,11 +30,7 @@ use tantivy::tokenizer::{
 
 /// The analyzer convention this module implements, recorded in every index
 /// manifest. Changing any rule below is a new `analyzer_id`, not a patch.
-///
-/// Conventions 1 and 2 existed only on the development branch and were never
-/// published; `docs/text-index-format.md` §10 records why they are skipped
-/// rather than documented.
-pub const ANALYZER_ID: u32 = 3;
+pub const ANALYZER_ID: u32 = 1;
 
 /// Name the tokenizer chain is registered under, and the name the schema stores
 /// against the text field.

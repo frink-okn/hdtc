@@ -337,7 +337,7 @@ mod tests {
 
     #[test]
     fn an_index_this_build_cannot_read_is_named_precisely() {
-        let bad_analyzer = sample().to_text().replace("analyzer\t3", "analyzer\t7");
+        let bad_analyzer = sample().to_text().replace("analyzer\t1", "analyzer\t7");
         assert!(
             TextManifest::parse(&bad_analyzer)
                 .unwrap_err()

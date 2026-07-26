@@ -917,7 +917,7 @@ the counts plus the exact datatype set are published in the index's manifest:
 ```console
 $ cat data.hdt.text/hdtc-text.meta
 hdtc-text	1
-analyzer	3
+analyzer	1
 tantivy	0.26.1
 untagged_language	en
 literals_scanned	12
