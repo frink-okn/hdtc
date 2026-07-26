@@ -257,7 +257,17 @@ fn the_manifest_accounts_for_every_literal() {
         .map(|fields| fields[0].clone())
         .collect();
     assert!(excluded.contains(&XSD_DOUBLE.to_string()));
-    assert!(excluded.contains(&"http://www.opengis.net/ont/geosparql#wktLiteral".to_string()));
+    for iri in [
+        "http://www.opengis.net/ont/geosparql#dggsLiteral",
+        "http://www.opengis.net/ont/geosparql#geoJSONLiteral",
+        "http://www.opengis.net/ont/geosparql#gmlLiteral",
+        "http://www.opengis.net/ont/geosparql#kmlLiteral",
+        "http://www.opengis.net/ont/geosparql#wktLiteral",
+        "http://www.w3.org/2002/07/owl#rational",
+        "http://www.w3.org/2002/07/owl#real",
+    ] {
+        assert!(excluded.iter().any(|excluded| excluded == iri), "{iri}");
+    }
     assert!(!excluded.iter().any(|iri| iri.ends_with("#string")));
     let mut sorted = excluded.clone();
     sorted.sort();

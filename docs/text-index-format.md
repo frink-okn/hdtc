@@ -215,8 +215,8 @@ tokenizing the whole corpus twice.
 
 ### 3.5 The datatype exclusion set
 
-The default set is the XSD datatypes with an ordered value space plus the
-GeoSPARQL WKT geometry datatype:
+The default set is the XSD and OWL datatypes with an ordered numeric or temporal
+value space, binary blobs, and the GeoSPARQL geometry datatypes:
 
 ```
 xsd:base64Binary  xsd:boolean   xsd:byte       xsd:date      xsd:dateTime
@@ -227,10 +227,13 @@ xsd:long          xsd:negativeInteger          xsd:nonNegativeInteger
 xsd:nonPositiveInteger          xsd:positiveInteger          xsd:short
 xsd:time          xsd:unsignedByte             xsd:unsignedInt
 xsd:unsignedLong  xsd:unsignedShort            xsd:yearMonthDuration
-geo:wktLiteral
+owl:rational      owl:real
+geo:dggsLiteral   geo:geoJSONLiteral            geo:gmlLiteral
+geo:kmlLiteral    geo:wktLiteral
 ```
 
-(`xsd:` is `http://www.w3.org/2001/XMLSchema#`, and `geo:` is
+(`xsd:` is `http://www.w3.org/2001/XMLSchema#`, `owl:` is
+`http://www.w3.org/2002/07/owl#`, and `geo:` is
 `http://www.opengis.net/ont/geosparql#`; the manifest records full IRIs.)
 
 Indexing these as text produces tokens nobody searches for and duplicates range
