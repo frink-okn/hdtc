@@ -763,6 +763,16 @@ fn indexed_and_sequential_resolution_agree() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn search_help_keeps_argument_implementation_details_internal() {
+    let output = hdtc(&["search", "--help"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let help = String::from_utf8_lossy(&output.stdout);
+    assert!(help.contains("How the query tokens must combine (--text only) [default: all]"));
+    assert!(!help.contains("clap"), "{help}");
+    assert!(!help.contains("Optional rather than defaulted"), "{help}");
+}
+
+#[test]
 fn text_search_without_an_index_says_how_to_build_one() {
     let temp = tempfile::tempdir().unwrap();
     let input = temp.path().join("input.nt");

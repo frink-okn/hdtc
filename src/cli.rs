@@ -311,11 +311,10 @@ pub struct SearchArgs {
     #[arg(long, value_name = "TEXT")]
     pub text: Option<String>,
 
+    // Keep this optional rather than setting an argument default: the
+    // text-only conflict group must be able to tell whether the user supplied
+    // it. `search_text` applies `all` when this is `None`.
     /// How the query tokens must combine (--text only) [default: all]
-    ///
-    /// Optional rather than defaulted so that `requires` is enforced: clap
-    /// treats an argument carrying a default value as always present, which
-    /// would make the requirement either always fire or never fire.
     #[arg(long, value_enum, value_name = "MODE")]
     pub text_match: Option<TextMatchMode>,
 
