@@ -20,8 +20,9 @@
 //!
 //! Unlike the other dictionary-derived artifacts, the published bytes are
 //! Tantivy's, not hdtc's; what hdtc specifies is the convention around them —
-//! the schema, the analyzer, the exclusion rules, and the manifest — under an
-//! exact version pin. `docs/text-index-format.md` §1.1 states the tradeoff.
+//! the schema, the analyzer, the exclusion rules, and the manifest. Tantivy
+//! decides byte-level compatibility; `docs/text-index-format.md` §1.1 states
+//! the tradeoff.
 
 pub(crate) mod analyzer;
 pub(crate) mod builder;

@@ -1,4 +1,4 @@
-# HDT text index format, version 1
+# HDT text index format, version 2
 
 `hdtc text` publishes a full-text index over the literals of an HDT dictionary,
 and `hdtc search --text` queries it. This document is normative for what that
@@ -40,15 +40,17 @@ It differs from them in one important way.
 
 The other artifacts specify their bytes exhaustively, so that a reader in any
 language can be written from the document alone. This one does not. The segment
-files are written and read by [Tantivy](https://github.com/quickwit-oss/tantivy)
-at the exact version §4 pins, and this document specifies the *convention around
-them*: what a document is, what fields it carries, how a literal becomes text,
-which literals are omitted, and what the manifest records.
+files are written and read by [Tantivy](https://github.com/quickwit-oss/tantivy),
+and this document specifies the *convention around them*: what a document is,
+what fields it carries, how a literal becomes text, which literals are omitted,
+and what the manifest records.
 
 This is a deliberate trade, and the cost is real: **a text index published by
-hdtc is, in practice, readable only by a program that links the same Tantivy
-release.** A conforming reader cannot be written from this document the way one
-can for `.filter` or `.keys`.
+hdtc is readable only by a program using a Tantivy release compatible with its
+segment format.** A conforming reader cannot be written from this document the
+way one can for `.filter` or `.keys`. The exact writer release is useful
+diagnostic information, but Tantivy's segment footer is the authority on whether
+a reader supports the bytes.
 
 It was accepted because the alternative is worse in the specific case. A binary
 fuse probe is thirty lines of normative text; a Lucene-class inverted index is
@@ -172,7 +174,7 @@ Two consequences worth stating plainly:
 - `1,3-dichlorobenzene` indexes as `1`, `3`, `dichlorobenzene`.
 - A language whose script does not delimit words (Chinese, Japanese, Thai)
   produces one token per unbroken run. Such text is findable by exact phrase but
-  not by word. A future `analyzer_id` may address this; version 1 does not.
+  not by word. A future `analyzer_id` may address this; analyzer 1 does not.
 
 ### 3.3 Which literals are indexed
 
@@ -337,9 +339,11 @@ Keys, each at most once except where noted:
 
 | key | fields | meaning |
 |---|---|---|
-| `hdtc-text` | version | Manifest schema version. `1` for this document. **Required, must be first-known.** |
+| `hdtc-text` | version | Manifest schema version. `2` for this document. **Required, must be first-known.** |
 | `analyzer` | id | §3's convention ID. Required. |
-| `tantivy` | version | Exact Tantivy release that wrote the segments (§5), as that release reports itself. Required. |
+| `schema` | id | §5.1's hdtc field-schema convention. `1` for this document. Required. |
+| `tantivy_writer` | version | Tantivy release that wrote the segments (§5), as that release reports itself. Informational but required. |
+| `tantivy_index_format` | version | Tantivy index-format version reported by the writer (§5). Informational but required. |
 | `source_digest` | 64 hex chars | SHA-256 over the source HDT's dictionary-and-triples suffix. |
 | `max_literal_bytes` | count | The §3.4 byte cap this build used. |
 | `untagged_language` | tag or `none` | Language untagged literals were stemmed as (§3.6). |
@@ -359,11 +363,22 @@ Reader rules:
 
 - A file without an `hdtc-text` line is not a text index.
 - A reader **must refuse** a manifest whose `hdtc-text` version, `analyzer` ID,
-  or `tantivy` version it does not implement, and should name the mismatch.
+  or `schema` ID it does not implement, and should name the mismatch.
+- A reader must not reject an index merely because `tantivy_writer` differs
+  from its linked release. It asks Tantivy to open the index, and Tantivy decides
+  compatibility from the segment footer. `tantivy_writer` and
+  `tantivy_index_format` make any failure diagnosable.
 - A reader **must ignore** keys it does not recognize, so that a later version
   may add lines without invalidating this one.
 
-### 4.1 Why the exclusions are counted
+### 4.1 Legacy version 1
+
+Version 1 has no `schema` or `tantivy_index_format` line and records the writer
+release as `tantivy`. A version-2 reader treats it as hdtc schema 1, preserves
+the writer release for diagnostics, and lets Tantivy decide whether it can open
+the segments. This is the only supported legacy manifest version.
+
+### 4.2 Why the exclusions are counted
 
 An index that silently omits some fraction of a dataset's literals makes every
 search over it quietly wrong about coverage — a caller cannot distinguish "no
@@ -373,15 +388,15 @@ statistics-honesty rule the other hdtc artifacts follow, applied to text.
 
 ## 5. The Tantivy index
 
-The rest of the directory is a Tantivy index, written by the release named in the
-manifest's `tantivy` line: **0.26.1**.
+The rest of the directory is a Tantivy index. The manifest records both the
+writer release and the index-format version reported by that release.
 
-A builder must take that string from the linked Tantivy rather than from a
-constant of its own, so that a dependency bump cannot label an index with a
-version that did not write it. The release version is stricter than the index
-format version Tantivy also reports — two releases may share a format — and
-refusing to read across releases anyway costs a rebuild rather than a wrong
-answer.
+A builder must take both values from linked Tantivy rather than from constants
+of its own, so that a dependency bump cannot label an index with versions that
+did not write it. Neither manifest value grants or denies compatibility: the
+reader opens the directory with Tantivy, whose segment footer carries the byte
+format information its compatibility logic uses. This permits a newer Tantivy
+to read an older supported format without hdtc rejecting it first.
 
 ### 5.1 Schema
 
@@ -528,7 +543,7 @@ size.
 
 A conforming implementation should report how far it walked so the over-fetch
 cost can be measured. A future predicate-ID → object-ID sidecar could make this
-filtering pre-rank, but version 1 of this format has no such sidecar. Adding one
+filtering pre-rank, but this version of the format has no such sidecar. Adding one
 would be additive — a new file beside this index — and would not change this
 format.
 
@@ -590,11 +605,14 @@ failure `source_digest` exists to make detectable.
 
 - Adding a manifest key is a compatible change; readers ignore unknown keys.
 - Changing any §3 rule is a new `analyzer_id`.
-- Changing the §5.1 schema, or moving to a Tantivy release whose segments the
-  pinned one cannot read, is a new `hdtc-text` manifest version.
+- Changing the §5.1 schema is a new `schema` ID.
+- Changing the manifest structure or the interpretation of an existing line is
+  a new `hdtc-text` manifest version.
+- Moving to a new Tantivy release changes `tantivy_writer` and may change
+  `tantivy_index_format`; it does not by itself change an hdtc convention.
 - Adding a sidecar beside the index (§7.3) changes neither.
 
-An index is identified by the triple (`hdtc-text` version, `analyzer_id`,
-`tantivy` version). A reader must check all three, because each fails
-differently: the first structurally, the second silently, the third at the byte
-level.
+An index's hdtc conventions are identified by the triple (`hdtc-text` version,
+`analyzer_id`, `schema` ID). A reader checks all three before opening the
+segments. Tantivy then checks its own byte-level compatibility; the recorded
+writer and index-format versions explain that result but do not override it.

@@ -15,10 +15,10 @@ use super::analyzer::{
     self, DatatypeExclusions, Exclusion, UNDETERMINED_LANGUAGE, collect_tokens, normalize_language,
     parse_literal, stemmer_language, stemming_tokenizer, tokenizer, whole_literal_key,
 };
-use super::manifest::{LanguageCount, TextManifest, tantivy_version};
+use super::manifest::{LanguageCount, TextManifest, linked_tantivy_version};
 use super::schema::{
-    FIELD_LANG, FIELD_OBJECT, FIELD_TEXT, FIELD_TEXT_EXACT, FIELD_TEXT_STEMMED, register_tokenizer,
-    text_schema,
+    FIELD_LANG, FIELD_OBJECT, FIELD_TEXT, FIELD_TEXT_EXACT, FIELD_TEXT_STEMMED, SCHEMA_ID,
+    register_tokenizer, text_schema,
 };
 use crate::hdt::artifacts::SourceIdentity;
 use crate::hdt::input_adapter::HdtInputAdapter;
@@ -204,10 +204,13 @@ pub fn create_text_index(config: &TextConfig) -> Result<TextSummary> {
         .map(|(tag, documents)| LanguageCount { tag, documents })
         .collect();
     languages.sort_by(|a, b| a.tag.cmp(&b.tag));
+    let tantivy = linked_tantivy_version()?;
 
     let manifest = TextManifest {
         analyzer_id: analyzer::ANALYZER_ID,
-        tantivy_version: tantivy_version(),
+        schema_id: SCHEMA_ID,
+        tantivy_writer: tantivy.writer,
+        tantivy_index_format: Some(tantivy.index_format),
         source_digest: *source.digest(),
         max_literal_bytes: config.max_literal_bytes as u64,
         untagged_language: config.untagged_language.clone(),

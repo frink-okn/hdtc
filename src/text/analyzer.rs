@@ -7,8 +7,8 @@
 //! - **RDF-side rules** — splitting a dictionary term into value, language tag
 //!   and datatype, and deciding whether that literal is indexed at all. Tantivy
 //!   knows nothing about RDF, so this is ours to define.
-//! - **The tokenizer chains** — delegated to Tantivy under an exact version
-//!   pin, registered so that indexing and querying cannot drift apart.
+//! - **The tokenizer chains** — delegated to Tantivy and registered so that
+//!   indexing and querying cannot drift apart.
 //!
 //! There are two chains, not one. The plain chain splits, caps and lowercases,
 //! and nothing else; the stemmed chain adds the Snowball stemmer for the

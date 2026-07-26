@@ -13,6 +13,7 @@
 //! dependency.
 
 use super::analyzer::{ANALYZER_ID, DatatypeExclusions};
+use super::schema::SCHEMA_ID;
 use anyhow::{Context, Result, bail, ensure};
 use std::fmt::Write as _;
 use std::path::Path;
@@ -21,29 +22,37 @@ use std::path::Path;
 pub const MANIFEST_FILE: &str = "hdtc-text.meta";
 
 /// Manifest schema version, bumped when a line's meaning changes.
-pub const MANIFEST_VERSION: u32 = 1;
+pub const MANIFEST_VERSION: u32 = 2;
+/// The original manifest, accepted for indexes published before compatibility
+/// metadata was separated from the Tantivy writer release.
+pub const LEGACY_MANIFEST_VERSION: u32 = 1;
 
-/// The exact Tantivy release whose segment format this build reads and writes.
+/// The compatibility metadata reported by the linked Tantivy release.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TantivyVersion {
+    pub writer: String,
+    pub index_format: u32,
+}
+
+/// Read the writer release and index-format version from linked Tantivy.
 ///
-/// Recorded per index because the segment bytes are Tantivy's, not ours: an
-/// index built by a different release may not be readable, and a reader should
-/// be able to say so precisely instead of failing on a parse error.
-///
-/// Taken from Tantivy itself rather than written down here, so that moving the
-/// `Cargo.toml` pin cannot leave indexes labelled with a version that did not
-/// write them. A mislabelled index is worse than an unreadable one.
-pub fn tantivy_version() -> String {
-    // Tantivy's `Version` fields are private, so its own rendering —
-    // "tantivy v0.26.1, index_format v7" — is the only accessor. The release
-    // version is the stricter of the two numbers it carries: two releases can
-    // share an index format, and refusing to read across them anyway costs a
-    // rebuild rather than a wrong answer.
+/// Tantivy keeps the [`tantivy::Version`] fields private, so its stable display
+/// string is the available accessor. Parsing it at build time prevents a
+/// dependency update from silently mislabelling newly published indexes.
+pub fn linked_tantivy_version() -> Result<TantivyVersion> {
     let rendered = tantivy::version_string();
-    rendered
+    let rest = rendered
         .strip_prefix("tantivy v")
-        .and_then(|rest| rest.split(',').next())
-        .unwrap_or(rendered)
-        .to_string()
+        .with_context(|| format!("Unrecognized Tantivy version string: {rendered}"))?;
+    let (writer, index_format) = rest
+        .split_once(", index_format v")
+        .with_context(|| format!("Unrecognized Tantivy version string: {rendered}"))?;
+    Ok(TantivyVersion {
+        writer: writer.to_string(),
+        index_format: index_format
+            .parse()
+            .with_context(|| format!("Invalid Tantivy index format in: {rendered}"))?,
+    })
 }
 
 /// One language tag and how many indexed documents carry it.
@@ -57,7 +66,12 @@ pub struct LanguageCount {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextManifest {
     pub analyzer_id: u32,
-    pub tantivy_version: String,
+    pub schema_id: u32,
+    /// Informational writer release. Tantivy's segment footer, not this string,
+    /// decides whether the linked reader can open the bytes.
+    pub tantivy_writer: String,
+    /// `None` only for a legacy version-1 manifest, which did not record it.
+    pub tantivy_index_format: Option<u32>,
     /// SHA-256 over the source HDT's dictionary-and-triples suffix, as
     /// `SourceIdentity` computes it for every dictionary-derived artifact.
     pub source_digest: [u8; 32],
@@ -88,7 +102,11 @@ impl TextManifest {
         let mut out = String::new();
         let _ = writeln!(out, "hdtc-text\t{MANIFEST_VERSION}");
         let _ = writeln!(out, "analyzer\t{}", self.analyzer_id);
-        let _ = writeln!(out, "tantivy\t{}", self.tantivy_version);
+        let _ = writeln!(out, "schema\t{}", self.schema_id);
+        let _ = writeln!(out, "tantivy_writer\t{}", self.tantivy_writer);
+        if let Some(index_format) = self.tantivy_index_format {
+            let _ = writeln!(out, "tantivy_index_format\t{index_format}");
+        }
         let _ = writeln!(out, "source_digest\t{}", hex(&self.source_digest));
         let _ = writeln!(out, "max_literal_bytes\t{}", self.max_literal_bytes);
         let _ = writeln!(
@@ -114,7 +132,10 @@ impl TextManifest {
     pub fn parse(text: &str) -> Result<Self> {
         let mut version = None;
         let mut analyzer_id = None;
-        let mut written_by = None;
+        let mut schema_id = None;
+        let mut legacy_writer = None;
+        let mut tantivy_writer = None;
+        let mut tantivy_index_format = None;
         let mut source_digest = [0u8; 32];
         let mut max_literal_bytes = 0u64;
         let mut untagged_language = None;
@@ -144,7 +165,10 @@ impl TextManifest {
             match key {
                 "hdtc-text" => version = Some(number_value(value)?),
                 "analyzer" => analyzer_id = Some(number_value(value)?),
-                "tantivy" => written_by = Some(value.to_string()),
+                "schema" => schema_id = Some(number_value(value)?),
+                "tantivy" => legacy_writer = Some(value.to_string()),
+                "tantivy_writer" => tantivy_writer = Some(value.to_string()),
+                "tantivy_index_format" => tantivy_index_format = Some(number_value(value)?),
                 "source_digest" => {
                     source_digest = parse_hex(value).with_context(at)?;
                 }
@@ -177,10 +201,11 @@ impl TextManifest {
         let version =
             version.context("Not an hdtc text index: no hdtc-text line in the manifest")?;
         ensure!(
-            version == u64::from(MANIFEST_VERSION),
-            "Unsupported text index manifest version {version} (this build reads version \
-             {MANIFEST_VERSION})"
+            version == u64::from(LEGACY_MANIFEST_VERSION) || version == u64::from(MANIFEST_VERSION),
+            "Unsupported text index manifest version {version} (this build reads versions \
+             {LEGACY_MANIFEST_VERSION} and {MANIFEST_VERSION})"
         );
+        let legacy = version == u64::from(LEGACY_MANIFEST_VERSION);
         let analyzer_id = analyzer_id.context("Text index manifest declares no analyzer")?;
         let analyzer_id = u32::try_from(analyzer_id).unwrap_or(u32::MAX);
         ensure!(
@@ -188,18 +213,33 @@ impl TextManifest {
             "Text index was built with analyzer {analyzer_id}, which this build cannot query (it \
              implements analyzer {ANALYZER_ID})"
         );
-        let written_by = written_by.context("Text index manifest declares no Tantivy version")?;
-        let linked = tantivy_version();
+        let schema_id = match schema_id {
+            Some(schema_id) => u32::try_from(schema_id).unwrap_or(u32::MAX),
+            None if legacy => SCHEMA_ID,
+            None => bail!("Text index manifest declares no hdtc schema"),
+        };
         ensure!(
-            written_by == linked,
-            "Text index was written by Tantivy {written_by}; this build links Tantivy {linked} \
-             and cannot rely on reading its segments. Rebuild with `hdtc text`."
+            schema_id == SCHEMA_ID,
+            "Text index uses hdtc schema {schema_id}, which this build cannot query (it \
+             implements schema {SCHEMA_ID})"
         );
+        let tantivy_writer = if legacy {
+            legacy_writer.context("Legacy text index manifest declares no Tantivy version")?
+        } else {
+            tantivy_writer.context("Text index manifest declares no Tantivy writer")?
+        };
+        let tantivy_index_format = match tantivy_index_format {
+            Some(index_format) => Some(u32::try_from(index_format).unwrap_or(u32::MAX)),
+            None if legacy => None,
+            None => bail!("Text index manifest declares no Tantivy index format"),
+        };
         languages.sort_by(|a, b| a.tag.cmp(&b.tag));
 
         Ok(Self {
             analyzer_id,
-            tantivy_version: written_by,
+            schema_id,
+            tantivy_writer,
+            tantivy_index_format,
             source_digest,
             max_literal_bytes,
             untagged_language,
@@ -266,9 +306,12 @@ mod tests {
     use super::*;
 
     fn sample() -> TextManifest {
+        let tantivy = linked_tantivy_version().unwrap();
         TextManifest {
             analyzer_id: ANALYZER_ID,
-            tantivy_version: tantivy_version(),
+            schema_id: SCHEMA_ID,
+            tantivy_writer: tantivy.writer,
+            tantivy_index_format: Some(tantivy.index_format),
             source_digest: [0xab; 32],
             max_literal_bytes: 4096,
             untagged_language: Some("en".to_string()),
@@ -295,24 +338,44 @@ mod tests {
         }
     }
 
-    /// The version is read out of Tantivy rather than written down, so this is
-    /// the one place the pin is asserted. It failing means the `Cargo.toml` pin
-    /// moved: that changes the segment bytes every published index carries and
-    /// makes existing indexes refuse to open, so it needs a deliberate update
-    /// here and in `docs/text-index-format.md` §5, not a silent one.
     #[test]
-    fn the_recorded_version_is_the_documented_pin() {
-        assert_eq!(tantivy_version(), "0.26.1");
+    fn linked_tantivy_reports_writer_and_index_format_separately() {
+        let version = linked_tantivy_version().unwrap();
+        assert!(!version.writer.is_empty());
+        assert!(version.index_format > 0);
     }
 
     #[test]
     fn manifest_round_trips_through_its_text_form() {
         let manifest = sample();
         let text = manifest.to_text();
-        assert!(text.starts_with("hdtc-text\t1\n"));
+        assert!(text.starts_with("hdtc-text\t2\n"));
+        assert!(text.contains("schema\t1\n"));
+        assert!(text.contains("tantivy_writer\t"));
+        assert!(text.contains("tantivy_index_format\t"));
         assert!(text.contains("source_digest\tabababab"));
         assert_eq!(TextManifest::parse(&text).unwrap(), manifest);
         assert_eq!(manifest.excluded_total(), 20);
+    }
+
+    #[test]
+    fn legacy_version_one_manifest_is_still_readable() {
+        let current = sample();
+        let format = current.tantivy_index_format.unwrap();
+        let legacy = current
+            .to_text()
+            .replace("hdtc-text\t2", "hdtc-text\t1")
+            .replace("schema\t1\n", "")
+            .replace(
+                &format!("tantivy_writer\t{}\n", current.tantivy_writer),
+                &format!("tantivy\t{}\n", current.tantivy_writer),
+            )
+            .replace(&format!("tantivy_index_format\t{format}\n"), "");
+
+        let parsed = TextManifest::parse(&legacy).unwrap();
+        assert_eq!(parsed.schema_id, SCHEMA_ID);
+        assert_eq!(parsed.tantivy_writer, current.tantivy_writer);
+        assert_eq!(parsed.tantivy_index_format, None);
     }
 
     /// Exclusion IRIs are written in sorted order regardless of how they were
@@ -335,7 +398,7 @@ mod tests {
     }
 
     #[test]
-    fn an_index_this_build_cannot_read_is_named_precisely() {
+    fn unsupported_hdtc_conventions_are_named_precisely() {
         let bad_analyzer = sample().to_text().replace("analyzer\t1", "analyzer\t7");
         assert!(
             TextManifest::parse(&bad_analyzer)
@@ -344,17 +407,15 @@ mod tests {
                 .contains("analyzer 7")
         );
 
-        let bad_tantivy = sample().to_text().replace(
-            &format!("tantivy\t{}", tantivy_version()),
-            "tantivy\t0.22.0",
-        );
-        let error = TextManifest::parse(&bad_tantivy).unwrap_err().to_string();
+        let bad_schema = sample().to_text().replace("schema\t1", "schema\t7");
         assert!(
-            error.contains("0.22.0") && error.contains("hdtc text"),
-            "{error}"
+            TextManifest::parse(&bad_schema)
+                .unwrap_err()
+                .to_string()
+                .contains("schema 7")
         );
 
-        let bad_version = sample().to_text().replace("hdtc-text\t1", "hdtc-text\t9");
+        let bad_version = sample().to_text().replace("hdtc-text\t2", "hdtc-text\t9");
         assert!(
             TextManifest::parse(&bad_version)
                 .unwrap_err()
@@ -363,6 +424,27 @@ mod tests {
         );
 
         assert!(TextManifest::parse("something else\t1\n").is_err());
+    }
+
+    #[test]
+    fn tantivy_metadata_is_diagnostic_not_a_manifest_gate() {
+        let sample = sample();
+        let text = sample
+            .to_text()
+            .replace(
+                &format!("tantivy_writer\t{}", sample.tantivy_writer),
+                "tantivy_writer\t0.1.0",
+            )
+            .replace(
+                &format!(
+                    "tantivy_index_format\t{}",
+                    sample.tantivy_index_format.unwrap()
+                ),
+                "tantivy_index_format\t999",
+            );
+        let parsed = TextManifest::parse(&text).unwrap();
+        assert_eq!(parsed.tantivy_writer, "0.1.0");
+        assert_eq!(parsed.tantivy_index_format, Some(999));
     }
 
     /// A later version may add lines; this one must ignore what it does not

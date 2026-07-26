@@ -9,6 +9,13 @@ use super::analyzer::{TOKENIZER_NAME, tokenizer};
 use tantivy::Index;
 use tantivy::schema::{FAST, IndexRecordOption, STRING, Schema, TextFieldIndexing, TextOptions};
 
+/// The hdtc field schema convention recorded in every version-2 manifest.
+///
+/// This is independent of the analyzer convention: changing field names,
+/// types, or indexing options increments this ID even when tokenization stays
+/// the same.
+pub const SCHEMA_ID: u32 = 1;
+
 /// The literal's lexical form, tokenized but not stemmed.
 pub const FIELD_TEXT: &str = "text";
 /// The same lexical form, stemmed for the literal's own language.

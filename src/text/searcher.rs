@@ -101,9 +101,9 @@ pub struct TextSearcher {
 impl TextSearcher {
     /// Open the index published at `dir`.
     ///
-    /// The manifest is read first: it is what says this index is hdtc's, which
-    /// analyzer its terms follow, and which Tantivy wrote its segments. All
-    /// three have to hold before the segment files are worth opening.
+    /// The manifest is read first: it says this index is hdtc's and identifies
+    /// its schema and analyzer conventions. The writer metadata is diagnostic;
+    /// Tantivy itself decides whether it can read the segment bytes.
     pub fn open(dir: &Path) -> Result<Self> {
         ensure!(
             dir.is_dir(),
@@ -111,8 +111,17 @@ impl TextSearcher {
             dir.display()
         );
         let manifest = TextManifest::read(dir)?;
-        let index = Index::open_in_dir(dir)
-            .with_context(|| format!("Failed to open text index {}", dir.display()))?;
+        let format = manifest
+            .tantivy_index_format
+            .map_or_else(|| "unknown".to_string(), |version| version.to_string());
+        let index = Index::open_in_dir(dir).with_context(|| {
+            format!(
+                "Failed to open text index {} (written by Tantivy {}, index format {})",
+                dir.display(),
+                manifest.tantivy_writer,
+                format
+            )
+        })?;
         register_tokenizer(&index);
 
         let schema = index.schema();

@@ -159,14 +159,21 @@ fn the_manifest_accounts_for_every_literal() {
     let temp = tempfile::tempdir().unwrap();
     let hdt = fixture(temp.path());
 
-    assert_eq!(manifest_value(&hdt, "hdtc-text"), "1");
+    assert_eq!(manifest_value(&hdt, "hdtc-text"), "2");
     assert_eq!(manifest_value(&hdt, "analyzer"), "1");
+    assert_eq!(manifest_value(&hdt, "schema"), "1");
     assert_eq!(
         manifest_value(&hdt, "untagged_language"),
         "en",
         "§3.6: the assumption made about untagged literals is recorded"
     );
-    assert_eq!(manifest_value(&hdt, "tantivy"), "0.26.1");
+    assert!(!manifest_value(&hdt, "tantivy_writer").is_empty());
+    assert!(
+        manifest_value(&hdt, "tantivy_index_format")
+            .parse::<u32>()
+            .unwrap()
+            > 0
+    );
     assert_eq!(manifest_value(&hdt, "max_literal_bytes"), "4096");
 
     let scanned: u64 = manifest_value(&hdt, "literals_scanned").parse().unwrap();
@@ -869,12 +876,9 @@ fn an_index_from_another_convention_is_refused() {
 
     for (broken, expected) in [
         (original.replace("analyzer\t1", "analyzer\t9"), "analyzer 9"),
+        (original.replace("schema\t1", "schema\t9"), "schema 9"),
         (
-            original.replace("tantivy\t0.26.1", "tantivy\t0.21.0"),
-            "0.21.0",
-        ),
-        (
-            original.replace("hdtc-text\t1", "hdtc-text\t4"),
+            original.replace("hdtc-text\t2", "hdtc-text\t4"),
             "version 4",
         ),
     ] {
@@ -883,6 +887,22 @@ fn an_index_from_another_convention_is_refused() {
         assert!(!output.status.success(), "expected refusal for {expected}");
         assert!(stderr(&output).contains(expected), "{}", stderr(&output));
     }
+
+    // Writer metadata describes the bytes but does not override Tantivy's own
+    // compatibility check of their segment footer.
+    let writer = manifest_value(&hdt, "tantivy_writer");
+    let index_format = manifest_value(&hdt, "tantivy_index_format");
+    let advisory = original
+        .replace(
+            &format!("tantivy_writer\t{writer}"),
+            "tantivy_writer\t0.1.0",
+        )
+        .replace(
+            &format!("tantivy_index_format\t{index_format}"),
+            "tantivy_index_format\t999",
+        );
+    write_file(&manifest_path, advisory.as_bytes());
+    assert!(!subjects(&hdt, &["--text", "atrazine"]).is_empty());
 
     // A later version adding a line it does not know must still be readable.
     write_file(
