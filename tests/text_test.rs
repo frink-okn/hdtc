@@ -428,7 +428,7 @@ fn limit_and_offset_page_through_the_ranking() {
 }
 
 #[test]
-fn scores_are_emitted_as_a_leading_column_on_request() {
+fn scores_are_emitted_as_trailing_comments_and_remain_valid_ntriples() {
     let temp = tempfile::tempdir().unwrap();
     let hdt = fixture(temp.path());
 
@@ -437,13 +437,22 @@ fn scores_are_emitted_as_a_leading_column_on_request() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut previous = f64::INFINITY;
     for line in stdout.lines().filter(|line| !line.is_empty()) {
-        let fields: Vec<&str> = line.split('\t').collect();
-        assert_eq!(fields.len(), 5, "score plus S\\tP\\tO\\t.");
-        let score: f64 = fields[0].parse().expect("leading score column");
+        let (triple, score) = line
+            .rsplit_once(" # score=")
+            .expect("trailing score comment");
+        let fields: Vec<&str> = triple.split('\t').collect();
+        assert_eq!(fields.len(), 4, "S\\tP\\tO\\t. before the comment");
+        assert_eq!(fields[3], ".");
+        let score: f64 = score.parse().expect("numeric score in comment");
         assert!(score > 0.0);
         assert!(score <= previous, "scores descend: {stdout}");
         previous = score;
     }
+
+    // An RDF parser must ignore the comments and accept the output directly.
+    let scored_nt = temp.path().join("scored.nt");
+    write_file(&scored_nt, &output.stdout);
+    run_hdtc_to_path(temp.path(), &[&scored_nt], "scored.hdt");
 }
 
 // ---------------------------------------------------------------------------

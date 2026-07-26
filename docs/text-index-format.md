@@ -542,6 +542,12 @@ determinism here is worth more than any cleverness about which of two equally
 scored literals is nicer, because a page that varies between identical calls
 poisons caching and response diffs.
 
+When scores are requested in line-oriented RDF output, each score is appended
+after the terminating dot as an N-Triples/N-Quads comment, for example
+`<s> <p> "value" . # score=1.1420`. Scores never add a field to the RDF statement,
+so scored output remains valid RDF and can be consumed directly by a conforming
+parser.
+
 ## 8. Cost
 
 | operation | work |

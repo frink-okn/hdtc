@@ -344,7 +344,7 @@ pub struct SearchArgs {
     #[arg(long)]
     pub no_dedupe: bool,
 
-    /// Prefix each row with its relevance score (--text only)
+    /// Append its relevance score as a trailing N-Triples comment (--text only)
     #[arg(long)]
     pub scores: bool,
 

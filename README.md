@@ -467,7 +467,7 @@ Named-graph options (`-m quads`, `--graph-map`, `--default-graph`,
 | `--lang LANG,...`     | all                         | `--text` only: BCP 47 ranges; untagged literals stay eligible            |
 | `--predicate IRI`     | all                         | `--text` only: keep only matches occurring on this predicate             |
 | `--no-dedupe`         | off                         | `--text` only: emit every occurrence instead of one row per subject      |
-| `--scores`            | off                         | `--text` only: prefix each row with its relevance score                  |
+| `--scores`            | off                         | `--text` only: append the relevance score as an N-Triples comment        |
 | `--text-index DIR`    | `<HDT_FILE>.text`           | `--text` only: text index directory                                      |
 | `-m, --memory-limit SIZE` | `4G`                    | Memory limit for dictionary caches and membership sorting                |
 | `-v, --verbose`       | —                           | Increase log verbosity (`-v` debug, `-vv` trace)                         |
@@ -857,9 +857,9 @@ anywhere:
 
 ```console
 $ hdtc search data.hdt --text atrazine --scores
-1.1420  <…/chebi/38769>  <…rdf-schema#label>    "atrazine"@en                    .
-0.9889  <…/gene/2>       <…rdf-schema#label>    "Atrazine chlorohydrolase"@en    .
-0.8719  <…/gene/1>       <…rdf-schema#label>    "atrazine degradation pathway"@en .
+<…/chebi/38769>  <…rdf-schema#label>  "atrazine"@en                      . # score=1.1420
+<…/gene/2>       <…rdf-schema#label>  "Atrazine chlorohydrolase"@en      . # score=0.9889
+<…/gene/1>       <…rdf-schema#label>  "atrazine degradation pathway"@en . # score=0.8719
 ```
 
 Results are entity-level: one row per subject, represented by its highest-ranked

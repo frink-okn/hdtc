@@ -20,7 +20,7 @@
 use crate::hdt::index_reader::open_index;
 use crate::hdt::reader::{
     BitmapTriplesScanner, DictionaryResolver, HdtSectionOffsets, make_writer, open_hdt,
-    write_triple_tab,
+    write_nt_object, write_nt_subject, write_triple_tab,
 };
 use crate::hdt::search::{Visit, resolve_index_path, resolve_object_page, scan_object_occurrences};
 use crate::text::{MatchMode, TextHit, TextQuery, TextSearcher, default_text_index_path};
@@ -297,9 +297,16 @@ fn emit_rows(
                     .predicate_term(predicate, &mut predicate_buf)
                     .with_context(|| format!("Failed to resolve predicate ID {predicate}"))?;
                 if options.scores {
-                    write!(writer, "{:.4}\t", hit.score)?;
+                    write_scored_triple_tab(
+                        writer,
+                        &subject_buf,
+                        &predicate_buf,
+                        &object_buf,
+                        hit.score,
+                    )?;
+                } else {
+                    write_triple_tab(writer, &subject_buf, &predicate_buf, &object_buf)?;
                 }
-                write_triple_tab(writer, &subject_buf, &predicate_buf, &object_buf)?;
             }
 
             if options.take.is_some_and(|take| outcome.rows >= take) {
@@ -308,6 +315,23 @@ fn emit_rows(
         }
     }
     Ok(outcome)
+}
+
+/// Write a scored result as valid N-Triples, with the diagnostic score in a
+/// trailing comment rather than an extra data column.
+fn write_scored_triple_tab(
+    writer: &mut impl Write,
+    subject: &[u8],
+    predicate: &[u8],
+    object: &[u8],
+    score: f32,
+) -> std::io::Result<()> {
+    write_nt_subject(writer, subject)?;
+    writer.write_all(b"\t<")?;
+    writer.write_all(predicate)?;
+    writer.write_all(b">\t")?;
+    write_nt_object(writer, object)?;
+    writeln!(writer, "\t. # score={score:.4}")
 }
 
 // ---------------------------------------------------------------------------
