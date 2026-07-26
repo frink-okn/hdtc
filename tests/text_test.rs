@@ -80,6 +80,26 @@ fn text_index_dir(hdt: &Path) -> PathBuf {
     PathBuf::from(format!("{}.text", hdt.display()))
 }
 
+/// Copy the frozen version-1 index into a writable temporary directory.
+/// Tantivy may create lock files beside an index even when it is only queried.
+fn legacy_text_fixture(temp: &Path) -> PathBuf {
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/text-index-v1");
+    let hdt = temp.join("legacy.hdt");
+    std::fs::copy(source.join("legacy.hdt"), &hdt).expect("copy legacy HDT");
+
+    let source_index = source.join("legacy.hdt.text");
+    let target_index = text_index_dir(&hdt);
+    std::fs::create_dir(&target_index).expect("create legacy text-index directory");
+    for entry in std::fs::read_dir(source_index).expect("read legacy text-index directory") {
+        let entry = entry.expect("read legacy text-index entry");
+        if entry.file_type().expect("read legacy entry type").is_file() {
+            std::fs::copy(entry.path(), target_index.join(entry.file_name()))
+                .expect("copy legacy text-index entry");
+        }
+    }
+    hdt
+}
+
 /// The manifest as key → list of records, since several keys repeat.
 fn manifest(hdt: &Path) -> HashMap<String, Vec<Vec<String>>> {
     let path = text_index_dir(hdt).join("hdtc-text.meta");
@@ -152,6 +172,28 @@ fn iri(suffix: &str) -> String {
 // ---------------------------------------------------------------------------
 // Building
 // ---------------------------------------------------------------------------
+
+/// A real version-1 manifest and Tantivy segment set stays queryable. Unlike a
+/// manifest-only unit test, this catches a future Tantivy upgrade that drops the
+/// segment format even when hdtc's own conventions remain compatible.
+#[test]
+fn frozen_version_one_index_remains_queryable() {
+    let temp = tempfile::tempdir().unwrap();
+    let hdt = legacy_text_fixture(temp.path());
+
+    assert_eq!(manifest_value(&hdt, "hdtc-text"), "1");
+    assert!(!manifest(&hdt).contains_key("schema"));
+
+    let whole = objects(&hdt, &["--text", "alice", "--no-index"]);
+    assert_eq!(whole, [r#""Alice""#, r#""Alice"@en"#]);
+
+    let prefix = objects(&hdt, &["--text", "ali", "--prefix", "--no-index"]);
+    assert!(prefix.contains(&r#""Alice""#.to_string()));
+    assert!(prefix.contains(&r#""Alicia"@es"#.to_string()));
+
+    let stemmed = objects(&hdt, &["--text", "alicias", "--no-index"]);
+    assert_eq!(stemmed, [r#""Alicia"@es"#]);
+}
 
 /// §4: every literal is accounted for, under exactly one reason.
 #[test]
