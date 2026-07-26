@@ -466,7 +466,6 @@ Named-graph options (`-m quads`, `--graph-map`, `--default-graph`,
 | `--prefix`            | off                         | `--text` only: match the final query token as a prefix                   |
 | `--lang LANG,...`     | all                         | `--text` only: BCP 47 ranges; untagged literals stay eligible            |
 | `--predicate IRI`     | all                         | `--text` only: keep only matches occurring on this predicate             |
-| `--no-dedupe`         | off                         | `--text` only: emit every occurrence instead of one row per subject      |
 | `--scores`            | off                         | `--text` only: append the relevance score as an N-Triples comment        |
 | `--text-index DIR`    | `<HDT_FILE>.text`           | `--text` only: text index directory                                      |
 | `-m, --memory-limit SIZE` | `4G`                    | Memory limit for dictionary caches and membership sorting                |
@@ -856,14 +855,15 @@ two-hundred-word `rdfs:comment` for the same query term, with nothing declared
 anywhere:
 
 ```console
-$ hdtc search data.hdt --text atrazine --scores
+$ hdtc search data.hdt --text atrazine --scores --limit 3
 <…/chebi/38769>  <…rdf-schema#label>  "atrazine"@en                      . # score=1.1420
 <…/gene/2>       <…rdf-schema#label>  "Atrazine chlorohydrolase"@en      . # score=0.9889
 <…/gene/1>       <…rdf-schema#label>  "atrazine degradation pathway"@en . # score=0.8719
 ```
 
-Results are entity-level: one row per subject, represented by its highest-ranked
-matching literal. `--no-dedupe` restores the occurrence view.
+Each ranked literal is resolved to every RDF triple that uses it, and every
+matching triple is emitted. A subject can therefore appear more than once when
+several of its literals match, just as it can in an ordinary pattern search.
 
 **The unit of indexing is the distinct literal**, identified by its object
 dictionary ID, so the index scales with distinct strings rather than with

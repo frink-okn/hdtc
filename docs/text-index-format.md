@@ -517,9 +517,9 @@ The index holds no predicate (§2.1), so a predicate restriction is applied
 
 This is the cost of the distinct-literal design and it should be named clearly:
 filling a page of results can require walking past arbitrarily many ranked
-literals whose occurrences all fail the filter. The same is true of subject
-deduplication (§7.4). Cost is bounded per literal — one OPS descent — but the
-number of literals examined is not bounded by the page size.
+literals whose occurrences all fail the filter. Cost is bounded per literal —
+one OPS descent — but the number of literals examined is not bounded by the page
+size.
 
 A conforming implementation should report how far it walked. Doc 19 §19.2.3
 proposes a predicate-ID → object-ID sidecar that would make this filtering
@@ -529,15 +529,16 @@ new file beside this index — and is not a change to this format.
 
 ### 7.4 Results
 
-Results are **entity-level and deduplicated by subject** by default: a subject
-appears once, represented by its highest-ranked matching literal. Under
-distinct-literal indexing this is the natural mode — a hit fans out to its
-occurrences, and collapsing by subject is what stops one popular string from
-filling a page. An occurrence view (every `(subject, predicate)` of every ranked
-literal) is available and is the raw form.
+Results are RDF triples. Every ranked literal expands to every
+`(subject, predicate)` occurrence that uses it, subject to the predicate filter,
+and no occurrences are collapsed by subject. A subject therefore appears once
+for each matching triple, preserving the same statement-oriented semantics as
+an ordinary pattern search.
 
-Ordering is by descending score, ties broken by ascending object dictionary ID,
-then by the OPS order of a literal's occurrences. The tie-break is normative:
+Ordering follows the whole-literal, exact, and stemmed class order of §6. Within
+a class it is by descending score, with ties broken by ascending object
+dictionary ID, then by the OPS order of a literal's occurrences. Every
+occurrence of one literal carries the same score. The tie-break is normative:
 determinism here is worth more than any cleverness about which of two equally
 scored literals is nicer, because a page that varies between identical calls
 poisons caching and response diffs.

@@ -641,7 +641,6 @@ fn search_text(
         prefix: args.prefix,
         languages: &languages,
         predicate: args.predicate.as_deref(),
-        dedupe: !args.no_dedupe,
         scores: args.scores,
         output: args.output.as_deref(),
         count_only: args.count,
@@ -658,14 +657,7 @@ fn search_text(
             start.elapsed().as_secs_f64()
         );
     }
-    tracing::info!(
-        "Done! {count} matching {}",
-        if args.no_dedupe {
-            "occurrence(s)"
-        } else {
-            "subject(s)"
-        }
-    );
+    tracing::info!("Done! {count} matching triple(s)");
     Ok(())
 }
 

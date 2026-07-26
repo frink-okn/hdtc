@@ -232,9 +232,10 @@ fn exclusions_are_configurable_and_recorded() {
     );
     // The long comment is gone; the short label is still there.
     assert!(objects(&capped, &["--text", "herbicide", "--no-index"]).is_empty());
-    assert_eq!(
-        objects(&capped, &["--text", "atrazine", "--no-index"]),
-        [r#""atrazine"@en"#]
+    assert!(
+        objects(&capped, &["--text", "atrazine", "--no-index"])
+            .contains(&r#""atrazine"@en"#.to_string()),
+        "the short exact label remains indexed"
     );
 
     let everything = run_hdtc_to_path(temp.path(), &[&input], "everything.hdt");
@@ -326,7 +327,7 @@ fn a_short_label_outranks_a_long_comment_without_any_field_configuration() {
     let temp = tempfile::tempdir().unwrap();
     let hdt = fixture(temp.path());
 
-    let found = objects(&hdt, &["--text", "atrazine", "--no-dedupe"]);
+    let found = objects(&hdt, &["--text", "atrazine"]);
     assert_eq!(found[0], r#""atrazine"@en"#);
     let comment_rank = found
         .iter()
@@ -338,31 +339,21 @@ fn a_short_label_outranks_a_long_comment_without_any_field_configuration() {
     );
 }
 
-/// §7.4: one row per subject, represented by its best literal.
+/// §7.4: every matching RDF statement is emitted, even when several have the
+/// same subject.
 #[test]
-fn results_are_deduplicated_by_subject_by_default() {
+fn every_matching_triple_is_emitted() {
     let temp = tempfile::tempdir().unwrap();
     let hdt = fixture(temp.path());
 
-    let deduped = subjects(&hdt, &["--text", "atrazine"]);
-    let mut sorted = deduped.clone();
-    sorted.sort();
-    sorted.dedup();
-    assert_eq!(deduped.len(), sorted.len(), "no subject appears twice");
-    assert_eq!(deduped[0], iri("chebi/38769"));
-
-    // chebi/38769 matches on both its label and its comment; deduplicated, the
-    // label represents it.
-    let occurrences = rows(&hdt, &["--text", "atrazine", "--no-dedupe"]);
-    assert!(
-        occurrences.len() > deduped.len(),
-        "the occurrence view is strictly larger: {occurrences:?}"
-    );
-    let (_, predicate, _) = rows(&hdt, &["--text", "atrazine"])
-        .into_iter()
-        .find(|(subject, _, _)| *subject == iri("chebi/38769"))
-        .unwrap();
-    assert_eq!(predicate, format!("<{RDFS_LABEL}>"));
+    let found = rows(&hdt, &["--text", "atrazine"]);
+    let chebi_predicates: Vec<&str> = found
+        .iter()
+        .filter(|(subject, _, _)| *subject == iri("chebi/38769"))
+        .map(|(_, predicate, _)| predicate.as_str())
+        .collect();
+    assert!(chebi_predicates.contains(&format!("<{RDFS_LABEL}>").as_str()));
+    assert!(chebi_predicates.contains(&format!("<{RDFS_COMMENT}>").as_str()));
 }
 
 /// §7.4: identical calls return identical pages. A ranking that varies between
@@ -435,7 +426,6 @@ fn scores_are_emitted_as_trailing_comments_and_remain_valid_ntriples() {
     let output = search(&hdt, &["--text", "atrazine", "--scores"]);
     assert!(output.status.success(), "{}", stderr(&output));
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut previous = f64::INFINITY;
     for line in stdout.lines().filter(|line| !line.is_empty()) {
         let (triple, score) = line
             .rsplit_once(" # score=")
@@ -444,9 +434,7 @@ fn scores_are_emitted_as_trailing_comments_and_remain_valid_ntriples() {
         assert_eq!(fields.len(), 4, "S\\tP\\tO\\t. before the comment");
         assert_eq!(fields[3], ".");
         let score: f64 = score.parse().expect("numeric score in comment");
-        assert!(score > 0.0);
-        assert!(score <= previous, "scores descend: {stdout}");
-        previous = score;
+        assert!(score.is_finite() && score > 0.0);
     }
 
     // An RDF parser must ignore the comments and accept the output directly.
@@ -514,7 +502,7 @@ fn fuzzy_and_prefix_widen_the_query() {
         subjects(&hdt, &["--text", "atraz"]).is_empty(),
         "a prefix is not a token"
     );
-    let prefixed = objects(&hdt, &["--text", "atraz", "--prefix", "--no-dedupe"]);
+    let prefixed = objects(&hdt, &["--text", "atraz", "--prefix"]);
     assert!(
         prefixed
             .iter()
@@ -524,7 +512,7 @@ fn fuzzy_and_prefix_widen_the_query() {
 
     // "atrazin" is an exact token of the German label and a prefix of the
     // English ones; §6 requires the exact match to lead.
-    let mixed = objects(&hdt, &["--text", "atrazin", "--prefix", "--no-dedupe"]);
+    let mixed = objects(&hdt, &["--text", "atrazin", "--prefix"]);
     assert!(mixed[0].contains("Atrazin\"@de"), "{mixed:?}");
     assert!(mixed.len() > 1, "prefix matches follow: {mixed:?}");
 }
@@ -558,7 +546,7 @@ fn stemming_finds_other_word_forms_including_in_untagged_literals() {
     );
 
     // §6: an exact hit outranks a stemmed one, as a class.
-    let ranked = objects(&hdt, &["--text", "run", "--no-dedupe"]);
+    let ranked = objects(&hdt, &["--text", "run"]);
     assert_eq!(ranked[0], r#""run""#, "exact first: {ranked:?}");
     assert!(ranked.len() > 1, "the stemmed hit follows: {ranked:?}");
 
@@ -656,7 +644,7 @@ fn language_filtering_keeps_untagged_literals_eligible() {
     // German "Atrazin" and English "atrazine" now share a stem. It is contained
     // rather than eliminated — the German literal is reachable from the English
     // query, but only in the stemmed class, below every exact hit.
-    let converged = objects(&hdt, &["--text", "atrazine", "--no-dedupe"]);
+    let converged = objects(&hdt, &["--text", "atrazine"]);
     assert_eq!(
         converged[0], r#""atrazine"@en"#,
         "the exact hit still leads: {converged:?}"
@@ -723,8 +711,7 @@ fn a_literal_with_a_very_large_occurrence_group_still_resolves() {
     let hdt = run_hdtc_to_path_with_args(temp.path(), &[&input], "data.hdt", &["--index"]);
     build_text(&hdt, &[]);
 
-    // Deduplicated, each subject appears once, so a page of 10 comes from 10
-    // distinct subjects of the oversized group.
+    // Each of the first ten triples has a distinct subject in this fixture.
     let page = subjects(&hdt, &["--text", "shared label", "--limit", "10"]);
     assert_eq!(page.len(), 10);
     let mut distinct = page.clone();
@@ -744,7 +731,7 @@ fn a_literal_with_a_very_large_occurrence_group_still_resolves() {
 
     // And the whole occurrence set is reachable, not truncated at the batch
     // threshold.
-    let output = search(&hdt, &["--text", "shared label", "--count", "--no-dedupe"]);
+    let output = search(&hdt, &["--text", "shared label", "--count"]);
     assert_eq!(
         String::from_utf8_lossy(&output.stdout).trim(),
         "4201",
@@ -762,7 +749,6 @@ fn indexed_and_sequential_resolution_agree() {
 
     for query in [
         vec!["--text", "atrazine"],
-        vec!["--text", "atrazine", "--no-dedupe"],
         vec!["--text", "degradation", "--predicate", RDFS_LABEL],
         vec!["--text", "atrazine degradation", "--text-match", "any"],
     ] {
@@ -849,7 +835,6 @@ fn pattern_and_text_search_are_mutually_exclusive() {
         vec!["--fuzzy", "1"],
         vec!["--prefix"],
         vec!["--scores"],
-        vec!["--no-dedupe"],
         vec!["--lang", "en"],
         vec!["--text-match", "phrase"],
         vec!["--predicate", RDFS_LABEL],

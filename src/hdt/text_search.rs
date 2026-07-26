@@ -6,16 +6,11 @@
 //! `(subject, predicate)` pairs that use it, by running the same `? ? <object>`
 //! resolution the `??O` pattern search uses.
 //!
-//! Results are **entity-level and deduplicated by subject** by default (doc 19
-//! §19.3): a subject appears once, represented by its highest-ranked matching
-//! literal. Without that, one popular string fills a page on its own.
-//!
 //! The cost this design trades for its small index is **over-fetch**: a filter
-//! the index cannot apply — `--predicate`, or subject deduplication itself —
-//! is applied after ranking, so filling a page can require walking past many
-//! ranked literals. Every run reports how far it walked, which is the
-//! measurement doc 19 §19.7 asks for before deciding whether a predicate
-//! sidecar is worth building.
+//! the index cannot apply — `--predicate` — is applied after ranking, so
+//! filling a page can require walking past many ranked literals. Every run
+//! reports how far it walked, which is the measurement doc 19 §19.7 asks for
+//! before deciding whether a predicate sidecar is worth building.
 
 use crate::hdt::index_reader::open_index;
 use crate::hdt::reader::{
@@ -30,8 +25,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// How many ranked literals to ask for before the first resolution attempt,
-/// relative to the page being filled. Four covers the common case where most
-/// literals contribute a fresh subject; anything more is paid for by growth.
+/// relative to the page being filled. Four tolerates literals whose occurrences
+/// do not survive predicate filtering; anything more is paid for by growth.
 const INITIAL_OVERFETCH: u64 = 4;
 /// Floor on the first request, so a two-row page still starts with a useful
 /// slice of the ranking.
@@ -51,9 +46,7 @@ pub struct TextSearchOptions<'a> {
     pub languages: &'a [String],
     /// Restrict matches to occurrences on this predicate IRI.
     pub predicate: Option<&'a str>,
-    /// Collapse to one row per subject.
-    pub dedupe: bool,
-    /// Prefix each row with its score.
+    /// Append each row's score as a trailing N-Triples comment.
     pub scores: bool,
     pub output: Option<&'a Path>,
     pub count_only: bool,
@@ -130,7 +123,6 @@ pub fn search_text_streaming(options: &TextSearchOptions<'_>) -> Result<u64> {
             &mut dictionary,
             &EmitOptions {
                 predicate_filter,
-                dedupe: options.dedupe,
                 scores: options.scores,
                 skip,
                 take: None,
@@ -165,7 +157,6 @@ pub fn search_text_streaming(options: &TextSearchOptions<'_>) -> Result<u64> {
             &mut dictionary,
             &EmitOptions {
                 predicate_filter,
-                dedupe: options.dedupe,
                 scores: options.scores,
                 skip,
                 take: Some(take),
@@ -220,7 +211,6 @@ fn report_overfetch(outcome: &EmitOutcome, total_hits: usize) {
 
 struct EmitOptions {
     predicate_filter: Option<u64>,
-    dedupe: bool,
     scores: bool,
     skip: u64,
     take: Option<u64>,
@@ -249,7 +239,6 @@ fn emit_rows(
     resolver.prepare(hits)?;
     let mut outcome = EmitOutcome::default();
     let mut skipped = 0u64;
-    let mut seen_subjects: HashSet<u64> = HashSet::new();
     let mut object_buf = Vec::new();
     let mut subject_buf = Vec::new();
     let mut predicate_buf = Vec::new();
@@ -266,15 +255,6 @@ fn emit_rows(
 
         let mut object_resolved = false;
         for (subject, predicate) in occurrences {
-            // Deduplication is by *subject*, not by literal: a subject appears
-            // once, represented by its highest-ranked matching literal (doc 19
-            // §19.3). A literal used by a thousand different subjects is a
-            // thousand entities and yields a row for each — collapsing it to
-            // one would hide every entity but the first that happens to share
-            // a common name.
-            if options.dedupe && !seen_subjects.insert(subject) {
-                continue;
-            }
             if skipped < options.skip {
                 skipped += 1;
                 continue;

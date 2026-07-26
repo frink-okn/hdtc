@@ -287,8 +287,7 @@ pub struct ValidateArgs {
 #[command(group(
     clap::ArgGroup::new("text_options")
         .args([
-            "text_match", "fuzzy", "prefix", "lang", "predicate", "no_dedupe", "scores",
-            "text_index",
+            "text_match", "fuzzy", "prefix", "lang", "predicate", "scores", "text_index",
         ])
         .multiple(true)
         .conflicts_with("query")
@@ -309,9 +308,6 @@ pub struct SearchArgs {
     pub query: Option<String>,
 
     /// Ranked full-text search over the literal index built by `hdtc text`
-    ///
-    /// Results are entity-level: one row per subject, represented by its
-    /// highest-ranked matching literal, unless --no-dedupe is given.
     #[arg(long, value_name = "TEXT")]
     pub text: Option<String>,
 
@@ -339,10 +335,6 @@ pub struct SearchArgs {
     /// Keep only matches occurring on this predicate (--text only)
     #[arg(long, value_name = "IRI")]
     pub predicate: Option<String>,
-
-    /// Emit every matching occurrence instead of one row per subject (--text only)
-    #[arg(long)]
-    pub no_dedupe: bool,
 
     /// Append its relevance score as a trailing N-Triples comment (--text only)
     #[arg(long)]
