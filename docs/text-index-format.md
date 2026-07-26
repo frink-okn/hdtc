@@ -213,7 +213,8 @@ tokenizing the whole corpus twice.
 
 ### 3.5 The datatype exclusion set
 
-The default set is the XSD datatypes with an ordered value space:
+The default set is the XSD datatypes with an ordered value space plus the
+GeoSPARQL WKT geometry datatype:
 
 ```
 xsd:base64Binary  xsd:boolean   xsd:byte       xsd:date      xsd:dateTime
@@ -224,14 +225,17 @@ xsd:long          xsd:negativeInteger          xsd:nonNegativeInteger
 xsd:nonPositiveInteger          xsd:positiveInteger          xsd:short
 xsd:time          xsd:unsignedByte             xsd:unsignedInt
 xsd:unsignedLong  xsd:unsignedShort            xsd:yearMonthDuration
+geo:wktLiteral
 ```
 
-(`xsd:` is `http://www.w3.org/2001/XMLSchema#`; the manifest records full IRIs.)
+(`xsd:` is `http://www.w3.org/2001/XMLSchema#`, and `geo:` is
+`http://www.opengis.net/ont/geosparql#`; the manifest records full IRIs.)
 
-Indexing these as text produces tokens nobody searches for. Everything else is
-indexed, including `xsd:string`, `rdf:langString`, `xsd:anyURI`, `rdf:XMLLiteral`,
-the string-derived types, and any datatype the builder has never heard of —
-which is the exhaustive-by-default stance of §3.3 applied to datatypes.
+Indexing these as text produces tokens nobody searches for and duplicates range
+or spatial indexing. Everything else is indexed, including `xsd:string`,
+`rdf:langString`, `xsd:anyURI`, `rdf:XMLLiteral`, the string-derived types, and
+any datatype the builder has never heard of — which is the
+exhaustive-by-default stance of §3.3 applied to datatypes.
 
 A build may add IRIs to this set or replace it with the empty set. Whatever set
 was used is recorded in full in the manifest (§4), so a consumer never has to

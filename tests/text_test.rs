@@ -208,6 +208,7 @@ fn the_manifest_accounts_for_every_literal() {
         .map(|fields| fields[0].clone())
         .collect();
     assert!(excluded.contains(&XSD_DOUBLE.to_string()));
+    assert!(excluded.contains(&"http://www.opengis.net/ont/geosparql#wktLiteral".to_string()));
     assert!(!excluded.iter().any(|iri| iri.ends_with("#string")));
     let mut sorted = excluded.clone();
     sorted.sort();

@@ -250,12 +250,13 @@ pub fn language_matches(range: &str, tag: &str) -> bool {
 /// document).
 ///
 /// These are the XSD datatypes with an ordered value space — numbers, dates,
-/// durations, binary blobs. Indexing their lexical forms as text produces
-/// tokens nobody searches for and duplicates what a range index does properly.
-/// Everything else is indexed, including `xsd:string`, `rdf:langString`,
-/// `xsd:anyURI` and the string-derived types, which preserves the format's
-/// exhaustive-by-default stance.
+/// durations, binary blobs — plus GeoSPARQL WKT geometry. Indexing their lexical
+/// forms as text produces tokens nobody searches for and duplicates what range
+/// and spatial indexes do properly. Everything else is indexed, including
+/// `xsd:string`, `rdf:langString`, `xsd:anyURI` and the string-derived types,
+/// which preserves the format's exhaustive-by-default stance.
 pub const DEFAULT_EXCLUDED_DATATYPES: &[&str] = &[
+    "http://www.opengis.net/ont/geosparql#wktLiteral",
     "http://www.w3.org/2001/XMLSchema#base64Binary",
     "http://www.w3.org/2001/XMLSchema#boolean",
     "http://www.w3.org/2001/XMLSchema#byte",
@@ -534,6 +535,7 @@ mod tests {
     #[test]
     fn value_space_datatypes_are_excluded_and_string_ones_are_not() {
         let exclusions = DatatypeExclusions::with_defaults(&[]);
+        assert!(exclusions.contains(b"http://www.opengis.net/ont/geosparql#wktLiteral"));
         assert!(exclusions.contains(b"http://www.w3.org/2001/XMLSchema#integer"));
         assert!(exclusions.contains(b"http://www.w3.org/2001/XMLSchema#dateTime"));
         assert!(!exclusions.contains(b"http://www.w3.org/2001/XMLSchema#string"));
@@ -569,6 +571,13 @@ mod tests {
         // reports should say the datatype was the reason.
         assert_eq!(
             classify_term(b"\"12345\"^^<http://www.w3.org/2001/XMLSchema#integer>", 2),
+            Some(Exclusion::Datatype)
+        );
+        assert_eq!(
+            classify_term(
+                b"\"Point(78.0419 27.175)\"^^<http://www.opengis.net/ont/geosparql#wktLiteral>",
+                4096
+            ),
             Some(Exclusion::Datatype)
         );
     }
