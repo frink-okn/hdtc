@@ -367,7 +367,7 @@ pub struct SearchArgs {
     #[arg(long)]
     pub no_index: bool,
 
-    /// Directory for bounded external sorting used by wildcard-graph queries
+    /// Directory for bounded external sorting used by graph and unlimited text queries
     #[arg(long, value_name = "DIR")]
     pub temp_dir: Option<PathBuf>,
 

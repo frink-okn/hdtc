@@ -647,6 +647,7 @@ fn search_text(
         limit,
         offset,
         memory_limit,
+        temp_dir: args.temp_dir.as_deref(),
         index_path: args.index.as_deref(),
         no_index: args.no_index,
     })?;

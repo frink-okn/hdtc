@@ -475,6 +475,13 @@ fn limit_and_offset_page_through_the_ranking() {
         all.len().to_string(),
         "--count counts the same rows the unlimited query emits"
     );
+
+    let output = search(&hdt, &["--text", "atrazine", "--limit", "0"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        output.stdout.is_empty(),
+        "--limit 0 must not emit its first matching row"
+    );
 }
 
 #[test]
@@ -815,6 +822,65 @@ fn indexed_and_sequential_resolution_agree() {
         let scanned = rows(&hdt, &[query.clone(), vec!["--no-index"]].concat());
         assert_eq!(indexed, scanned, "resolution paths disagree for {query:?}");
     }
+}
+
+/// §7.4 specifies OPS order within one literal. A sequential BitmapTriples
+/// scan naturally discovers SPO order, so it has to normalize each group
+/// before paging it.
+#[test]
+fn indexed_and_sequential_resolution_use_the_same_ops_order() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input.nt");
+    write_file(
+        &input,
+        br#"<http://example.org/s1> <http://example.org/p2> "shared label" .
+<http://example.org/s2> <http://example.org/p1> "shared label" .
+"#,
+    );
+    let hdt = run_hdtc_to_path_with_args(temp.path(), &[&input], "data.hdt", &["--index"]);
+    build_text(&hdt, &[]);
+
+    let indexed = rows(&hdt, &["--text", "shared label", "--limit", "1"]);
+    let scanned = rows(
+        &hdt,
+        &["--text", "shared label", "--limit", "1", "--no-index"],
+    );
+    assert_eq!(indexed, scanned);
+    assert_eq!(indexed[0].0, iri("s2"), "p1 precedes p2 in OPS order");
+}
+
+/// Over-fetch telemetry counts occurrences inspected before predicate
+/// filtering, not merely the rows that survived it.
+#[test]
+fn predicate_telemetry_reports_prefilter_occurrences() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input.nt");
+    write_file(
+        &input,
+        br#"<http://example.org/s1> <http://example.org/p1> "shared label" .
+<http://example.org/s2> <http://example.org/p2> "shared label" .
+"#,
+    );
+    let hdt = run_hdtc_to_path_with_args(temp.path(), &[&input], "data.hdt", &["--index"]);
+    build_text(&hdt, &[]);
+
+    let output = search(
+        &hdt,
+        &[
+            "--text",
+            "shared label",
+            "--predicate",
+            "http://example.org/p1",
+            "--count",
+        ],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "1");
+    assert!(
+        stderr(&output).contains("2 occurrence(s) examined"),
+        "telemetry did not report the pre-filter pair count: {}",
+        stderr(&output)
+    );
 }
 
 // ---------------------------------------------------------------------------

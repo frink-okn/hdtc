@@ -460,7 +460,7 @@ Named-graph options (`-m quads`, `--graph-map`, `--default-graph`,
 | `--offset N`          | 0                           | Skip the first N matching results (ignored when combined with `--count`) |
 | `--index PATH`        | `<HDT_FILE>.hdt.index.v1-1` | Index file path (used for `? P ?`, `? ? O`, and `? P O` queries)         |
 | `--no-index`          | off                         | Disable index use; fall back to sequential scan for all patterns         |
-| `--temp-dir DIR`      | system temp                 | Directory for wildcard-graph membership sorting                          |
+| `--temp-dir DIR`      | system temp                 | Directory for graph and unlimited-text external sorting                  |
 | `--text-match MODE`   | `all`                       | `--text` only: how query tokens combine (`all`, `any`, `phrase`)         |
 | `--fuzzy N`           | `0`                         | `--text` only: maximum edit distance per token (0-2)                     |
 | `--prefix`            | off                         | `--text` only: match the final query token as a prefix                   |
@@ -468,7 +468,7 @@ Named-graph options (`-m quads`, `--graph-map`, `--default-graph`,
 | `--predicate IRI`     | all                         | `--text` only: keep only matches occurring on this predicate             |
 | `--scores`            | off                         | `--text` only: append the relevance score as an N-Triples comment        |
 | `--text-index DIR`    | `<HDT_FILE>.text`           | `--text` only: text index directory                                      |
-| `-m, --memory-limit SIZE` | `4G`                    | Memory limit for dictionary caches and membership sorting                |
+| `-m, --memory-limit SIZE` | `4G`                    | Memory limit for caches, membership sorting, and text ranking            |
 | `-v, --verbose`       | —                           | Increase log verbosity (`-v` debug, `-vv` trace)                         |
 | `-q, --quiet`         | —                           | Suppress all output except errors                                        |
 

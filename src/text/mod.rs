@@ -34,7 +34,7 @@ pub use analyzer::{
     DEFAULT_MAX_LITERAL_BYTES, DEFAULT_UNTAGGED_LANGUAGE, DatatypeExclusions, normalize_language,
 };
 pub use builder::{TextConfig, create_text_index};
-pub use searcher::{MatchMode, TextHit, TextQuery, TextSearcher};
+pub use searcher::{MatchKind, MatchMode, TextHit, TextQuery, TextSearcher};
 
 use std::path::{Path, PathBuf};
 

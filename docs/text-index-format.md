@@ -537,7 +537,9 @@ parser.
 | build | one pass over the object dictionary section; no triple pass |
 | build memory | Tantivy's indexing arena, bounded by the configured limit |
 | index size | scales with distinct indexed literals and their token counts |
-| query, ranking | posting-list scan and top-k heap, over distinct literals |
+| query, bounded ranking | posting-list scan and top-k heap, over distinct literals |
+| query, unlimited ranking | posting-list scan plus bounded external sort, spilling to `--temp-dir` |
+| query, count | unscored posting-list scan; object IDs are resolved in bounded batches |
 | hit → `(subject, predicate)` | one OPS descent per ranked literal |
 | page fill | ranking cost plus one descent per literal examined (§7.3) |
 

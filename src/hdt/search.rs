@@ -415,6 +415,13 @@ fn write_zero_count_if_needed(output: Option<&Path>, count_only: bool) -> Result
     Ok(())
 }
 
+fn write_empty_output_if_needed(output: Option<&Path>) -> Result<()> {
+    if output.is_some() {
+        crate::hdt::reader::make_writer(output)?.flush()?;
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // ?P? search using predicate index
 // ---------------------------------------------------------------------------
@@ -975,9 +982,10 @@ fn scan_object_group_sorted(
 /// scans are shared: one pass locates every group, and one pass resolves every
 /// position. Cost stops scaling with the page size.
 ///
-/// Objects whose group is larger than the memory budget are left out of the
-/// returned map; the caller resolves those individually, where the chunked
-/// path's bounded memory matters more than the extra scan.
+/// Object groups that would make the page's aggregate resident entries exceed
+/// the memory budget are left out of the returned map; the caller resolves
+/// those individually, where the chunked path's bounded memory matters more
+/// than the extra scan.
 ///
 /// Each object's pairs come back in the group's OPS order, as
 /// [`scan_object_occurrences`] would have produced them.
@@ -999,16 +1007,22 @@ pub(crate) fn resolve_object_page(
     sorted.dedup();
     let groups = bitmap_index_z_groups(index_path, idx.bitmap_index_z_start, &sorted)?;
 
-    // (pos_y, which object, which entry within that object's group)
-    let entries_per_chunk = (memory_limit / std::mem::size_of::<u64>()).clamp(4096, 262_144) as u64;
+    // One resident occurrence appears once in `targets` and once in its
+    // object's output vector. Cap their aggregate, not merely each individual
+    // object group, so a page of many medium groups stays bounded too.
+    let bytes_per_entry =
+        std::mem::size_of::<(u64, u32, u32)>() + std::mem::size_of::<(u64, u64)>();
+    let resident_entry_budget = (memory_limit / bytes_per_entry).clamp(4096, 262_144) as u64;
+    let mut resident_entries = 0u64;
     let mut targets: Vec<(u64, u32, u32)> = Vec::new();
     let mut objects: Vec<u64> = Vec::new();
     for (object_id, group) in sorted.iter().zip(groups) {
         let Some(group) = group else { continue };
-        if group.size > entries_per_chunk {
-            continue; // too large to hold resident; caller falls back
+        if group.size > resident_entry_budget.saturating_sub(resident_entries) {
+            continue; // aggregate page would be too large; caller falls back
         }
         let positions = read_index_z_range(index_path, idx.index_z_start, group.start, group.size)?;
+        resident_entries += group.size;
         let slot = objects.len() as u32;
         objects.push(*object_id);
         resolved.insert(*object_id, vec![(0, 0); positions.len()]);
@@ -1113,6 +1127,14 @@ pub fn search_hdt_streaming(
 
     let (offsets, mut dictionary) = open_hdt(hdt_path, memory_limit)
         .with_context(|| format!("Failed to open HDT file {}", hdt_path.display()))?;
+
+    // A zero-sized page is empty by definition. Stop before resolving terms or
+    // selecting an indexed route so `--limit 0` neither emits a row nor
+    // requires an index.
+    if !count_only && limit == Some(0) {
+        write_empty_output_if_needed(output)?;
+        return Ok(0);
+    }
 
     // Resolve bound terms to dictionary IDs. If any bound term is not found,
     // the result set is empty — return immediately (not an error).

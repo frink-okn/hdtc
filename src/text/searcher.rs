@@ -11,13 +11,14 @@ use super::analyzer::{
 use super::manifest::TextManifest;
 use super::schema::{FIELD_LANG, FIELD_OBJECT, FIELD_TEXT, FIELD_TEXT_STEMMED, register_tokenizer};
 use anyhow::{Context, Result, ensure};
-use std::collections::HashSet;
 use std::path::Path;
 use tantivy::collector::{Count, TopDocs};
-use tantivy::query::{BooleanQuery, FuzzyTermQuery, Occur, PhraseQuery, Query, TermQuery};
+use tantivy::query::{
+    BooleanQuery, EnableScoring, FuzzyTermQuery, Occur, PhraseQuery, Query, QueryClone, TermQuery,
+};
 use tantivy::schema::{Field, IndexRecordOption};
 use tantivy::tokenizer::{Language, TextAnalyzer, TokenStream};
-use tantivy::{Index, IndexReader, Term};
+use tantivy::{DocSet, Index, IndexReader, TERMINATED, Term};
 
 /// How the tokens of a query must combine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -158,19 +159,13 @@ impl TextSearcher {
 
     /// Number of documents matching `query` in either form, without ranking.
     pub fn count(&self, query: &TextQuery) -> Result<usize> {
-        let mut clauses = Vec::new();
-        for target in [Target::Plain, Target::Stemmed] {
-            if let Some(built) = self.build_query(query, target)? {
-                clauses.push((Occur::Should, built));
-            }
-        }
-        if clauses.is_empty() {
+        let Some(built) = self.union_query(query)? else {
             return Ok(0);
-        }
+        };
         let searcher = self.reader.searcher();
         // A document matching both forms is one document; the union query
         // counts it once, which is what a `--count` has to report.
-        Ok(searcher.search(&BooleanQuery::new(clauses), &Count)?)
+        Ok(searcher.search(&built, &Count)?)
     }
 
     /// The `top_k` highest-scoring literals, best first.
@@ -189,29 +184,135 @@ impl TextSearcher {
             return Ok(Vec::new());
         }
         let mut hits: Vec<TextHit> = Vec::new();
-        let mut seen: HashSet<u64> = HashSet::new();
 
-        for (target, kind) in [
-            (Target::Plain, MatchKind::Exact),
-            (Target::Stemmed, MatchKind::Stemmed),
-        ] {
+        for (built, kind) in self.phase_queries(query)? {
             if hits.len() >= top_k {
                 break;
             }
-            let Some(built) = self.build_query(query, target)? else {
-                continue;
-            };
-            for mut hit in self.run(&built, top_k, kind)? {
-                // A stemmed hit for a document already found exactly is the
-                // same document; the exact classification is the truthful one.
-                if seen.insert(hit.object_id) {
-                    hit.kind = kind;
-                    hits.push(hit);
+            hits.extend(self.run(&built, top_k - hits.len(), kind)?);
+        }
+        Ok(hits)
+    }
+
+    /// Visit every matching object ID without calculating or retaining scores.
+    ///
+    /// The union query yields a document once even when both text fields match.
+    /// This is the bounded-memory path used by `search --text --count`.
+    pub(crate) fn for_each_matching_object(
+        &self,
+        query: &TextQuery,
+        mut visit: impl FnMut(u64) -> Result<()>,
+    ) -> Result<usize> {
+        let Some(built) = self.union_query(query)? else {
+            return Ok(0);
+        };
+        let searcher = self.reader.searcher();
+        let weight = built.weight(EnableScoring::disabled_from_searcher(&searcher))?;
+        let mut count = 0usize;
+
+        for segment in searcher.segment_readers() {
+            let object_ids = segment
+                .fast_fields()
+                .u64(FIELD_OBJECT)
+                .context("Text index has no object ID column")?;
+            let mut scorer = weight.scorer(segment, 1.0)?;
+            while scorer.doc() != TERMINATED {
+                let doc = scorer.doc();
+                if segment
+                    .alive_bitset()
+                    .is_none_or(|alive| alive.is_alive(doc))
+                {
+                    let object_id = object_ids
+                        .first(doc)
+                        .context("Text index document carries no object ID")?;
+                    visit(object_id)?;
+                    count += 1;
+                }
+                scorer.advance();
+            }
+        }
+        Ok(count)
+    }
+
+    /// Visit every ranked hit without retaining the complete ranking.
+    ///
+    /// Hits arrive in segment/doc order. The caller can feed them to an
+    /// external sorter to obtain the normative class/score/object ordering
+    /// without a `TopDocs` heap proportional to the result count.
+    pub(crate) fn for_each_ranked_hit(
+        &self,
+        query: &TextQuery,
+        mut visit: impl FnMut(TextHit) -> Result<()>,
+    ) -> Result<usize> {
+        let searcher = self.reader.searcher();
+        let mut count = 0usize;
+
+        for (built, kind) in self.phase_queries(query)? {
+            let weight = built.weight(EnableScoring::enabled_from_searcher(&searcher))?;
+            for segment in searcher.segment_readers() {
+                let object_ids = segment
+                    .fast_fields()
+                    .u64(FIELD_OBJECT)
+                    .context("Text index has no object ID column")?;
+                let mut scorer = weight.scorer(segment, 1.0)?;
+                while scorer.doc() != TERMINATED {
+                    let doc = scorer.doc();
+                    if segment
+                        .alive_bitset()
+                        .is_none_or(|alive| alive.is_alive(doc))
+                    {
+                        let object_id = object_ids
+                            .first(doc)
+                            .context("Text index document carries no object ID")?;
+                        visit(TextHit {
+                            object_id,
+                            score: scorer.score(),
+                            kind,
+                        })?;
+                        count += 1;
+                    }
+                    scorer.advance();
                 }
             }
         }
-        hits.truncate(top_k);
-        Ok(hits)
+        Ok(count)
+    }
+
+    /// Union of the plain and stemmed forms, for unranked set operations.
+    fn union_query(&self, query: &TextQuery) -> Result<Option<Box<dyn Query>>> {
+        let mut clauses = Vec::new();
+        for target in [Target::Plain, Target::Stemmed] {
+            if let Some(built) = self.build_query(query, target)? {
+                clauses.push((Occur::Should, built));
+            }
+        }
+        Ok((!clauses.is_empty()).then(|| Box::new(BooleanQuery::new(clauses)) as Box<dyn Query>))
+    }
+
+    /// Ranked phases, with documents matched by the plain phase excluded from
+    /// the stemmed phase at query time. Besides avoiding an unbounded `seen`
+    /// set, this ensures a top-k stemmed request cannot be consumed by plain
+    /// duplicates while lower-ranked stemmed-only documents are missed.
+    fn phase_queries(&self, query: &TextQuery) -> Result<Vec<(Box<dyn Query>, MatchKind)>> {
+        let plain = self.build_query(query, Target::Plain)?;
+        let stemmed = self.build_query(query, Target::Stemmed)?;
+        let plain_exclusion = plain.as_ref().map(|built| built.box_clone());
+        let mut phases = Vec::with_capacity(2);
+
+        if let Some(built) = plain {
+            phases.push((built, MatchKind::Exact));
+        }
+        if let Some(built) = stemmed {
+            let stemmed_only: Box<dyn Query> = match plain_exclusion {
+                Some(exact) => Box::new(BooleanQuery::new(vec![
+                    (Occur::Must, built),
+                    (Occur::MustNot, exact),
+                ])),
+                None => built,
+            };
+            phases.push((stemmed_only, MatchKind::Stemmed));
+        }
+        Ok(phases)
     }
 
     /// Collect one phase's hits, ordered by score then object ID.
