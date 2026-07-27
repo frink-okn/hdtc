@@ -18,7 +18,7 @@ use tantivy::query::{
 };
 use tantivy::schema::{Field, IndexRecordOption};
 use tantivy::tokenizer::{Language, TextAnalyzer, TokenStream};
-use tantivy::{DocSet, Index, IndexReader, TERMINATED, Term};
+use tantivy::{DocSet, Index, IndexReader, ReloadPolicy, TERMINATED, Term};
 
 /// How the tokens of a query must combine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -128,8 +128,14 @@ impl TextSearcher {
             .tokenizers()
             .get(TOKENIZER_NAME)
             .context("hdtc tokenizer was not registered")?;
+        // Published hdtc indexes are immutable. Tantivy's default reader
+        // watches meta.json for later commits and logs its initial checksum as
+        // a modification; manual reload avoids that misleading watcher and an
+        // unnecessary reload.
         let reader = index
-            .reader()
+            .reader_builder()
+            .reload_policy(ReloadPolicy::Manual)
+            .try_into()
             .with_context(|| format!("Failed to open text index reader {}", dir.display()))?;
 
         Ok(Self {
