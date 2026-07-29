@@ -241,7 +241,10 @@ impl GraphIndex {
         let end = select1(&mut self.file, bitmap, superranks, subranks, position)?
             .checked_add(1)
             .context("graph run end overflow")?;
-        let capacity = usize::try_from(end - start).context("graph run is too large")?;
+        let run_length = end
+            .checked_sub(start)
+            .context("graph run offsets are reversed")?;
+        let capacity = usize::try_from(run_length).context("graph run is too large")?;
         let mut graphs = Vec::with_capacity(capacity);
         for ordinal in start..end {
             graphs.push(packed_value(&mut self.file, array, ordinal)?);
@@ -255,7 +258,9 @@ impl GraphIndex {
             "invalid position range"
         );
         ensure!(self.has_membership_ranks(), "graph-index BitmapG is absent");
-        Ok(self.adjacency_offset(end)? - self.adjacency_offset(start)?)
+        self.adjacency_offset(end)?
+            .checked_sub(self.adjacency_offset(start)?)
+            .context("membership offsets are reversed")
     }
 
     fn adjacency_offset(&mut self, position: u64) -> Result<u64> {
@@ -371,6 +376,13 @@ fn read_header(file: &mut File, actual_size: u64, strict_crc: bool) -> Result<He
     ensure!(
         get_u64(&bytes, 88).is_multiple_of(64),
         "unaligned graph-index footer"
+    );
+    let directory_end = get_u64(&bytes, 64)
+        .checked_add(get_u64(&bytes, 72))
+        .context("graph-index directory end overflow")?;
+    ensure!(
+        directory_end <= get_u64(&bytes, 88),
+        "graph-index directory overlaps payloads or footer"
     );
     let mut source_digest = [0u8; 32];
     source_digest.copy_from_slice(&bytes[112..144]);
@@ -813,14 +825,24 @@ fn select1(
             high = mid;
         }
     }
-    let superblock = low - 1;
+    let superblock = low
+        .checked_sub(1)
+        .context("BitmapG superrank directory has no origin")?;
     let super_rank = packed_value(file, superranks, superblock)?;
-    let first_subblock = superblock * 8;
+    let first_subblock = superblock
+        .checked_mul(8)
+        .context("BitmapG subblock offset overflow")?;
     let subblock_count = bitmap.entry_count.div_ceil(u64::from(SUBBLOCK_BITS));
     let mut chosen = first_subblock;
     let mut chosen_rank = super_rank;
-    for subblock in first_subblock..(first_subblock + 8).min(subblock_count) {
-        let rank = super_rank + packed_value(file, subranks, subblock)?;
+    let superblock_end = first_subblock
+        .checked_add(8)
+        .context("BitmapG subblock range overflow")?
+        .min(subblock_count);
+    for subblock in first_subblock..superblock_end {
+        let rank = super_rank
+            .checked_add(packed_value(file, subranks, subblock)?)
+            .context("BitmapG rank overflow")?;
         if rank > ordinal {
             break;
         }
@@ -828,15 +850,26 @@ fn select1(
         chosen_rank = rank;
     }
 
-    let start_bit = chosen * u64::from(SUBBLOCK_BITS);
-    let bits = (bitmap.entry_count - start_bit).min(u64::from(SUBBLOCK_BITS));
+    let start_bit = chosen
+        .checked_mul(u64::from(SUBBLOCK_BITS))
+        .context("BitmapG subblock bit offset overflow")?;
+    let bits = bitmap
+        .entry_count
+        .checked_sub(start_bit)
+        .context("BitmapG rank points beyond the bitmap")?
+        .min(u64::from(SUBBLOCK_BITS));
     let mut bytes = [0u8; 64];
     read_exact_at(
         file,
-        bitmap.offset + start_bit / 8,
+        bitmap
+            .offset
+            .checked_add(start_bit / 8)
+            .context("BitmapG byte offset overflow")?,
         &mut bytes[..bits.div_ceil(8) as usize],
     )?;
-    let mut remaining = ordinal - chosen_rank;
+    let mut remaining = ordinal
+        .checked_sub(chosen_rank)
+        .context("BitmapG rank exceeds the select ordinal")?;
     for (byte_index, &byte) in bytes[..bits.div_ceil(8) as usize].iter().enumerate() {
         let mut word = byte;
         let population = u64::from(word.count_ones());
@@ -849,7 +882,10 @@ fn select1(
             remaining -= 1;
         }
         let bit = u64::from(word.trailing_zeros());
-        let result = start_bit + byte_index as u64 * 8 + bit;
+        let result = start_bit
+            .checked_add(byte_index as u64 * 8)
+            .and_then(|value| value.checked_add(bit))
+            .context("BitmapG select result overflow")?;
         ensure!(
             result < bitmap.entry_count,
             "bitmap select reached a tail bit"
@@ -1140,6 +1176,34 @@ mod tests {
     use std::io::Write;
 
     #[test]
+    fn directory_length_is_bounded_by_the_file_before_allocation() -> Result<()> {
+        let actual_size = HEADER_SIZE + FOOTER_SIZE;
+        let section_count = u32::MAX;
+        let directory_length = u64::from(section_count) * DIRECTORY_ENTRY_SIZE + 4;
+        let mut header = [0u8; HEADER_SIZE as usize];
+        header[..8].copy_from_slice(b"$HDTGIDX");
+        header[8..10].copy_from_slice(&1u16.to_le_bytes());
+        header[12..16].copy_from_slice(&(HEADER_SIZE as u32).to_le_bytes());
+        header[16..24].copy_from_slice(&HAS_POS_LAYERS.to_le_bytes());
+        header[56..64].copy_from_slice(&actual_size.to_le_bytes());
+        header[64..72].copy_from_slice(&HEADER_SIZE.to_le_bytes());
+        header[72..80].copy_from_slice(&directory_length.to_le_bytes());
+        header[80..84].copy_from_slice(&section_count.to_le_bytes());
+        header[84..88].copy_from_slice(&1u32.to_le_bytes());
+        header[88..96].copy_from_slice(&HEADER_SIZE.to_le_bytes());
+        header[96..100].copy_from_slice(&SUPERBLOCK_BITS.to_le_bytes());
+        header[100..104].copy_from_slice(&SUBBLOCK_BITS.to_le_bytes());
+        header[104..108].copy_from_slice(&16u32.to_le_bytes());
+
+        let mut file = tempfile::tempfile()?;
+        file.write_all(&header)?;
+        file.write_all(&[0u8; FOOTER_SIZE as usize])?;
+        let error = read_header(&mut file, actual_size, false).unwrap_err();
+        assert!(error.to_string().contains("overlaps"), "{error}");
+        Ok(())
+    }
+
+    #[test]
     fn select_uses_rank_directories() -> Result<()> {
         let mut file = tempfile::tempfile()?;
         file.write_all(&[0b0011_0010])?; // set positions 1, 4, 5
@@ -1183,6 +1247,53 @@ mod tests {
         assert_eq!(select1(&mut file, bitmap, superranks, subranks, 0)?, 1);
         assert_eq!(select1(&mut file, bitmap, superranks, subranks, 1)?, 4);
         assert_eq!(select1(&mut file, bitmap, superranks, subranks, 2)?, 5);
+        Ok(())
+    }
+
+    #[test]
+    fn select_rejects_a_missing_superrank_origin() -> Result<()> {
+        let mut file = tempfile::tempfile()?;
+        file.write_all(&[1])?;
+        file.write_all(&[0; 7])?;
+        file.write_all(&1u64.to_le_bytes())?;
+        file.write_all(&1u64.to_le_bytes())?;
+        file.write_all(&0u16.to_le_bytes())?;
+        let bitmap = Section {
+            section_type: TRANSPOSE_BITMAP,
+            flags: REQUIRED,
+            offset: 0,
+            length: 1,
+            entry_count: 1,
+            bits_per_entry: 1,
+            crc: 0,
+            parameter: 0,
+            indexed_bits: 0,
+        };
+        let superranks = Section {
+            section_type: TRANSPOSE_SUPER,
+            flags: REQUIRED,
+            offset: 8,
+            length: 16,
+            entry_count: 2,
+            bits_per_entry: 64,
+            crc: 0,
+            parameter: 4096,
+            indexed_bits: 1,
+        };
+        let subranks = Section {
+            section_type: TRANSPOSE_SUB,
+            flags: REQUIRED,
+            offset: 24,
+            length: 2,
+            entry_count: 1,
+            bits_per_entry: 16,
+            crc: 0,
+            parameter: 512,
+            indexed_bits: 1,
+        };
+
+        let error = select1(&mut file, bitmap, superranks, subranks, 0).unwrap_err();
+        assert!(error.to_string().contains("no origin"), "{error}");
         Ok(())
     }
 }
