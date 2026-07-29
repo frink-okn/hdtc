@@ -219,6 +219,18 @@ hdtc graphs-index data.hdt
 # Creates: data.hdt.graphs.idx
 ```
 
+For new datasets, build the graph index during quads creation. This is the fast
+path: graph IDs travel through the two POS/OPS permutation sorts, so no sidecar
+transpose, inverse-position sort, or completed-HDT scan is needed. With a
+bounded graph dictionary, it also avoids the final membership sort; larger
+graph dictionaries use the bounded external-sort fallback. The same sorted
+streams also produce `.hdt.perm` when both flags are present:
+
+```sh
+hdtc create data.nq -o data.hdt -m quads --graphs-index
+hdtc create data.nq -o data.hdt -m quads --graphs-index --perm --index
+```
+
 The SPO transpose is opt-in because its value depends on graph count and query
 mix. `--transpose-ranks` adds `BitmapG`; `--transpose-ids` also adds `ArrayG`
 and implies ranks. Use `--positions pos` for POS only, or `--no-layers` for a
@@ -470,6 +482,7 @@ predicate (the `void:` statistics and the `hdt:` namespace).
 | `--temp-dir`                       | system temp                  | Directory for temporary working files                       |
 | `--index`                          | off                          | Generate `.hdt.index.v1-1` index file                       |
 | `--perm`                           | off                          | Generate `.hdt.perm` POS/OPS permutation index              |
+| `--graphs-index`                   | off                          | Generate `.hdt.graphs.idx` POS/OPS graph layers (quads)     |
 | `--perm-position-maps PERM,...`    | —                            | Include optional `pos` and/or `ops` maps to SPO positions   |
 | `--base-uri`                       | first input's `file://` URI  | Base URI used to resolve relative IRIs while parsing input  |
 | `--dataset-uri`                    | `--base-uri` value           | Dataset IRI recorded as the subject of the header metadata  |
@@ -629,6 +642,11 @@ unique SPO stream, while standalone `perm` first streams the existing HDT.
 `hdtc graphs-index` validates and transposes the graph sidecar once, then uses
 two external sorts per requested position space to map memberships into POS or
 OPS order. Its chunks are zstd-compressed and bounded by `--memory-limit`.
+`create --graphs-index` instead decorates the two permutation sorts with graph
+IDs and, for a bounded graph dictionary, writes each graph's positions directly
+while draining them. Larger graph dictionaries retain a bounded membership-sort
+fallback. When `--perm` is also selected, the same two permutation sorts feed
+both indexes.
 
 `hdtc sketch` additionally writes an uncompressed 8-byte hash for each
 qualifying IRI in every selected role while building the filters. An IRI in the
@@ -710,6 +728,10 @@ in the [format specification](docs/graphs-sidecar-format.md).
 hdtc create dataset.nq -o dataset.hdt -m quads
 # Creates dataset.hdt and dataset.hdt.graphs
 ```
+
+Add `--graphs-index` to publish the default POS/OPS graph index in the same
+operation. The index is staged against the exact HDT and sidecar bytes and is
+published last, after both parents.
 
 `--graph-map PATH=URI` adds a source-level named graph, and `--default-graph URI`
 is the fallback for otherwise unassigned statements.

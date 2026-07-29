@@ -1,13 +1,17 @@
+use crate::dictionary::DictCounts;
 use crate::hdt::artifacts::SourceIdentity;
 use crate::hdt::reader::{BitmapTriplesScanner, sha256_to_end};
 use crate::io::crc_utils::{CRC32C_ALGO, crc32c};
 use crate::io::{StreamingBitmapEncoder, StreamingLogArrayEncoder};
-use crate::permutation::{PermutationCollector, scan_hdt};
+use crate::permutation::{
+    PermEntry, PermutationCollector, PositionMaps, PreparedPermutationAssembler, scan_hdt,
+};
 use crate::quads::writer::encode_layer_set;
 use crate::quads::{
     GraphMembership, GraphSidecarReader, PositionGraphMembership, canonical_sidecar_path,
 };
 use crate::sort::{ExternalSorter, Sortable};
+use crate::triples::BitmapTriplesFiles;
 use crate::triples::id_triple::IdTriple;
 use anyhow::{Context, Result, ensure};
 use std::ffi::OsString;
@@ -37,6 +41,9 @@ const HAS_POS_LAYERS: u64 = 1 << 0;
 const HAS_OPS_LAYERS: u64 = 1 << 1;
 const HAS_MEMBERSHIP_RANKS: u64 = 1 << 2;
 const HAS_MEMBERSHIP_IDS: u64 = 1 << 3;
+const DIRECT_PREPARED_LAYER_LIMIT: u64 = 128;
+const DIRECT_PREPARED_LAYER_BUFFER: usize = 64 * 1024;
+const DIRECT_PREPARED_LAYER_ESTIMATED_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GraphIndexOptions {
@@ -67,6 +74,403 @@ pub fn canonical_path(hdt_path: &Path) -> PathBuf {
 struct SpoPositionMap {
     spo_position: u64,
     permuted_position: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PreparedGraphEntry {
+    first: u64,
+    second: u64,
+    third: u64,
+    graph: u64,
+    spo_position: u64,
+}
+
+impl Ord for PreparedGraphEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.first
+            .cmp(&other.first)
+            .then(self.second.cmp(&other.second))
+            .then(self.third.cmp(&other.third))
+            .then(self.graph.cmp(&other.graph))
+            .then(self.spo_position.cmp(&other.spo_position))
+    }
+}
+
+impl PartialOrd for PreparedGraphEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Sortable for PreparedGraphEntry {
+    fn write_to<W: Write>(&self, writer: &mut W) -> Result<()> {
+        for value in [
+            self.first,
+            self.second,
+            self.third,
+            self.graph,
+            self.spo_position,
+        ] {
+            writer.write_all(&value.to_le_bytes())?;
+        }
+        Ok(())
+    }
+
+    fn read_from<R: Read>(reader: &mut R) -> Result<Option<Self>> {
+        let mut bytes = [0u8; 40];
+        match reader.read_exact(&mut bytes) {
+            Ok(()) => Ok(Some(Self {
+                first: u64::from_le_bytes(bytes[0..8].try_into().unwrap()),
+                second: u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+                third: u64::from_le_bytes(bytes[16..24].try_into().unwrap()),
+                graph: u64::from_le_bytes(bytes[24..32].try_into().unwrap()),
+                spo_position: u64::from_le_bytes(bytes[32..40].try_into().unwrap()),
+            })),
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn mem_size(&self) -> usize {
+        40
+    }
+}
+
+/// POS/OPS sort runs decorated with graph IDs while the create pipeline still
+/// has each unique SPO triple and all of its memberships together.
+pub struct PreparedGraphIndexCollector {
+    pos_sorter: ExternalSorter,
+    ops_sorter: ExternalSorter,
+    pos_buffer: Vec<PreparedGraphEntry>,
+    ops_buffer: Vec<PreparedGraphEntry>,
+    pos_memory: usize,
+    ops_memory: usize,
+    membership_count: u64,
+    triple_count: u64,
+    last_position: Option<u64>,
+    last_graph: Option<u64>,
+    last_triple: Option<IdTriple>,
+}
+
+impl PreparedGraphIndexCollector {
+    pub fn new(temp_dir: &Path, memory_budget: usize) -> Self {
+        let pos_budget = (memory_budget / 2).max(1);
+        let ops_budget = memory_budget.saturating_sub(pos_budget).max(1);
+        Self {
+            pos_sorter: ExternalSorter::new(temp_dir, pos_budget),
+            ops_sorter: ExternalSorter::new(temp_dir, ops_budget),
+            pos_buffer: Vec::new(),
+            ops_buffer: Vec::new(),
+            pos_memory: 0,
+            ops_memory: 0,
+            membership_count: 0,
+            triple_count: 0,
+            last_position: None,
+            last_graph: None,
+            last_triple: None,
+        }
+    }
+
+    pub fn push(&mut self, triple: IdTriple, membership: GraphMembership) -> Result<()> {
+        if self.last_position != Some(membership.position) {
+            ensure!(
+                self.last_position
+                    .map_or(membership.position == 0, |before| {
+                        before.checked_add(1) == Some(membership.position)
+                    }),
+                "prepared graph memberships skip an SPO position"
+            );
+            self.triple_count = self
+                .triple_count
+                .checked_add(1)
+                .context("prepared graph-index triple count overflow")?;
+            self.last_position = Some(membership.position);
+            self.last_graph = None;
+            self.last_triple = Some(triple);
+        } else {
+            ensure!(
+                self.last_triple == Some(triple),
+                "one SPO position contains different triples"
+            );
+        }
+        ensure!(
+            self.last_graph
+                .is_none_or(|before| membership.graph > before),
+            "prepared graph IDs are not strictly increasing within an SPO position"
+        );
+        self.last_graph = Some(membership.graph);
+
+        self.pos_sorter.push(
+            PreparedGraphEntry {
+                first: triple.predicate,
+                second: triple.object,
+                third: triple.subject,
+                graph: membership.graph,
+                spo_position: membership.position,
+            },
+            &mut self.pos_buffer,
+            &mut self.pos_memory,
+        )?;
+        self.ops_sorter.push(
+            PreparedGraphEntry {
+                first: triple.object,
+                second: triple.predicate,
+                third: triple.subject,
+                graph: membership.graph,
+                spo_position: membership.position,
+            },
+            &mut self.ops_buffer,
+            &mut self.ops_memory,
+        )?;
+        self.membership_count = self
+            .membership_count
+            .checked_add(1)
+            .context("prepared graph-index membership count overflow")?;
+        Ok(())
+    }
+}
+
+type PreparedMembershipEncoder = zstd::Encoder<'static, BufWriter<File>>;
+
+struct DirectPreparedLayerSpool {
+    temp_dir: PathBuf,
+    encoders: Vec<Option<PreparedMembershipEncoder>>,
+    last_positions: Vec<Option<u64>>,
+    count: u64,
+}
+
+impl DirectPreparedLayerSpool {
+    fn new(temp_dir: &Path, layer_count: u64) -> Result<Self> {
+        let layer_count = usize::try_from(layer_count).context("graph layer count overflow")?;
+        Ok(Self {
+            temp_dir: temp_dir.to_path_buf(),
+            encoders: std::iter::repeat_with(|| None).take(layer_count).collect(),
+            last_positions: vec![None; layer_count],
+            count: 0,
+        })
+    }
+
+    fn push(&mut self, membership: GraphMembership) -> Result<()> {
+        let graph = usize::try_from(membership.graph).context("graph ID overflow")?;
+        let previous = self
+            .last_positions
+            .get_mut(graph)
+            .context("graph ID exceeds prepared layer count")?;
+        ensure!(
+            previous.is_none_or(|value| membership.position > value),
+            "prepared layer positions are not strictly increasing"
+        );
+        *previous = Some(membership.position);
+        if self.encoders[graph].is_none() {
+            let file = tempfile::tempfile_in(&self.temp_dir)?;
+            self.encoders[graph] = Some(zstd::Encoder::new(
+                BufWriter::with_capacity(DIRECT_PREPARED_LAYER_BUFFER, file),
+                1,
+            )?);
+        }
+        membership.write_to(
+            self.encoders[graph]
+                .as_mut()
+                .context("prepared layer encoder is absent")?,
+        )?;
+        self.count = self
+            .count
+            .checked_add(1)
+            .context("prepared layer membership count overflow")?;
+        Ok(())
+    }
+
+    fn finish(self, temp_dir: &Path) -> Result<TempPath> {
+        let output = tempfile::Builder::new()
+            .prefix(".hdtc-prepared-graph-memberships-")
+            .tempfile_in(temp_dir)?
+            .into_temp_path();
+        let file = File::create(&output)?;
+        if self.count == 0 {
+            zstd::Encoder::new(BufWriter::new(file), 1)?.finish()?;
+            return Ok(output);
+        }
+        let mut writer = BufWriter::with_capacity(256 * 1024, file);
+        for encoder in self.encoders.into_iter().flatten() {
+            let mut frame = encoder.finish()?;
+            frame.flush()?;
+            let mut frame = frame.into_inner().map_err(|error| error.into_error())?;
+            frame.seek(SeekFrom::Start(0))?;
+            std::io::copy(&mut frame, &mut writer)?;
+        }
+        writer.flush()?;
+        Ok(output)
+    }
+}
+
+struct SortedPreparedLayerSpool {
+    sorter: ExternalSorter,
+    buffer: Vec<GraphMembership>,
+    memory: usize,
+    count: u64,
+}
+
+enum PreparedLayerSpool {
+    Direct(DirectPreparedLayerSpool),
+    Sorted(SortedPreparedLayerSpool),
+}
+
+impl PreparedLayerSpool {
+    fn new(temp_dir: &Path, layer_count: u64, memory_budget: usize) -> Result<Self> {
+        let memory_limit =
+            u64::try_from((memory_budget / DIRECT_PREPARED_LAYER_ESTIMATED_BYTES).max(1))
+                .unwrap_or(u64::MAX);
+        let direct_layer_limit = DIRECT_PREPARED_LAYER_LIMIT.min(memory_limit);
+        if layer_count <= direct_layer_limit {
+            tracing::info!(
+                layer_count,
+                "Spooling integrated graph-index memberships directly by layer"
+            );
+            Ok(Self::Direct(DirectPreparedLayerSpool::new(
+                temp_dir,
+                layer_count,
+            )?))
+        } else {
+            tracing::info!(
+                layer_count,
+                direct_layer_limit,
+                "Graph count exceeds integrated direct-spool resource limit; using external membership sort"
+            );
+            Ok(Self::Sorted(SortedPreparedLayerSpool {
+                sorter: ExternalSorter::new(temp_dir, memory_budget.max(1)),
+                buffer: Vec::new(),
+                memory: 0,
+                count: 0,
+            }))
+        }
+    }
+
+    fn push(&mut self, membership: GraphMembership) -> Result<()> {
+        match self {
+            Self::Direct(spool) => spool.push(membership),
+            Self::Sorted(spool) => {
+                spool
+                    .sorter
+                    .push(membership, &mut spool.buffer, &mut spool.memory)?;
+                spool.count = spool
+                    .count
+                    .checked_add(1)
+                    .context("prepared layer membership count overflow")?;
+                Ok(())
+            }
+        }
+    }
+
+    fn finish(self, temp_dir: &Path) -> Result<TempPath> {
+        match self {
+            Self::Direct(spool) => spool.finish(temp_dir),
+            Self::Sorted(mut spool) => {
+                let output = tempfile::Builder::new()
+                    .prefix(".hdtc-prepared-graph-memberships-")
+                    .tempfile_in(temp_dir)?
+                    .into_temp_path();
+                let file = File::create(&output)?;
+                let mut encoder = zstd::Encoder::new(BufWriter::new(file), 3)?;
+                let mut observed = 0u64;
+                for membership in spool.sorter.finish(&mut spool.buffer)? {
+                    membership?.write_to(&mut encoder)?;
+                    observed += 1;
+                }
+                ensure!(
+                    observed == spool.count,
+                    "prepared layer sort count mismatch"
+                );
+                encoder.finish()?.flush()?;
+                Ok(output)
+            }
+        }
+    }
+}
+
+struct PreparedGraphGroups<'a, I> {
+    inner: I,
+    pending: Option<PreparedGraphEntry>,
+    spool: &'a mut PreparedLayerSpool,
+    permuted_position: u64,
+}
+
+impl<'a, I> PreparedGraphGroups<'a, I>
+where
+    I: Iterator<Item = Result<PreparedGraphEntry>>,
+{
+    fn new(inner: I, spool: &'a mut PreparedLayerSpool) -> Self {
+        Self {
+            inner,
+            pending: None,
+            spool,
+            permuted_position: 0,
+        }
+    }
+
+    fn positions_emitted(&self) -> u64 {
+        self.permuted_position
+    }
+}
+
+impl<I> Iterator for PreparedGraphGroups<'_, I>
+where
+    I: Iterator<Item = Result<PreparedGraphEntry>>,
+{
+    type Item = Result<PermEntry>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let result = (|| -> Result<Option<PermEntry>> {
+            let first = match self.pending.take() {
+                Some(entry) => entry,
+                None => match self.inner.next().transpose()? {
+                    Some(entry) => entry,
+                    None => return Ok(None),
+                },
+            };
+            let key = (first.first, first.second, first.third);
+            let spo_position = first.spo_position;
+            let mut previous_graph = None;
+            let mut current = first;
+            loop {
+                ensure!(
+                    current.spo_position == spo_position,
+                    "one prepared permutation triple has multiple SPO positions"
+                );
+                ensure!(
+                    previous_graph.is_none_or(|before| current.graph > before),
+                    "prepared permutation graph IDs are not strictly increasing"
+                );
+                self.spool.push(GraphMembership {
+                    graph: current.graph,
+                    position: self.permuted_position,
+                })?;
+                previous_graph = Some(current.graph);
+                match self.inner.next().transpose()? {
+                    Some(next) if (next.first, next.second, next.third) == key => current = next,
+                    Some(next) => {
+                        self.pending = Some(next);
+                        break;
+                    }
+                    None => break,
+                }
+            }
+            self.permuted_position = self
+                .permuted_position
+                .checked_add(1)
+                .context("prepared permutation position overflow")?;
+            Ok(Some(PermEntry {
+                first: first.first,
+                second: first.second,
+                third: first.third,
+                spo_position,
+            }))
+        })();
+        match result {
+            Ok(Some(entry)) => Some(Ok(entry)),
+            Ok(None) => None,
+            Err(error) => Some(Err(error)),
+        }
+    }
 }
 
 impl Sortable for SpoPositionMap {
@@ -573,6 +977,339 @@ fn assemble(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn assemble_from_memberships(
+    output: &Path,
+    options: GraphIndexOptions,
+    pos_memberships: Option<&Path>,
+    ops_memberships: Option<&Path>,
+    transpose: Option<Transpose>,
+    triples: u64,
+    named_graphs: u64,
+    memberships: u64,
+    source_data_length: u64,
+    source_digest: &[u8; 32],
+    sidecar_digest: &[u8; 32],
+    temp_dir: &Path,
+) -> Result<()> {
+    let mut flags = 0u64;
+    let mut section_count = 0u32;
+    if options.pos_layers {
+        flags |= HAS_POS_LAYERS;
+        section_count += 2;
+    }
+    if options.ops_layers {
+        flags |= HAS_OPS_LAYERS;
+        section_count += 2;
+    }
+    if options.membership_ranks {
+        flags |= HAS_MEMBERSHIP_RANKS;
+        section_count += 3;
+    }
+    if options.membership_ids {
+        flags |= HAS_MEMBERSHIP_IDS;
+        section_count += 1;
+    }
+    ensure!(flags != 0, "a graph index must contain a structure");
+
+    let directory_offset = HEADER_SIZE;
+    let directory_length = u64::from(section_count)
+        .checked_mul(DIRECTORY_ENTRY_SIZE)
+        .and_then(|length| length.checked_add(4))
+        .context("graph-index directory length overflow")?;
+    let mut cursor = align64(
+        directory_offset
+            .checked_add(directory_length)
+            .context("graph-index directory end overflow")?,
+    )?;
+    let mut sections = Vec::with_capacity(section_count as usize);
+
+    if let Some(path) = pos_memberships {
+        let layer_count = named_graphs
+            .checked_add(1)
+            .context("POS layer count overflow")?;
+        let layer_directory_length = layer_count
+            .checked_mul(96)
+            .and_then(|length| length.checked_add(4))
+            .context("POS layer-directory length overflow")?;
+        let region_base = align64(
+            cursor
+                .checked_add(layer_directory_length)
+                .context("POS layer-directory end overflow")?,
+        )?;
+        let set = encode_layer_set(
+            path,
+            named_graphs,
+            triples,
+            memberships,
+            region_base,
+            temp_dir,
+        )?;
+        append_section(
+            &mut sections,
+            &mut cursor,
+            POS_DIRECTORY,
+            set.directory,
+            layer_count,
+            0,
+            0,
+            0,
+            false,
+        )?;
+        ensure!(cursor == region_base, "POS layer region base mismatch");
+        append_section(
+            &mut sections,
+            &mut cursor,
+            POS_REGION,
+            set.region,
+            set.non_empty_layers,
+            0,
+            0,
+            0,
+            true,
+        )?;
+    }
+    if let Some(path) = ops_memberships {
+        let layer_count = named_graphs
+            .checked_add(1)
+            .context("OPS layer count overflow")?;
+        let layer_directory_length = layer_count
+            .checked_mul(96)
+            .and_then(|length| length.checked_add(4))
+            .context("OPS layer-directory length overflow")?;
+        let region_base = align64(
+            cursor
+                .checked_add(layer_directory_length)
+                .context("OPS layer-directory end overflow")?,
+        )?;
+        let set = encode_layer_set(
+            path,
+            named_graphs,
+            triples,
+            memberships,
+            region_base,
+            temp_dir,
+        )?;
+        append_section(
+            &mut sections,
+            &mut cursor,
+            OPS_DIRECTORY,
+            set.directory,
+            layer_count,
+            0,
+            0,
+            0,
+            false,
+        )?;
+        ensure!(cursor == region_base, "OPS layer region base mismatch");
+        append_section(
+            &mut sections,
+            &mut cursor,
+            OPS_REGION,
+            set.region,
+            set.non_empty_layers,
+            0,
+            0,
+            0,
+            true,
+        )?;
+    }
+    if let Some(mut transpose) = transpose {
+        if let Some(array) = transpose.array.take() {
+            append_section(
+                &mut sections,
+                &mut cursor,
+                TRANSPOSE_ARRAY,
+                array,
+                memberships,
+                transpose.width,
+                0,
+                0,
+                false,
+            )?;
+        }
+        append_section(
+            &mut sections,
+            &mut cursor,
+            TRANSPOSE_BITMAP,
+            transpose.bitmap,
+            memberships,
+            1,
+            0,
+            0,
+            false,
+        )?;
+        append_section(
+            &mut sections,
+            &mut cursor,
+            TRANSPOSE_SUPER,
+            transpose.superranks,
+            memberships
+                .div_ceil(u64::from(SUPERBLOCK_BITS))
+                .checked_add(1)
+                .context("transpose superrank count overflow")?,
+            64,
+            u64::from(SUPERBLOCK_BITS),
+            memberships,
+            false,
+        )?;
+        append_section(
+            &mut sections,
+            &mut cursor,
+            TRANSPOSE_SUB,
+            transpose.subranks,
+            memberships.div_ceil(u64::from(SUBBLOCK_BITS)),
+            16,
+            u64::from(SUBBLOCK_BITS),
+            memberships,
+            false,
+        )?;
+    }
+
+    assemble(
+        output,
+        flags,
+        triples,
+        named_graphs,
+        memberships,
+        source_data_length,
+        source_digest,
+        sidecar_digest,
+        sections,
+        directory_offset,
+        directory_length,
+        cursor,
+    )
+}
+
+/// Finish the default POS/OPS graph index from sort runs populated during HDT
+/// creation. Graph IDs ride through the permutation sorts, so draining each
+/// sorted stream can append directly to monotonically ordered per-graph layers.
+/// No sidecar transpose, inverse-position sort, HDT rescan, or membership sort
+/// is needed for the common bounded-graph-count case.
+#[allow(clippy::too_many_arguments)]
+pub fn finish_prepared_graph_index(
+    mut collector: PreparedGraphIndexCollector,
+    graph_index_output: &Path,
+    permutation_output: Option<&Path>,
+    hdt_path: &Path,
+    sidecar_path: &Path,
+    counts: &DictCounts,
+    triples_files: &BitmapTriplesFiles,
+    expected_memberships: u64,
+    temp_dir: &Path,
+    memory_budget: usize,
+    permutation_maps: PositionMaps,
+) -> Result<()> {
+    ensure!(
+        collector.triple_count == triples_files.num_triples,
+        "prepared graph-index triple-count mismatch"
+    );
+    ensure!(
+        collector.membership_count == expected_memberships,
+        "prepared graph-index membership-count mismatch"
+    );
+    let layer_count = counts
+        .graphs
+        .checked_add(1)
+        .context("prepared graph layer count overflow")?;
+    let layer_budget = (memory_budget / 2).max(1);
+    let mut permutation = permutation_output
+        .map(|_| {
+            PreparedPermutationAssembler::new(
+                hdt_path,
+                counts,
+                triples_files,
+                temp_dir,
+                permutation_maps,
+            )
+        })
+        .transpose()?;
+
+    let mut pos_spool = PreparedLayerSpool::new(temp_dir, layer_count, layer_budget)?;
+    let pos_sorted = collector.pos_sorter.finish(&mut collector.pos_buffer)?;
+    let mut pos_groups = PreparedGraphGroups::new(pos_sorted, &mut pos_spool);
+    if let Some(permutation) = permutation.as_mut() {
+        permutation.encode_pos(&mut pos_groups)?;
+    } else {
+        for entry in &mut pos_groups {
+            entry?;
+        }
+    }
+    ensure!(
+        pos_groups.positions_emitted() == triples_files.num_triples,
+        "prepared POS triple-count mismatch"
+    );
+    drop(pos_groups);
+    drop(collector.pos_sorter);
+    let pos_memberships = pos_spool.finish(temp_dir)?;
+
+    let mut ops_spool = PreparedLayerSpool::new(temp_dir, layer_count, layer_budget)?;
+    let ops_sorted = collector.ops_sorter.finish(&mut collector.ops_buffer)?;
+    let mut ops_groups = PreparedGraphGroups::new(ops_sorted, &mut ops_spool);
+    if let Some(permutation) = permutation.as_mut() {
+        permutation.encode_ops(&mut ops_groups)?;
+    } else {
+        for entry in &mut ops_groups {
+            entry?;
+        }
+    }
+    ensure!(
+        ops_groups.positions_emitted() == triples_files.num_triples,
+        "prepared OPS triple-count mismatch"
+    );
+    drop(ops_groups);
+    drop(collector.ops_sorter);
+    let ops_memberships = ops_spool.finish(temp_dir)?;
+
+    if let (Some(permutation), Some(output)) = (permutation, permutation_output) {
+        permutation.finish(output)?;
+    }
+
+    let source = SourceIdentity::capture(hdt_path)?;
+    let metadata = scan_hdt(hdt_path)?;
+    let sidecar = GraphSidecarReader::open(sidecar_path, hdt_path)?;
+    ensure!(
+        sidecar.source_digest() == *source.digest(),
+        "prepared sidecar/HDT stored digest mismatch"
+    );
+    ensure!(
+        sidecar.triple_count() == triples_files.num_triples,
+        "prepared sidecar triple-count mismatch"
+    );
+    ensure!(
+        sidecar.named_graph_count() == counts.graphs,
+        "prepared sidecar graph-count mismatch"
+    );
+    ensure!(
+        sidecar.membership_count() == expected_memberships,
+        "prepared sidecar membership-count mismatch"
+    );
+    let sidecar_digest = sidecar.whole_file_digest()?;
+    drop(sidecar);
+
+    assemble_from_memberships(
+        graph_index_output,
+        GraphIndexOptions::default(),
+        Some(&pos_memberships),
+        Some(&ops_memberships),
+        None,
+        triples_files.num_triples,
+        counts.graphs,
+        expected_memberships,
+        metadata.file_length - metadata.data_offset,
+        source.digest(),
+        &sidecar_digest,
+        temp_dir,
+    )?;
+    source.ensure_unchanged(hdt_path)?;
+    ensure!(
+        whole_file_digest(sidecar_path)? == sidecar_digest,
+        "prepared graph sidecar changed during graph-index construction"
+    );
+    Ok(())
+}
+
 pub fn create_graph_index(
     hdt_path: &Path,
     memory_budget: usize,
@@ -693,203 +1430,25 @@ pub fn create_graph_index(
     };
     drop(collector);
 
-    let mut flags = 0u64;
-    let mut section_count = 0u32;
-    if options.pos_layers {
-        flags |= HAS_POS_LAYERS;
-        section_count += 2;
-    }
-    if options.ops_layers {
-        flags |= HAS_OPS_LAYERS;
-        section_count += 2;
-    }
-    if options.membership_ranks {
-        flags |= HAS_MEMBERSHIP_RANKS;
-        section_count += 3;
-    }
-    if options.membership_ids {
-        flags |= HAS_MEMBERSHIP_IDS;
-        section_count += 1;
-    }
-    ensure!(
-        flags != 0,
-        "an empty dataset still needs a layer-set structure"
-    );
-
-    let directory_offset = HEADER_SIZE;
-    let directory_length = u64::from(section_count)
-        .checked_mul(DIRECTORY_ENTRY_SIZE)
-        .and_then(|length| length.checked_add(4))
-        .context("graph-index directory length overflow")?;
-    let mut cursor = align64(
-        directory_offset
-            .checked_add(directory_length)
-            .context("graph-index directory end overflow")?,
-    )?;
-    let mut sections = Vec::with_capacity(section_count as usize);
-
-    if let Some(path) = pos_memberships.as_deref() {
-        let layer_count = named_graphs
-            .checked_add(1)
-            .context("POS layer count overflow")?;
-        let directory_length = layer_count
-            .checked_mul(96)
-            .and_then(|length| length.checked_add(4))
-            .context("POS layer-directory length overflow")?;
-        let region_base = align64(
-            cursor
-                .checked_add(directory_length)
-                .context("POS layer-directory end overflow")?,
-        )?;
-        let set = encode_layer_set(
-            path,
-            named_graphs,
-            triples,
-            memberships,
-            region_base,
-            temp_dir,
-        )?;
-        append_section(
-            &mut sections,
-            &mut cursor,
-            POS_DIRECTORY,
-            set.directory,
-            layer_count,
-            0,
-            0,
-            0,
-            false,
-        )?;
-        ensure!(cursor == region_base, "POS layer region base mismatch");
-        append_section(
-            &mut sections,
-            &mut cursor,
-            POS_REGION,
-            set.region,
-            set.non_empty_layers,
-            0,
-            0,
-            0,
-            true,
-        )?;
-    }
-    if let Some(path) = ops_memberships.as_deref() {
-        let layer_count = named_graphs
-            .checked_add(1)
-            .context("OPS layer count overflow")?;
-        let directory_length = layer_count
-            .checked_mul(96)
-            .and_then(|length| length.checked_add(4))
-            .context("OPS layer-directory length overflow")?;
-        let region_base = align64(
-            cursor
-                .checked_add(directory_length)
-                .context("OPS layer-directory end overflow")?,
-        )?;
-        let set = encode_layer_set(
-            path,
-            named_graphs,
-            triples,
-            memberships,
-            region_base,
-            temp_dir,
-        )?;
-        append_section(
-            &mut sections,
-            &mut cursor,
-            OPS_DIRECTORY,
-            set.directory,
-            layer_count,
-            0,
-            0,
-            0,
-            false,
-        )?;
-        ensure!(cursor == region_base, "OPS layer region base mismatch");
-        append_section(
-            &mut sections,
-            &mut cursor,
-            OPS_REGION,
-            set.region,
-            set.non_empty_layers,
-            0,
-            0,
-            0,
-            true,
-        )?;
-    }
-    if let Some(mut transpose) = transpose {
-        if let Some(array) = transpose.array.take() {
-            append_section(
-                &mut sections,
-                &mut cursor,
-                TRANSPOSE_ARRAY,
-                array,
-                memberships,
-                transpose.width,
-                0,
-                0,
-                false,
-            )?;
-        }
-        append_section(
-            &mut sections,
-            &mut cursor,
-            TRANSPOSE_BITMAP,
-            transpose.bitmap,
-            memberships,
-            1,
-            0,
-            0,
-            false,
-        )?;
-        append_section(
-            &mut sections,
-            &mut cursor,
-            TRANSPOSE_SUPER,
-            transpose.superranks,
-            memberships
-                .div_ceil(u64::from(SUPERBLOCK_BITS))
-                .checked_add(1)
-                .context("transpose superrank count overflow")?,
-            64,
-            u64::from(SUPERBLOCK_BITS),
-            memberships,
-            false,
-        )?;
-        append_section(
-            &mut sections,
-            &mut cursor,
-            TRANSPOSE_SUB,
-            transpose.subranks,
-            memberships.div_ceil(u64::from(SUBBLOCK_BITS)),
-            16,
-            u64::from(SUBBLOCK_BITS),
-            memberships,
-            false,
-        )?;
-    }
-
-    let footer_offset = cursor;
     let output = canonical_path(hdt_path);
     let parent = output.parent().unwrap_or_else(|| Path::new("."));
     let temporary = tempfile::Builder::new()
         .prefix(".hdtc-graph-index-output-")
         .tempfile_in(parent)?
         .into_temp_path();
-    assemble(
+    assemble_from_memberships(
         &temporary,
-        flags,
+        options,
+        pos_memberships.as_deref(),
+        ops_memberships.as_deref(),
+        transpose,
         triples,
         named_graphs,
         memberships,
         metadata.file_length - metadata.data_offset,
         source.digest(),
         &sidecar_digest,
-        sections,
-        directory_offset,
-        directory_length,
-        footer_offset,
+        temp_dir,
     )?;
     source.ensure_unchanged(hdt_path)?;
     ensure!(

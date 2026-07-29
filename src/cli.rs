@@ -233,6 +233,10 @@ pub struct CreateArgs {
     #[arg(long)]
     pub perm: bool,
 
+    /// Generate POS/OPS graph layers (.hdt.graphs.idx); requires --mode quads
+    #[arg(long)]
+    pub graphs_index: bool,
+
     /// Optional permutation-to-SPO position maps to include
     #[arg(
         long = "perm-position-maps",

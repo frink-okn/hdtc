@@ -5,6 +5,9 @@
 mod builder;
 mod reader;
 
-pub use builder::{GraphIndexOptions, canonical_path, create_graph_index};
+pub use builder::{
+    GraphIndexOptions, PreparedGraphIndexCollector, canonical_path, create_graph_index,
+    finish_prepared_graph_index,
+};
 #[allow(unused_imports)]
 pub use reader::{GraphIndex, GraphIndexSpace, validate_graph_index};

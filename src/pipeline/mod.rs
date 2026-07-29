@@ -141,6 +141,9 @@ pub struct PipelineResult {
     /// POS/OPS sort runs fed directly from the unique SPO stream when
     /// `create --perm` is requested.
     pub permutation: Option<crate::permutation::PermutationCollector>,
+    /// Graph-decorated POS/OPS sort runs shared by integrated graph and
+    /// permutation index construction.
+    pub graph_permutation: Option<crate::graph_index::PreparedGraphIndexCollector>,
     pub ntriples_size: u64, // N-Triples serialization size of parsed data
 }
 
@@ -1203,6 +1206,7 @@ pub fn run_pipeline(
     base_uri: &str,
     parser_parallelism: &ParserParallelismConfig,
     permutation_maps: Option<crate::permutation::PositionMaps>,
+    prepare_graph_index: bool,
     benchmark: bool,
 ) -> Result<PipelineResult> {
     tracing::info!("Stage 1-3: Parsing, building vocabulary, writing batches");
@@ -1594,10 +1598,10 @@ pub fn run_pipeline(
     // Stage 6: External sort + BitmapTriples construction
     tracing::info!("Stage 6: Sorting global-ID quad memberships in SPO+G order");
 
-    // `create --perm` adds a second pair of external sorts (POS and OPS) that
-    // fill while this sorter's drained buffer still holds its capacity, so the
-    // stage-5/6 sort budget is split between them rather than handed out twice.
-    let perm_sort_budget = if permutation_maps.is_some() {
+    // Integrated permutation or graph indexing adds a second pair of external
+    // sorts (POS and OPS) that fill while this sorter's drained buffer still
+    // holds its capacity, so the stage-5/6 sort budget is split between them.
+    let perm_sort_budget = if permutation_maps.is_some() || prepare_graph_index {
         stage56_budget.sort_budget_bytes / 2
     } else {
         0
@@ -1660,9 +1664,15 @@ pub fn run_pipeline(
     // Build BitmapTriples — stream each component to temp files (O(1) memory)
     let bitmap_start;
     let bitmap_rss_before;
-    let mut permutation = permutation_maps.map(|maps| {
-        crate::permutation::PermutationCollector::new(temp_dir, perm_sort_budget, maps)
-    });
+    let mut permutation = if prepare_graph_index {
+        None
+    } else {
+        permutation_maps.map(|maps| {
+            crate::permutation::PermutationCollector::new(temp_dir, perm_sort_budget, maps)
+        })
+    };
+    let mut graph_permutation = prepare_graph_index
+        .then(|| crate::graph_index::PreparedGraphIndexCollector::new(temp_dir, perm_sort_budget));
     let (bitmap_triples, membership_path, membership_count) = match statements {
         StatementSorter::Quads {
             mut sorter,
@@ -1694,8 +1704,12 @@ pub fn run_pipeline(
                 stage56_budget.sort_budget_bytes,
             )?;
 
-            let union_triples = QuadUnionIterator::new(sorted_quads, |membership| {
-                membership_spool.push(membership)
+            let union_triples = QuadUnionIterator::new(sorted_quads, |triple, membership| {
+                membership_spool.push(membership)?;
+                if let Some(collector) = graph_permutation.as_mut() {
+                    collector.push(triple, membership)?;
+                }
+                Ok(())
             });
             let tapped = union_triples.map(|result| {
                 let triple = result?;
@@ -1780,6 +1794,7 @@ pub fn run_pipeline(
         membership_count,
         bitmap_triples,
         permutation,
+        graph_permutation,
         ntriples_size,
     })
 }

@@ -467,6 +467,141 @@ struct EncodedPermutation {
     pair_count: u64,
 }
 
+/// Incremental encoder for POS/OPS streams that were prepared while the HDT's
+/// unique SPO stream was still available.
+///
+/// Keeping the two encoders separate lets another derived artifact consume the
+/// same sorted streams as they are drained, without sorting the triples again.
+pub(crate) struct PreparedPermutationAssembler {
+    hdt_path: PathBuf,
+    source: SourceIdentity,
+    metadata: HdtMetadata,
+    maps: PositionMaps,
+    temp_dir: PathBuf,
+    spo_y: RawBitmap,
+    spo_z: RawBitmap,
+    pos: Option<EncodedPermutation>,
+    ops: Option<EncodedPermutation>,
+}
+
+impl PreparedPermutationAssembler {
+    pub(crate) fn new(
+        hdt_path: &Path,
+        counts: &DictCounts,
+        triples: &BitmapTriplesFiles,
+        temp_dir: &Path,
+        maps: PositionMaps,
+    ) -> Result<Self> {
+        let source = SourceIdentity::capture(hdt_path)?;
+        let metadata = scan_hdt(hdt_path)?;
+        ensure!(
+            metadata.subjects == counts.shared + counts.subjects,
+            "prepared permutation subject count mismatch"
+        );
+        ensure!(
+            metadata.predicates == counts.predicates,
+            "prepared permutation predicate count mismatch"
+        );
+        ensure!(
+            metadata.objects == counts.shared + counts.objects,
+            "prepared permutation object count mismatch"
+        );
+        ensure!(
+            metadata.triples == triples.num_triples,
+            "prepared permutation HDT triple count mismatch"
+        );
+        Ok(Self {
+            hdt_path: hdt_path.to_path_buf(),
+            source,
+            metadata,
+            maps,
+            temp_dir: temp_dir.to_path_buf(),
+            spo_y: raw_bitmap_from_temp(&triples.bitmap_y.path, triples.bitmap_y.num_bits),
+            spo_z: raw_bitmap_from_temp(&triples.bitmap_z.path, triples.bitmap_z.num_bits),
+            pos: None,
+            ops: None,
+        })
+    }
+
+    pub(crate) fn encode_pos(
+        &mut self,
+        sorted: impl Iterator<Item = Result<PermEntry>>,
+    ) -> Result<()> {
+        ensure!(self.pos.is_none(), "POS permutation was already encoded");
+        self.pos = Some(encode_permutation(
+            sorted,
+            1,
+            self.metadata.triples,
+            self.metadata.predicates,
+            self.metadata.objects,
+            self.metadata.subjects,
+            self.maps.pos,
+            &self.temp_dir,
+        )?);
+        Ok(())
+    }
+
+    pub(crate) fn encode_ops(
+        &mut self,
+        sorted: impl Iterator<Item = Result<PermEntry>>,
+    ) -> Result<()> {
+        ensure!(self.ops.is_none(), "OPS permutation was already encoded");
+        self.ops = Some(encode_permutation(
+            sorted,
+            2,
+            self.metadata.triples,
+            self.metadata.objects,
+            self.metadata.predicates,
+            self.metadata.subjects,
+            self.maps.ops,
+            &self.temp_dir,
+        )?);
+        Ok(())
+    }
+
+    pub(crate) fn finish(self, output: &Path) -> Result<()> {
+        let pos = self.pos.context("POS permutation was not encoded")?;
+        let ops = self.ops.context("OPS permutation was not encoded")?;
+        let spo_y_dirs = build_rank_directories(&self.spo_y, &self.temp_dir)?;
+        let spo_z_dirs = build_rank_directories(&self.spo_z, &self.temp_dir)?;
+        let mut drafts = pos.sections;
+        drafts.extend(ops.sections);
+        drafts.push(rank_draft(
+            SPO_Y_SUPER,
+            spo_y_dirs.0,
+            self.metadata.sp_pairs,
+            true,
+        ));
+        drafts.push(rank_draft(
+            SPO_Y_SUB,
+            spo_y_dirs.1,
+            self.metadata.sp_pairs,
+            false,
+        ));
+        drafts.push(rank_draft(
+            SPO_Z_SUPER,
+            spo_z_dirs.0,
+            self.metadata.triples,
+            true,
+        ));
+        drafts.push(rank_draft(
+            SPO_Z_SUB,
+            spo_z_dirs.1,
+            self.metadata.triples,
+            false,
+        ));
+        assemble(
+            output,
+            &self.metadata,
+            self.source.digest(),
+            pos.pair_count,
+            ops.pair_count,
+            drafts,
+        )?;
+        self.source.ensure_unchanged(&self.hdt_path)
+    }
+}
+
 fn temp_file(temp_dir: &Path, prefix: &str) -> Result<NamedTempFile> {
     tempfile::Builder::new()
         .prefix(prefix)
@@ -1115,41 +1250,30 @@ pub fn create_permutation_index(
 }
 
 pub fn finish_prepared_index(
-    collector: PermutationCollector,
+    mut collector: PermutationCollector,
     output: &Path,
     hdt_path: &Path,
     counts: &DictCounts,
     triples: &BitmapTriplesFiles,
 ) -> Result<()> {
-    let source = SourceIdentity::capture(hdt_path)?;
-    let metadata = scan_hdt(hdt_path)?;
     ensure!(
-        metadata.subjects == counts.shared + counts.subjects,
-        "prepared permutation subject count mismatch"
+        collector.count == triples.num_triples,
+        "prepared permutation triple-count mismatch"
     );
-    ensure!(
-        metadata.predicates == counts.predicates,
-        "prepared permutation predicate count mismatch"
-    );
-    ensure!(
-        metadata.objects == counts.shared + counts.objects,
-        "prepared permutation object count mismatch"
-    );
-    ensure!(
-        metadata.triples == triples.num_triples,
-        "prepared permutation HDT triple count mismatch"
-    );
-    let spo_y = raw_bitmap_from_temp(&triples.bitmap_y.path, triples.bitmap_y.num_bits);
-    let spo_z = raw_bitmap_from_temp(&triples.bitmap_z.path, triples.bitmap_z.num_bits);
-    finish_collector(
-        collector,
-        output,
-        &metadata,
-        source.digest(),
-        &spo_y,
-        &spo_z,
+    let mut assembler = PreparedPermutationAssembler::new(
+        hdt_path,
+        counts,
+        triples,
+        &collector.temp_dir,
+        collector.maps,
     )?;
-    source.ensure_unchanged(hdt_path)
+    let pos = collector.pos_sorter.finish(&mut collector.pos_buffer)?;
+    assembler.encode_pos(pos)?;
+    drop(collector.pos_sorter);
+    let ops = collector.ops_sorter.finish(&mut collector.ops_buffer)?;
+    assembler.encode_ops(ops)?;
+    drop(collector.ops_sorter);
+    assembler.finish(output)
 }
 
 #[cfg(test)]

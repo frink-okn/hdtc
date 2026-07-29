@@ -763,6 +763,18 @@ remains.
 sorted positions, gather density statistics, choose chunked or Elias–Fano,
 encode, reuse the scratch file. No new encoder is required.
 
+**Integrated HDT creation** has a faster construction path. While the unique
+SPO stream is available, every triple is still adjacent to its graph IDs. A
+producer can carry those IDs through each POS/OPS permutation sort, group the
+sorted output by triple, and append the current permuted position directly to
+one spool per graph when the graph dictionary fits the implementation's bounded
+direct-spool limit. Positions in every spool are then intrinsically sorted. For
+larger graph dictionaries, the producer may feed the grouped memberships to a
+bounded graph-major external sort instead. Both forms remove the sidecar
+transposition and inverse-position sort described above. If a permutation index
+is also being emitted, its encoder consumes the same grouped streams; no
+additional permutation sort is necessary.
+
 A builder MUST NOT treat §7 check 5 as verification of a completed layer set
 (§7). Verifying the mapping means check 6 or the sampling procedure described
 there; counts alone would pass a build whose POS and OPS sets were swapped.

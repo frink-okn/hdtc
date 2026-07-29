@@ -8,7 +8,7 @@ mod builder;
 mod format;
 mod reader;
 
-pub(crate) use builder::{PermEntry, scan_hdt};
+pub(crate) use builder::{PermEntry, PreparedPermutationAssembler, scan_hdt};
 pub use builder::{
     PermutationCollector, PositionMaps, create_permutation_index, finish_prepared_index,
 };

@@ -28,6 +28,172 @@ fn graph_index_path(hdt: &Path) -> PathBuf {
     PathBuf::from(format!("{}.graphs.idx", hdt.display()))
 }
 
+fn permutation_path(hdt: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.perm", hdt.display()))
+}
+
+fn standard_index_path(hdt: &Path) -> PathBuf {
+    hdt.with_extension("hdt.index.v1-1")
+}
+
+#[test]
+fn integrated_create_matches_standalone_indexes() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input.nq");
+    let integrated = temp.path().join("integrated.hdt");
+    let standalone = temp.path().join("standalone.hdt");
+    fs::write(&input, QUADS).unwrap();
+
+    assert_success(&run(&[
+        "create",
+        input.to_str().unwrap(),
+        "--output",
+        integrated.to_str().unwrap(),
+        "--mode",
+        "quads",
+        "--graphs-index",
+        "--perm",
+        "--index",
+        "--perm-position-maps",
+        "pos,ops",
+        "--temp-dir",
+        temp.path().to_str().unwrap(),
+        "--memory-limit",
+        "1M",
+    ]));
+    assert_success(&run(&[
+        "create",
+        input.to_str().unwrap(),
+        "--output",
+        standalone.to_str().unwrap(),
+        "--mode",
+        "quads",
+        "--perm",
+        "--index",
+        "--perm-position-maps",
+        "pos,ops",
+        "--temp-dir",
+        temp.path().to_str().unwrap(),
+        "--memory-limit",
+        "1M",
+    ]));
+    assert_success(&run(&[
+        "graphs-index",
+        standalone.to_str().unwrap(),
+        "--temp-dir",
+        temp.path().to_str().unwrap(),
+        "--memory-limit",
+        "1M",
+    ]));
+
+    assert_eq!(
+        fs::read(&integrated).unwrap(),
+        fs::read(&standalone).unwrap()
+    );
+    assert_eq!(
+        fs::read(format!("{}.graphs", integrated.display())).unwrap(),
+        fs::read(format!("{}.graphs", standalone.display())).unwrap()
+    );
+    assert_eq!(
+        fs::read(permutation_path(&integrated)).unwrap(),
+        fs::read(permutation_path(&standalone)).unwrap()
+    );
+    assert_eq!(
+        fs::read(standard_index_path(&integrated)).unwrap(),
+        fs::read(standard_index_path(&standalone)).unwrap()
+    );
+    assert_eq!(
+        fs::read(graph_index_path(&integrated)).unwrap(),
+        fs::read(graph_index_path(&standalone)).unwrap()
+    );
+    assert_success(&run(&[
+        "validate",
+        integrated.to_str().unwrap(),
+        "--temp-dir",
+        temp.path().to_str().unwrap(),
+        "--memory-limit",
+        "1M",
+    ]));
+}
+
+#[test]
+fn integrated_graph_index_requires_quads_mode() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input.nt");
+    let hdt = temp.path().join("data.hdt");
+    fs::write(&input, "<urn:s> <urn:p> <urn:o> .\n").unwrap();
+    let output = run(&[
+        "create",
+        input.to_str().unwrap(),
+        "--output",
+        hdt.to_str().unwrap(),
+        "--graphs-index",
+    ]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("require --mode quads"));
+    assert!(!hdt.exists());
+}
+
+#[test]
+fn integrated_graph_index_handles_empty_and_sorted_spool_fallback() {
+    let temp = tempfile::tempdir().unwrap();
+    let empty = temp.path().join("empty.nq");
+    let empty_hdt = temp.path().join("empty.hdt");
+    fs::write(&empty, "").unwrap();
+    assert_success(&run(&[
+        "create",
+        empty.to_str().unwrap(),
+        "--output",
+        empty_hdt.to_str().unwrap(),
+        "--mode",
+        "quads",
+        "--graphs-index",
+        "--temp-dir",
+        temp.path().to_str().unwrap(),
+        "--memory-limit",
+        "1M",
+    ]));
+    assert_success(&run(&[
+        "validate",
+        empty_hdt.to_str().unwrap(),
+        "--temp-dir",
+        temp.path().to_str().unwrap(),
+        "--memory-limit",
+        "1M",
+    ]));
+
+    let many = temp.path().join("many-graphs.nq");
+    let many_hdt = temp.path().join("many-graphs.hdt");
+    let mut quads = String::new();
+    for graph in 0..20 {
+        quads.push_str(&format!(
+            "<urn:s{graph}> <urn:p> <urn:o{graph}> <urn:g{graph}> .\n"
+        ));
+    }
+    fs::write(&many, quads).unwrap();
+    assert_success(&run(&[
+        "create",
+        many.to_str().unwrap(),
+        "--output",
+        many_hdt.to_str().unwrap(),
+        "--mode",
+        "quads",
+        "--graphs-index",
+        "--temp-dir",
+        temp.path().to_str().unwrap(),
+        "--memory-limit",
+        "1M",
+    ]));
+    assert_success(&run(&[
+        "validate",
+        many_hdt.to_str().unwrap(),
+        "--temp-dir",
+        temp.path().to_str().unwrap(),
+        "--memory-limit",
+        "1M",
+    ]));
+}
+
 #[test]
 fn builds_and_strictly_validates_all_v1_structures() {
     let temp = tempfile::tempdir().unwrap();

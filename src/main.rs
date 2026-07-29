@@ -214,13 +214,15 @@ fn create_hdt(args: cli::CreateArgs, benchmark: bool) -> Result<()> {
     let include_graphs = args.mode == cli::OutputMode::Quads;
     let graph_options_require_quads = !args.graph_map.is_empty()
         || args.default_graph.is_some()
+        || args.graphs_index
         || matches!(
             args.input_sidecars,
             Some(cli::InputSidecarPolicy::Preserve | cli::InputSidecarPolicy::Require)
         );
     if !include_graphs && graph_options_require_quads {
         anyhow::bail!(
-            "--graph-map, --default-graph, and preserve/require --input-sidecars require --mode quads"
+            "--graphs-index, --graph-map, --default-graph, and preserve/require \
+             --input-sidecars require --mode quads"
         );
     }
     let input_sidecar_policy = if include_graphs {
@@ -293,6 +295,7 @@ fn create_hdt(args: cli::CreateArgs, benchmark: bool) -> Result<()> {
         &base_uri,
         &parser_parallelism,
         permutation_maps,
+        args.graphs_index,
         benchmark,
     )?;
 
@@ -360,30 +363,80 @@ fn create_hdt(args: cli::CreateArgs, benchmark: bool) -> Result<()> {
     };
 
     let canonical_perm_path = permutation::canonical_path(&args.output);
-    let perm_temp = if args.perm {
+    let mut perm_temp = None;
+    let graph_index_temp = if args.graphs_index {
         let prepared = pipeline_result
-            .permutation
+            .graph_permutation
             .take()
-            .context("Permutation collection was not prepared")?;
-        let temp = tempfile::Builder::new()
-            .prefix(".hdtc-perm-")
+            .context("Graph-index collection was not prepared")?;
+        let graph_temp = tempfile::Builder::new()
+            .prefix(".hdtc-graph-index-")
             .tempfile_in(output_parent)
+            .with_context(|| {
+                format!(
+                    "Failed to create graph-index temp file in {}",
+                    output_parent.display()
+                )
+            })?
+            .into_temp_path();
+        let prepared_perm = args
+            .perm
+            .then(|| {
+                tempfile::Builder::new()
+                    .prefix(".hdtc-perm-")
+                    .tempfile_in(output_parent)
+                    .map(|file| file.into_temp_path())
+            })
+            .transpose()
             .with_context(|| {
                 format!(
                     "Failed to create permutation-index temp file in {}",
                     output_parent.display()
                 )
-            })?
-            .into_temp_path();
-        permutation::finish_prepared_index(
+            })?;
+        let sidecar_path = sidecar_temp
+            .as_deref()
+            .context("Graph-index creation requires a staged graph sidecar")?;
+        graph_index::finish_prepared_graph_index(
             prepared,
-            &temp,
+            &graph_temp,
+            prepared_perm.as_deref(),
             &hdt_temp,
+            sidecar_path,
             &pipeline_result.counts,
             &pipeline_result.bitmap_triples,
+            pipeline_result.membership_count,
+            &temp_dir,
+            memory_budget,
+            permutation_maps.unwrap_or_default(),
         )?;
-        Some(temp)
+        perm_temp = prepared_perm;
+        Some(graph_temp)
     } else {
+        if args.perm {
+            let prepared = pipeline_result
+                .permutation
+                .take()
+                .context("Permutation collection was not prepared")?;
+            let temp = tempfile::Builder::new()
+                .prefix(".hdtc-perm-")
+                .tempfile_in(output_parent)
+                .with_context(|| {
+                    format!(
+                        "Failed to create permutation-index temp file in {}",
+                        output_parent.display()
+                    )
+                })?
+                .into_temp_path();
+            permutation::finish_prepared_index(
+                prepared,
+                &temp,
+                &hdt_temp,
+                &pipeline_result.counts,
+                &pipeline_result.bitmap_triples,
+            )?;
+            perm_temp = Some(temp);
+        }
         None
     };
 
@@ -463,7 +516,7 @@ fn create_hdt(args: cli::CreateArgs, benchmark: bool) -> Result<()> {
             canonical_graphs_path.display()
         );
     }
-    if retired_graph_index.is_some() {
+    if !args.graphs_index && retired_graph_index.is_some() {
         tracing::info!(
             "Removed stale graph index: {}",
             canonical_graph_index_path.display()
@@ -498,6 +551,20 @@ fn create_hdt(args: cli::CreateArgs, benchmark: bool) -> Result<()> {
         tracing::info!(
             "Permutation index written: {}",
             canonical_perm_path.display()
+        );
+    }
+    if let Some(graph_index_temp) = graph_index_temp {
+        graph_index_temp
+            .persist(&canonical_graph_index_path)
+            .with_context(|| {
+                format!(
+                    "Failed to publish graph index {}",
+                    canonical_graph_index_path.display()
+                )
+            })?;
+        tracing::info!(
+            "Graph index written: {}",
+            canonical_graph_index_path.display()
         );
     }
 
