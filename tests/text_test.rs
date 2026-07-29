@@ -583,6 +583,29 @@ fn fuzzy_and_prefix_widen_the_query() {
     assert!(mixed.len() > 1, "prefix matches follow: {mixed:?}");
 }
 
+#[test]
+fn phrase_mode_rejects_fuzzy_and_prefix_widening() {
+    let temp = tempfile::tempdir().unwrap();
+    let hdt = fixture(temp.path());
+
+    for widening in [vec!["--fuzzy", "1"], vec!["--prefix"]] {
+        let output = search(
+            &hdt,
+            &[
+                vec!["--text", "atrazine degradation", "--text-match", "phrase"],
+                widening,
+            ]
+            .concat(),
+        );
+        assert!(!output.status.success());
+        assert!(
+            stderr(&output).contains("cannot be combined with --text-match phrase"),
+            "{}",
+            stderr(&output)
+        );
+    }
+}
+
 /// §3.6: stemming finds the other forms of a word, in the language the literal
 /// declares — and in the assumed language when it declares none.
 #[test]

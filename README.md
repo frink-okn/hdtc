@@ -24,7 +24,7 @@ Development of hdtc is done primarily through Claude Code.
 
 ## Installation
 
-Requires [Rust](https://www.rust-lang.org/tools/install) 1.85 or later.
+Requires [Rust](https://www.rust-lang.org/tools/install) 1.88 or later.
 
 ```sh
 cargo install --path .
@@ -462,8 +462,8 @@ Named-graph options (`-m quads`, `--graph-map`, `--default-graph`,
 | `--no-index`          | off                         | Disable index use; fall back to sequential scan for all patterns         |
 | `--temp-dir DIR`      | system temp                 | Directory for graph and unlimited-text external sorting                  |
 | `--text-match MODE`   | `all`                       | `--text` only: how query tokens combine (`all`, `any`, `phrase`)         |
-| `--fuzzy N`           | `0`                         | `--text` only: maximum edit distance per token (0-2)                     |
-| `--prefix`            | off                         | `--text` only: match the final query token as a prefix                   |
+| `--fuzzy N`           | `0`                         | `--text` only: maximum edit distance per token (0-2; not with `phrase`)  |
+| `--prefix`            | off                         | `--text` only: match the final query token as a prefix (not with `phrase`) |
 | `--lang LANG,...`     | all                         | `--text` only: BCP 47 ranges; untagged literals stay eligible            |
 | `--predicate IRI`     | all                         | `--text` only: keep only matches occurring on this predicate             |
 | `--scores`            | off                         | `--text` only: append the relevance score as an N-Triples comment        |

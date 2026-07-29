@@ -318,11 +318,11 @@ pub struct SearchArgs {
     #[arg(long, value_enum, value_name = "MODE")]
     pub text_match: Option<TextMatchMode>,
 
-    /// Maximum edit distance per token, for typo tolerance (--text only) [default: 0]
+    /// Maximum edit distance per token, for typo tolerance (--text only, not phrase) [default: 0]
     #[arg(long, value_name = "N", value_parser = clap::value_parser!(u8).range(0..=2))]
     pub fuzzy: Option<u8>,
 
-    /// Match the final query token as a prefix (--text only)
+    /// Match the final query token as a prefix (--text only, not phrase)
     #[arg(long)]
     pub prefix: bool,
 

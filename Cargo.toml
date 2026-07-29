@@ -2,6 +2,7 @@
 name = "hdtc"
 version = "1.1.0"
 edition = "2024"
+rust-version = "1.88"
 description = "HDT Creator - converts RDF files to HDT format"
 
 [dependencies]

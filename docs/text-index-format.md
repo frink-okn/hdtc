@@ -473,9 +473,11 @@ or two distinct terms. Under `all`, a token that no stemmer changes still has to
 match, so a query token absent from the stemmed field drops that phase rather
 than weakening the requirement.
 
-Optionally, each token may be widened to a maximum edit distance (with a
-transposition counting as one edit), and the final token may be treated as a
-prefix. Both apply to the plain field only.
+In `all` and `any` modes, each token may optionally be widened to a maximum edit
+distance (with a transposition counting as one edit), and the final token may be
+treated as a prefix. Both apply to the plain field only. Phrase mode is exact
+after plain or stemmed analysis; the CLI rejects fuzzy or prefix widening with
+`phrase` rather than silently weakening its adjacency semantics.
 
 ### 7.2 Language
 

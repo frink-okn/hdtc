@@ -11,6 +11,7 @@ use super::analyzer::{
 use super::manifest::TextManifest;
 use super::schema::{FIELD_LANG, FIELD_OBJECT, FIELD_TEXT, FIELD_TEXT_STEMMED, register_tokenizer};
 use anyhow::{Context, Result, ensure};
+use std::cmp::Reverse;
 use std::path::Path;
 use tantivy::collector::{Count, TopDocs};
 use tantivy::query::{
@@ -324,10 +325,24 @@ impl TextSearcher {
     /// Collect one phase's hits, ordered by score then object ID.
     fn run(&self, query: &dyn Query, top_k: usize, kind: MatchKind) -> Result<Vec<TextHit>> {
         let searcher = self.reader.searcher();
-        let collected = searcher.search(query, &TopDocs::with_limit(top_k).order_by_score())?;
+        // Object ID is part of the collector key, rather than a sort applied
+        // after collection. Tantivy otherwise breaks a score tie by DocAddress,
+        // so a top-k boundary could discard the lower object ID before we ever
+        // had a chance to impose the published ordering.
+        let collector = TopDocs::with_limit(top_k).tweak_score(|segment| {
+            let object_ids = segment.fast_fields().u64(FIELD_OBJECT).ok();
+            move |doc, score| {
+                let object_id = object_ids
+                    .as_ref()
+                    .and_then(|column| column.first(doc))
+                    .unwrap_or(0);
+                (score, Reverse(object_id))
+            }
+        });
+        let collected = searcher.search(query, &collector)?;
 
         let mut hits = Vec::with_capacity(collected.len());
-        for (score, address) in collected {
+        for ((score, _), address) in collected {
             let segment = searcher.segment_reader(address.segment_ord);
             let object_id = segment
                 .fast_fields()
@@ -354,6 +369,10 @@ impl TextSearcher {
     /// a query with no tokens, or a stemmed phase over an index that stems
     /// nothing.
     fn build_query(&self, query: &TextQuery, target: Target) -> Result<Option<Box<dyn Query>>> {
+        ensure!(
+            query.mode != MatchMode::Phrase || (query.fuzzy == 0 && !query.prefix),
+            "--fuzzy and --prefix cannot be combined with --text-match phrase"
+        );
         let tokens = self.analyze(&query.text);
         if tokens.is_empty() {
             return Ok(None);
@@ -594,5 +613,84 @@ fn stem_with(analyzer: &mut TextAnalyzer, token: &str) -> String {
         stream.token().text.clone()
     } else {
         token.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::text::analyzer::{ANALYZER_ID, DatatypeExclusions};
+    use crate::text::schema::{SCHEMA_ID, text_schema};
+    use tantivy::{IndexWriter, TantivyDocument};
+
+    #[test]
+    fn top_k_applies_the_object_id_tiebreak_before_truncation() -> Result<()> {
+        let index = Index::create_in_ram(text_schema());
+        register_tokenizer(&index);
+        let schema = index.schema();
+        let text_field = schema.get_field(FIELD_TEXT)?;
+        let stemmed_field = schema.get_field(FIELD_TEXT_STEMMED)?;
+        let object_field = schema.get_field(FIELD_OBJECT)?;
+        let lang_field = schema.get_field(FIELD_LANG)?;
+
+        // Deliberately make DocAddress order the reverse of object-ID order.
+        // All documents have the same term frequency and length, so their BM25
+        // scores tie exactly at the top-k boundary.
+        let mut writer: IndexWriter<TantivyDocument> =
+            index.writer_with_num_threads(1, 20 * 1024 * 1024)?;
+        for object_id in [30u64, 20, 10] {
+            let mut document = TantivyDocument::new();
+            document.add_text(text_field, "shared");
+            document.add_u64(object_field, object_id);
+            document.add_text(lang_field, UNDETERMINED_LANGUAGE);
+            writer.add_document(document)?;
+        }
+        writer.commit()?;
+
+        let reader = index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::Manual)
+            .try_into()?;
+        let analyzer = index
+            .tokenizers()
+            .get(TOKENIZER_NAME)
+            .context("hdtc tokenizer was not registered")?;
+        let searcher = TextSearcher {
+            reader,
+            analyzer,
+            manifest: TextManifest {
+                analyzer_id: ANALYZER_ID,
+                schema_id: SCHEMA_ID,
+                tantivy_writer: "test".to_string(),
+                tantivy_index_format: None,
+                source_digest: [0; 32],
+                max_literal_bytes: 4096,
+                untagged_language: None,
+                literals_scanned: 3,
+                indexed_docs: 3,
+                excluded_oversize: 0,
+                excluded_datatype: 0,
+                excluded_no_tokens: 0,
+                exclusions: DatatypeExclusions::default(),
+                languages: Vec::new(),
+            },
+            text_field,
+            stemmed_field,
+            lang_field,
+            stemmers: Vec::new(),
+        };
+
+        let hits = searcher.search(
+            &TextQuery {
+                text: "shared".to_string(),
+                ..TextQuery::default()
+            },
+            2,
+        )?;
+        assert_eq!(
+            hits.iter().map(|hit| hit.object_id).collect::<Vec<_>>(),
+            [10, 20]
+        );
+        Ok(())
     }
 }
