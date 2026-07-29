@@ -104,6 +104,12 @@ pub enum PermutationPositionMap {
     Ops,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, ValueEnum)]
+pub enum GraphIndexPositionSpace {
+    Pos,
+    Ops,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum TextMatchMode {
     /// Every query token must be present
@@ -168,13 +174,17 @@ pub enum Commands {
     /// Build a memory-mapped POS/OPS permutation index
     Perm(PermArgs),
 
+    /// Build the derived index over an HDT graph sidecar
+    #[command(name = "graphs-index")]
+    GraphIndex(GraphIndexArgs),
+
     /// Export an HDT triples union or sidecar-backed RDF dataset
     Dump(DumpArgs),
 
     /// Search an HDT/sidecar with a triple or quad pattern
     Search(SearchArgs),
 
-    /// Validate HDT structures and discovered graph/permutation sidecars
+    /// Validate HDT structures and discovered graph/permutation indexes
     Validate(ValidateArgs),
 
     /// Compute VoID statistics for an HDT file and output as N-Triples
@@ -305,6 +315,42 @@ pub struct PermArgs {
     pub temp_dir: Option<PathBuf>,
 
     /// Soft memory limit for POS/OPS sorting (e.g. 4G, 2000M)
+    #[arg(short = 'm', long, value_name = "SIZE", default_value = "4G")]
+    pub memory_limit: MemorySize,
+}
+
+#[derive(Debug, Parser)]
+pub struct GraphIndexArgs {
+    /// Path to an existing HDT file with a canonical .graphs sidecar
+    pub hdt_file: PathBuf,
+
+    /// Position-keyed layer sets to build (default: pos,ops)
+    #[arg(
+        long = "positions",
+        value_enum,
+        value_delimiter = ',',
+        value_name = "SPACE,...",
+        conflicts_with = "no_layers"
+    )]
+    pub positions: Vec<GraphIndexPositionSpace>,
+
+    /// Omit both position-keyed layer sets
+    #[arg(long)]
+    pub no_layers: bool,
+
+    /// Include BitmapG and its rank directory
+    #[arg(long)]
+    pub transpose_ranks: bool,
+
+    /// Include ArrayG graph IDs (also enables --transpose-ranks)
+    #[arg(long)]
+    pub transpose_ids: bool,
+
+    /// Directory for temporary sorting and payload files
+    #[arg(long, value_name = "DIR")]
+    pub temp_dir: Option<PathBuf>,
+
+    /// Soft memory limit for external sorting (e.g. 4G, 2000M)
     #[arg(short = 'm', long, value_name = "SIZE", default_value = "4G")]
     pub memory_limit: MemorySize,
 }

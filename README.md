@@ -15,6 +15,7 @@ Development of hdtc is done primarily through Claude Code.
 - **Multiple inputs** — accepts any mix of RDF files, HDT files, and directories; recursively discovers RDF files
 - **Parallel NT/NQ parsing** — newline-safe chunk parsing for N-Triples/N-Quads (including `.gz`, `.bz2`, `.xz`, `.zst`) with bounded in-flight memory
 - **Two query indexes** — standard FoQ `.hdt.index.v1-1` and memory-mapped POS/OPS `.hdt.perm` indexes enable efficient `? P ?`, `? ? O`, and `? P O` queries
+- **Graph index** — optional `.hdt.graphs.idx` POS/OPS layer sets scope index-side patterns to a graph; optional SPO transpose sections accelerate membership counts and graph projection
 - **VoID statistics** — compute dataset-level, property, and class partition statistics as N-Triples
 - **Structural validation** — walk an HDT's triple structures and checksums, plus discovered graph and permutation sidecars, end to end
 - **Resilient parsing** — skips malformed triples with warnings, reports total skipped at the end
@@ -59,6 +60,12 @@ hdtc index [OPTIONS] <HDT_FILE>
 
 ```
 hdtc perm [OPTIONS] <HDT_FILE>
+```
+
+### `hdtc graphs-index` — Index graph memberships
+
+```
+hdtc graphs-index [OPTIONS] <HDT_FILE>
 ```
 
 ### `hdtc dump` — Export the triples union or RDF dataset
@@ -201,6 +208,22 @@ the unique SPO stream and avoids decoding the completed HDT again:
 hdtc create data.nt -o data.hdt --perm
 hdtc create data.nt -o data.hdt --perm --perm-position-maps ops
 ```
+
+### Graphs index: Indexing sidecar memberships
+
+Build the default POS- and OPS-keyed layer sets for an existing HDT/graphs
+pair:
+
+```sh
+hdtc graphs-index data.hdt
+# Creates: data.hdt.graphs.idx
+```
+
+The SPO transpose is opt-in because its value depends on graph count and query
+mix. `--transpose-ranks` adds `BitmapG`; `--transpose-ids` also adds `ArrayG`
+and implies ranks. Use `--positions pos` for POS only, or `--no-layers` for a
+transpose-only artifact. The wire format and build policy are specified in
+[`docs/graphs-index-format.md`](docs/graphs-index-format.md).
 
 ### Dump: Exporting the union or dataset
 
@@ -603,6 +626,10 @@ Its sort chunks are zstd-compressed; peak scratch usage depends on identifier
 widths and compressibility. `create --perm` begins those sorts directly from the
 unique SPO stream, while standalone `perm` first streams the existing HDT.
 
+`hdtc graphs-index` validates and transposes the graph sidecar once, then uses
+two external sorts per requested position space to map memberships into POS or
+OPS order. Its chunks are zstd-compressed and bounded by `--memory-limit`.
+
 `hdtc sketch` additionally writes an uncompressed 8-byte hash for each
 qualifying IRI in every selected role while building the filters. An IRI in the
 shared dictionary is therefore present in both temporary role files when both
@@ -620,6 +647,10 @@ HDT files are typically 10–20% of the equivalent uncompressed N-Triples. A
 `.hdt.perm` stores two additional complete permutations and is therefore
 roughly twice the dominant triple-array size of a FoQ index; optional position
 maps add about `log2(N)` bits per triple each.
+
+A `.hdt.graphs.idx` layer set is approximately the size of the graph sidecar's
+membership layers. `BitmapG` costs about one bit per membership plus ranks;
+`ArrayG` adds `ceil(log2(G + 1))` bits per membership.
 
 ## Beyond standard HDT
 
