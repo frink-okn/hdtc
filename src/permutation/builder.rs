@@ -1,6 +1,7 @@
 use super::format::*;
 use crate::dictionary::DictCounts;
-use crate::hdt::reader::{BitmapTriplesScanner, HdtSectionOffsets, hdt_data_offset, sha256_to_end};
+use crate::hdt::artifacts::SourceIdentity;
+use crate::hdt::reader::{BitmapTriplesScanner, HdtSectionOffsets};
 use crate::io::crc_utils::{CRC32C_ALGO, crc8, crc32c};
 use crate::io::{ControlInfo, ControlType, StreamingBitmapEncoder, StreamingLogArrayEncoder};
 use crate::sort::{ExternalSorter, Sortable};
@@ -108,6 +109,63 @@ fn read_vbyte_recording<R: Read>(reader: &mut R, bytes: &mut Vec<u8>) -> Result<
     }
 }
 
+/// Read the counts needed by the permutation format and seek past a PFC
+/// section without materializing its block-offset LogArray. The normal PFC
+/// reader expands those offsets for random term access; this structural scan
+/// only needs the string count and the position of the following section.
+fn skip_pfc_section<R: Read + Seek>(reader: &mut R, section_name: &str) -> Result<u64> {
+    let mut preamble = vec![0u8; 1];
+    reader.read_exact(&mut preamble)?;
+    ensure!(preamble[0] == 2, "invalid {section_name} PFC section type");
+    let string_count = read_vbyte_recording(reader, &mut preamble)?;
+    let buffer_length = read_vbyte_recording(reader, &mut preamble)?;
+    let block_size = read_vbyte_recording(reader, &mut preamble)?;
+    ensure!(block_size > 0, "invalid {section_name} PFC block size");
+    let mut stored_crc = [0u8; 1];
+    reader.read_exact(&mut stored_crc)?;
+    ensure!(
+        crc8(&preamble) == stored_crc[0],
+        "{section_name} PFC preamble CRC8 mismatch"
+    );
+
+    let mut offsets_preamble = vec![0u8; 2];
+    reader.read_exact(&mut offsets_preamble)?;
+    ensure!(
+        offsets_preamble[0] == 1,
+        "invalid {section_name} PFC offsets LogArray type"
+    );
+    let offsets_width = offsets_preamble[1];
+    ensure!(
+        offsets_width <= 64,
+        "invalid {section_name} PFC offsets width"
+    );
+    let offsets_count = read_vbyte_recording(reader, &mut offsets_preamble)?;
+    reader.read_exact(&mut stored_crc)?;
+    ensure!(
+        crc8(&offsets_preamble) == stored_crc[0],
+        "{section_name} PFC offsets preamble CRC8 mismatch"
+    );
+    let expected_offsets = string_count
+        .div_ceil(block_size)
+        .checked_add(1)
+        .context("PFC block-offset count overflow")?;
+    ensure!(
+        offsets_count == expected_offsets,
+        "unexpected {section_name} PFC block-offset count"
+    );
+
+    let offsets_length = packed_len(offsets_count, offsets_width)?;
+    let bytes_to_skip = offsets_length
+        .checked_add(4)
+        .and_then(|length| length.checked_add(buffer_length))
+        .and_then(|length| length.checked_add(4))
+        .context("PFC section length overflow")?;
+    reader.seek(SeekFrom::Current(
+        i64::try_from(bytes_to_skip).context("PFC section is too large to seek")?,
+    ))?;
+    Ok(string_count)
+}
+
 pub(crate) fn scan_hdt(path: &Path) -> Result<HdtMetadata> {
     let file =
         File::open(path).with_context(|| format!("Failed to open HDT file {}", path.display()))?;
@@ -147,10 +205,10 @@ pub(crate) fn scan_hdt(path: &Path) -> Result<HdtMetadata> {
         "unsupported HDT dictionary format: {}",
         dictionary.format
     );
-    let shared = crate::hdt::pfc_reader::skip_pfc_section(&mut reader, "shared")?;
-    let subjects_only = crate::hdt::pfc_reader::skip_pfc_section(&mut reader, "subjects")?;
-    let predicates = crate::hdt::pfc_reader::skip_pfc_section(&mut reader, "predicates")?;
-    let objects_only = crate::hdt::pfc_reader::skip_pfc_section(&mut reader, "objects")?;
+    let shared = skip_pfc_section(&mut reader, "shared")?;
+    let subjects_only = skip_pfc_section(&mut reader, "subjects")?;
+    let predicates = skip_pfc_section(&mut reader, "predicates")?;
+    let objects_only = skip_pfc_section(&mut reader, "objects")?;
 
     let triples_ci =
         ControlInfo::read_from(&mut reader).context("Failed to read HDT triples control info")?;
@@ -714,18 +772,6 @@ fn build_rank_directories(bitmap: &RawBitmap, temp_dir: &Path) -> Result<(TempPa
     Ok((super_file.into_temp_path(), sub_file.into_temp_path()))
 }
 
-fn source_identity(path: &Path, metadata: &HdtMetadata) -> Result<(u64, [u8; 32])> {
-    let file = File::open(path)?;
-    let mut reader = BufReader::with_capacity(256 * 1024, file);
-    let offset = hdt_data_offset(&mut reader)?;
-    ensure!(
-        offset == metadata.data_offset,
-        "HDT identity offset changed during permutation build"
-    );
-    let digest = sha256_to_end(&mut reader)?;
-    Ok((metadata.file_length - metadata.data_offset, digest))
-}
-
 fn file_crc(path: &Path) -> Result<(u64, u32)> {
     let file = File::open(path)?;
     let length = file.metadata()?.len();
@@ -765,8 +811,8 @@ fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {
 #[allow(clippy::too_many_arguments)]
 fn assemble(
     output: &Path,
-    hdt_path: &Path,
     metadata: &HdtMetadata,
+    source_digest: &[u8; 32],
     pos_pairs: u64,
     ops_pairs: u64,
     mut drafts: Vec<DraftSection>,
@@ -809,7 +855,10 @@ fn assemble(
     let file_size = footer_offset
         .checked_add(FOOTER_SIZE)
         .context("permutation-index size overflow")?;
-    let (source_length, source_digest) = source_identity(hdt_path, metadata)?;
+    let source_length = metadata
+        .file_length
+        .checked_sub(metadata.data_offset)
+        .context("HDT source-data length underflow")?;
 
     let mut directory = Vec::with_capacity(sections.len() * 64);
     for section in &sections {
@@ -855,7 +904,7 @@ fn assemble(
     put_u64(&mut header, 112, footer_offset);
     put_u32(&mut header, 120, SUPERBLOCK_BITS);
     put_u32(&mut header, 124, SUBBLOCK_BITS);
-    header[128..160].copy_from_slice(&source_digest);
+    header[128..160].copy_from_slice(source_digest);
     let header_crc = crc32c(&header[..252]);
     put_u32(&mut header, 252, header_crc);
 
@@ -889,6 +938,14 @@ fn assemble(
     write_zeros_to(&mut writer, footer_offset)?;
     writer.write_all(&footer)?;
     writer.flush()?;
+    // The caller renames this file into the canonical `.perm` name, and a
+    // normal open verifies metadata but not payload checksums. Reaching disk
+    // before the rename is what keeps a crash from publishing a well-formed
+    // header over payload bytes that never landed.
+    writer
+        .get_ref()
+        .sync_all()
+        .with_context(|| format!("Failed to flush permutation index {}", output.display()))?;
     ensure!(
         std::fs::metadata(output)?.len() == file_size,
         "written permutation-index size mismatch"
@@ -920,8 +977,8 @@ fn raw_bitmap_from_temp(path: &Path, bits: u64) -> RawBitmap {
 fn finish_collector(
     mut collector: PermutationCollector,
     output: &Path,
-    hdt_path: &Path,
     metadata: &HdtMetadata,
+    source_digest: &[u8; 32],
     spo_y: &RawBitmap,
     spo_z: &RawBitmap,
 ) -> Result<()> {
@@ -983,8 +1040,8 @@ fn finish_collector(
     drafts.push(rank_draft(SPO_Z_SUB, spo_z_dirs.1, metadata.triples, false));
     assemble(
         output,
-        hdt_path,
         metadata,
+        source_digest,
         pos.pair_count,
         ops.pair_count,
         drafts,
@@ -997,6 +1054,7 @@ pub fn create_permutation_index(
     temp_dir: &Path,
     maps: PositionMaps,
 ) -> Result<PathBuf> {
+    let source = SourceIdentity::capture(hdt_path)?;
     let metadata = scan_hdt(hdt_path)?;
     let mut collector = PermutationCollector::new(temp_dir, memory_budget, maps);
     let mut scanner = BitmapTriplesScanner::new(&metadata.offsets, hdt_path)?;
@@ -1018,11 +1076,12 @@ pub fn create_permutation_index(
     finish_collector(
         collector,
         &temp,
-        hdt_path,
         &metadata,
+        source.digest(),
         &metadata.bitmap_y,
         &metadata.bitmap_z,
     )?;
+    source.ensure_unchanged(hdt_path)?;
     temp.persist(&output)
         .map_err(|error| error.error)
         .with_context(|| format!("Failed to publish permutation index {}", output.display()))?;
@@ -1036,6 +1095,7 @@ pub fn finish_prepared_index(
     counts: &DictCounts,
     triples: &BitmapTriplesFiles,
 ) -> Result<()> {
+    let source = SourceIdentity::capture(hdt_path)?;
     let metadata = scan_hdt(hdt_path)?;
     ensure!(
         metadata.subjects == counts.shared + counts.subjects,
@@ -1055,5 +1115,44 @@ pub fn finish_prepared_index(
     );
     let spo_y = raw_bitmap_from_temp(&triples.bitmap_y.path, triples.bitmap_y.num_bits);
     let spo_z = raw_bitmap_from_temp(&triples.bitmap_z.path, triples.bitmap_z.num_bits);
-    finish_collector(collector, output, hdt_path, &metadata, &spo_y, &spo_z)
+    finish_collector(
+        collector,
+        output,
+        &metadata,
+        source.digest(),
+        &spo_y,
+        &spo_z,
+    )?;
+    source.ensure_unchanged(hdt_path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dictionary::pfc::PfcEncoder;
+    use std::io::Cursor;
+
+    #[test]
+    fn structural_pfc_skip_preserves_counts_and_next_section_position() {
+        for terms in [&[][..], &["alpha", "beta", "gamma"][..]] {
+            let mut encoder = PfcEncoder::with_block_size(2);
+            for term in terms {
+                encoder.push(*term);
+            }
+            let mut section = Vec::new();
+            encoder.write_to(&mut section).unwrap();
+            let section_length = section.len() as u64;
+            section.extend_from_slice(b"next");
+
+            let mut reader = Cursor::new(section);
+            assert_eq!(
+                skip_pfc_section(&mut reader, "test").unwrap(),
+                terms.len() as u64
+            );
+            assert_eq!(reader.position(), section_length);
+            let mut next = [0u8; 4];
+            reader.read_exact(&mut next).unwrap();
+            assert_eq!(&next, b"next");
+        }
+    }
 }

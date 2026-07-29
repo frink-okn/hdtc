@@ -187,6 +187,10 @@ pub(crate) fn parse_header(bytes: &[u8; 256]) -> Result<Header> {
         "invalid permutation-index header size"
     );
     ensure!(
+        u64_at(bytes, 88) == HEADER_SIZE,
+        "noncanonical permutation-index directory offset"
+    );
+    ensure!(
         u32_at(bytes, 108) == 1,
         "unsupported source identity algorithm"
     );
@@ -349,4 +353,30 @@ pub(crate) fn read_header_and_sections(path: &Path) -> Result<(Header, Vec<Secti
         }
     }
     Ok((header, sections))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn header_with_directory_offset(directory_offset: u64) -> [u8; 256] {
+        let mut header = [0u8; 256];
+        header[0..8].copy_from_slice(b"$HDTPERM");
+        header[8..10].copy_from_slice(&1u16.to_le_bytes());
+        header[12..16].copy_from_slice(&256u32.to_le_bytes());
+        header[88..96].copy_from_slice(&directory_offset.to_le_bytes());
+        header[108..112].copy_from_slice(&1u32.to_le_bytes());
+        header[120..124].copy_from_slice(&SUPERBLOCK_BITS.to_le_bytes());
+        header[124..128].copy_from_slice(&SUBBLOCK_BITS.to_le_bytes());
+        let checksum = crc32c(&header[..252]);
+        header[252..256].copy_from_slice(&checksum.to_le_bytes());
+        header
+    }
+
+    #[test]
+    fn header_rejects_padding_before_the_directory() {
+        parse_header(&header_with_directory_offset(HEADER_SIZE)).unwrap();
+        let error = parse_header(&header_with_directory_offset(HEADER_SIZE + 64)).unwrap_err();
+        assert!(error.to_string().contains("noncanonical"), "{error}");
+    }
 }

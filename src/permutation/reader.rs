@@ -340,7 +340,6 @@ fn validate_canonical_regions(
         .checked_add(header.directory_length)
         .context("directory end overflow")?;
     let mut cursor = align64(directory_end)?;
-    validate_zero_range(path, HEADER_SIZE, header.directory_offset)?;
     validate_zero_range(path, directory_end, cursor)?;
     for section in sections {
         if section.length == 0 {

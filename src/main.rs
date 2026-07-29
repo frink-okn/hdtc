@@ -393,8 +393,13 @@ fn create_hdt(args: cli::CreateArgs, benchmark: bool) -> Result<()> {
         match retire_existing_artifact(&canonical_perm_path, output_parent, "permutation index") {
             Ok(retired) => retired,
             Err(error) => {
-                if let Some(retired) = retired_sidecar.as_ref() {
-                    retired.restore()?;
+                if let Some(retired) = retired_sidecar.as_ref()
+                    && let Err(restore_error) = retired.restore()
+                {
+                    return Err(anyhow::anyhow!(
+                        "{error:#}; additionally failed to roll back the graph sidecar: \
+                         {restore_error:#}"
+                    ));
                 }
                 return Err(error);
             }

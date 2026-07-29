@@ -1234,6 +1234,15 @@ pub fn search_hdt_streaming(
     // Canonically discovered permutation indexes take precedence over FoQ for
     // predicate- and object-rooted patterns. An explicitly supplied --index
     // still selects that FoQ file, preserving the meaning of the option.
+    //
+    // `? ? O` and `? P O` enumerate in the same order either way — OPS order,
+    // and a single (P,O) group is subject-ordered under both — so the choice is
+    // invisible to `--offset`/`--limit`. `? P ?` is not: POS walks the
+    // predicate's objects group by group while the FoQ predicate index walks
+    // pos_y, which is subject order. Preferring the permutation there would
+    // silently repaginate a dataset the moment a `.perm` appeared beside it, so
+    // it is used for `? P ?` only when no FoQ index exists to be consistent
+    // with.
     if !no_index
         && index_path.is_none()
         && matches!(
@@ -1242,6 +1251,7 @@ pub fn search_hdt_streaming(
                 | PatternKind::ObjectBound
                 | PatternKind::PredicateObjectBound
         )
+        && (kind != PatternKind::PredicateBound || !resolve_index_path(hdt_path, None).exists())
     {
         let perm_path = crate::permutation::canonical_path(hdt_path);
         if perm_path.exists() {

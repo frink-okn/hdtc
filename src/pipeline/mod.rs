@@ -1594,10 +1594,22 @@ pub fn run_pipeline(
     // Stage 6: External sort + BitmapTriples construction
     tracing::info!("Stage 6: Sorting global-ID quad memberships in SPO+G order");
 
+    // `create --perm` adds a second pair of external sorts (POS and OPS) that
+    // fill while this sorter's drained buffer still holds its capacity, so the
+    // stage-5/6 sort budget is split between them rather than handed out twice.
+    let perm_sort_budget = if permutation_maps.is_some() {
+        stage56_budget.sort_budget_bytes / 2
+    } else {
+        0
+    };
+    let spo_sort_budget = stage56_budget
+        .sort_budget_bytes
+        .saturating_sub(perm_sort_budget)
+        .max(std::mem::size_of::<IdQuad>());
+
     // Collect statements into the external sorter, tracking max IDs for
     // BitmapTriples bit widths.
-    let mut statements =
-        StatementSorter::new(temp_dir, stage56_budget.sort_budget_bytes, include_graphs);
+    let mut statements = StatementSorter::new(temp_dir, spo_sort_budget, include_graphs);
     let mut mem_used: usize = 0;
     let mut triple_count = 0u64;
     let mut max_subject: u64 = 0;
@@ -1649,11 +1661,7 @@ pub fn run_pipeline(
     let bitmap_start;
     let bitmap_rss_before;
     let mut permutation = permutation_maps.map(|maps| {
-        crate::permutation::PermutationCollector::new(
-            temp_dir,
-            stage56_budget.sort_budget_bytes,
-            maps,
-        )
+        crate::permutation::PermutationCollector::new(temp_dir, perm_sort_budget, maps)
     });
     let (bitmap_triples, membership_path, membership_count) = match statements {
         StatementSorter::Quads {
