@@ -166,6 +166,7 @@ struct EfHeader {
 /// dictionary, directory, indexes, and payloads remain on disk.
 pub struct GraphSidecarReader {
     hdt_path: PathBuf,
+    artifact_path: PathBuf,
     file: File,
     header: Header,
     dictionary: GraphDictionary,
@@ -241,6 +242,7 @@ impl EmbeddedLayerSetReader {
         Ok(Self {
             inner: GraphSidecarReader {
                 hdt_path: PathBuf::new(),
+                artifact_path: path.to_path_buf(),
                 file,
                 header,
                 dictionary,
@@ -372,10 +374,14 @@ impl EmbeddedLayerSetReader {
             let mut previous = None;
             for position in self.inner.layer_iter(graph_id)? {
                 let position = position?;
-                ensure!(
-                    previous.is_none_or(|value| position > value),
-                    "embedded layer positions are not strictly increasing"
-                );
+                if let Some(before) = previous {
+                    ensure!(
+                        position > before,
+                        "embedded layer {graph_id} positions are not strictly increasing at \
+                         ordinal {count}: previous {before}, current {position}, encoding {}",
+                        layer.encoding
+                    );
+                }
                 previous = Some(position);
                 minimum = minimum.min(position);
                 maximum_exclusive = position + 1;
@@ -472,6 +478,7 @@ impl GraphSidecarReader {
 
         Ok(Self {
             hdt_path: hdt_path.to_path_buf(),
+            artifact_path: sidecar_path.to_path_buf(),
             file,
             header,
             dictionary,
@@ -639,7 +646,7 @@ impl GraphSidecarReader {
 
     pub fn layer_iter(&mut self, graph_id: u64) -> Result<LayerMemberIter> {
         let layer = self.layer_entry(graph_id)?;
-        LayerMemberIter::new(self.file.try_clone()?, layer, self.header.triple_count)
+        LayerMemberIter::new(&self.artifact_path, layer, self.header.triple_count)
     }
 
     /// Perform full identity, checksum, encoding, dictionary, and exhaustive
@@ -755,10 +762,14 @@ impl GraphSidecarReader {
             let iterator = self.layer_iter(graph_id)?;
             for position in iterator {
                 let position = position?;
-                ensure!(
-                    previous.is_none_or(|value| position > value),
-                    "layer positions are not strictly increasing"
-                );
+                if let Some(before) = previous {
+                    ensure!(
+                        position > before,
+                        "layer {graph_id} positions are not strictly increasing at ordinal \
+                         {count}: previous {before}, current {position}, encoding {}",
+                        layer.encoding
+                    );
+                }
                 previous = Some(position);
                 minimum = minimum.min(position);
                 maximum_exclusive = position + 1;
@@ -1899,13 +1910,13 @@ pub enum LayerMemberIter {
 }
 
 impl LayerMemberIter {
-    fn new(file: File, layer: LayerEntry, universe: u64) -> Result<Self> {
+    fn new(path: &Path, layer: LayerEntry, universe: u64) -> Result<Self> {
         if layer.member_count == 0 {
             return Ok(Self::Empty);
         }
         match layer.encoding {
             ENCODING_DENSE | ENCODING_SPARSE => Ok(Self::Chunked(ChunkLayerIter {
-                file,
+                file: File::open(path)?,
                 layer,
                 universe,
                 entry_index: 0,
@@ -1914,7 +1925,10 @@ impl LayerMemberIter {
                 yielded: 0,
             })),
             ENCODING_ELIAS_FANO => Ok(Self::EliasFano(EliasFanoLayerIter::new(
-                file, layer, universe,
+                File::open(path)?,
+                File::open(path)?,
+                layer,
+                universe,
             )?)),
             other => bail!("unsupported layer encoding {other}"),
         }
@@ -2046,13 +2060,17 @@ pub struct EliasFanoLayerIter {
 }
 
 impl EliasFanoLayerIter {
-    fn new(mut file: File, layer: LayerEntry, universe: u64) -> Result<Self> {
-        let header = read_ef_header_from(&mut file, layer)?;
+    fn new(
+        mut upper_file: File,
+        lower_file: File,
+        layer: LayerEntry,
+        universe: u64,
+    ) -> Result<Self> {
+        let header = read_ef_header_from(&mut upper_file, layer)?;
         ensure!(header.universe == universe, "Elias-Fano universe mismatch");
-        let mut upper_file = file.try_clone()?;
         upper_file.seek(SeekFrom::Start(header.upper_offset))?;
         Ok(Self {
-            lower_file: file,
+            lower_file,
             upper_reader: BufReader::new(upper_file),
             header,
             universe,
@@ -2857,6 +2875,74 @@ mod tests {
         assert_eq!(reader.graphs_of(300_000)?, vec![0]);
 
         reader.validate_strict(temp.path(), 4 * 1024 * 1024, None)?;
+        Ok(())
+    }
+
+    #[test]
+    fn elias_fano_iteration_keeps_upper_and_lower_cursors_independent() -> Result<()> {
+        const MEMBERS: u64 = 70_000;
+        const UNIVERSE: u64 = MEMBERS * 2;
+        const LOWER_OFFSET: u64 = 160;
+        const LOWER_LENGTH: u64 = MEMBERS.div_ceil(8);
+        const UPPER_OFFSET: u64 = (LOWER_OFFSET + LOWER_LENGTH).next_multiple_of(8);
+        const UPPER_BITS: u64 = MEMBERS * 2;
+        const UPPER_LENGTH: u64 = UPPER_BITS.div_ceil(8);
+
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("large-ef-layer.bin");
+
+        let mut header = [0u8; 160];
+        header[0..8].copy_from_slice(b"$HDTEF01");
+        header[8..12].copy_from_slice(&160u32.to_le_bytes());
+        header[12..16].copy_from_slice(&1u32.to_le_bytes());
+        header[16..24].copy_from_slice(&UNIVERSE.to_le_bytes());
+        header[24..32].copy_from_slice(&MEMBERS.to_le_bytes());
+        header[32..40].copy_from_slice(&UPPER_BITS.to_le_bytes());
+        header[40..48].copy_from_slice(&MEMBERS.to_le_bytes());
+        header[48..56].copy_from_slice(&LOWER_OFFSET.to_le_bytes());
+        header[56..64].copy_from_slice(&LOWER_LENGTH.to_le_bytes());
+        header[96..104].copy_from_slice(&UPPER_OFFSET.to_le_bytes());
+        header[104..112].copy_from_slice(&UPPER_LENGTH.to_le_bytes());
+        let header_crc = crc32c(&header[..156]);
+        header[156..160].copy_from_slice(&header_crc.to_le_bytes());
+
+        // Values are 0, 2, 4, ...: every lower bit is zero and every even
+        // upper-bit position is set. The upper payload is deliberately larger
+        // than BufReader's buffer so iteration must refill it after lower reads.
+        let mut upper = vec![0u8; UPPER_LENGTH as usize];
+        for ordinal in 0..MEMBERS {
+            let bit = ordinal * 2;
+            upper[(bit / 8) as usize] |= 1 << (bit % 8);
+        }
+        let mut file = File::create(&path)?;
+        file.write_all(&header)?;
+        file.write_all(&vec![0u8; LOWER_LENGTH as usize])?;
+        file.write_all(&vec![
+            0u8;
+            (UPPER_OFFSET - LOWER_OFFSET - LOWER_LENGTH) as usize
+        ])?;
+        file.write_all(&upper)?;
+        file.flush()?;
+
+        let layer = LayerEntry {
+            primary_offset: 0,
+            primary_length: 160,
+            secondary_offset: 0,
+            secondary_length: 0,
+            item_count_a: 0,
+            item_count_b: 0,
+            member_count: MEMBERS,
+            minimum_position: 0,
+            maximum_position_exclusive: UNIVERSE - 1,
+            encoding: ENCODING_ELIAS_FANO,
+            flags: 0,
+            primary_crc: crc32c(&header),
+            secondary_crc: 0,
+            parameter: 0,
+        };
+        for (ordinal, position) in LayerMemberIter::new(&path, layer, UNIVERSE)?.enumerate() {
+            assert_eq!(position?, ordinal as u64 * 2);
+        }
         Ok(())
     }
 }
