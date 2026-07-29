@@ -3,6 +3,7 @@ mod dictionary;
 mod hdt;
 mod index;
 mod io;
+mod permutation;
 mod pipeline;
 mod quads;
 mod rdf;
@@ -58,24 +59,24 @@ fn make_default_temp_dir() -> Result<std::path::PathBuf> {
 /// An existing graph sidecar moved out of its canonical name while a new HDT
 /// is published. Keeping the backup in a sibling directory makes both moves
 /// atomic on supported filesystems.
-struct RetiredSidecar {
+struct RetiredArtifact {
     original_path: PathBuf,
     backup_path: PathBuf,
     _quarantine: tempfile::TempDir,
 }
 
-impl RetiredSidecar {
+impl RetiredArtifact {
     fn restore(&self) -> Result<()> {
         match std::fs::symlink_metadata(&self.original_path) {
             Ok(_) => anyhow::bail!(
-                "Cannot restore graph sidecar {} because another entry now exists there",
+                "Cannot restore artifact {} because another entry now exists there",
                 self.original_path.display()
             ),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
                 return Err(error).with_context(|| {
                     format!(
-                        "Failed to inspect graph sidecar path {} before rollback",
+                        "Failed to inspect artifact path {} before rollback",
                         self.original_path.display()
                     )
                 });
@@ -83,25 +84,26 @@ impl RetiredSidecar {
         }
         std::fs::rename(&self.backup_path, &self.original_path).with_context(|| {
             format!(
-                "Failed to restore graph sidecar {}",
+                "Failed to restore artifact {}",
                 self.original_path.display()
             )
         })
     }
 }
 
-fn retire_existing_sidecar(
-    sidecar_path: &Path,
+fn retire_existing_artifact(
+    artifact_path: &Path,
     output_parent: &Path,
-) -> Result<Option<RetiredSidecar>> {
-    let metadata = match std::fs::symlink_metadata(sidecar_path) {
+    label: &str,
+) -> Result<Option<RetiredArtifact>> {
+    let metadata = match std::fs::symlink_metadata(artifact_path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
             return Err(error).with_context(|| {
                 format!(
-                    "Failed to inspect existing graph sidecar {}",
-                    sidecar_path.display()
+                    "Failed to inspect existing {label} {}",
+                    artifact_path.display()
                 )
             });
         }
@@ -109,29 +111,29 @@ fn retire_existing_sidecar(
     let file_type = metadata.file_type();
     anyhow::ensure!(
         file_type.is_file() || file_type.is_symlink(),
-        "Refusing to replace graph sidecar path {} because it is not a file",
-        sidecar_path.display()
+        "Refusing to replace {label} path {} because it is not a file",
+        artifact_path.display()
     );
 
     let quarantine = tempfile::Builder::new()
-        .prefix(".hdtc-retired-graphs-")
+        .prefix(".hdtc-retired-artifact-")
         .tempdir_in(output_parent)
         .with_context(|| {
             format!(
-                "Failed to create sidecar quarantine in {}",
+                "Failed to create artifact quarantine in {}",
                 output_parent.display()
             )
         })?;
-    let backup_path = quarantine.path().join("previous.hdt.graphs");
-    std::fs::rename(sidecar_path, &backup_path).with_context(|| {
+    let backup_path = quarantine.path().join("previous-artifact");
+    std::fs::rename(artifact_path, &backup_path).with_context(|| {
         format!(
-            "Failed to retire existing graph sidecar {}",
-            sidecar_path.display()
+            "Failed to retire existing {label} {}",
+            artifact_path.display()
         )
     })?;
 
-    Ok(Some(RetiredSidecar {
-        original_path: sidecar_path.to_path_buf(),
+    Ok(Some(RetiredArtifact {
+        original_path: artifact_path.to_path_buf(),
         backup_path,
         _quarantine: quarantine,
     }))
@@ -176,6 +178,7 @@ fn main() -> Result<()> {
     match cli.command {
         cli::Commands::Create(args) => create_hdt(args, benchmark),
         cli::Commands::Index(args) => create_index_from_hdt(args, benchmark),
+        cli::Commands::Perm(args) => create_permutation_from_hdt(args, benchmark),
         cli::Commands::Dump(args) => dump_hdt_to_ntriples(args, benchmark),
         cli::Commands::Search(args) => search_hdt(args, benchmark),
         cli::Commands::Validate(args) => validate_hdt_file(args, benchmark),
@@ -269,7 +272,15 @@ fn create_hdt(args: cli::CreateArgs, benchmark: bool) -> Result<()> {
     let dataset_uri = args.dataset_uri.clone().unwrap_or_else(|| base_uri.clone());
 
     // Run the pipelined HDT construction
-    let pipeline_result = pipeline::run_pipeline(
+    let permutation_maps = args.perm.then(|| permutation::PositionMaps {
+        pos: args
+            .perm_position_maps
+            .contains(&cli::PermutationPositionMap::Pos),
+        ops: args
+            .perm_position_maps
+            .contains(&cli::PermutationPositionMap::Ops),
+    });
+    let mut pipeline_result = pipeline::run_pipeline(
         &inputs,
         &hdt_inputs,
         &temp_dir,
@@ -279,6 +290,7 @@ fn create_hdt(args: cli::CreateArgs, benchmark: bool) -> Result<()> {
         &graph_assignments,
         &base_uri,
         &parser_parallelism,
+        permutation_maps,
         benchmark,
     )?;
 
@@ -344,20 +356,65 @@ fn create_hdt(args: cli::CreateArgs, benchmark: bool) -> Result<()> {
         None
     };
 
+    let canonical_perm_path = permutation::canonical_path(&args.output);
+    let perm_temp = if args.perm {
+        let prepared = pipeline_result
+            .permutation
+            .take()
+            .context("Permutation collection was not prepared")?;
+        let temp = tempfile::Builder::new()
+            .prefix(".hdtc-perm-")
+            .tempfile_in(output_parent)
+            .with_context(|| {
+                format!(
+                    "Failed to create permutation-index temp file in {}",
+                    output_parent.display()
+                )
+            })?
+            .into_temp_path();
+        permutation::finish_prepared_index(
+            prepared,
+            &temp,
+            &hdt_temp,
+            &pipeline_result.counts,
+            &pipeline_result.bitmap_triples,
+        )?;
+        Some(temp)
+    } else {
+        None
+    };
+
     // Move the old sidecar out of its canonical name before replacing the HDT.
     // A crash can therefore leave a detectably missing sidecar, but never a
     // new HDT next to stale graph data.
-    let retired_sidecar = retire_existing_sidecar(&canonical_graphs_path, output_parent)?;
+    let retired_sidecar =
+        retire_existing_artifact(&canonical_graphs_path, output_parent, "graph sidecar")?;
+    let retired_perm =
+        match retire_existing_artifact(&canonical_perm_path, output_parent, "permutation index") {
+            Ok(retired) => retired,
+            Err(error) => {
+                if let Some(retired) = retired_sidecar.as_ref() {
+                    retired.restore()?;
+                }
+                return Err(error);
+            }
+        };
     if let Err(error) = hdt_temp.persist(&args.output) {
         let publish_error = anyhow::Error::new(error.error).context(format!(
             "Failed to publish HDT file {}",
             args.output.display()
         ));
-        if let Some(retired) = retired_sidecar.as_ref()
-            && let Err(restore_error) = retired.restore()
-        {
+        let perm_restore = retired_perm
+            .as_ref()
+            .map(RetiredArtifact::restore)
+            .transpose();
+        let graph_restore = retired_sidecar
+            .as_ref()
+            .map(RetiredArtifact::restore)
+            .transpose();
+        if let Err(restore_error) = perm_restore.and(graph_restore) {
             return Err(anyhow::anyhow!(
-                "{publish_error:#}; additionally failed to roll back the graph sidecar: {restore_error:#}"
+                "{publish_error:#}; additionally failed to roll back an artifact: {restore_error:#}"
             ));
         }
         return Err(publish_error);
@@ -380,6 +437,25 @@ fn create_hdt(args: cli::CreateArgs, benchmark: bool) -> Result<()> {
                 )
             })?;
         tracing::info!("Graph sidecar written: {}", canonical_graphs_path.display());
+    }
+
+    if !args.perm && retired_perm.is_some() {
+        tracing::info!(
+            "Removed stale permutation index: {}",
+            canonical_perm_path.display()
+        );
+    }
+    if let Some(perm_temp) = perm_temp {
+        perm_temp.persist(&canonical_perm_path).with_context(|| {
+            format!(
+                "Failed to publish permutation index {}",
+                canonical_perm_path.display()
+            )
+        })?;
+        tracing::info!(
+            "Permutation index written: {}",
+            canonical_perm_path.display()
+        );
     }
 
     // Clean up dict section and triples temp files
@@ -465,6 +541,55 @@ fn create_index_from_hdt(args: cli::IndexArgs, benchmark: bool) -> Result<()> {
             Err(e)
         }
     }
+}
+
+/// Create a POS/OPS permutation index for an existing HDT file.
+fn create_permutation_from_hdt(args: cli::PermArgs, benchmark: bool) -> Result<()> {
+    if !args.hdt_file.is_file() {
+        anyhow::bail!("HDT file not found: {}", args.hdt_file.display());
+    }
+    let temp_dir = match &args.temp_dir {
+        Some(dir) => {
+            std::fs::create_dir_all(dir)
+                .with_context(|| format!("Failed to create temp dir {}", dir.display()))?;
+            dir.clone()
+        }
+        None => make_default_temp_dir()?,
+    };
+    let maps = permutation::PositionMaps {
+        pos: args
+            .position_maps
+            .contains(&cli::PermutationPositionMap::Pos),
+        ops: args
+            .position_maps
+            .contains(&cli::PermutationPositionMap::Ops),
+    };
+    tracing::info!(
+        "Creating permutation index for: {}",
+        args.hdt_file.display()
+    );
+    tracing::info!(
+        "Output: {}",
+        permutation::canonical_path(&args.hdt_file).display()
+    );
+    tracing::info!("Temp directory: {}", temp_dir.display());
+    tracing::info!("Memory limit: {}", args.memory_limit);
+    let start = std::time::Instant::now();
+    let output = permutation::create_permutation_index(
+        &args.hdt_file,
+        args.memory_limit.as_bytes(),
+        &temp_dir,
+        maps,
+    )?;
+    if benchmark {
+        tracing::info!(
+            "Benchmark summary (perm): total {:.3}s",
+            start.elapsed().as_secs_f64()
+        );
+    }
+    tracing::info!("Permutation index written: {}", output.display());
+    tracing::info!("Done!");
+    Ok(())
 }
 
 /// Dump an existing HDT file as the triples union or lossless RDF dataset.
@@ -939,7 +1064,7 @@ fn run_header(args: cli::HeaderArgs, benchmark: bool) -> Result<()> {
     Ok(())
 }
 
-/// Validate an HDT and, when present, its graph sidecar.
+/// Validate an HDT and any discovered graph/permutation sidecars.
 fn validate_hdt_file(args: cli::ValidateArgs, benchmark: bool) -> Result<()> {
     if !args.hdt_file.exists() {
         anyhow::bail!("HDT file not found: {}", args.hdt_file.display());
@@ -965,6 +1090,23 @@ fn validate_hdt_file(args: cli::ValidateArgs, benchmark: bool) -> Result<()> {
                 };
                 let mut sidecar = quads::GraphSidecarReader::open(&sidecar_path, &args.hdt_file)?;
                 sidecar.validate_strict(&temp_dir, args.memory_limit.as_bytes(), None)?;
+            }
+            let perm_path = permutation::canonical_path(&args.hdt_file);
+            if perm_path.exists() {
+                tracing::info!("Validating permutation index: {}", perm_path.display());
+                let temp_dir = match &args.temp_dir {
+                    Some(path) => {
+                        std::fs::create_dir_all(path)?;
+                        path.clone()
+                    }
+                    None => make_default_temp_dir()?,
+                };
+                permutation::validate_permutation_index(
+                    &perm_path,
+                    &args.hdt_file,
+                    &temp_dir,
+                    args.memory_limit.as_bytes(),
+                )?;
             }
             if benchmark {
                 tracing::info!(
@@ -992,7 +1134,7 @@ mod tests {
         let sidecar = dir.path().join("dataset.hdt.graphs");
         std::fs::write(&sidecar, b"old sidecar").unwrap();
 
-        let retired = retire_existing_sidecar(&sidecar, dir.path())
+        let retired = retire_existing_artifact(&sidecar, dir.path(), "graph sidecar")
             .unwrap()
             .unwrap();
         assert!(!sidecar.exists());
@@ -1009,7 +1151,7 @@ mod tests {
         let sidecar = dir.path().join("dataset.hdt.graphs");
         std::fs::create_dir(&sidecar).unwrap();
 
-        let result = retire_existing_sidecar(&sidecar, dir.path());
+        let result = retire_existing_artifact(&sidecar, dir.path(), "graph sidecar");
         assert!(result.is_err());
         assert!(sidecar.is_dir());
     }

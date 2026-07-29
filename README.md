@@ -14,9 +14,9 @@ Development of hdtc is done primarily through Claude Code.
 - **Scalable** — streaming, disk-backed pipeline with configurable memory limit (default 4 GB)
 - **Multiple inputs** — accepts any mix of RDF files, HDT files, and directories; recursively discovers RDF files
 - **Parallel NT/NQ parsing** — newline-safe chunk parsing for N-Triples/N-Quads (including `.gz`, `.bz2`, `.xz`, `.zst`) with bounded in-flight memory
-- **Index generation** — optional `.hdt.index.v1-1` enables efficient `? P ?`, `? ? O`, and `? P O` queries
+- **Two query indexes** — standard FoQ `.hdt.index.v1-1` and memory-mapped POS/OPS `.hdt.perm` indexes enable efficient `? P ?`, `? ? O`, and `? P O` queries
 - **VoID statistics** — compute dataset-level, property, and class partition statistics as N-Triples
-- **Structural validation** — walk an HDT's triple structures and checksums, and any graph sidecar, end to end
+- **Structural validation** — walk an HDT's triple structures and checksums, plus discovered graph and permutation sidecars, end to end
 - **Resilient parsing** — skips malformed triples with warnings, reports total skipped at the end
 - **[Named graphs](#named-graphs)** — optional packed `<data.hdt>.graphs` sidecars preserve N-Quads/TriG datasets while the standard HDT remains the deduplicated triples union
 - **[Membership and overlap sketches](#membership-and-overlap-sketches)** — build source-bound binary fuse filters and bottom-k MinHash files directly from an HDT dictionary
@@ -55,6 +55,12 @@ hdtc create [OPTIONS] --output <OUTPUT> <INPUTS>...
 hdtc index [OPTIONS] <HDT_FILE>
 ```
 
+### `hdtc perm` — Create a memory-mapped permutation index
+
+```
+hdtc perm [OPTIONS] <HDT_FILE>
+```
+
 ### `hdtc dump` — Export the triples union or RDF dataset
 
 ```
@@ -67,7 +73,7 @@ hdtc dump [OPTIONS] <HDT_FILE>
 hdtc search [OPTIONS] --query <PATTERN> <HDT_FILE>
 ```
 
-### `hdtc validate` — Check HDT structures and any graph sidecar
+### `hdtc validate` — Check HDT structures and discovered sidecars
 
 ```
 hdtc validate [OPTIONS] <HDT_FILE>
@@ -170,6 +176,30 @@ With custom memory and temp settings:
 
 ```sh
 hdtc index existing.hdt --memory-limit 8G --temp-dir /mnt/fast-ssd/tmp
+```
+
+### Perm: Creating permutation indexes
+
+Create the canonical twenty-section POS/OPS index for an existing HDT:
+
+```sh
+hdtc perm existing.hdt
+# Creates: existing.hdt.perm
+```
+
+Optional POS-to-SPO and OPS-to-SPO position maps are omitted by default.
+Specialized consumers can request either or both:
+
+```sh
+hdtc perm existing.hdt --position-maps pos,ops
+```
+
+During HDT creation, `--perm` feeds the two permutation sorts directly from
+the unique SPO stream and avoids decoding the completed HDT again:
+
+```sh
+hdtc create data.nt -o data.hdt --perm
+hdtc create data.nt -o data.hdt --perm --perm-position-maps ops
 ```
 
 ### Dump: Exporting the union or dataset
@@ -306,7 +336,10 @@ hdtc search data.hdt --query "? <http://www.w3.org/1999/02/22-rdf-syntax-ns#type
 | `? ? O` | Yes (or `--no-index`) | All triples with a given object               |
 | `? P O` | Yes (or `--no-index`) | All triples with a given predicate and object |
 
-For `? P ?`, `? ? O`, and `? P O`, hdtc uses the `.hdt.index.v1-1` sidecar file (auto-detected next to the HDT file, or specified with `--index`). Pass `--no-index` to fall back to a sequential full scan instead. For `? P O`, hdtc automatically chooses the most efficient query path based on predicate selectivity.
+For `? P ?`, `? ? O`, and `? P O`, hdtc prefers an automatically discovered
+`.hdt.perm` sidecar. If none is present it uses `.hdt.index.v1-1`, which can
+also be selected explicitly with `--index`. Pass `--no-index` to fall back to a
+sequential full scan. The two index formats are independent and may coexist.
 
 Adding a fourth graph position applies any of the same S/P/O constraints to
 dataset memberships. A bound graph streams its layer directly. A wildcard graph
@@ -335,6 +368,12 @@ layer region ordering, and each layer's positions being strictly increasing and
 in range. That pass uses a bounded external sort, so `--temp-dir` and
 `--memory-limit` apply to it. A missing sidecar is not an error; hdtc checks one
 only if it finds one beside the HDT.
+
+If `<data.hdt>.perm` is present, validation also checks its source digest,
+header/footer/directory and payload CRCs, canonical alignment and padding,
+rank directories, POS/OPS ordering, optional position maps, and that both
+permutations contain exactly the HDT's triples. The semantic comparison uses
+bounded external sorts controlled by `--temp-dir` and `--memory-limit`.
 
 Progress and results are logged at `info` level, and the command exits non-zero
 on the first failure.
@@ -407,6 +446,8 @@ predicate (the `void:` statistics and the `hdt:` namespace).
 | `--input-sidecars POLICY`          | preserve in quads mode       | Preserve, require, or ignore sidecars beside HDT inputs      |
 | `--temp-dir`                       | system temp                  | Directory for temporary working files                       |
 | `--index`                          | off                          | Generate `.hdt.index.v1-1` index file                       |
+| `--perm`                           | off                          | Generate `.hdt.perm` POS/OPS permutation index              |
+| `--perm-position-maps PERM,...`    | —                            | Include optional `pos` and/or `ops` maps to SPO positions   |
 | `--base-uri`                       | first input's `file://` URI  | Base URI used to resolve relative IRIs while parsing input  |
 | `--dataset-uri`                    | `--base-uri` value           | Dataset IRI recorded as the subject of the header metadata  |
 | `--memory-limit SIZE`              | `4G`                         | Soft memory limit for internal buffers (e.g. `4G`, `2000M`) |
@@ -434,6 +475,18 @@ Named-graph options (`-m quads`, `--graph-map`, `--default-graph`,
 | `-v, --verbose`       | —            | Increase log verbosity (`-v` debug, `-vv` trace)              |
 | `-q, --quiet`         | —            | Suppress all output except errors                             |
 
+### Perm: All options
+
+| Option                     | Default      | Description                                                       |
+| -------------------------- | ------------ | ----------------------------------------------------------------- |
+| `<HDT_FILE>`               | _(required)_ | Path to existing HDT file                                         |
+| `--position-maps PERM,...` | —            | Include optional maps (`pos`, `ops`, or `pos,ops`)                |
+| `--temp-dir DIR`           | system temp  | Directory for permutation sort chunks and payload scratch files   |
+| `-m, --memory-limit SIZE`  | `4G`         | Soft memory limit shared by the POS and OPS external sorts        |
+| `--benchmark`              | off          | Emit total permutation-index timing                               |
+| `-v, --verbose`            | —            | Increase logging verbosity (`-v` debug, `-vv` trace)              |
+| `-q, --quiet`              | —            | Suppress all output except errors                                 |
+
 ### Dump: All options
 
 | Option                          | Default      | Description                                                     |
@@ -458,7 +511,7 @@ Named-graph options (`-m quads`, `--graph-map`, `--default-graph`,
 | `--count`             | off                         | Print only the count of matching triples                                 |
 | `--limit N`           | unlimited                   | Stop after N results (ignored when combined with `--count`)              |
 | `--offset N`          | 0                           | Skip the first N matching results (ignored when combined with `--count`) |
-| `--index PATH`        | `<HDT_FILE>.hdt.index.v1-1` | Index file path (used for `? P ?`, `? ? O`, and `? P O` queries)         |
+| `--index PATH`        | auto discovery              | Explicit FoQ index path; otherwise `.hdt.perm` is preferred when present |
 | `--no-index`          | off                         | Disable index use; fall back to sequential scan for all patterns         |
 | `--temp-dir DIR`      | system temp                 | Directory for graph and unlimited-text external sorting                  |
 | `--text-match MODE`   | `all`                       | `--text` only: how query tokens combine (`all`, `any`, `phrase`)         |
@@ -493,8 +546,8 @@ Named-graph options (`-m quads`, `--graph-map`, `--default-graph`,
 | Option                | Default      | Description                                                       |
 | --------------------- | ------------ | ----------------------------------------------------------------- |
 | `<HDT_FILE>`          | _(required)_ | Path to existing HDT file                                         |
-| `--temp-dir`          | system temp  | Directory for graph-sidecar validation sort files                 |
-| `--memory-limit SIZE` | `4G`         | Soft memory limit for graph-sidecar validation (e.g. `4G`, `2000M`) |
+| `--temp-dir`          | system temp  | Directory for graph/permutation validation sort files             |
+| `--memory-limit SIZE` | `4G`         | Soft memory limit for sidecar validation (e.g. `4G`, `2000M`)      |
 | `--benchmark`         | off          | Emit total validation timing                                      |
 | `-v, --verbose`       | —            | Increase log verbosity (`-v` debug, `-vv` trace)                  |
 | `-q, --quiet`         | —            | Suppress all output except errors                                 |
@@ -545,6 +598,11 @@ The single-pass pipeline deduplicates terms early via per-batch hash maps, so te
 
 Actual usage varies with term uniqueness and compressibility (~6–10 bytes/triple after compression). Temporary files are automatically cleaned up after completion. Use `--temp-dir` to direct them to a disk with sufficient space.
 
+`hdtc perm` externally sorts one record per triple into both POS and OPS order.
+Its sort chunks are zstd-compressed; peak scratch usage depends on identifier
+widths and compressibility. `create --perm` begins those sorts directly from the
+unique SPO stream, while standalone `perm` first streams the existing HDT.
+
 `hdtc sketch` additionally writes an uncompressed 8-byte hash for each
 qualifying IRI in every selected role while building the filters. An IRI in the
 shared dictionary is therefore present in both temporary role files when both
@@ -558,7 +616,10 @@ encoder streams from — released as soon as the artifact is published. Point
 
 ### Output size
 
-HDT files are typically 10–20% of the equivalent uncompressed N-Triples.
+HDT files are typically 10–20% of the equivalent uncompressed N-Triples. A
+`.hdt.perm` stores two additional complete permutations and is therefore
+roughly twice the dominant triple-array size of a FoQ index; optional position
+maps add about `log2(N)` bits per triple each.
 
 ## Beyond standard HDT
 
@@ -870,9 +931,9 @@ dictionary ID, so the index scales with distinct strings rather than with
 triples — in annotation-heavy graphs, repeated type labels and boilerplate
 definitions make that difference large. It also means the index stores **no
 subject and no predicate at all**: a hit is an HDT ID, and the `? ? O` path
-through the `.hdt.index.v1-1` index turns it into every `(subject, predicate)`
-that uses it. `hdtc text` therefore reads no triples — one pass over the object
-dictionary is the whole build.
+through `.hdt.perm` or `.hdt.index.v1-1` turns it into every
+`(subject, predicate)` that uses it. `hdtc text` therefore reads no triples —
+one pass over the object dictionary is the whole build.
 
 **Stemming.** Every literal is indexed twice — as written, and stemmed for its
 language — so `run` finds `running`, and `process` finds `processes`. Exact
@@ -971,6 +1032,7 @@ src/
   triples/           BitmapTriples encoding
   hdt/               HDT serialization, reading, querying, statistics, sketches, and key sets
   index/             HDT index generation (.hdt.index.v1-1)
+  permutation/       POS/OPS permutation-index construction, querying, and validation
   io/                VByte, LogArray, Bitmap, CRC, Control Information
   pipeline/          6-stage pipelined architecture
   sort/              External merge sort

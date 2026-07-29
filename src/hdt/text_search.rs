@@ -18,6 +18,7 @@ use crate::hdt::reader::{
     write_nt_object, write_nt_subject, write_triple_tab,
 };
 use crate::hdt::search::{Visit, resolve_index_path, resolve_object_page, scan_object_occurrences};
+use crate::permutation::PermutationIndex;
 use crate::sort::{ExternalSorter, Sortable};
 use crate::text::{
     MatchKind, MatchMode, TextHit, TextQuery, TextSearcher, default_text_index_path,
@@ -576,6 +577,8 @@ fn write_scored_triple_tab(
 
 /// The two ways to find every `(subject, predicate)` that uses an object.
 enum OccurrenceResolver {
+    /// Through the OPS permutation, reading each object's contiguous run.
+    Permutation(PermutationResolver),
     /// Through the HDT-FoQ index, resolving a whole page in one pass.
     Indexed(IndexedResolver),
     /// One sequential pass over every triple, shared by every literal.
@@ -584,6 +587,12 @@ enum OccurrenceResolver {
     /// full triples pass; this is intentionally a small-file escape hatch, not
     /// the scalable resolution path.
     Scanned(ScannedResolver),
+}
+
+struct PermutationResolver {
+    index: PermutationIndex,
+    memory_limit: usize,
+    occurrences: HashMap<u64, Vec<(u64, u64)>>,
 }
 
 struct IndexedResolver {
@@ -613,6 +622,18 @@ impl OccurrenceResolver {
                 offsets: *offsets,
                 occurrences: HashMap::new(),
             }));
+        }
+
+        if options.index_path.is_none() {
+            let perm_path = crate::permutation::canonical_path(options.hdt_path);
+            if perm_path.exists() {
+                let index = PermutationIndex::open(&perm_path, options.hdt_path)?;
+                return Ok(Self::Permutation(PermutationResolver {
+                    index,
+                    memory_limit: options.memory_limit,
+                    occurrences: HashMap::new(),
+                }));
+            }
         }
 
         let index_path = resolve_index_path(options.hdt_path, options.index_path);
@@ -647,6 +668,28 @@ impl OccurrenceResolver {
     /// for the whole page.
     fn prepare_ids(&mut self, object_ids: &[u64]) -> Result<()> {
         let resolver = match self {
+            Self::Permutation(resolver) => {
+                resolver.occurrences.clear();
+                let pair_budget =
+                    (resolver.memory_limit / std::mem::size_of::<(u64, u64)>()).max(1);
+                let mut stored = 0usize;
+                for &object_id in object_ids {
+                    let mut pairs = Vec::new();
+                    for triple in resolver.index.triples(None, Some(object_id))? {
+                        let (subject, predicate, _) = triple?;
+                        if stored.saturating_add(pairs.len()) >= pair_budget {
+                            pairs.clear();
+                            break;
+                        }
+                        pairs.push((subject, predicate));
+                    }
+                    if !pairs.is_empty() {
+                        stored = stored.saturating_add(pairs.len());
+                        resolver.occurrences.insert(object_id, pairs);
+                    }
+                }
+                return Ok(());
+            }
             Self::Indexed(resolver) => {
                 tracing::debug!(
                     "Resolving {} ranked literal(s) in one pass",
@@ -696,6 +739,30 @@ impl OccurrenceResolver {
         predicate_filter: Option<u64>,
     ) -> Result<ResolvedOccurrences> {
         match self {
+            Self::Permutation(resolver) => {
+                if let Some(pairs) = resolver.occurrences.get(&object_id) {
+                    return Ok(ResolvedOccurrences {
+                        examined: pairs.len() as u64,
+                        pairs: pairs
+                            .iter()
+                            .copied()
+                            .filter(|(_, predicate)| {
+                                predicate_filter.is_none_or(|wanted| *predicate == wanted)
+                            })
+                            .collect(),
+                    });
+                }
+                let mut pairs = Vec::new();
+                let mut examined = 0u64;
+                for triple in resolver.index.triples(None, Some(object_id))? {
+                    let (subject, predicate, _) = triple?;
+                    examined += 1;
+                    if predicate_filter.is_none_or(|wanted| predicate == wanted) {
+                        pairs.push((subject, predicate));
+                    }
+                }
+                Ok(ResolvedOccurrences { pairs, examined })
+            }
             Self::Indexed(resolver) => {
                 // Resolved with the rest of the page unless its group was too
                 // large to hold; only then does it cost a pass of its own.

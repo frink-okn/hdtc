@@ -138,6 +138,9 @@ pub struct PipelineResult {
     pub membership_path: Option<PathBuf>,
     pub membership_count: u64,
     pub bitmap_triples: crate::triples::BitmapTriplesFiles,
+    /// POS/OPS sort runs fed directly from the unique SPO stream when
+    /// `create --perm` is requested.
+    pub permutation: Option<crate::permutation::PermutationCollector>,
     pub ntriples_size: u64, // N-Triples serialization size of parsed data
 }
 
@@ -1199,6 +1202,7 @@ pub fn run_pipeline(
     graph_assignments: &GraphAssignments,
     base_uri: &str,
     parser_parallelism: &ParserParallelismConfig,
+    permutation_maps: Option<crate::permutation::PositionMaps>,
     benchmark: bool,
 ) -> Result<PipelineResult> {
     tracing::info!("Stage 1-3: Parsing, building vocabulary, writing batches");
@@ -1644,6 +1648,13 @@ pub fn run_pipeline(
     // Build BitmapTriples — stream each component to temp files (O(1) memory)
     let bitmap_start;
     let bitmap_rss_before;
+    let mut permutation = permutation_maps.map(|maps| {
+        crate::permutation::PermutationCollector::new(
+            temp_dir,
+            stage56_budget.sort_budget_bytes,
+            maps,
+        )
+    });
     let (bitmap_triples, membership_path, membership_count) = match statements {
         StatementSorter::Quads {
             mut sorter,
@@ -1678,8 +1689,15 @@ pub fn run_pipeline(
             let union_triples = QuadUnionIterator::new(sorted_quads, |membership| {
                 membership_spool.push(membership)
             });
+            let tapped = union_triples.map(|result| {
+                let triple = result?;
+                if let Some(collector) = permutation.as_mut() {
+                    collector.push(triple)?;
+                }
+                Ok(triple)
+            });
             let bitmap = crate::triples::build_bitmap_triples_to_files(
-                union_triples,
+                tapped,
                 max_subject,
                 max_predicate,
                 max_object,
@@ -1709,8 +1727,15 @@ pub fn run_pipeline(
                 None
             };
 
+            let tapped = DedupSortedTriples::new(sorted_triples).map(|result| {
+                let triple = result?;
+                if let Some(collector) = permutation.as_mut() {
+                    collector.push(triple)?;
+                }
+                Ok(triple)
+            });
             let bitmap = crate::triples::build_bitmap_triples_to_files(
-                DedupSortedTriples::new(sorted_triples),
+                tapped,
                 max_subject,
                 max_predicate,
                 max_object,
@@ -1746,6 +1771,7 @@ pub fn run_pipeline(
         membership_path,
         membership_count,
         bitmap_triples,
+        permutation,
         ntriples_size,
     })
 }

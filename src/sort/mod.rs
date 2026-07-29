@@ -7,4 +7,5 @@
 pub(crate) mod external;
 pub(crate) mod parallel_merge;
 
+pub(crate) use external::MergeIterator;
 pub use external::{ExternalSorter, Sortable};
