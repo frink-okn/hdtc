@@ -1,0 +1,47 @@
+hdtc-text	1
+analyzer	1
+tantivy	0.26.1
+source_digest	78bcfd636b5e1f32bd1179fc8315cc072bc964ee9d6b73cdc74407aa57b7f06e
+max_literal_bytes	4096
+untagged_language	en
+literals_scanned	5
+indexed_docs	4
+whole_literal_keys	4
+excluded_oversize	0
+excluded_datatype	1
+excluded_no_tokens	0
+excluded_datatype_iri	http://www.opengis.net/ont/geosparql#wktLiteral
+excluded_datatype_iri	http://www.w3.org/2001/XMLSchema#base64Binary
+excluded_datatype_iri	http://www.w3.org/2001/XMLSchema#boolean
+excluded_datatype_iri	http://www.w3.org/2001/XMLSchema#byte
+excluded_datatype_iri	http://www.w3.org/2001/XMLSchema#date
+excluded_datatype_iri	http://www.w3.org/2001/XMLSchema#dateTime
+excluded_datatype_iri	http://www.w3.org/2001/XMLSchema#dateTimeStamp
+excluded_datatype_iri	http://www.w3.org/2001/XMLSchema#dayTimeDuration
+excluded_datatype_iri	http://www.w3.org/2001/XMLSchema#decimal
+excluded_datatype_iri	http://www.w3.org/2001/XMLSchema#double
+excluded_datatype_iri	http://www.w3.org/2001/XMLSchema#duration
+excluded_datatype_iri	http://www.w3.org/2001/XMLSchema#float
+excluded_datatype_iri	http://www.w3.org/2001/XMLSchema#gDay
+excluded_datatype_iri	http://www.w3.org/2001/XMLSchema#gMonth
+excluded_datatype_iri	http://www.w3.org/2001/XMLSchema#gMonthDay
+excluded_datatype_iri	http://www.w3.org/2001/XMLSchema#gYear
+excluded_datatype_iri	http://www.w3.org/2001/XMLSchema#gYearMonth
+excluded_datatype_iri	http://www.w3.org/2001/XMLSchema#hexBinary
+excluded_datatype_iri	http://www.w3.org/2001/XMLSchema#int
+excluded_datatype_iri	http://www.w3.org/2001/XMLSchema#integer
+excluded_datatype_iri	http://www.w3.org/2001/XMLSchema#long
+excluded_datatype_iri	http://www.w3.org/2001/XMLSchema#negativeInteger
+excluded_datatype_iri	http://www.w3.org/2001/XMLSchema#nonNegativeInteger
+excluded_datatype_iri	http://www.w3.org/2001/XMLSchema#nonPositiveInteger
+excluded_datatype_iri	http://www.w3.org/2001/XMLSchema#positiveInteger
+excluded_datatype_iri	http://www.w3.org/2001/XMLSchema#short
+excluded_datatype_iri	http://www.w3.org/2001/XMLSchema#time
+excluded_datatype_iri	http://www.w3.org/2001/XMLSchema#unsignedByte
+excluded_datatype_iri	http://www.w3.org/2001/XMLSchema#unsignedInt
+excluded_datatype_iri	http://www.w3.org/2001/XMLSchema#unsignedLong
+excluded_datatype_iri	http://www.w3.org/2001/XMLSchema#unsignedShort
+excluded_datatype_iri	http://www.w3.org/2001/XMLSchema#yearMonthDuration
+language	en	1
+language	es	1
+language	und	2

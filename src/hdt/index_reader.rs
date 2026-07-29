@@ -19,6 +19,7 @@ use crate::io::{
     skip_log_array_section,
 };
 use anyhow::{Context, Result, bail};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
@@ -200,6 +201,117 @@ pub fn bitmap_index_z_group_range(
     }
 
     Ok(None) // obj_id-th 1-bit not found
+}
+
+/// Find the groups for several object IDs in **one** pass over bitmapIndexZ.
+///
+/// Locating one group is a `select1`, which this reader answers by scanning
+/// from the first bit — so resolving a page of *k* objects one at a time costs
+/// *k* scans of a bitmap with one bit per triple. On a billion-triple dataset
+/// that is the dominant cost of a ranked text page. Ascending object IDs let
+/// one scan answer all of them.
+///
+/// `object_ids` must be ascending and distinct. The result is positional:
+/// `None` where that object has no group.
+pub fn bitmap_index_z_groups(
+    index_path: &Path,
+    bitmap_index_z_start: u64,
+    object_ids: &[u64],
+) -> Result<Vec<Option<ObjectGroupStats>>> {
+    let mut groups = vec![None; object_ids.len()];
+    if object_ids.is_empty() {
+        return Ok(groups);
+    }
+    debug_assert!(object_ids.windows(2).all(|pair| pair[0] < pair[1]));
+
+    // Every group needs the positions of two set bits: the one ending the
+    // previous group and the one ending its own. Rank 0 is the notional bit
+    // before the first, whose successor is position 0.
+    let mut wanted: Vec<u64> = Vec::with_capacity(object_ids.len() * 2);
+    for &object_id in object_ids {
+        if object_id == 0 {
+            continue;
+        }
+        wanted.push(object_id - 1);
+        wanted.push(object_id);
+    }
+    wanted.sort_unstable();
+    wanted.dedup();
+
+    let mut f = File::open(index_path)
+        .with_context(|| format!("Failed to open index file {}", index_path.display()))?;
+    f.seek(SeekFrom::Start(bitmap_index_z_start))?;
+    let mut reader = BufReader::with_capacity(256 * 1024, f);
+
+    let mut type_byte = [0u8; 1];
+    reader.read_exact(&mut type_byte)?;
+    let num_bits = read_vbyte(&mut reader)?;
+    let mut _crc = [0u8; 1];
+    reader.read_exact(&mut _crc)?;
+
+    // Position of the r-th set bit, for each rank r in `wanted`; rank 0 is
+    // recorded as "one before position 0" so that `+ 1` gives the start.
+    let mut positions: HashMap<u64, u64> = HashMap::new();
+    let mut next_wanted = 0usize;
+    if wanted.first() == Some(&0) {
+        // Handled by the `rank == 0` case at lookup time.
+        next_wanted = 1;
+    }
+
+    let total_data_bytes = num_bits.div_ceil(8);
+    let mut cumulative_ones = 0u64;
+    let mut bits_processed = 0u64;
+    let mut data_bytes_read = 0u64;
+
+    while bits_processed < num_bits && next_wanted < wanted.len() {
+        let bytes_remaining = total_data_bytes - data_bytes_read;
+        let bytes_to_read = bytes_remaining.min(8) as usize;
+        let mut buf = [0u8; 8];
+        reader.read_exact(&mut buf[..bytes_to_read])?;
+        data_bytes_read += bytes_to_read as u64;
+        let word = u64::from_le_bytes(buf);
+
+        let bits_in_word = (num_bits - bits_processed).min(64) as u32;
+        let masked = if bits_in_word < 64 {
+            word & ((1u64 << bits_in_word) - 1)
+        } else {
+            word
+        };
+        let ones_in_word = masked.count_ones() as u64;
+
+        // Every wanted rank landing in this word is resolved before moving on.
+        while next_wanted < wanted.len() && wanted[next_wanted] <= cumulative_ones + ones_in_word {
+            let rank = wanted[next_wanted];
+            let need = rank - cumulative_ones;
+            positions.insert(rank, nth_set_bit(masked, need, bits_processed));
+            next_wanted += 1;
+        }
+
+        cumulative_ones += ones_in_word;
+        bits_processed += bits_in_word as u64;
+    }
+
+    for (slot, &object_id) in object_ids.iter().enumerate() {
+        if object_id == 0 {
+            continue;
+        }
+        let Some(&end) = positions.get(&object_id) else {
+            continue; // the object_id-th set bit does not exist
+        };
+        let start = if object_id == 1 {
+            0
+        } else {
+            match positions.get(&(object_id - 1)) {
+                Some(&previous_end) => previous_end + 1,
+                None => continue,
+            }
+        };
+        groups[slot] = Some(ObjectGroupStats {
+            start,
+            size: end - start + 1,
+        });
+    }
+    Ok(groups)
 }
 
 /// Find object group boundaries and size in bitmapIndexZ.

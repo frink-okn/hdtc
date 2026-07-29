@@ -134,6 +134,23 @@ fn test_search_limit() {
     );
 }
 
+/// A zero-sized page is empty for both sequential and indexed routes.
+#[test]
+fn test_search_limit_zero() {
+    let temp = tempfile::tempdir().unwrap();
+    let hdt = make_representative_hdt(temp.path());
+
+    let (ok, stdout, stderr) = run_search(&hdt, "? ? ?", &["--limit", "0"]);
+    assert!(ok, "hdtc search failed: {stderr}");
+    assert!(stdout.is_empty(), "scan-all emitted a row: {stdout:?}");
+
+    // This pattern would normally require an index. A zero page should not.
+    let (ok, stdout, stderr) =
+        run_search(&hdt, "? <http://example.org/knows> ?", &["--limit", "0"]);
+    assert!(ok, "zero page unexpectedly required an index: {stderr}");
+    assert!(stdout.is_empty(), "indexed route emitted a row: {stdout:?}");
+}
+
 /// `--offset 2 --limit 3` skips first 2 matches, then returns next 3.
 #[test]
 fn test_search_offset_with_limit() {

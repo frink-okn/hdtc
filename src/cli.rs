@@ -99,6 +99,16 @@ pub enum KeysetEncoding {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum TextMatchMode {
+    /// Every query token must be present
+    All,
+    /// Any query token may match; more matches rank higher
+    Any,
+    /// The query tokens must be adjacent and in order
+    Phrase,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum SketchFilterBits {
     #[value(name = "8")]
     Eight,
@@ -165,6 +175,9 @@ pub enum Commands {
 
     /// Build exact role-specific key sets
     Keyset(KeysetArgs),
+
+    /// Build a full-text index over an HDT's literals
+    Text(TextArgs),
 
     /// Dump or modify the RDF triples embedded in an HDT file's header
     Header(HeaderArgs),
@@ -264,6 +277,21 @@ pub struct ValidateArgs {
 }
 
 #[derive(Debug, Parser)]
+#[command(group(
+    clap::ArgGroup::new("mode").args(["query", "text"]).required(true)
+))]
+// The text-only options are grouped rather than marked `requires = "text"`,
+// because a per-argument requirement is not enforced for arguments that carry a
+// default value — and silently accepting `--fuzzy` on a pattern query would
+// suggest it did something.
+#[command(group(
+    clap::ArgGroup::new("text_options")
+        .args([
+            "text_match", "fuzzy", "prefix", "lang", "predicate", "scores", "text_index",
+        ])
+        .multiple(true)
+        .conflicts_with("query")
+))]
 pub struct SearchArgs {
     /// Path to existing HDT file
     pub hdt_file: PathBuf,
@@ -277,7 +305,43 @@ pub struct SearchArgs {
     ///   "? ? ? <http://example.org/graph>"
     ///   "? ? ? default"
     #[arg(long, value_name = "PATTERN")]
-    pub query: String,
+    pub query: Option<String>,
+
+    /// Ranked full-text search over the literal index built by `hdtc text`
+    #[arg(long, value_name = "TEXT")]
+    pub text: Option<String>,
+
+    // Keep this optional rather than setting an argument default: the
+    // text-only conflict group must be able to tell whether the user supplied
+    // it. `search_text` applies `all` when this is `None`.
+    /// How the query tokens must combine (--text only) [default: all]
+    #[arg(long, value_enum, value_name = "MODE")]
+    pub text_match: Option<TextMatchMode>,
+
+    /// Maximum edit distance per token, for typo tolerance (--text only, not phrase) [default: 0]
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u8).range(0..=2))]
+    pub fuzzy: Option<u8>,
+
+    /// Match the final query token as a prefix (--text only, not phrase)
+    #[arg(long)]
+    pub prefix: bool,
+
+    /// Restrict to these BCP 47 language ranges; untagged literals always
+    /// remain eligible (--text only)
+    #[arg(long, value_name = "LANG,...", value_delimiter = ',')]
+    pub lang: Vec<String>,
+
+    /// Keep only matches occurring on this predicate (--text only)
+    #[arg(long, value_name = "IRI")]
+    pub predicate: Option<String>,
+
+    /// Append its relevance score as a trailing N-Triples comment (--text only)
+    #[arg(long)]
+    pub scores: bool,
+
+    /// Text index directory (default: <HDT_FILE>.text)
+    #[arg(long, value_name = "DIR")]
+    pub text_index: Option<PathBuf>,
 
     /// Write results to file instead of stdout
     #[arg(short, long, value_name = "PATH")]
@@ -303,7 +367,7 @@ pub struct SearchArgs {
     #[arg(long)]
     pub no_index: bool,
 
-    /// Directory for bounded external sorting used by wildcard-graph queries
+    /// Directory for bounded external sorting used by graph and unlimited text queries
     #[arg(long, value_name = "DIR")]
     pub temp_dir: Option<PathBuf>,
 
@@ -417,6 +481,54 @@ pub struct KeysetArgs {
     ///
     /// Keys are sorted externally, so this bounds memory but not the size of
     /// the key set: any role builds at any limit, spilling to --temp-dir.
+    #[arg(short = 'm', long, value_name = "SIZE", default_value = "4G")]
+    pub memory_limit: MemorySize,
+}
+
+#[derive(Debug, Parser)]
+#[command(
+    long_about = "Builds a full-text index over the distinct literals in an HDT's object \
+                  dictionary, so `hdtc search --text` can rank them. Every literal is indexed \
+                  except those excluded mechanically: values above --max-literal-bytes, values \
+                  whose datatype has an ordered value space (xsd:integer, xsd:date and friends), \
+                  and values with no alphanumeric character. Whatever is excluded is counted and \
+                  recorded in the index manifest, so a consumer can tell what the index does not \
+                  cover. See docs/text-index-format.md."
+)]
+pub struct TextArgs {
+    /// Path to the existing HDT file
+    pub hdt_file: PathBuf,
+
+    /// Output index directory (default: <HDT_FILE>.text)
+    #[arg(short, long, value_name = "DIR")]
+    pub output: Option<PathBuf>,
+
+    /// Skip literals whose lexical form is longer than this many bytes
+    #[arg(long, value_name = "BYTES", default_value_t = crate::text::DEFAULT_MAX_LITERAL_BYTES)]
+    pub max_literal_bytes: usize,
+
+    /// Skip this datatype in addition to the defaults (repeatable)
+    #[arg(long, value_name = "IRI")]
+    pub exclude_datatype: Vec<String>,
+
+    /// Index every datatype, dropping the default value-space exclusions
+    #[arg(long, conflicts_with = "exclude_datatype")]
+    pub index_all_datatypes: bool,
+
+    /// Language to stem untagged literals as, or `none` to leave them unstemmed
+    ///
+    /// Untagged literals are overwhelmingly English in practice, and tagging is
+    /// inconsistent across source ontologies within one merged graph, so
+    /// leaving them unstemmed makes search quality depend on which source a
+    /// term came from. The value used is recorded in the index manifest.
+    #[arg(long, value_name = "LANG", default_value = crate::text::DEFAULT_UNTAGGED_LANGUAGE)]
+    pub untagged_language: String,
+
+    /// Number of indexing threads (default: auto)
+    #[arg(long, value_name = "N")]
+    pub threads: Option<usize>,
+
+    /// Soft memory limit for the indexing arena (e.g. 4G, 2000M)
     #[arg(short = 'm', long, value_name = "SIZE", default_value = "4G")]
     pub memory_limit: MemorySize,
 }
