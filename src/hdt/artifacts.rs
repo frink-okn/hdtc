@@ -245,8 +245,8 @@ impl SourceIdentity {
         let now = FileMarks::read(path)?;
         ensure!(
             now == self.marks,
-            "Source HDT {} changed during the build; refusing to publish artifacts whose keys and \
-             source_digest may describe different bytes",
+            "Source HDT {} changed during the build; refusing to publish artifacts whose contents \
+             and source_digest may describe different bytes",
             path.display()
         );
         Ok(())

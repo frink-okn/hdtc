@@ -22,6 +22,7 @@ use crate::hdt::reader::{
     BitmapTriplesScanner, DictionaryResolver, HdtSectionOffsets, open_hdt, write_triple_tab,
 };
 use crate::io::{StreamingBitmapDecoder, StreamingLogArrayDecoder};
+use crate::permutation::PermutationIndex;
 use anyhow::{Context, Result, bail, ensure};
 use std::collections::HashMap;
 use std::fs::File;
@@ -420,6 +421,65 @@ fn write_empty_output_if_needed(output: Option<&Path>) -> Result<()> {
         crate::hdt::reader::make_writer(output)?.flush()?;
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn search_permutation_bound(
+    hdt_path: &Path,
+    perm_path: &Path,
+    predicate: Option<u64>,
+    object: Option<u64>,
+    dictionary: &mut DictionaryResolver,
+    output: Option<&Path>,
+    count_only: bool,
+    offset: Option<u64>,
+    limit: Option<u64>,
+) -> Result<u64> {
+    let index = PermutationIndex::open(perm_path, hdt_path)
+        .with_context(|| format!("Failed to open permutation index {}", perm_path.display()))?;
+    let triples = index.triples(predicate, object)?;
+    let mut writer = crate::hdt::reader::make_writer(output)?;
+    if count_only {
+        let count = triples.len().saturating_sub(offset.unwrap_or(0));
+        writeln!(writer, "{count}")?;
+        writer.flush()?;
+        return Ok(count);
+    }
+    let mut remaining_offset = offset.unwrap_or(0);
+    let mut count = 0u64;
+    let mut subject_buf = Vec::new();
+    let mut predicate_buf = Vec::new();
+    let mut object_buf = Vec::new();
+    let mut previous_subject = 0u64;
+    let mut previous_predicate = 0u64;
+    let mut previous_object = 0u64;
+
+    for triple in triples {
+        let (subject, predicate, object) = triple?;
+        if remaining_offset > 0 {
+            remaining_offset -= 1;
+            continue;
+        }
+        count += 1;
+        if subject != previous_subject {
+            dictionary.subject_term(subject, &mut subject_buf)?;
+            previous_subject = subject;
+        }
+        if predicate != previous_predicate {
+            dictionary.predicate_term(predicate, &mut predicate_buf)?;
+            previous_predicate = predicate;
+        }
+        if object != previous_object {
+            dictionary.object_term(object, &mut object_buf)?;
+            previous_object = object;
+        }
+        write_triple_tab(&mut writer, &subject_buf, &predicate_buf, &object_buf)?;
+        if limit.is_some_and(|limit| count >= limit) {
+            break;
+        }
+    }
+    writer.flush()?;
+    Ok(count)
 }
 
 // ---------------------------------------------------------------------------
@@ -1104,7 +1164,8 @@ pub(crate) fn resolve_object_page(
 /// - `limit`: stop after this many results (`None` = no limit; ignored when `count_only`)
 /// - `offset`: skip this many matching results before emitting/counting
 /// - `memory_limit`: budget for the PFC block caches
-/// - `index_path`: explicit index file path; `None` = auto-derive as `<hdt>.hdt.index.v1-1`
+/// - `index_path`: explicit FoQ index path; `None` = prefer `<hdt>.perm`, then
+///   auto-derive `<hdt>.hdt.index.v1-1`
 /// - `no_index`: if true, skip the index and fall back to sequential scan for all patterns
 ///
 /// Returns the count of matching triples.
@@ -1170,6 +1231,34 @@ pub fn search_hdt_streaming(
             }
         },
     };
+
+    // Canonically discovered permutation indexes take precedence over FoQ for
+    // every predicate- and object-rooted pattern. An explicitly supplied
+    // --index still selects that FoQ file, preserving the meaning of the option.
+    if !no_index
+        && index_path.is_none()
+        && matches!(
+            kind,
+            PatternKind::PredicateBound
+                | PatternKind::ObjectBound
+                | PatternKind::PredicateObjectBound
+        )
+    {
+        let perm_path = crate::permutation::canonical_path(hdt_path);
+        if perm_path.exists() {
+            return search_permutation_bound(
+                hdt_path,
+                &perm_path,
+                p_id,
+                o_id,
+                &mut dictionary,
+                output,
+                count_only,
+                offset,
+                limit,
+            );
+        }
+    }
 
     // Phase 2: predicate-bound query — use the predicate index when available.
     if kind == PatternKind::PredicateBound && !no_index {

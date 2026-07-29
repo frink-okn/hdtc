@@ -75,9 +75,10 @@ and its identity is that literal's **object dictionary ID**. One document per
 distinct string, not one per triple.
 
 The consequence that makes this the right unit: **the index stores no subject
-and no predicate at all.** A hit is an object ID; `? ? <that object>` through the
-HDT-FoQ index (`.hdt.index.v1-1`) turns it into every `(subject, predicate)` that
-uses it. Therefore:
+and no predicate at all.** A hit is an object ID; `? ? <that object>` through
+the OPS permutation in `.hdt.perm`, or through the HDT-FoQ index
+(`.hdt.index.v1-1`), turns it into every `(subject, predicate)` that uses it.
+Therefore:
 
 - Index size scales with *distinct literals*, not with triples. In
   annotation-heavy datasets, shared type labels, boilerplate definitions and

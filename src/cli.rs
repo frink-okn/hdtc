@@ -98,6 +98,12 @@ pub enum KeysetEncoding {
     Raw,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, ValueEnum)]
+pub enum PermutationPositionMap {
+    Pos,
+    Ops,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum TextMatchMode {
     /// Every query token must be present
@@ -131,7 +137,8 @@ impl SketchFilterBits {
     about = "HDT Creator - converts RDF files to HDT format",
     long_about = "Converts RDF files in any standard format to HDT (Header, Dictionary, Triples) \
                   binary format. Optimized for very large inputs with bounded memory usage. \
-                  Can also create index files (.hdt.index.v1-1) for existing HDT files."
+                  Can also create FoQ (.hdt.index.v1-1) and memory-mapped permutation \
+                  (.hdt.perm) indexes for existing HDT files."
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -158,13 +165,16 @@ pub enum Commands {
     /// Create index file for an existing HDT file
     Index(IndexArgs),
 
+    /// Build a memory-mapped POS/OPS permutation index
+    Perm(PermArgs),
+
     /// Export an HDT triples union or sidecar-backed RDF dataset
     Dump(DumpArgs),
 
     /// Search an HDT/sidecar with a triple or quad pattern
     Search(SearchArgs),
 
-    /// Validate HDT structures and any discovered graph sidecar
+    /// Validate HDT structures and discovered graph/permutation sidecars
     Validate(ValidateArgs),
 
     /// Compute VoID statistics for an HDT file and output as N-Triples
@@ -208,6 +218,20 @@ pub struct CreateArgs {
     /// Generate HDT index file (.hdt.index.v1-1)
     #[arg(long)]
     pub index: bool,
+
+    /// Generate a memory-mapped POS/OPS permutation index (.hdt.perm)
+    #[arg(long)]
+    pub perm: bool,
+
+    /// Optional permutation-to-SPO position maps to include
+    #[arg(
+        long = "perm-position-maps",
+        value_enum,
+        value_delimiter = ',',
+        value_name = "PERM,...",
+        requires = "perm"
+    )]
+    pub perm_position_maps: Vec<PermutationPositionMap>,
 
     /// Base URI used to resolve relative IRIs while parsing the input RDF
     /// (defaults to the first input file's file:// URI if not specified)
@@ -263,15 +287,38 @@ pub struct IndexArgs {
 }
 
 #[derive(Debug, Parser)]
+pub struct PermArgs {
+    /// Path to existing HDT file
+    pub hdt_file: PathBuf,
+
+    /// Optional permutation-to-SPO position maps to include
+    #[arg(
+        long = "position-maps",
+        value_enum,
+        value_delimiter = ',',
+        value_name = "PERM,..."
+    )]
+    pub position_maps: Vec<PermutationPositionMap>,
+
+    /// Directory for temporary sorting and payload files
+    #[arg(long, value_name = "DIR")]
+    pub temp_dir: Option<PathBuf>,
+
+    /// Soft memory limit for POS/OPS sorting (e.g. 4G, 2000M)
+    #[arg(short = 'm', long, value_name = "SIZE", default_value = "4G")]
+    pub memory_limit: MemorySize,
+}
+
+#[derive(Debug, Parser)]
 pub struct ValidateArgs {
     /// Path to existing HDT file
     pub hdt_file: PathBuf,
 
-    /// Directory for graph-sidecar validation sort files
+    /// Directory for graph/permutation validation sort files
     #[arg(long)]
     pub temp_dir: Option<PathBuf>,
 
-    /// Soft memory limit for graph-sidecar validation (e.g. 4G, 2000M)
+    /// Soft memory limit for sidecar validation (e.g. 4G, 2000M)
     #[arg(long, value_name = "SIZE", default_value = "4G")]
     pub memory_limit: MemorySize,
 }
@@ -359,7 +406,7 @@ pub struct SearchArgs {
     #[arg(long, value_name = "N")]
     pub offset: Option<u64>,
 
-    /// Index file path (default: <HDT_FILE>.hdt.index.v1-1)
+    /// Explicit FoQ index path (disables automatic .hdt.perm discovery)
     #[arg(long, value_name = "PATH")]
     pub index: Option<PathBuf>,
 
