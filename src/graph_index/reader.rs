@@ -1037,7 +1037,9 @@ fn validate_layer_relation(
     memory_budget: usize,
 ) -> Result<()> {
     let mut layers = open_layer_set(index, component)?;
-    layers.validate_strict()?;
+    // The region section's entry count declares how many layers are non-empty
+    // (§5), so strict validation has to hold the decoded directory to it.
+    layers.validate_strict(index.section((component << 8) | 2)?.entry_count)?;
     let mut sidecar = GraphSidecarReader::open(&index.sidecar_path, &index.hdt_path)?;
     let budget = (memory_budget / 2).max(1);
     let mut by_permuted = ExternalSorter::new(temp_dir, budget);
@@ -1147,8 +1149,13 @@ pub fn validate_graph_index(
     validate_transpose(&index, &transposed)?;
 
     if index.has_pos_layers() || index.has_ops_layers() {
-        let mut collector =
-            PermutationCollector::new(temp_dir, memory_budget, PositionMaps::default());
+        let mut collector = PermutationCollector::for_spaces(
+            temp_dir,
+            memory_budget,
+            PositionMaps::default(),
+            index.has_pos_layers(),
+            index.has_ops_layers(),
+        );
         let mut scanner = BitmapTriplesScanner::new(&hdt.offsets, hdt_path)?;
         while let Some((subject, predicate, object)) = scanner.next_triple()? {
             collector.push(IdTriple {

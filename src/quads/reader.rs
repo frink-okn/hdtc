@@ -275,7 +275,10 @@ impl EmbeddedLayerSetReader {
     }
 
     /// Validate directory framing, nested encoding checksums and semantics.
-    pub(crate) fn validate_strict(&mut self) -> Result<()> {
+    ///
+    /// `expected_non_empty_layers` is the enclosing artifact's declared count of
+    /// layers carrying members, which only the decoded directory can confirm.
+    pub(crate) fn validate_strict(&mut self, expected_non_empty_layers: u64) -> Result<()> {
         let entry_bytes = self
             .inner
             .header
@@ -296,6 +299,7 @@ impl EmbeddedLayerSetReader {
         );
 
         let mut total = 0u64;
+        let mut non_empty_layers = 0u64;
         let mut first_start = None;
         let mut previous_end = self.inner.header.layers_offset;
         let mut covered_end = self.inner.header.layers_offset;
@@ -310,6 +314,9 @@ impl EmbeddedLayerSetReader {
                 previous_end = end;
             }
             if layer.member_count != 0 {
+                non_empty_layers = non_empty_layers
+                    .checked_add(1)
+                    .context("embedded non-empty layer count overflow")?;
                 cover_embedded_range(
                     &mut self.inner.file,
                     &mut covered_end,
@@ -390,6 +397,10 @@ impl EmbeddedLayerSetReader {
         ensure!(
             total == self.inner.header.membership_count,
             "embedded layer-set membership-count mismatch"
+        );
+        ensure!(
+            non_empty_layers == expected_non_empty_layers,
+            "embedded layer-set non-empty layer-count mismatch"
         );
         if self.inner.header.layers_length == 0 {
             ensure!(

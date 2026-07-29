@@ -558,6 +558,14 @@ fn assemble(
     write_zeros_to(&mut writer, footer_offset)?;
     writer.write_all(&footer)?;
     writer.flush()?;
+    // The caller renames this file into the canonical `.graphs.idx` name, and a
+    // normal open verifies metadata but not payload checksums. Reaching disk
+    // before the rename is what keeps a crash from publishing a well-formed
+    // header over payload bytes that never landed.
+    writer
+        .get_ref()
+        .sync_all()
+        .with_context(|| format!("Failed to flush graph index {}", output.display()))?;
     ensure!(
         std::fs::metadata(output)?.len() == file_size,
         "graph-index size mismatch after assembly"
@@ -630,10 +638,12 @@ pub fn create_graph_index(
     };
 
     let mut collector = if options.pos_layers || options.ops_layers {
-        let mut collector = PermutationCollector::new(
+        let mut collector = PermutationCollector::for_spaces(
             temp_dir,
             memory_budget,
             crate::permutation::PositionMaps::default(),
+            options.pos_layers,
+            options.ops_layers,
         );
         let mut scanner = BitmapTriplesScanner::new(&metadata.offsets, hdt_path)?;
         while let Some((subject, predicate, object)) = scanner.next_triple()? {

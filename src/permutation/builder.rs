@@ -351,12 +351,33 @@ pub struct PermutationCollector {
     last_source_subject: u64,
     maps: PositionMaps,
     temp_dir: PathBuf,
+    collect_pos: bool,
+    collect_ops: bool,
 }
 
 impl PermutationCollector {
     pub fn new(temp_dir: &Path, memory_budget: usize, maps: PositionMaps) -> Self {
-        let pos_budget = (memory_budget / 2).max(1);
-        let ops_budget = memory_budget.saturating_sub(pos_budget).max(1);
+        Self::for_spaces(temp_dir, memory_budget, maps, true, true)
+    }
+
+    /// Collect only the requested position spaces. A space that is not
+    /// collected costs nothing: its sorter never sees a record, so a
+    /// single-space caller neither spills run files it will never merge nor
+    /// gives up half its sort budget to them.
+    pub(crate) fn for_spaces(
+        temp_dir: &Path,
+        memory_budget: usize,
+        maps: PositionMaps,
+        collect_pos: bool,
+        collect_ops: bool,
+    ) -> Self {
+        let (pos_budget, ops_budget) = match (collect_pos, collect_ops) {
+            (true, true) => {
+                let pos_budget = (memory_budget / 2).max(1);
+                (pos_budget, memory_budget.saturating_sub(pos_budget).max(1))
+            }
+            _ => (memory_budget.max(1), memory_budget.max(1)),
+        };
         Self {
             pos_sorter: ExternalSorter::new(temp_dir, pos_budget),
             ops_sorter: ExternalSorter::new(temp_dir, ops_budget),
@@ -368,6 +389,8 @@ impl PermutationCollector {
             last_source_subject: 0,
             maps,
             temp_dir: temp_dir.to_path_buf(),
+            collect_pos,
+            collect_ops,
         }
     }
 
@@ -386,26 +409,30 @@ impl PermutationCollector {
             );
         }
         let spo_position = self.count;
-        self.pos_sorter.push(
-            PermEntry {
-                first: triple.predicate,
-                second: triple.object,
-                third: triple.subject,
-                spo_position,
-            },
-            &mut self.pos_buffer,
-            &mut self.pos_memory,
-        )?;
-        self.ops_sorter.push(
-            PermEntry {
-                first: triple.object,
-                second: triple.predicate,
-                third: triple.subject,
-                spo_position,
-            },
-            &mut self.ops_buffer,
-            &mut self.ops_memory,
-        )?;
+        if self.collect_pos {
+            self.pos_sorter.push(
+                PermEntry {
+                    first: triple.predicate,
+                    second: triple.object,
+                    third: triple.subject,
+                    spo_position,
+                },
+                &mut self.pos_buffer,
+                &mut self.pos_memory,
+            )?;
+        }
+        if self.collect_ops {
+            self.ops_sorter.push(
+                PermEntry {
+                    first: triple.object,
+                    second: triple.predicate,
+                    third: triple.subject,
+                    spo_position,
+                },
+                &mut self.ops_buffer,
+                &mut self.ops_memory,
+            )?;
+        }
         self.count = self
             .count
             .checked_add(1)
@@ -415,10 +442,12 @@ impl PermutationCollector {
     }
 
     pub(crate) fn finish_pos(&mut self) -> Result<crate::sort::MergeIterator<PermEntry>> {
+        ensure!(self.collect_pos, "POS permutation was not collected");
         self.pos_sorter.finish(&mut self.pos_buffer)
     }
 
     pub(crate) fn finish_ops(&mut self) -> Result<crate::sort::MergeIterator<PermEntry>> {
+        ensure!(self.collect_ops, "OPS permutation was not collected");
         self.ops_sorter.finish(&mut self.ops_buffer)
     }
 }
