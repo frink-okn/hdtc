@@ -829,10 +829,7 @@ fn validate_rank(
         let bytes_here = bits_here.div_ceil(8) as usize;
         let mut bytes = [0u8; 64];
         bitmap.read_exact(&mut bytes[..bytes_here])?;
-        let count = bytes[..bytes_here]
-            .iter()
-            .map(|byte| u64::from(byte.count_ones()))
-            .sum::<u64>();
+        let count = u64::from(block_popcount(&bytes[..bytes_here], bits_here)?);
         total += count;
         within += count;
     }

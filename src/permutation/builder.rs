@@ -748,10 +748,7 @@ fn build_rank_directories(bitmap: &RawBitmap, temp_dir: &Path) -> Result<(TempPa
             let bytes_here = bits_here.div_ceil(8) as usize;
             let mut bytes = [0u8; 64];
             reader.read_exact(&mut bytes[..bytes_here])?;
-            let count: u32 = bytes[..bytes_here]
-                .iter()
-                .map(|byte| byte.count_ones())
-                .sum();
+            let count = block_popcount(&bytes[..bytes_here], bits_here)?;
             total = total
                 .checked_add(u64::from(count))
                 .context("bitmap population overflow")?;

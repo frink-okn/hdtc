@@ -65,7 +65,8 @@ pub struct TextSearchOptions<'a> {
     pub memory_limit: usize,
     /// Directory for temporary ranking chunks; `None` uses the system temp dir.
     pub temp_dir: Option<&'a Path>,
-    /// HDT-FoQ index path; `None` derives `<hdt>.index.v1-1`.
+    /// Explicit HDT-FoQ index path; `None` prefers `<hdt>.perm`, then derives
+    /// `<hdt>.index.v1-1`.
     pub index_path: Option<&'a Path>,
     /// Resolve each bounded occurrence batch by a sequential triples pass.
     pub no_index: bool,

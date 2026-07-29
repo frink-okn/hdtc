@@ -406,7 +406,7 @@ pub struct SearchArgs {
     #[arg(long, value_name = "N")]
     pub offset: Option<u64>,
 
-    /// Index file path (default: <HDT_FILE>.hdt.index.v1-1)
+    /// Explicit FoQ index path (disables automatic .hdt.perm discovery)
     #[arg(long, value_name = "PATH")]
     pub index: Option<PathBuf>,
 

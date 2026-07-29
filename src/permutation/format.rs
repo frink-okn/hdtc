@@ -89,6 +89,30 @@ pub(crate) fn sub_count(bits: u64) -> u64 {
     }
 }
 
+/// Count only the declared bits in one rank-directory subblock. The final
+/// storage byte may contain padding bits that are not part of the bitmap.
+pub(crate) fn block_popcount(bytes: &[u8], bits: u64) -> Result<u32> {
+    ensure!(
+        bits <= u64::from(SUBBLOCK_BITS),
+        "rank subblock exceeds the configured width"
+    );
+    ensure!(
+        bytes.len() as u64 == bits.div_ceil(8),
+        "rank subblock byte length mismatch"
+    );
+    let complete_bytes = usize::try_from(bits / 8).unwrap();
+    let mut count = bytes[..complete_bytes]
+        .iter()
+        .map(|byte| byte.count_ones())
+        .sum::<u32>();
+    let remainder = (bits % 8) as u8;
+    if remainder != 0 {
+        let mask = (1u8 << remainder) - 1;
+        count += (bytes[complete_bytes] & mask).count_ones();
+    }
+    Ok(count)
+}
+
 pub(crate) fn is_core(section_type: u32) -> bool {
     matches!(
         section_type,
@@ -275,8 +299,11 @@ pub(crate) fn read_header_and_sections(path: &Path) -> Result<(Header, Vec<Secti
     let entries_len = u64::from(header.section_count)
         .checked_mul(DIRECTORY_ENTRY_SIZE)
         .context("section-directory length overflow")?;
+    let expected_directory_length = entries_len
+        .checked_add(4)
+        .context("section-directory length overflow")?;
     ensure!(
-        header.directory_length == entries_len + 4,
+        header.directory_length == expected_directory_length,
         "invalid section-directory length"
     );
     ensure!(
@@ -289,6 +316,14 @@ pub(crate) fn read_header_and_sections(path: &Path) -> Result<(Header, Vec<Secti
                 .checked_sub(FOOTER_SIZE)
                 .context("file is shorter than footer")?,
         "invalid footer offset"
+    );
+    let directory_end = header
+        .directory_offset
+        .checked_add(header.directory_length)
+        .context("section-directory end overflow")?;
+    ensure!(
+        directory_end <= header.footer_offset,
+        "section directory overlaps payloads or footer"
     );
 
     reader.seek(SeekFrom::Start(header.directory_offset))?;
@@ -358,6 +393,7 @@ pub(crate) fn read_header_and_sections(path: &Path) -> Result<(Header, Vec<Secti
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     fn header_with_directory_offset(directory_offset: u64) -> [u8; 256] {
         let mut header = [0u8; 256];
@@ -378,5 +414,35 @@ mod tests {
         parse_header(&header_with_directory_offset(HEADER_SIZE)).unwrap();
         let error = parse_header(&header_with_directory_offset(HEADER_SIZE + 64)).unwrap_err();
         assert!(error.to_string().contains("noncanonical"), "{error}");
+    }
+
+    #[test]
+    fn directory_length_is_bounded_by_the_file_before_allocation() {
+        let mut header = header_with_directory_offset(HEADER_SIZE);
+        header[16..24].copy_from_slice(&0b111u64.to_le_bytes());
+        header[80..88].copy_from_slice(&(HEADER_SIZE + FOOTER_SIZE).to_le_bytes());
+        let section_count = u32::MAX;
+        let directory_length = u64::from(section_count) * DIRECTORY_ENTRY_SIZE + 4;
+        header[96..104].copy_from_slice(&directory_length.to_le_bytes());
+        header[104..108].copy_from_slice(&section_count.to_le_bytes());
+        header[112..120].copy_from_slice(&HEADER_SIZE.to_le_bytes());
+        let checksum = crc32c(&header[..252]);
+        header[252..256].copy_from_slice(&checksum.to_le_bytes());
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&header).unwrap();
+        file.write_all(&[0u8; FOOTER_SIZE as usize]).unwrap();
+        file.flush().unwrap();
+
+        let error = read_header_and_sections(file.path()).unwrap_err();
+        assert!(error.to_string().contains("overlaps"), "{error}");
+    }
+
+    #[test]
+    fn block_popcount_ignores_unused_high_bits() {
+        assert_eq!(block_popcount(&[0xff], 1).unwrap(), 1);
+        assert_eq!(block_popcount(&[0xff], 7).unwrap(), 7);
+        assert_eq!(block_popcount(&[0xff], 8).unwrap(), 8);
+        assert_eq!(block_popcount(&[0xff, 0xff], 9).unwrap(), 9);
     }
 }

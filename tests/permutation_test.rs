@@ -148,6 +148,31 @@ fn core_profile_is_discovered_by_search() {
 }
 
 #[test]
+fn automatic_discovery_prefers_permutation_over_foq_for_predicate_queries() {
+    let temp = tempfile::tempdir().unwrap();
+    let hdt = fixture(temp.path(), &["--perm", "--index"]);
+    let foq = hdt.with_extension("hdt.index.v1-1");
+    assert!(foq.exists());
+    fs::write(&foq, b"deliberately broken FoQ index").unwrap();
+
+    let query = "? <http://example.org/knows> ?";
+    let output = run(&["search", hdt.to_str().unwrap(), "--query", query, "--count"]);
+    assert_ok(&output);
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "2");
+
+    let explicit = run(&[
+        "search",
+        hdt.to_str().unwrap(),
+        "--query",
+        query,
+        "--index",
+        foq.to_str().unwrap(),
+        "--count",
+    ]);
+    assert!(!explicit.status.success());
+}
+
+#[test]
 fn empty_core_profile_is_canonical_and_valid() {
     let temp = tempfile::tempdir().unwrap();
     let input = temp.path().join("empty.nt");

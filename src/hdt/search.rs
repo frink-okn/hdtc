@@ -1164,7 +1164,8 @@ pub(crate) fn resolve_object_page(
 /// - `limit`: stop after this many results (`None` = no limit; ignored when `count_only`)
 /// - `offset`: skip this many matching results before emitting/counting
 /// - `memory_limit`: budget for the PFC block caches
-/// - `index_path`: explicit index file path; `None` = auto-derive as `<hdt>.hdt.index.v1-1`
+/// - `index_path`: explicit FoQ index path; `None` = prefer `<hdt>.perm`, then
+///   auto-derive `<hdt>.hdt.index.v1-1`
 /// - `no_index`: if true, skip the index and fall back to sequential scan for all patterns
 ///
 /// Returns the count of matching triples.
@@ -1232,17 +1233,8 @@ pub fn search_hdt_streaming(
     };
 
     // Canonically discovered permutation indexes take precedence over FoQ for
-    // predicate- and object-rooted patterns. An explicitly supplied --index
-    // still selects that FoQ file, preserving the meaning of the option.
-    //
-    // `? ? O` and `? P O` enumerate in the same order either way — OPS order,
-    // and a single (P,O) group is subject-ordered under both — so the choice is
-    // invisible to `--offset`/`--limit`. `? P ?` is not: POS walks the
-    // predicate's objects group by group while the FoQ predicate index walks
-    // pos_y, which is subject order. Preferring the permutation there would
-    // silently repaginate a dataset the moment a `.perm` appeared beside it, so
-    // it is used for `? P ?` only when no FoQ index exists to be consistent
-    // with.
+    // every predicate- and object-rooted pattern. An explicitly supplied
+    // --index still selects that FoQ file, preserving the meaning of the option.
     if !no_index
         && index_path.is_none()
         && matches!(
@@ -1251,7 +1243,6 @@ pub fn search_hdt_streaming(
                 | PatternKind::ObjectBound
                 | PatternKind::PredicateObjectBound
         )
-        && (kind != PatternKind::PredicateBound || !resolve_index_path(hdt_path, None).exists())
     {
         let perm_path = crate::permutation::canonical_path(hdt_path);
         if perm_path.exists() {
