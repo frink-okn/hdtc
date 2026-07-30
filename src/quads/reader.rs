@@ -174,6 +174,285 @@ pub struct GraphSidecarReader {
     ef_header_cache: Option<(u64, EfHeader)>,
 }
 
+/// Reader over a sidecar-compatible layer set embedded in another artifact.
+///
+/// Graph indexes deliberately reuse the sidecar's 96-byte directory entries
+/// and all three layer encodings. This adapter routes them through the same
+/// decoder and metadata validator while supplying the enclosing region bounds.
+pub(crate) struct EmbeddedLayerSetReader {
+    inner: GraphSidecarReader,
+}
+
+impl EmbeddedLayerSetReader {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn open(
+        path: &Path,
+        directory_offset: u64,
+        directory_length: u64,
+        region_offset: u64,
+        region_length: u64,
+        triple_count: u64,
+        named_graph_count: u64,
+        membership_count: u64,
+    ) -> Result<Self> {
+        let file = File::open(path)?;
+        let file_size = file.metadata()?.len();
+        let expected_directory_length = named_graph_count
+            .checked_add(1)
+            .and_then(|count| count.checked_mul(DIRECTORY_ENTRY_SIZE))
+            .and_then(|length| length.checked_add(4))
+            .context("embedded layer-directory length overflow")?;
+        ensure!(
+            directory_length == expected_directory_length,
+            "embedded layer-directory length mismatch"
+        );
+        let layers_offset = if region_length == 0 { 0 } else { region_offset };
+        let header = Header {
+            flags: 1,
+            triple_count,
+            named_graph_count,
+            membership_count,
+            source_data_length: 0,
+            sidecar_size: file_size,
+            dictionary_offset: 0,
+            dictionary_length: 0,
+            directory_offset,
+            directory_length,
+            layers_offset,
+            layers_length: region_length,
+            footer_offset: file_size,
+            source_digest: [0; 32],
+            header_crc: 0,
+        };
+        let dictionary = GraphDictionary {
+            string_count: 0,
+            block_size: 1,
+            buffer_offset: 0,
+            buffer_length: 0,
+            buffer_crc: 0,
+            offsets: DiskLogArray {
+                bits: 0,
+                count: 0,
+                data_offset: 0,
+                data_length: 0,
+                stored_crc: 0,
+            },
+        };
+        Ok(Self {
+            inner: GraphSidecarReader {
+                hdt_path: PathBuf::new(),
+                file,
+                header,
+                dictionary,
+                hdt_data_offset: 0,
+                ef_header_cache: None,
+            },
+        })
+    }
+
+    pub(crate) fn count(&mut self, graph_id: u64) -> Result<u64> {
+        self.inner.count(graph_id)
+    }
+
+    pub(crate) fn access(&mut self, graph_id: u64, position: u64) -> Result<bool> {
+        self.inner.access(graph_id, position)
+    }
+
+    pub(crate) fn rank(&mut self, graph_id: u64, position: u64) -> Result<u64> {
+        self.inner.rank(graph_id, position)
+    }
+
+    pub(crate) fn select(&mut self, graph_id: u64, ordinal: u64) -> Result<u64> {
+        self.inner.select(graph_id, ordinal)
+    }
+
+    pub(crate) fn next_member(&mut self, graph_id: u64, position: u64) -> Result<Option<u64>> {
+        self.inner.next_member(graph_id, position)
+    }
+
+    pub(crate) fn layer_iter(&mut self, graph_id: u64) -> Result<LayerMemberIter> {
+        self.inner.layer_iter(graph_id)
+    }
+
+    /// Validate directory framing, nested encoding checksums and semantics.
+    ///
+    /// `expected_non_empty_layers` is the enclosing artifact's declared count of
+    /// layers carrying members, which only the decoded directory can confirm.
+    pub(crate) fn validate_strict(&mut self, expected_non_empty_layers: u64) -> Result<()> {
+        let entry_bytes = self
+            .inner
+            .header
+            .directory_length
+            .checked_sub(4)
+            .context("invalid embedded layer-directory length")?;
+        let stored = read_u32_at(
+            &mut self.inner.file,
+            self.inner.header.directory_offset + entry_bytes,
+        )?;
+        ensure!(
+            range_crc(
+                &mut self.inner.file,
+                self.inner.header.directory_offset,
+                entry_bytes
+            )? == stored,
+            "embedded layer-directory CRC mismatch"
+        );
+
+        let mut total = 0u64;
+        let mut non_empty_layers = 0u64;
+        let mut first_start = None;
+        let mut previous_end = self.inner.header.layers_offset;
+        let mut covered_end = self.inner.header.layers_offset;
+        for graph_id in 0..=self.inner.header.named_graph_count {
+            let layer = self.inner.layer_entry(graph_id)?;
+            if let Some((start, end)) = self.inner.validate_layer_metadata(layer)? {
+                ensure!(
+                    start >= previous_end,
+                    "embedded layer payloads overlap or are out of order"
+                );
+                first_start.get_or_insert(start);
+                previous_end = end;
+            }
+            if layer.member_count != 0 {
+                non_empty_layers = non_empty_layers
+                    .checked_add(1)
+                    .context("embedded non-empty layer count overflow")?;
+                cover_embedded_range(
+                    &mut self.inner.file,
+                    &mut covered_end,
+                    layer.primary_offset,
+                    layer.primary_length,
+                )?;
+                match layer.encoding {
+                    ENCODING_DENSE | ENCODING_SPARSE => {
+                        if layer.secondary_length != 0 {
+                            cover_embedded_range(
+                                &mut self.inner.file,
+                                &mut covered_end,
+                                layer.secondary_offset,
+                                layer.secondary_length,
+                            )?;
+                        }
+                        for index in 0..layer.item_count_a {
+                            let chunk = self.inner.read_chunk(layer, index)?;
+                            if chunk.payload_length != 0 {
+                                cover_embedded_range(
+                                    &mut self.inner.file,
+                                    &mut covered_end,
+                                    chunk.payload_offset,
+                                    u64::from(chunk.payload_length),
+                                )?;
+                            }
+                        }
+                    }
+                    ENCODING_ELIAS_FANO => {
+                        let header = read_ef_header_from(&mut self.inner.file, layer)?;
+                        for (offset, length) in [
+                            (header.lower_offset, header.lower_length),
+                            (header.superrank_offset, header.superrank_length),
+                            (header.subrank_offset, header.subrank_length),
+                            (header.upper_offset, header.upper_length),
+                        ] {
+                            if length != 0 {
+                                cover_embedded_range(
+                                    &mut self.inner.file,
+                                    &mut covered_end,
+                                    offset,
+                                    length,
+                                )?;
+                            }
+                        }
+                    }
+                    _ => unreachable!("encoding was checked above"),
+                }
+            }
+            let mut count = 0u64;
+            let mut minimum = self.inner.header.triple_count;
+            let mut maximum_exclusive = 0u64;
+            let mut previous = None;
+            for position in self.inner.layer_iter(graph_id)? {
+                let position = position?;
+                if let Some(before) = previous {
+                    ensure!(
+                        position > before,
+                        "embedded layer {graph_id} positions are not strictly increasing at \
+                         ordinal {count}: previous {before}, current {position}, encoding {}",
+                        layer.encoding
+                    );
+                }
+                previous = Some(position);
+                minimum = minimum.min(position);
+                maximum_exclusive = position + 1;
+                count += 1;
+            }
+            ensure!(count == layer.member_count, "embedded layer count mismatch");
+            ensure!(
+                minimum == layer.minimum_position,
+                "embedded layer minimum mismatch"
+            );
+            ensure!(
+                maximum_exclusive == layer.maximum_position_exclusive,
+                "embedded layer maximum mismatch"
+            );
+            total = total
+                .checked_add(count)
+                .context("embedded membership overflow")?;
+        }
+        ensure!(
+            total == self.inner.header.membership_count,
+            "embedded layer-set membership-count mismatch"
+        );
+        ensure!(
+            non_empty_layers == expected_non_empty_layers,
+            "embedded layer-set non-empty layer-count mismatch"
+        );
+        if self.inner.header.layers_length == 0 {
+            ensure!(
+                first_start.is_none(),
+                "empty embedded region contains a layer"
+            );
+        } else {
+            ensure!(
+                first_start == Some(self.inner.header.layers_offset),
+                "embedded region does not begin with its first layer"
+            );
+            ensure!(
+                previous_end
+                    == self
+                        .inner
+                        .header
+                        .layers_offset
+                        .checked_add(self.inner.header.layers_length)
+                        .context("embedded region end overflow")?,
+                "embedded region does not end with its final layer"
+            );
+            let region_end = self
+                .inner
+                .header
+                .layers_offset
+                .checked_add(self.inner.header.layers_length)
+                .context("embedded region end overflow")?;
+            ensure!(covered_end <= region_end, "embedded child exceeds region");
+            validate_zero_range(&mut self.inner.file, covered_end, region_end - covered_end)?;
+        }
+        Ok(())
+    }
+}
+
+fn cover_embedded_range(
+    file: &mut File,
+    covered_end: &mut u64,
+    offset: u64,
+    length: u64,
+) -> Result<()> {
+    ensure!(offset >= *covered_end, "embedded child payloads overlap");
+    validate_zero_range(file, *covered_end, offset - *covered_end)?;
+    *covered_end = offset
+        .checked_add(length)
+        .context("embedded child range overflow")?;
+    Ok(())
+}
+
 impl GraphSidecarReader {
     pub fn open_for_hdt(hdt_path: &Path) -> Result<Self> {
         Self::open(&canonical_sidecar_path(hdt_path), hdt_path)
@@ -215,6 +494,20 @@ impl GraphSidecarReader {
 
     pub fn membership_count(&self) -> u64 {
         self.header.membership_count
+    }
+
+    pub(crate) fn source_data_length(&self) -> u64 {
+        self.header.source_data_length
+    }
+
+    pub(crate) fn source_digest(&self) -> [u8; 32] {
+        self.header.source_digest
+    }
+
+    pub(crate) fn whole_file_digest(&self) -> Result<[u8; 32]> {
+        let mut file = self.file.try_clone()?;
+        file.seek(SeekFrom::Start(0))?;
+        sha256_to_end(&mut BufReader::with_capacity(256 * 1024, file))
     }
 
     pub fn graph(&mut self, graph_id: u64) -> Result<GraphTerm> {
@@ -350,7 +643,7 @@ impl GraphSidecarReader {
 
     pub fn layer_iter(&mut self, graph_id: u64) -> Result<LayerMemberIter> {
         let layer = self.layer_entry(graph_id)?;
-        LayerMemberIter::new(self.file.try_clone()?, layer, self.header.triple_count)
+        LayerMemberIter::new(&self.file, layer, self.header.triple_count)
     }
 
     /// Perform full identity, checksum, encoding, dictionary, and exhaustive
@@ -466,10 +759,14 @@ impl GraphSidecarReader {
             let iterator = self.layer_iter(graph_id)?;
             for position in iterator {
                 let position = position?;
-                ensure!(
-                    previous.is_none_or(|value| position > value),
-                    "layer positions are not strictly increasing"
-                );
+                if let Some(before) = previous {
+                    ensure!(
+                        position > before,
+                        "layer {graph_id} positions are not strictly increasing at ordinal \
+                         {count}: previous {before}, current {position}, encoding {}",
+                        layer.encoding
+                    );
+                }
                 previous = Some(position);
                 minimum = minimum.min(position);
                 maximum_exclusive = position + 1;
@@ -1609,14 +1906,74 @@ pub enum LayerMemberIter {
     EliasFano(EliasFanoLayerIter),
 }
 
+/// A virtual file cursor backed by positioned reads.
+///
+/// `File::try_clone` remains bound to the same opened artifact, but cloned file
+/// descriptors may share an OS cursor. Positioned reads give every iterator an
+/// independent logical cursor without reopening a pathname that may now name a
+/// replacement artifact.
+struct PositionedFile {
+    file: File,
+    position: u64,
+}
+
+impl PositionedFile {
+    fn new(file: File) -> Self {
+        Self { file, position: 0 }
+    }
+}
+
+impl Read for PositionedFile {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        #[cfg(unix)]
+        let count = {
+            use std::os::unix::fs::FileExt;
+            self.file.read_at(bytes, self.position)?
+        };
+        #[cfg(windows)]
+        let count = {
+            use std::os::windows::fs::FileExt;
+            self.file.seek_read(bytes, self.position)?
+        };
+        #[cfg(not(any(unix, windows)))]
+        let count = {
+            let mut file = self.file.try_clone()?;
+            file.seek(SeekFrom::Start(self.position))?;
+            file.read(bytes)?
+        };
+        self.position = self
+            .position
+            .checked_add(count as u64)
+            .ok_or_else(|| std::io::Error::other("positioned read offset overflow"))?;
+        Ok(count)
+    }
+}
+
+impl Seek for PositionedFile {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+        let base = match position {
+            SeekFrom::Start(value) => {
+                self.position = value;
+                return Ok(value);
+            }
+            SeekFrom::End(delta) => i128::from(self.file.metadata()?.len()) + i128::from(delta),
+            SeekFrom::Current(delta) => i128::from(self.position) + i128::from(delta),
+        };
+        self.position = u64::try_from(base).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid positioned seek")
+        })?;
+        Ok(self.position)
+    }
+}
+
 impl LayerMemberIter {
-    fn new(file: File, layer: LayerEntry, universe: u64) -> Result<Self> {
+    fn new(file: &File, layer: LayerEntry, universe: u64) -> Result<Self> {
         if layer.member_count == 0 {
             return Ok(Self::Empty);
         }
         match layer.encoding {
             ENCODING_DENSE | ENCODING_SPARSE => Ok(Self::Chunked(ChunkLayerIter {
-                file,
+                file: PositionedFile::new(file.try_clone()?),
                 layer,
                 universe,
                 entry_index: 0,
@@ -1625,7 +1982,10 @@ impl LayerMemberIter {
                 yielded: 0,
             })),
             ENCODING_ELIAS_FANO => Ok(Self::EliasFano(EliasFanoLayerIter::new(
-                file, layer, universe,
+                PositionedFile::new(file.try_clone()?),
+                PositionedFile::new(file.try_clone()?),
+                layer,
+                universe,
             )?)),
             other => bail!("unsupported layer encoding {other}"),
         }
@@ -1645,7 +2005,7 @@ impl Iterator for LayerMemberIter {
 }
 
 pub struct ChunkLayerIter {
-    file: File,
+    file: PositionedFile,
     layer: LayerEntry,
     universe: u64,
     entry_index: u64,
@@ -1746,8 +2106,8 @@ impl Iterator for ChunkLayerIter {
 }
 
 pub struct EliasFanoLayerIter {
-    lower_file: File,
-    upper_reader: BufReader<File>,
+    lower_file: PositionedFile,
+    upper_reader: BufReader<PositionedFile>,
     header: EfHeader,
     universe: u64,
     ordinal: u64,
@@ -1757,13 +2117,17 @@ pub struct EliasFanoLayerIter {
 }
 
 impl EliasFanoLayerIter {
-    fn new(mut file: File, layer: LayerEntry, universe: u64) -> Result<Self> {
-        let header = read_ef_header_from(&mut file, layer)?;
+    fn new(
+        mut upper_file: PositionedFile,
+        lower_file: PositionedFile,
+        layer: LayerEntry,
+        universe: u64,
+    ) -> Result<Self> {
+        let header = read_ef_header_from(&mut upper_file, layer)?;
         ensure!(header.universe == universe, "Elias-Fano universe mismatch");
-        let mut upper_file = file.try_clone()?;
         upper_file.seek(SeekFrom::Start(header.upper_offset))?;
         Ok(Self {
-            lower_file: file,
+            lower_file,
             upper_reader: BufReader::new(upper_file),
             header,
             universe,
@@ -2238,7 +2602,7 @@ fn parse_hdt_triple_count(header: &[u8]) -> Result<u64> {
     value.context("HDT header has no triple count")
 }
 
-fn read_ef_header_from(file: &mut File, layer: LayerEntry) -> Result<EfHeader> {
+fn read_ef_header_from<R: Read + Seek>(file: &mut R, layer: LayerEntry) -> Result<EfHeader> {
     ensure!(
         layer.primary_length == 160,
         "invalid Elias-Fano primary length"
@@ -2278,7 +2642,7 @@ fn read_ef_header_from(file: &mut File, layer: LayerEntry) -> Result<EfHeader> {
     })
 }
 
-fn read_exact_at(file: &mut File, offset: u64, bytes: &mut [u8]) -> Result<()> {
+fn read_exact_at<R: Read + Seek>(file: &mut R, offset: u64, bytes: &mut [u8]) -> Result<()> {
     file.seek(SeekFrom::Start(offset))?;
     file.read_exact(bytes)?;
     Ok(())
@@ -2340,6 +2704,22 @@ fn range_crc(file: &mut File, offset: u64, length: u64) -> Result<u32> {
         remaining -= amount as u64;
     }
     Ok(digest.finalize())
+}
+
+fn validate_zero_range(file: &mut File, offset: u64, length: u64) -> Result<()> {
+    file.seek(SeekFrom::Start(offset))?;
+    let mut remaining = length;
+    let mut bytes = [0u8; 64 * 1024];
+    while remaining > 0 {
+        let amount = usize::try_from(remaining.min(bytes.len() as u64)).unwrap();
+        file.read_exact(&mut bytes[..amount])?;
+        ensure!(
+            bytes[..amount].iter().all(|byte| *byte == 0),
+            "nonzero embedded layer-region padding"
+        );
+        remaining -= amount as u64;
+    }
+    Ok(())
 }
 
 fn select_in_word(mut word: u64, mut ordinal: u64) -> Result<u32> {
@@ -2552,6 +2932,82 @@ mod tests {
         assert_eq!(reader.graphs_of(300_000)?, vec![0]);
 
         reader.validate_strict(temp.path(), 4 * 1024 * 1024, None)?;
+        Ok(())
+    }
+
+    #[test]
+    fn elias_fano_iteration_keeps_upper_and_lower_cursors_independent() -> Result<()> {
+        const MEMBERS: u64 = 70_000;
+        const UNIVERSE: u64 = MEMBERS * 2;
+        const LOWER_OFFSET: u64 = 160;
+        const LOWER_LENGTH: u64 = MEMBERS.div_ceil(8);
+        const UPPER_OFFSET: u64 = (LOWER_OFFSET + LOWER_LENGTH).next_multiple_of(8);
+        const UPPER_BITS: u64 = MEMBERS * 2;
+        const UPPER_LENGTH: u64 = UPPER_BITS.div_ceil(8);
+
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("large-ef-layer.bin");
+
+        let mut header = [0u8; 160];
+        header[0..8].copy_from_slice(b"$HDTEF01");
+        header[8..12].copy_from_slice(&160u32.to_le_bytes());
+        header[12..16].copy_from_slice(&1u32.to_le_bytes());
+        header[16..24].copy_from_slice(&UNIVERSE.to_le_bytes());
+        header[24..32].copy_from_slice(&MEMBERS.to_le_bytes());
+        header[32..40].copy_from_slice(&UPPER_BITS.to_le_bytes());
+        header[40..48].copy_from_slice(&MEMBERS.to_le_bytes());
+        header[48..56].copy_from_slice(&LOWER_OFFSET.to_le_bytes());
+        header[56..64].copy_from_slice(&LOWER_LENGTH.to_le_bytes());
+        header[96..104].copy_from_slice(&UPPER_OFFSET.to_le_bytes());
+        header[104..112].copy_from_slice(&UPPER_LENGTH.to_le_bytes());
+        let header_crc = crc32c(&header[..156]);
+        header[156..160].copy_from_slice(&header_crc.to_le_bytes());
+
+        // Values are 0, 2, 4, ...: every lower bit is zero and every even
+        // upper-bit position is set. The upper payload is deliberately larger
+        // than BufReader's buffer so iteration must refill it after lower reads.
+        let mut upper = vec![0u8; UPPER_LENGTH as usize];
+        for ordinal in 0..MEMBERS {
+            let bit = ordinal * 2;
+            upper[(bit / 8) as usize] |= 1 << (bit % 8);
+        }
+        let mut file = File::create(&path)?;
+        file.write_all(&header)?;
+        file.write_all(&vec![0u8; LOWER_LENGTH as usize])?;
+        file.write_all(&vec![
+            0u8;
+            (UPPER_OFFSET - LOWER_OFFSET - LOWER_LENGTH) as usize
+        ])?;
+        file.write_all(&upper)?;
+        file.flush()?;
+
+        let layer = LayerEntry {
+            primary_offset: 0,
+            primary_length: 160,
+            secondary_offset: 0,
+            secondary_length: 0,
+            item_count_a: 0,
+            item_count_b: 0,
+            member_count: MEMBERS,
+            minimum_position: 0,
+            maximum_position_exclusive: UNIVERSE - 1,
+            encoding: ENCODING_ELIAS_FANO,
+            flags: 0,
+            primary_crc: crc32c(&header),
+            secondary_crc: 0,
+            parameter: 0,
+        };
+        drop(file);
+        let source = File::open(&path)?;
+        #[cfg(unix)]
+        {
+            let retired = temp.path().join("large-ef-layer.original");
+            std::fs::rename(&path, retired)?;
+            std::fs::write(&path, b"replacement artifact")?;
+        }
+        for (ordinal, position) in LayerMemberIter::new(&source, layer, UNIVERSE)?.enumerate() {
+            assert_eq!(position?, ordinal as u64 * 2);
+        }
         Ok(())
     }
 }

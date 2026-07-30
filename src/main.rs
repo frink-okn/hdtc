@@ -1,5 +1,6 @@
 mod cli;
 mod dictionary;
+mod graph_index;
 mod hdt;
 mod index;
 mod io;
@@ -179,6 +180,7 @@ fn main() -> Result<()> {
         cli::Commands::Create(args) => create_hdt(args, benchmark),
         cli::Commands::Index(args) => create_index_from_hdt(args, benchmark),
         cli::Commands::Perm(args) => create_permutation_from_hdt(args, benchmark),
+        cli::Commands::GraphIndex(args) => create_graph_index_from_hdt(args, benchmark),
         cli::Commands::Dump(args) => dump_hdt_to_ntriples(args, benchmark),
         cli::Commands::Search(args) => search_hdt(args, benchmark),
         cli::Commands::Validate(args) => validate_hdt_file(args, benchmark),
@@ -212,13 +214,15 @@ fn create_hdt(args: cli::CreateArgs, benchmark: bool) -> Result<()> {
     let include_graphs = args.mode == cli::OutputMode::Quads;
     let graph_options_require_quads = !args.graph_map.is_empty()
         || args.default_graph.is_some()
+        || args.graphs_index
         || matches!(
             args.input_sidecars,
             Some(cli::InputSidecarPolicy::Preserve | cli::InputSidecarPolicy::Require)
         );
     if !include_graphs && graph_options_require_quads {
         anyhow::bail!(
-            "--graph-map, --default-graph, and preserve/require --input-sidecars require --mode quads"
+            "--graphs-index, --graph-map, --default-graph, and preserve/require \
+             --input-sidecars require --mode quads"
         );
     }
     let input_sidecar_policy = if include_graphs {
@@ -291,6 +295,7 @@ fn create_hdt(args: cli::CreateArgs, benchmark: bool) -> Result<()> {
         &base_uri,
         &parser_parallelism,
         permutation_maps,
+        args.graphs_index,
         benchmark,
     )?;
 
@@ -324,6 +329,7 @@ fn create_hdt(args: cli::CreateArgs, benchmark: bool) -> Result<()> {
     let num_triples = pipeline_result.bitmap_triples.num_triples;
 
     let canonical_graphs_path = quads::canonical_sidecar_path(&args.output);
+    let canonical_graph_index_path = graph_index::canonical_path(&args.output);
     let sidecar_temp = if include_graphs {
         let membership_path = pipeline_result
             .membership_path
@@ -357,47 +363,121 @@ fn create_hdt(args: cli::CreateArgs, benchmark: bool) -> Result<()> {
     };
 
     let canonical_perm_path = permutation::canonical_path(&args.output);
-    let perm_temp = if args.perm {
+    let mut perm_temp = None;
+    let graph_index_temp = if args.graphs_index {
         let prepared = pipeline_result
-            .permutation
+            .graph_permutation
             .take()
-            .context("Permutation collection was not prepared")?;
-        let temp = tempfile::Builder::new()
-            .prefix(".hdtc-perm-")
+            .context("Graph-index collection was not prepared")?;
+        let graph_temp = tempfile::Builder::new()
+            .prefix(".hdtc-graph-index-")
             .tempfile_in(output_parent)
+            .with_context(|| {
+                format!(
+                    "Failed to create graph-index temp file in {}",
+                    output_parent.display()
+                )
+            })?
+            .into_temp_path();
+        let prepared_perm = args
+            .perm
+            .then(|| {
+                tempfile::Builder::new()
+                    .prefix(".hdtc-perm-")
+                    .tempfile_in(output_parent)
+                    .map(|file| file.into_temp_path())
+            })
+            .transpose()
             .with_context(|| {
                 format!(
                     "Failed to create permutation-index temp file in {}",
                     output_parent.display()
                 )
-            })?
-            .into_temp_path();
-        permutation::finish_prepared_index(
+            })?;
+        let sidecar_path = sidecar_temp
+            .as_deref()
+            .context("Graph-index creation requires a staged graph sidecar")?;
+        graph_index::finish_prepared_graph_index(
             prepared,
-            &temp,
+            &graph_temp,
+            prepared_perm.as_deref(),
             &hdt_temp,
+            sidecar_path,
             &pipeline_result.counts,
             &pipeline_result.bitmap_triples,
+            pipeline_result.membership_count,
+            &temp_dir,
+            memory_budget,
+            permutation_maps.unwrap_or_default(),
         )?;
-        Some(temp)
+        perm_temp = prepared_perm;
+        Some(graph_temp)
     } else {
+        if args.perm {
+            let prepared = pipeline_result
+                .permutation
+                .take()
+                .context("Permutation collection was not prepared")?;
+            let temp = tempfile::Builder::new()
+                .prefix(".hdtc-perm-")
+                .tempfile_in(output_parent)
+                .with_context(|| {
+                    format!(
+                        "Failed to create permutation-index temp file in {}",
+                        output_parent.display()
+                    )
+                })?
+                .into_temp_path();
+            permutation::finish_prepared_index(
+                prepared,
+                &temp,
+                &hdt_temp,
+                &pipeline_result.counts,
+                &pipeline_result.bitmap_triples,
+            )?;
+            perm_temp = Some(temp);
+        }
         None
     };
 
+    // Move derived graph data out first: a graph index binds to both the HDT
+    // and sidecar, so it must never survive replacement of either parent.
+    let retired_graph_index =
+        retire_existing_artifact(&canonical_graph_index_path, output_parent, "graph index")?;
     // Move the old sidecar out of its canonical name before replacing the HDT.
-    // A crash can therefore leave a detectably missing sidecar, but never a
+    // A crash can therefore leave detectably missing artifacts, but never a
     // new HDT next to stale graph data.
     let retired_sidecar =
-        retire_existing_artifact(&canonical_graphs_path, output_parent, "graph sidecar")?;
+        match retire_existing_artifact(&canonical_graphs_path, output_parent, "graph sidecar") {
+            Ok(retired) => retired,
+            Err(error) => {
+                if let Some(retired) = retired_graph_index.as_ref()
+                    && let Err(restore_error) = retired.restore()
+                {
+                    return Err(anyhow::anyhow!(
+                        "{error:#}; additionally failed to roll back the graph index: \
+                     {restore_error:#}"
+                    ));
+                }
+                return Err(error);
+            }
+        };
     let retired_perm =
         match retire_existing_artifact(&canonical_perm_path, output_parent, "permutation index") {
             Ok(retired) => retired,
             Err(error) => {
-                if let Some(retired) = retired_sidecar.as_ref()
-                    && let Err(restore_error) = retired.restore()
-                {
+                let graph_restore = (|| -> Result<()> {
+                    if let Some(retired) = retired_sidecar.as_ref() {
+                        retired.restore()?;
+                    }
+                    if let Some(retired) = retired_graph_index.as_ref() {
+                        retired.restore()?;
+                    }
+                    Ok(())
+                })();
+                if let Err(restore_error) = graph_restore {
                     return Err(anyhow::anyhow!(
-                        "{error:#}; additionally failed to roll back the graph sidecar: \
+                        "{error:#}; additionally failed to roll back a graph artifact: \
                          {restore_error:#}"
                     ));
                 }
@@ -413,11 +493,16 @@ fn create_hdt(args: cli::CreateArgs, benchmark: bool) -> Result<()> {
             .as_ref()
             .map(RetiredArtifact::restore)
             .transpose();
-        let graph_restore = retired_sidecar
-            .as_ref()
-            .map(RetiredArtifact::restore)
-            .transpose();
-        if let Err(restore_error) = perm_restore.and(graph_restore) {
+        let graph_restore = (|| -> Result<()> {
+            if let Some(retired) = retired_sidecar.as_ref() {
+                retired.restore()?;
+            }
+            if let Some(retired) = retired_graph_index.as_ref() {
+                retired.restore()?;
+            }
+            Ok(())
+        })();
+        if let Err(restore_error) = perm_restore.map(|_| ()).and(graph_restore) {
             return Err(anyhow::anyhow!(
                 "{publish_error:#}; additionally failed to roll back an artifact: {restore_error:#}"
             ));
@@ -429,6 +514,12 @@ fn create_hdt(args: cli::CreateArgs, benchmark: bool) -> Result<()> {
         tracing::info!(
             "Removed stale graph sidecar: {}",
             canonical_graphs_path.display()
+        );
+    }
+    if !args.graphs_index && retired_graph_index.is_some() {
+        tracing::info!(
+            "Removed stale graph index: {}",
+            canonical_graph_index_path.display()
         );
     }
 
@@ -460,6 +551,20 @@ fn create_hdt(args: cli::CreateArgs, benchmark: bool) -> Result<()> {
         tracing::info!(
             "Permutation index written: {}",
             canonical_perm_path.display()
+        );
+    }
+    if let Some(graph_index_temp) = graph_index_temp {
+        graph_index_temp
+            .persist(&canonical_graph_index_path)
+            .with_context(|| {
+                format!(
+                    "Failed to publish graph index {}",
+                    canonical_graph_index_path.display()
+                )
+            })?;
+        tracing::info!(
+            "Graph index written: {}",
+            canonical_graph_index_path.display()
         );
     }
 
@@ -593,6 +698,53 @@ fn create_permutation_from_hdt(args: cli::PermArgs, benchmark: bool) -> Result<(
         );
     }
     tracing::info!("Permutation index written: {}", output.display());
+    tracing::info!("Done!");
+    Ok(())
+}
+
+/// Create the derived graph index for an existing HDT/graphs pair.
+fn create_graph_index_from_hdt(args: cli::GraphIndexArgs, benchmark: bool) -> Result<()> {
+    if !args.hdt_file.is_file() {
+        anyhow::bail!("HDT file not found: {}", args.hdt_file.display());
+    }
+    let temp_dir = match &args.temp_dir {
+        Some(dir) => {
+            std::fs::create_dir_all(dir)
+                .with_context(|| format!("Failed to create temp dir {}", dir.display()))?;
+            dir.clone()
+        }
+        None => make_default_temp_dir()?,
+    };
+    let default_positions = args.positions.is_empty() && !args.no_layers;
+    let options = graph_index::GraphIndexOptions {
+        pos_layers: default_positions
+            || args.positions.contains(&cli::GraphIndexPositionSpace::Pos),
+        ops_layers: default_positions
+            || args.positions.contains(&cli::GraphIndexPositionSpace::Ops),
+        membership_ranks: args.transpose_ranks || args.transpose_ids,
+        membership_ids: args.transpose_ids,
+    };
+    tracing::info!("Creating graph index for: {}", args.hdt_file.display());
+    tracing::info!(
+        "Output: {}",
+        graph_index::canonical_path(&args.hdt_file).display()
+    );
+    tracing::info!("Temp directory: {}", temp_dir.display());
+    tracing::info!("Memory limit: {}", args.memory_limit);
+    let start = std::time::Instant::now();
+    let output = graph_index::create_graph_index(
+        &args.hdt_file,
+        args.memory_limit.as_bytes(),
+        &temp_dir,
+        options,
+    )?;
+    if benchmark {
+        tracing::info!(
+            "Benchmark summary (graphs-index): total {:.3}s",
+            start.elapsed().as_secs_f64()
+        );
+    }
+    tracing::info!("Graph index written: {}", output.display());
     tracing::info!("Done!");
     Ok(())
 }
@@ -1108,6 +1260,23 @@ fn validate_hdt_file(args: cli::ValidateArgs, benchmark: bool) -> Result<()> {
                 };
                 permutation::validate_permutation_index(
                     &perm_path,
+                    &args.hdt_file,
+                    &temp_dir,
+                    args.memory_limit.as_bytes(),
+                )?;
+            }
+            let graph_index_path = graph_index::canonical_path(&args.hdt_file);
+            if graph_index_path.exists() {
+                tracing::info!("Validating graph index: {}", graph_index_path.display());
+                let temp_dir = match &args.temp_dir {
+                    Some(path) => {
+                        std::fs::create_dir_all(path)?;
+                        path.clone()
+                    }
+                    None => make_default_temp_dir()?,
+                };
+                graph_index::validate_graph_index(
+                    &graph_index_path,
                     &args.hdt_file,
                     &temp_dir,
                     args.memory_limit.as_bytes(),

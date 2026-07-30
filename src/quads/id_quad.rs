@@ -88,7 +88,7 @@ pub struct QuadUnionIterator<I, F> {
 impl<I, F> QuadUnionIterator<I, F>
 where
     I: Iterator<Item = Result<IdQuad>>,
-    F: FnMut(GraphMembership) -> Result<()>,
+    F: FnMut(IdTriple, GraphMembership) -> Result<()>,
 {
     pub fn new(inner: I, emit_membership: F) -> Self {
         Self {
@@ -103,7 +103,7 @@ where
 impl<I, F> Iterator for QuadUnionIterator<I, F>
 where
     I: Iterator<Item = Result<IdQuad>>,
-    F: FnMut(GraphMembership) -> Result<()>,
+    F: FnMut(IdTriple, GraphMembership) -> Result<()>,
 {
     type Item = Result<IdTriple>;
 
@@ -126,10 +126,13 @@ where
 
         loop {
             if last_graph != Some(current.graph) {
-                if let Err(error) = (self.emit_membership)(GraphMembership {
-                    graph: current.graph,
-                    position: self.position,
-                }) {
+                if let Err(error) = (self.emit_membership)(
+                    triple,
+                    GraphMembership {
+                        graph: current.graph,
+                        position: self.position,
+                    },
+                ) {
                     return Some(Err(error));
                 }
                 last_graph = Some(current.graph);
@@ -249,7 +252,7 @@ mod tests {
             }),
         ];
         let mut memberships = Vec::new();
-        let triples = QuadUnionIterator::new(quads.into_iter(), |m| {
+        let triples = QuadUnionIterator::new(quads.into_iter(), |_, m| {
             memberships.push(m);
             Ok(())
         })

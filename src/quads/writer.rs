@@ -164,6 +164,147 @@ pub fn canonical_sidecar_path(hdt_path: &Path) -> PathBuf {
     PathBuf::from(value)
 }
 
+/// A fully encoded graph-layer set whose directory entries already contain
+/// absolute offsets for `region_base`.
+///
+/// The graph index reuses the sidecar's layer encodings verbatim. Keeping the
+/// encoder here makes that identity structural instead of duplicating the
+/// dense/sparse/Elias-Fano choice and framing logic in two modules.
+pub(crate) struct EncodedLayerSet {
+    pub directory: File,
+    pub region: File,
+    pub region_length: u64,
+    pub non_empty_layers: u64,
+}
+
+/// Encode one graph-major membership stream as a sidecar-compatible layer set.
+/// `region_base` is the absolute file offset at which `region` will be copied.
+pub(crate) fn encode_layer_set(
+    membership_path: &Path,
+    named_graph_count: u64,
+    triple_count: u64,
+    expected_membership_count: u64,
+    region_base: u64,
+    temp_dir: &Path,
+) -> Result<EncodedLayerSet> {
+    let directory_length = named_graph_count
+        .checked_add(1)
+        .and_then(|count| count.checked_mul(DIRECTORY_ENTRY_SIZE))
+        .and_then(|bytes| bytes.checked_add(4))
+        .context("layer-directory size overflow")?;
+    let mut region = tempfile::tempfile_in(temp_dir)?;
+    let mut directory = tempfile::tempfile_in(temp_dir)?;
+    let mut positions_file = tempfile::tempfile_in(temp_dir)?;
+    let mut scratch = LayerScratch::new(temp_dir)?;
+
+    let membership_file = File::open(membership_path)
+        .with_context(|| format!("Failed to open {}", membership_path.display()))?;
+    let decoder = zstd::Decoder::with_buffer(BufReader::new(membership_file))?;
+    let mut memberships = MembershipStream::new(decoder)?;
+    let mut observed_membership_count = 0u64;
+    let mut non_empty_layers = 0u64;
+    let mut directory_crc = CRC32C_ALGO.digest();
+
+    for graph_id in 0..=named_graph_count {
+        let layer_started = std::time::Instant::now();
+        let stats = spool_layer(
+            graph_id,
+            triple_count,
+            &mut memberships,
+            &mut positions_file,
+        )?;
+        observed_membership_count = observed_membership_count
+            .checked_add(stats.member_count)
+            .context("membership count overflow")?;
+
+        let entry = if stats.member_count == 0 {
+            LayerEntry::empty(triple_count)
+        } else {
+            non_empty_layers = non_empty_layers
+                .checked_add(1)
+                .context("non-empty layer count overflow")?;
+            match choose_encoding(triple_count, stats)? {
+                ChosenEncoding::DenseChunks => encode_chunked_layer(
+                    &mut region,
+                    region_base,
+                    &mut positions_file,
+                    triple_count,
+                    stats,
+                    true,
+                    0,
+                    &mut scratch,
+                )?,
+                ChosenEncoding::SparseChunks { hash_capacity } => encode_chunked_layer(
+                    &mut region,
+                    region_base,
+                    &mut positions_file,
+                    triple_count,
+                    stats,
+                    false,
+                    hash_capacity,
+                    &mut scratch,
+                )?,
+                ChosenEncoding::EliasFano => encode_elias_fano_layer(
+                    &mut region,
+                    region_base,
+                    &mut positions_file,
+                    triple_count,
+                    stats,
+                    &mut scratch,
+                )?,
+            }
+        };
+
+        let bytes = entry.bytes();
+        directory.write_all(&bytes)?;
+        directory_crc.update(&bytes);
+        let elapsed = layer_started.elapsed();
+        if stats.member_count > 0 && elapsed.as_secs() >= 1 {
+            tracing::info!(
+                graph_id,
+                memberships = stats.member_count,
+                elapsed_seconds = elapsed.as_secs_f64(),
+                "Encoded graph layer"
+            );
+        } else {
+            tracing::debug!(
+                graph_id,
+                memberships = stats.member_count,
+                elapsed_seconds = elapsed.as_secs_f64(),
+                "Encoded graph layer"
+            );
+        }
+    }
+
+    ensure!(
+        memberships.next.is_none(),
+        "membership stream contains graph ID greater than named graph count"
+    );
+    ensure!(
+        observed_membership_count == expected_membership_count,
+        "membership count mismatch: stream has {observed_membership_count}, expected {expected_membership_count}"
+    );
+    ensure!(
+        observed_membership_count >= triple_count,
+        "non-exhaustive membership stream: {observed_membership_count} memberships for {triple_count} triples"
+    );
+
+    directory.write_all(&directory_crc.finalize().to_le_bytes())?;
+    ensure!(
+        directory.stream_position()? == directory_length,
+        "layer-directory length mismatch"
+    );
+    let region_length = region.stream_position()?;
+    rewind(&mut directory)?;
+    rewind(&mut region)?;
+    Ok(EncodedLayerSet {
+        directory,
+        region,
+        region_length,
+        non_empty_layers,
+    })
+}
+
 /// Assemble a version-1 graph sidecar from a graph-major zstd membership file.
 #[allow(clippy::too_many_arguments)]
 pub fn write_graph_sidecar(
@@ -204,104 +345,16 @@ pub fn write_graph_sidecar(
         64,
     )?;
 
-    let mut layers_file = tempfile::tempfile_in(temp_dir)?;
-    let mut directory_file = tempfile::tempfile_in(temp_dir)?;
-    let mut positions_file = tempfile::tempfile_in(temp_dir)?;
-    // One fixed scratch set reused by every layer, never one file per graph.
-    let mut scratch = LayerScratch::new(temp_dir)?;
-
-    let membership_file = File::open(membership_path)
-        .with_context(|| format!("Failed to open {}", membership_path.display()))?;
-    let decoder = zstd::Decoder::with_buffer(BufReader::new(membership_file))?;
-    let mut memberships = MembershipStream::new(decoder)?;
-    let mut observed_membership_count = 0u64;
-
-    let mut directory_crc = CRC32C_ALGO.digest();
-    for graph_id in 0..=named_graph_count {
-        let layer_started = std::time::Instant::now();
-        let stats = spool_layer(
-            graph_id,
-            triple_count,
-            &mut memberships,
-            &mut positions_file,
-        )?;
-        observed_membership_count = observed_membership_count
-            .checked_add(stats.member_count)
-            .context("membership count overflow")?;
-
-        let entry = if stats.member_count == 0 {
-            LayerEntry::empty(triple_count)
-        } else {
-            let encoding = choose_encoding(triple_count, stats)?;
-            match encoding {
-                ChosenEncoding::DenseChunks => encode_chunked_layer(
-                    &mut layers_file,
-                    layers_offset,
-                    &mut positions_file,
-                    triple_count,
-                    stats,
-                    true,
-                    0,
-                    &mut scratch,
-                )?,
-                ChosenEncoding::SparseChunks { hash_capacity } => encode_chunked_layer(
-                    &mut layers_file,
-                    layers_offset,
-                    &mut positions_file,
-                    triple_count,
-                    stats,
-                    false,
-                    hash_capacity,
-                    &mut scratch,
-                )?,
-                ChosenEncoding::EliasFano => encode_elias_fano_layer(
-                    &mut layers_file,
-                    layers_offset,
-                    &mut positions_file,
-                    triple_count,
-                    stats,
-                    &mut scratch,
-                )?,
-            }
-        };
-
-        let bytes = entry.bytes();
-        directory_file.write_all(&bytes)?;
-        directory_crc.update(&bytes);
-        let layer_elapsed = layer_started.elapsed();
-        if stats.member_count > 0 && layer_elapsed.as_secs() >= 1 {
-            tracing::info!(
-                graph_id,
-                memberships = stats.member_count,
-                elapsed_seconds = layer_elapsed.as_secs_f64(),
-                "Encoded graph layer"
-            );
-        } else {
-            tracing::debug!(
-                graph_id,
-                memberships = stats.member_count,
-                elapsed_seconds = layer_elapsed.as_secs_f64(),
-                "Encoded graph layer"
-            );
-        }
-    }
-
-    ensure!(
-        memberships.next.is_none(),
-        "membership stream contains graph ID greater than named graph count"
-    );
-    ensure!(
-        observed_membership_count == expected_membership_count,
-        "membership count mismatch: stream has {observed_membership_count}, expected {expected_membership_count}"
-    );
-    ensure!(
-        observed_membership_count >= triple_count,
-        "non-exhaustive membership stream: {observed_membership_count} memberships for {triple_count} triples"
-    );
-
-    let directory_crc = directory_crc.finalize();
-    directory_file.write_all(&directory_crc.to_le_bytes())?;
-    let layers_length = layers_file.stream_position()?;
+    let mut layer_set = encode_layer_set(
+        membership_path,
+        named_graph_count,
+        triple_count,
+        expected_membership_count,
+        layers_offset,
+        temp_dir,
+    )?;
+    let observed_membership_count = expected_membership_count;
+    let layers_length = layer_set.region_length;
     let footer_offset = align_up(
         layers_offset
             .checked_add(layers_length)
@@ -350,11 +403,11 @@ pub fn write_graph_sidecar(
     writer.write_all(&header)?;
     copy_exact_file(graph_dictionary_path, graph_dictionary_length, &mut writer)?;
     pad_to_absolute(&mut writer, directory_offset)?;
-    rewind(&mut directory_file)?;
-    std::io::copy(&mut directory_file, &mut writer)?;
+    rewind(&mut layer_set.directory)?;
+    std::io::copy(&mut layer_set.directory, &mut writer)?;
     pad_to_absolute(&mut writer, layers_offset)?;
-    rewind(&mut layers_file)?;
-    std::io::copy(&mut layers_file, &mut writer)?;
+    rewind(&mut layer_set.region)?;
+    std::io::copy(&mut layer_set.region, &mut writer)?;
     pad_to_absolute(&mut writer, footer_offset)?;
     writer.write_all(&footer)?;
     writer.flush()?;
