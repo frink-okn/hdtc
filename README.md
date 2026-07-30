@@ -639,14 +639,30 @@ Its sort chunks are zstd-compressed; peak scratch usage depends on identifier
 widths and compressibility. `create --perm` begins those sorts directly from the
 unique SPO stream, while standalone `perm` first streams the existing HDT.
 
-`hdtc graphs-index` validates and transposes the graph sidecar once, then uses
-two external sorts per requested position space to map memberships into POS or
-OPS order. Its chunks are zstd-compressed and bounded by `--memory-limit`.
-`create --graphs-index` instead decorates the two permutation sorts with graph
-IDs and, for a bounded graph dictionary, writes each graph's positions directly
-while draining them. Larger graph dictionaries retain a bounded membership-sort
-fallback. When `--perm` is also selected, the same two permutation sorts feed
-both indexes.
+`hdtc graphs-index` transposes the graph sidecar by k-way merging its layers,
+each of which is already position-sorted, so the transpose costs one buffered
+iterator per layer rather than an external sort of every membership. Graph
+dictionaries too large to hold that many concurrent iterators fall back to the
+bounded external sort. The HDT's SPO scan is already in position order, so
+joining it against the merged stream re-attaches each triple to its graphs
+without a sort.
+
+From there it takes whichever layer strategy suits the sidecar. Up to 16
+memberships per triple it decorates the two permutation sorts with graph IDs,
+exactly as `create --graphs-index` does, and appends to the per-graph layers
+while draining them. Past that, repeating a triple's key once per membership
+costs more than mapping does, so it sorts each triple once and maps permuted
+positions onto the memberships instead. Both strategies produce identical
+bytes; all sorting is zstd-compressed and bounded by `--memory-limit`.
+
+`create --graphs-index` always decorates, since the pipeline hands it each
+triple alongside its memberships, and for a bounded graph dictionary it writes
+each graph's positions directly while draining. Larger graph dictionaries retain
+a bounded membership-sort fallback. When `--perm` is also selected, the same two
+permutation sorts feed both indexes.
+
+Neither path validates its inputs beyond what constructing the output requires;
+`hdtc validate` is what checks an HDT, sidecar, and graph index for consistency.
 
 `hdtc sketch` additionally writes an uncompressed 8-byte hash for each
 qualifying IRI in every selected role while building the filters. An IRI in the

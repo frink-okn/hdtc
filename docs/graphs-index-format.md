@@ -763,17 +763,28 @@ remains.
 sorted positions, gather density statistics, choose chunked or Elias–Fano,
 encode, reuse the scratch file. No new encoder is required.
 
-**Integrated HDT creation** has a faster construction path. While the unique
-SPO stream is available, every triple is still adjacent to its graph IDs. A
-producer can carry those IDs through each POS/OPS permutation sort, group the
-sorted output by triple, and append the current permuted position directly to
-one spool per graph when the graph dictionary fits the implementation's bounded
-direct-spool limit. Positions in every spool are then intrinsically sorted. For
-larger graph dictionaries, the producer may feed the grouped memberships to a
-bounded graph-major external sort instead. Both forms remove the sidecar
-transposition and inverse-position sort described above. If a permutation index
-is also being emitted, its encoder consumes the same grouped streams; no
-additional permutation sort is necessary.
+**Decorating the permutation sort** is a faster construction path. Wherever a
+producer holds each unique SPO triple adjacent to its graph IDs, it can carry
+those IDs through each POS/OPS permutation sort, group the sorted output by
+triple, and append the current permuted position directly to one spool per graph
+when the graph dictionary fits the implementation's bounded direct-spool limit.
+Positions in every spool are then intrinsically sorted. For larger graph
+dictionaries, the producer may feed the grouped memberships to a bounded
+graph-major external sort instead. Both forms remove the inverse-position sort
+described above. If a permutation index is also being emitted, its encoder
+consumes the same grouped streams; no additional permutation sort is necessary.
+
+Integrated HDT creation has that adjacency for free. A producer working from a
+finished HDT can reconstruct it: the memberships of a §4 layer set are already
+sorted by position within each layer, so transposing the sidecar is a k-way
+merge over its layers rather than a sort of every membership, and an SPO scan of
+the HDT is already in position order, so the two join sequentially.
+
+Decorating repeats a triple's key once per membership, so its advantage narrows
+as memberships per triple rise; past roughly sixteen, sorting each triple once
+and mapping permuted positions onto the memberships moves fewer bytes. Producers
+are free to choose either, or to route between them — the encoded bytes do not
+depend on which is used.
 
 A builder MUST NOT treat §7 check 5 as verification of a completed layer set
 (§7). Verifying the mapping means check 6 or the sampling procedure described

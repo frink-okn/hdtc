@@ -8,12 +8,15 @@ use crate::permutation::{
 };
 use crate::quads::writer::encode_layer_set;
 use crate::quads::{
-    GraphMembership, GraphSidecarReader, PositionGraphMembership, canonical_sidecar_path,
+    GraphMembership, GraphSidecarReader, LayerMemberIter, PositionGraphMembership,
+    canonical_sidecar_path,
 };
-use crate::sort::{ExternalSorter, Sortable};
+use crate::sort::{ExternalSorter, MergeIterator, Sortable};
 use crate::triples::BitmapTriplesFiles;
 use crate::triples::id_triple::IdTriple;
 use anyhow::{Context, Result, ensure};
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
@@ -44,6 +47,13 @@ const HAS_MEMBERSHIP_IDS: u64 = 1 << 3;
 const DIRECT_PREPARED_LAYER_LIMIT: u64 = 128;
 const DIRECT_PREPARED_LAYER_BUFFER: usize = 64 * 1024;
 const DIRECT_PREPARED_LAYER_ESTIMATED_BYTES: usize = 2 * 1024 * 1024;
+const LAYER_MERGE_LIMIT: u64 = 128;
+// A chunked layer decodes one 2^POSITION_CHUNK_SHIFT container at a time, so a
+// fully dense container is the resident cost of holding one layer iterator.
+const LAYER_MERGE_ESTIMATED_BYTES: usize = (1 << POSITION_CHUNK_SHIFT) * 8;
+// Memberships per triple past which repeating a triple's key once per
+// membership costs more than the extra sorts the mapping strategy needs.
+const DECORATED_MULTIPLICITY_LIMIT: u64 = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GraphIndexOptions {
@@ -150,12 +160,31 @@ pub struct PreparedGraphIndexCollector {
     last_position: Option<u64>,
     last_graph: Option<u64>,
     last_triple: Option<IdTriple>,
+    collect_pos: bool,
+    collect_ops: bool,
 }
 
 impl PreparedGraphIndexCollector {
     pub fn new(temp_dir: &Path, memory_budget: usize) -> Self {
-        let pos_budget = (memory_budget / 2).max(1);
-        let ops_budget = memory_budget.saturating_sub(pos_budget).max(1);
+        Self::for_spaces(temp_dir, memory_budget, true, true)
+    }
+
+    /// Collect only the requested position spaces. A space that is not
+    /// collected never sees a record, so a single-space caller neither spills
+    /// runs it will not merge nor gives up half its sort budget to them.
+    pub(crate) fn for_spaces(
+        temp_dir: &Path,
+        memory_budget: usize,
+        collect_pos: bool,
+        collect_ops: bool,
+    ) -> Self {
+        let (pos_budget, ops_budget) = match (collect_pos, collect_ops) {
+            (true, true) => {
+                let pos_budget = (memory_budget / 2).max(1);
+                (pos_budget, memory_budget.saturating_sub(pos_budget).max(1))
+            }
+            _ => (memory_budget.max(1), memory_budget.max(1)),
+        };
         Self {
             pos_sorter: ExternalSorter::new(temp_dir, pos_budget),
             ops_sorter: ExternalSorter::new(temp_dir, ops_budget),
@@ -168,6 +197,8 @@ impl PreparedGraphIndexCollector {
             last_position: None,
             last_graph: None,
             last_triple: None,
+            collect_pos,
+            collect_ops,
         }
     }
 
@@ -200,33 +231,169 @@ impl PreparedGraphIndexCollector {
         );
         self.last_graph = Some(membership.graph);
 
-        self.pos_sorter.push(
-            PreparedGraphEntry {
-                first: triple.predicate,
-                second: triple.object,
-                third: triple.subject,
-                graph: membership.graph,
-                spo_position: membership.position,
-            },
-            &mut self.pos_buffer,
-            &mut self.pos_memory,
-        )?;
-        self.ops_sorter.push(
-            PreparedGraphEntry {
-                first: triple.object,
-                second: triple.predicate,
-                third: triple.subject,
-                graph: membership.graph,
-                spo_position: membership.position,
-            },
-            &mut self.ops_buffer,
-            &mut self.ops_memory,
-        )?;
+        if self.collect_pos {
+            self.pos_sorter.push(
+                PreparedGraphEntry {
+                    first: triple.predicate,
+                    second: triple.object,
+                    third: triple.subject,
+                    graph: membership.graph,
+                    spo_position: membership.position,
+                },
+                &mut self.pos_buffer,
+                &mut self.pos_memory,
+            )?;
+        }
+        if self.collect_ops {
+            self.ops_sorter.push(
+                PreparedGraphEntry {
+                    first: triple.object,
+                    second: triple.predicate,
+                    third: triple.subject,
+                    graph: membership.graph,
+                    spo_position: membership.position,
+                },
+                &mut self.ops_buffer,
+                &mut self.ops_memory,
+            )?;
+        }
         self.membership_count = self
             .membership_count
             .checked_add(1)
             .context("prepared graph-index membership count overflow")?;
         Ok(())
+    }
+}
+
+/// Position-major memberships produced by merging the sidecar's layers.
+///
+/// Every layer is already strictly increasing in position, so transposing the
+/// sidecar is a k-way merge rather than a sort of all memberships: nothing
+/// spills, and each layer contributes one buffered iterator.
+struct LayerMergeIter {
+    layers: Vec<LayerMemberIter>,
+    heads: BinaryHeap<Reverse<(u64, usize)>>,
+}
+
+impl LayerMergeIter {
+    fn new(sidecar: &mut GraphSidecarReader, named_graphs: u64) -> Result<Self> {
+        let count = usize::try_from(
+            named_graphs
+                .checked_add(1)
+                .context("layer-merge layer count overflow")?,
+        )
+        .context("layer-merge layer count overflow")?;
+        let mut layers = Vec::with_capacity(count);
+        let mut heads = BinaryHeap::with_capacity(count);
+        for graph in 0..=named_graphs {
+            let mut layer = sidecar.layer_iter(graph)?;
+            if let Some(position) = layer.next().transpose()? {
+                heads.push(Reverse((position, layers.len())));
+            }
+            layers.push(layer);
+        }
+        Ok(Self { layers, heads })
+    }
+}
+
+impl Iterator for LayerMergeIter {
+    type Item = Result<PositionGraphMembership>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let Reverse((position, index)) = self.heads.pop()?;
+        match self.layers[index].next().transpose() {
+            Ok(Some(next)) => self.heads.push(Reverse((next, index))),
+            Ok(None) => {}
+            Err(error) => return Some(Err(error)),
+        }
+        Some(Ok(PositionGraphMembership {
+            position,
+            graph: index as u64,
+        }))
+    }
+}
+
+/// The sidecar's memberships in `(position, graph)` order.
+///
+/// A bounded graph dictionary merges its layers directly. Past that the layers
+/// no longer fit as concurrent iterators, so the memberships go through the
+/// bounded external sort instead.
+enum PositionMajorMemberships {
+    Merged(LayerMergeIter),
+    // The sorter owns the chunk files its iterator reads, so it has to outlive
+    // the merge it handed out.
+    Sorted {
+        // Owns the chunk files its iterator reads, so it outlives the merge.
+        _sorter: ExternalSorter,
+        sorted: MergeIterator<PositionGraphMembership>,
+    },
+}
+
+/// Bytes the k-way layer merge holds resident, or `None` if it does not apply.
+///
+/// The merge keeps one buffered iterator per layer, so its cost is known up
+/// front rather than budgeted as a fraction. Reporting it lets the caller hand
+/// the rest of the budget to the POS/OPS sorts, which is where it does work.
+fn layer_merge_reserve(layer_count: u64, memory_budget: usize) -> Option<usize> {
+    if layer_count > LAYER_MERGE_LIMIT {
+        return None;
+    }
+    let reserve = layer_count
+        .checked_mul(LAYER_MERGE_ESTIMATED_BYTES as u64)
+        .and_then(|bytes| usize::try_from(bytes).ok())?;
+    (reserve <= memory_budget / 2).then_some(reserve)
+}
+
+impl PositionMajorMemberships {
+    fn open(
+        sidecar: &mut GraphSidecarReader,
+        named_graphs: u64,
+        temp_dir: &Path,
+        memory_budget: usize,
+        merge: bool,
+    ) -> Result<Self> {
+        let layer_count = named_graphs
+            .checked_add(1)
+            .context("layer-merge layer count overflow")?;
+        if merge {
+            tracing::info!(layer_count, "Transposing graph layers by k-way merge");
+            return Ok(Self::Merged(LayerMergeIter::new(sidecar, named_graphs)?));
+        }
+        tracing::info!(
+            layer_count,
+            "Graph count exceeds layer-merge resource limit; transposing by external sort"
+        );
+        let mut sorter = ExternalSorter::new(temp_dir, memory_budget.max(1));
+        let mut buffer = Vec::new();
+        let mut memory = 0usize;
+        for graph in 0..=named_graphs {
+            for position in sidecar.layer_iter(graph)? {
+                sorter.push(
+                    PositionGraphMembership {
+                        position: position?,
+                        graph,
+                    },
+                    &mut buffer,
+                    &mut memory,
+                )?;
+            }
+        }
+        let sorted = sorter.finish(&mut buffer)?;
+        Ok(Self::Sorted {
+            _sorter: sorter,
+            sorted,
+        })
+    }
+}
+
+impl Iterator for PositionMajorMemberships {
+    type Item = Result<PositionGraphMembership>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Merged(inner) => inner.next(),
+            Self::Sorted { sorted, .. } => sorted.next(),
+        }
     }
 }
 
@@ -1182,6 +1349,44 @@ fn assemble_from_memberships(
     )
 }
 
+/// Drain one graph-decorated position space into a graph-major membership file.
+///
+/// The sorted stream is grouped by triple, which yields the permuted position of
+/// each triple and, alongside it, that triple's graphs. `consume` sees the same
+/// grouped stream, so a permutation index can be encoded from it without sorting
+/// the triples a second time.
+fn drain_prepared_space<F>(
+    sorted: MergeIterator<PreparedGraphEntry>,
+    layer_count: u64,
+    expected_triples: u64,
+    temp_dir: &Path,
+    layer_budget: usize,
+    consume: F,
+) -> Result<TempPath>
+where
+    F: FnOnce(&mut PreparedGraphGroups<'_, MergeIterator<PreparedGraphEntry>>) -> Result<()>,
+{
+    let mut spool = PreparedLayerSpool::new(temp_dir, layer_count, layer_budget)?;
+    let mut groups = PreparedGraphGroups::new(sorted, &mut spool);
+    consume(&mut groups)?;
+    ensure!(
+        groups.positions_emitted() == expected_triples,
+        "prepared layer-set triple-count mismatch"
+    );
+    drop(groups);
+    spool.finish(temp_dir)
+}
+
+/// Drain a grouped stream when nothing else consumes it.
+fn drain_groups(
+    groups: &mut PreparedGraphGroups<'_, MergeIterator<PreparedGraphEntry>>,
+) -> Result<()> {
+    for entry in groups {
+        entry?;
+    }
+    Ok(())
+}
+
 /// Finish the default POS/OPS graph index from sort runs populated during HDT
 /// creation. Graph IDs ride through the permutation sorts, so draining each
 /// sorted stream can append directly to monotonically ordered per-graph layers.
@@ -1226,41 +1431,33 @@ pub fn finish_prepared_graph_index(
         })
         .transpose()?;
 
-    let mut pos_spool = PreparedLayerSpool::new(temp_dir, layer_count, layer_budget)?;
     let pos_sorted = collector.pos_sorter.finish(&mut collector.pos_buffer)?;
-    let mut pos_groups = PreparedGraphGroups::new(pos_sorted, &mut pos_spool);
-    if let Some(permutation) = permutation.as_mut() {
-        permutation.encode_pos(&mut pos_groups)?;
-    } else {
-        for entry in &mut pos_groups {
-            entry?;
-        }
-    }
-    ensure!(
-        pos_groups.positions_emitted() == triples_files.num_triples,
-        "prepared POS triple-count mismatch"
-    );
-    drop(pos_groups);
+    let pos_memberships = drain_prepared_space(
+        pos_sorted,
+        layer_count,
+        triples_files.num_triples,
+        temp_dir,
+        layer_budget,
+        |groups| match permutation.as_mut() {
+            Some(permutation) => permutation.encode_pos(groups),
+            None => drain_groups(groups),
+        },
+    )?;
     drop(collector.pos_sorter);
-    let pos_memberships = pos_spool.finish(temp_dir)?;
 
-    let mut ops_spool = PreparedLayerSpool::new(temp_dir, layer_count, layer_budget)?;
     let ops_sorted = collector.ops_sorter.finish(&mut collector.ops_buffer)?;
-    let mut ops_groups = PreparedGraphGroups::new(ops_sorted, &mut ops_spool);
-    if let Some(permutation) = permutation.as_mut() {
-        permutation.encode_ops(&mut ops_groups)?;
-    } else {
-        for entry in &mut ops_groups {
-            entry?;
-        }
-    }
-    ensure!(
-        ops_groups.positions_emitted() == triples_files.num_triples,
-        "prepared OPS triple-count mismatch"
-    );
-    drop(ops_groups);
+    let ops_memberships = drain_prepared_space(
+        ops_sorted,
+        layer_count,
+        triples_files.num_triples,
+        temp_dir,
+        layer_budget,
+        |groups| match permutation.as_mut() {
+            Some(permutation) => permutation.encode_ops(groups),
+            None => drain_groups(groups),
+        },
+    )?;
     drop(collector.ops_sorter);
-    let ops_memberships = ops_spool.finish(temp_dir)?;
 
     if let (Some(permutation), Some(output)) = (permutation, permutation_output) {
         permutation.finish(output)?;
@@ -1350,85 +1547,271 @@ pub fn create_graph_index(
     let named_graphs = sidecar.named_graph_count();
     let memberships = sidecar.membership_count();
 
-    let transposed = tempfile::Builder::new()
-        .prefix(".hdtc-graph-index-transposed-")
-        .tempfile_in(temp_dir)?
-        .into_temp_path();
-    sidecar.validate_strict(temp_dir, memory_budget, Some(&transposed))?;
     let sidecar_digest = sidecar.whole_file_digest()?;
 
     if memberships == 0 {
         options.membership_ranks = false;
         options.membership_ids = false;
     }
-    let transpose = if options.membership_ranks {
-        Some(build_transpose(
-            &transposed,
-            triples,
-            memberships,
-            named_graphs,
-            options.membership_ids,
-            temp_dir,
-        )?)
-    } else {
-        None
-    };
 
-    let mut collector = if options.pos_layers || options.ops_layers {
-        let mut collector = PermutationCollector::for_spaces(
+    // Transposing the sidecar is a k-way merge of its layers, each of which is
+    // already position-sorted, so it costs one buffered iterator per layer
+    // instead of an external sort of every membership. Both layer strategies
+    // below consume that same stream.
+    let layer_count = named_graphs
+        .checked_add(1)
+        .context("graph layer count overflow")?;
+    let collect_layers = options.pos_layers || options.ops_layers;
+
+    // Two ways to reach graph-major permuted positions, and which is cheaper
+    // depends on how many graphs the average triple belongs to.
+    //
+    // Decorating carries a graph ID through the POS/OPS sorts, so each triple
+    // is sorted once per membership but the layer spools can then be appended
+    // to directly. Mapping sorts each triple once, then pays two further sorts
+    // per position space to invert the permutation and regroup by graph.
+    //
+    // Decorating therefore moves fewer bytes until a triple averages several
+    // graphs, after which repeating its key per membership dominates. Measured
+    // against both, `decorate` wins comfortably through 16 memberships per
+    // triple at every budget and loses beyond that under memory pressure.
+    let decorate = collect_layers
+        && memberships <= triples.saturating_mul(DECORATED_MULTIPLICITY_LIMIT).max(1);
+    if collect_layers {
+        if decorate {
+            tracing::info!(
+                triples,
+                memberships,
+                "Building graph layers from graph-decorated permutation sorts"
+            );
+        } else {
+            tracing::info!(
+                triples,
+                memberships,
+                "Memberships per triple exceed the decorated-sort limit; \
+                 building graph layers by mapping permuted positions"
+            );
+        }
+    }
+    // `build_layer_memberships` reads the transposed stream back, so the
+    // mapping strategy needs it on disk even without membership ranks.
+    let need_transposed_file = options.membership_ranks || (collect_layers && !decorate);
+
+    // The merge's cost is one buffered iterator per layer, so reserve exactly
+    // that and leave the rest to the sorts. Only the external-sort fallback
+    // needs a real share of the budget.
+    let merge_reserve = layer_merge_reserve(layer_count, memory_budget);
+    let stream_budget = match (merge_reserve, collect_layers) {
+        (Some(reserve), _) => reserve,
+        (None, true) => (memory_budget / 2).max(1),
+        (None, false) => memory_budget.max(1),
+    };
+    let collector_budget = if decorate {
+        memory_budget.saturating_sub(stream_budget).max(1)
+    } else {
+        1
+    };
+    let mut collector = decorate.then(|| {
+        PreparedGraphIndexCollector::for_spaces(
+            temp_dir,
+            collector_budget,
+            options.pos_layers,
+            options.ops_layers,
+        )
+    });
+    let transposed = need_transposed_file
+        .then(|| -> Result<_> {
+            Ok(tempfile::Builder::new()
+                .prefix(".hdtc-graph-index-transposed-")
+                .tempfile_in(temp_dir)?
+                .into_temp_path())
+        })
+        .transpose()?;
+    let mut transposed_encoder = transposed
+        .as_deref()
+        .map(|path| -> Result<_> {
+            let file = File::create(path)
+                .with_context(|| format!("Failed to create {}", path.display()))?;
+            Ok(zstd::Encoder::new(
+                BufWriter::with_capacity(256 * 1024, file),
+                3,
+            )?)
+        })
+        .transpose()?;
+
+    let mut positioned = PositionMajorMemberships::open(
+        &mut sidecar,
+        named_graphs,
+        temp_dir,
+        stream_budget,
+        merge_reserve.is_some(),
+    )?;
+    let mut pending = positioned.next().transpose()?;
+    let mut observed_memberships = 0u64;
+    if let Some(collector) = collector.as_mut() {
+        let mut scanner = BitmapTriplesScanner::new(&metadata.offsets, hdt_path)?;
+        let mut position = 0u64;
+        while let Some((subject, predicate, object)) = scanner.next_triple()? {
+            let triple = IdTriple {
+                subject,
+                predicate,
+                object,
+            };
+            let mut joined = false;
+            while pending.is_some_and(|item| item.position == position) {
+                let item = pending.context("graph membership vanished mid-join")?;
+                if let Some(encoder) = transposed_encoder.as_mut() {
+                    item.write_to(encoder)?;
+                }
+                collector.push(
+                    triple,
+                    GraphMembership {
+                        graph: item.graph,
+                        position,
+                    },
+                )?;
+                observed_memberships += 1;
+                joined = true;
+                pending = positioned.next().transpose()?;
+            }
+            ensure!(joined, "SPO position {position} has no graph membership");
+            position += 1;
+        }
+        scanner.finish()?;
+        ensure!(position == triples, "HDT/sidecar triple-count mismatch");
+    } else {
+        while let Some(item) = pending {
+            if let Some(encoder) = transposed_encoder.as_mut() {
+                item.write_to(encoder)?;
+            }
+            observed_memberships += 1;
+            pending = positioned.next().transpose()?;
+        }
+    }
+    ensure!(
+        pending.is_none(),
+        "graph membership position exceeds the HDT triple count"
+    );
+    ensure!(
+        observed_memberships == memberships,
+        "sidecar membership-count mismatch"
+    );
+    drop(positioned);
+    if let Some(encoder) = transposed_encoder {
+        encoder.finish()?.flush()?;
+    }
+    drop(sidecar);
+
+    // Keyed off the option, not off the file: the mapping strategy stages a
+    // transposed stream of its own, and building a transpose from it that the
+    // flags do not declare would desync the section directory.
+    let transpose = options
+        .membership_ranks
+        .then(|| -> Result<_> {
+            build_transpose(
+                transposed
+                    .as_deref()
+                    .context("membership ranks require a transposed stream")?,
+                triples,
+                memberships,
+                named_graphs,
+                options.membership_ids,
+                temp_dir,
+            )
+        })
+        .transpose()?;
+
+    let layer_budget = (memory_budget / 2).max(1);
+    let (pos_memberships, ops_memberships) = if decorate {
+        let pos = options
+            .pos_layers
+            .then(|| -> Result<_> {
+                let collector = collector
+                    .as_mut()
+                    .context("POS graph-index collector is absent")?;
+                let sorted = collector.pos_sorter.finish(&mut collector.pos_buffer)?;
+                drain_prepared_space(
+                    sorted,
+                    layer_count,
+                    triples,
+                    temp_dir,
+                    layer_budget,
+                    drain_groups,
+                )
+            })
+            .transpose()?;
+        let ops = options
+            .ops_layers
+            .then(|| -> Result<_> {
+                let collector = collector
+                    .as_mut()
+                    .context("OPS graph-index collector is absent")?;
+                let sorted = collector.ops_sorter.finish(&mut collector.ops_buffer)?;
+                drain_prepared_space(
+                    sorted,
+                    layer_count,
+                    triples,
+                    temp_dir,
+                    layer_budget,
+                    drain_groups,
+                )
+            })
+            .transpose()?;
+        drop(collector);
+        (pos, ops)
+    } else if collect_layers {
+        // High multiplicity: sort each triple once, then map its permuted
+        // position onto the memberships already sitting in SPO-position order.
+        let transposed = transposed
+            .as_deref()
+            .context("mapped layer construction requires a transposed stream")?;
+        let mut permutation = PermutationCollector::for_spaces(
             temp_dir,
             memory_budget,
-            crate::permutation::PositionMaps::default(),
+            PositionMaps::default(),
             options.pos_layers,
             options.ops_layers,
         );
         let mut scanner = BitmapTriplesScanner::new(&metadata.offsets, hdt_path)?;
         while let Some((subject, predicate, object)) = scanner.next_triple()? {
-            collector.push(IdTriple {
+            permutation.push(IdTriple {
                 subject,
                 predicate,
                 object,
             })?;
         }
         scanner.finish()?;
-        Some(collector)
+        let pos = options
+            .pos_layers
+            .then(|| -> Result<_> {
+                build_layer_memberships(
+                    permutation.finish_pos()?,
+                    transposed,
+                    triples,
+                    memberships,
+                    temp_dir,
+                    layer_budget,
+                )
+            })
+            .transpose()?;
+        let ops = options
+            .ops_layers
+            .then(|| -> Result<_> {
+                build_layer_memberships(
+                    permutation.finish_ops()?,
+                    transposed,
+                    triples,
+                    memberships,
+                    temp_dir,
+                    layer_budget,
+                )
+            })
+            .transpose()?;
+        drop(permutation);
+        (pos, ops)
     } else {
-        None
+        (None, None)
     };
-
-    let pos_memberships = if options.pos_layers {
-        let sorted = collector
-            .as_mut()
-            .context("POS permutation collector is absent")?
-            .finish_pos()?;
-        Some(build_layer_memberships(
-            sorted,
-            &transposed,
-            triples,
-            memberships,
-            temp_dir,
-            (memory_budget / 2).max(1),
-        )?)
-    } else {
-        None
-    };
-    let ops_memberships = if options.ops_layers {
-        let sorted = collector
-            .as_mut()
-            .context("OPS permutation collector is absent")?
-            .finish_ops()?;
-        Some(build_layer_memberships(
-            sorted,
-            &transposed,
-            triples,
-            memberships,
-            temp_dir,
-            (memory_budget / 2).max(1),
-        )?)
-    } else {
-        None
-    };
-    drop(collector);
 
     let output = canonical_path(hdt_path);
     let parent = output.parent().unwrap_or_else(|| Path::new("."));
