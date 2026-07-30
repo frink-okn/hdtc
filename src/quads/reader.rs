@@ -166,7 +166,6 @@ struct EfHeader {
 /// dictionary, directory, indexes, and payloads remain on disk.
 pub struct GraphSidecarReader {
     hdt_path: PathBuf,
-    artifact_path: PathBuf,
     file: File,
     header: Header,
     dictionary: GraphDictionary,
@@ -242,7 +241,6 @@ impl EmbeddedLayerSetReader {
         Ok(Self {
             inner: GraphSidecarReader {
                 hdt_path: PathBuf::new(),
-                artifact_path: path.to_path_buf(),
                 file,
                 header,
                 dictionary,
@@ -478,7 +476,6 @@ impl GraphSidecarReader {
 
         Ok(Self {
             hdt_path: hdt_path.to_path_buf(),
-            artifact_path: sidecar_path.to_path_buf(),
             file,
             header,
             dictionary,
@@ -646,7 +643,7 @@ impl GraphSidecarReader {
 
     pub fn layer_iter(&mut self, graph_id: u64) -> Result<LayerMemberIter> {
         let layer = self.layer_entry(graph_id)?;
-        LayerMemberIter::new(&self.artifact_path, layer, self.header.triple_count)
+        LayerMemberIter::new(&self.file, layer, self.header.triple_count)
     }
 
     /// Perform full identity, checksum, encoding, dictionary, and exhaustive
@@ -1909,14 +1906,74 @@ pub enum LayerMemberIter {
     EliasFano(EliasFanoLayerIter),
 }
 
+/// A virtual file cursor backed by positioned reads.
+///
+/// `File::try_clone` remains bound to the same opened artifact, but cloned file
+/// descriptors may share an OS cursor. Positioned reads give every iterator an
+/// independent logical cursor without reopening a pathname that may now name a
+/// replacement artifact.
+struct PositionedFile {
+    file: File,
+    position: u64,
+}
+
+impl PositionedFile {
+    fn new(file: File) -> Self {
+        Self { file, position: 0 }
+    }
+}
+
+impl Read for PositionedFile {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        #[cfg(unix)]
+        let count = {
+            use std::os::unix::fs::FileExt;
+            self.file.read_at(bytes, self.position)?
+        };
+        #[cfg(windows)]
+        let count = {
+            use std::os::windows::fs::FileExt;
+            self.file.seek_read(bytes, self.position)?
+        };
+        #[cfg(not(any(unix, windows)))]
+        let count = {
+            let mut file = self.file.try_clone()?;
+            file.seek(SeekFrom::Start(self.position))?;
+            file.read(bytes)?
+        };
+        self.position = self
+            .position
+            .checked_add(count as u64)
+            .ok_or_else(|| std::io::Error::other("positioned read offset overflow"))?;
+        Ok(count)
+    }
+}
+
+impl Seek for PositionedFile {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+        let base = match position {
+            SeekFrom::Start(value) => {
+                self.position = value;
+                return Ok(value);
+            }
+            SeekFrom::End(delta) => i128::from(self.file.metadata()?.len()) + i128::from(delta),
+            SeekFrom::Current(delta) => i128::from(self.position) + i128::from(delta),
+        };
+        self.position = u64::try_from(base).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid positioned seek")
+        })?;
+        Ok(self.position)
+    }
+}
+
 impl LayerMemberIter {
-    fn new(path: &Path, layer: LayerEntry, universe: u64) -> Result<Self> {
+    fn new(file: &File, layer: LayerEntry, universe: u64) -> Result<Self> {
         if layer.member_count == 0 {
             return Ok(Self::Empty);
         }
         match layer.encoding {
             ENCODING_DENSE | ENCODING_SPARSE => Ok(Self::Chunked(ChunkLayerIter {
-                file: File::open(path)?,
+                file: PositionedFile::new(file.try_clone()?),
                 layer,
                 universe,
                 entry_index: 0,
@@ -1925,8 +1982,8 @@ impl LayerMemberIter {
                 yielded: 0,
             })),
             ENCODING_ELIAS_FANO => Ok(Self::EliasFano(EliasFanoLayerIter::new(
-                File::open(path)?,
-                File::open(path)?,
+                PositionedFile::new(file.try_clone()?),
+                PositionedFile::new(file.try_clone()?),
                 layer,
                 universe,
             )?)),
@@ -1948,7 +2005,7 @@ impl Iterator for LayerMemberIter {
 }
 
 pub struct ChunkLayerIter {
-    file: File,
+    file: PositionedFile,
     layer: LayerEntry,
     universe: u64,
     entry_index: u64,
@@ -2049,8 +2106,8 @@ impl Iterator for ChunkLayerIter {
 }
 
 pub struct EliasFanoLayerIter {
-    lower_file: File,
-    upper_reader: BufReader<File>,
+    lower_file: PositionedFile,
+    upper_reader: BufReader<PositionedFile>,
     header: EfHeader,
     universe: u64,
     ordinal: u64,
@@ -2061,8 +2118,8 @@ pub struct EliasFanoLayerIter {
 
 impl EliasFanoLayerIter {
     fn new(
-        mut upper_file: File,
-        lower_file: File,
+        mut upper_file: PositionedFile,
+        lower_file: PositionedFile,
         layer: LayerEntry,
         universe: u64,
     ) -> Result<Self> {
@@ -2545,7 +2602,7 @@ fn parse_hdt_triple_count(header: &[u8]) -> Result<u64> {
     value.context("HDT header has no triple count")
 }
 
-fn read_ef_header_from(file: &mut File, layer: LayerEntry) -> Result<EfHeader> {
+fn read_ef_header_from<R: Read + Seek>(file: &mut R, layer: LayerEntry) -> Result<EfHeader> {
     ensure!(
         layer.primary_length == 160,
         "invalid Elias-Fano primary length"
@@ -2585,7 +2642,7 @@ fn read_ef_header_from(file: &mut File, layer: LayerEntry) -> Result<EfHeader> {
     })
 }
 
-fn read_exact_at(file: &mut File, offset: u64, bytes: &mut [u8]) -> Result<()> {
+fn read_exact_at<R: Read + Seek>(file: &mut R, offset: u64, bytes: &mut [u8]) -> Result<()> {
     file.seek(SeekFrom::Start(offset))?;
     file.read_exact(bytes)?;
     Ok(())
@@ -2940,7 +2997,15 @@ mod tests {
             secondary_crc: 0,
             parameter: 0,
         };
-        for (ordinal, position) in LayerMemberIter::new(&path, layer, UNIVERSE)?.enumerate() {
+        drop(file);
+        let source = File::open(&path)?;
+        #[cfg(unix)]
+        {
+            let retired = temp.path().join("large-ef-layer.original");
+            std::fs::rename(&path, retired)?;
+            std::fs::write(&path, b"replacement artifact")?;
+        }
+        for (ordinal, position) in LayerMemberIter::new(&source, layer, UNIVERSE)?.enumerate() {
             assert_eq!(position?, ordinal as u64 * 2);
         }
         Ok(())

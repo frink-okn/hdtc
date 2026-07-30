@@ -36,6 +36,16 @@ fn standard_index_path(hdt: &Path) -> PathBuf {
     hdt.with_extension("hdt.index.v1-1")
 }
 
+/// Return the stable dictionary-and-triples suffix bound by graph artifacts.
+/// The preceding HDT header contains a build timestamp and is intentionally
+/// excluded from artifact identity.
+fn hdt_data_suffix(hdt: &Path) -> Vec<u8> {
+    let sidecar = fs::read(format!("{}.graphs", hdt.display())).unwrap();
+    let length = u64::from_le_bytes(sidecar[48..56].try_into().unwrap()) as usize;
+    let bytes = fs::read(hdt).unwrap();
+    bytes[bytes.len() - length..].to_vec()
+}
+
 #[test]
 fn integrated_create_matches_standalone_indexes() {
     let temp = tempfile::tempdir().unwrap();
@@ -86,10 +96,7 @@ fn integrated_create_matches_standalone_indexes() {
         "1M",
     ]));
 
-    assert_eq!(
-        fs::read(&integrated).unwrap(),
-        fs::read(&standalone).unwrap()
-    );
+    assert_eq!(hdt_data_suffix(&integrated), hdt_data_suffix(&standalone));
     assert_eq!(
         fs::read(format!("{}.graphs", integrated.display())).unwrap(),
         fs::read(format!("{}.graphs", standalone.display())).unwrap()
