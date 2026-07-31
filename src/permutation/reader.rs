@@ -147,6 +147,10 @@ impl PermutationIndex {
 
 fn validate_source_metadata(header: &Header, hdt: &HdtMetadata) -> Result<()> {
     ensure!(
+        header.pos_pairs == header.ops_pairs,
+        "POS/OPS pair-count mismatch"
+    );
+    ensure!(
         header.triples == hdt.triples,
         "permutation/HDT triple-count mismatch"
     );

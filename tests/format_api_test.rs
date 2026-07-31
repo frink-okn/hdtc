@@ -11,17 +11,24 @@ mod common;
 
 use common::{REPRESENTATIVE_NT, write_file};
 use hdtc::format::{
-    PermutationIndex, packed_len, permutation_index_path, scan_hdt_sections, sha256_to_end,
+    PermutationComponent, PermutationIndex, PermutationSectionKind, packed_len,
+    permutation_index_path, scan_hdt_sections, sha256_to_end,
 };
 use std::fs::File;
 use std::io::{BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Section types are `(component << 8) | kind`; see `docs/permutation-index-format.md` §5.
-const COMPONENT_POS: u32 = 0x01;
-const COMPONENT_OPS: u32 = 0x02;
-const COMPONENT_SPO: u32 = 0x03;
+const CORE_KINDS: [PermutationSectionKind; 8] = [
+    PermutationSectionKind::ArrayY,
+    PermutationSectionKind::BitmapY,
+    PermutationSectionKind::ArrayZ,
+    PermutationSectionKind::BitmapZ,
+    PermutationSectionKind::BitmapYSuperrank,
+    PermutationSectionKind::BitmapYSubrank,
+    PermutationSectionKind::BitmapZSuperrank,
+    PermutationSectionKind::BitmapZSubrank,
+];
 
 fn build_fixture(temp: &Path) -> PathBuf {
     let input = temp.join("input.nt");
@@ -78,20 +85,18 @@ fn the_permutation_directory_describes_every_region_well_enough_to_map_it() {
             .all(|w| w[0].section_type < w[1].section_type),
         "the directory must be ascending and duplicate-free"
     );
-    for component in [COMPONENT_POS, COMPONENT_OPS] {
-        for kind in 1..=8u32 {
+    for component in [PermutationComponent::Pos, PermutationComponent::Ops] {
+        for kind in CORE_KINDS {
+            let want = component.section_type(kind);
             assert!(
-                sections
-                    .iter()
-                    .any(|s| s.section_type == (component << 8) | kind),
-                "missing section {:#06x}",
-                (component << 8) | kind
+                sections.iter().any(|s| s.section_type == want),
+                "missing section {want:#06x}",
             );
         }
     }
     // SPO carries directories only: its bitmaps live in the HDT (§7.3).
-    for kind in 5..=8u32 {
-        let want = (COMPONENT_SPO << 8) | kind;
+    for &kind in &CORE_KINDS[4..] {
+        let want = PermutationComponent::Spo.section_type(kind);
         let section = sections
             .iter()
             .find(|s| s.section_type == want)
@@ -215,12 +220,24 @@ fn the_hdt_scan_describes_every_section_well_enough_to_map_it() {
     // lengths must be the ones the scan found: kinds 5–6 cover BitmapY, 7–8
     // BitmapZ (`docs/permutation-index-format.md` §7.3).
     for (kind, bits) in [
-        (5u32, sections.bitmap_y.num_bits),
-        (6, sections.bitmap_y.num_bits),
-        (7, sections.bitmap_z.num_bits),
-        (8, sections.bitmap_z.num_bits),
+        (
+            PermutationSectionKind::BitmapYSuperrank,
+            sections.bitmap_y.num_bits,
+        ),
+        (
+            PermutationSectionKind::BitmapYSubrank,
+            sections.bitmap_y.num_bits,
+        ),
+        (
+            PermutationSectionKind::BitmapZSuperrank,
+            sections.bitmap_z.num_bits,
+        ),
+        (
+            PermutationSectionKind::BitmapZSubrank,
+            sections.bitmap_z.num_bits,
+        ),
     ] {
-        let want = (COMPONENT_SPO << 8) | kind;
+        let want = PermutationComponent::Spo.section_type(kind);
         let section = index
             .sections()
             .iter()
