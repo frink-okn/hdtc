@@ -154,7 +154,7 @@ pub(crate) fn is_array(section_type: u32) -> bool {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct Header {
+pub struct Header {
     pub flags: u64,
     pub triples: u64,
     pub subjects: u64,
@@ -173,7 +173,7 @@ pub(crate) struct Header {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct Section {
+pub struct Section {
     pub section_type: u32,
     pub flags: u32,
     pub offset: u64,

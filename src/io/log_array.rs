@@ -577,7 +577,6 @@ impl LogArrayReader {
     }
 
     /// Whether the array is empty.
-    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.num_entries == 0
     }

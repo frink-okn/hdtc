@@ -35,6 +35,36 @@ impl PermutationIndex {
         })
     }
 
+    /// The file this index was opened from.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The parsed 256-byte file header.
+    ///
+    /// Exposed for readers that map the file rather than seek it: the header
+    /// carries the identifier-space sizes and pair counts needed to size typed
+    /// views, plus the source binding needed to check the file against its HDT.
+    pub fn header(&self) -> &Header {
+        &self.header
+    }
+
+    /// The section directory, ascending by section type.
+    ///
+    /// Each entry gives a section's absolute payload offset, byte length, entry
+    /// count, element width, and — for the SPO directory sections — the length
+    /// of the HDT bitmap it indexes. That is everything required to build a
+    /// mapped view of a region without re-deriving the layout, and the format's
+    /// mapped-load guarantee (`docs/permutation-index-format.md` §2.1) holds for
+    /// every byte range described here.
+    ///
+    /// This is the integration point for out-of-process mapped readers such as
+    /// KGF's `kgf-store` (KGF doc 20 §20.4). [`triples`](Self::triples) is a
+    /// seek-based path for this crate's CLI and is not on theirs.
+    pub fn sections(&self) -> &[Section] {
+        &self.sections
+    }
+
     fn section(&self, section_type: u32) -> Result<&Section> {
         self.sections
             .binary_search_by_key(&section_type, |section| section.section_type)

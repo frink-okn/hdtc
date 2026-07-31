@@ -53,7 +53,7 @@ pub(crate) fn hdt_data_offset<R: Read + Seek>(reader: &mut R) -> Result<u64> {
 }
 
 /// SHA-256 over every remaining byte of `reader`.
-pub(crate) fn sha256_to_end<R: Read>(reader: &mut R) -> Result<[u8; 32]> {
+pub fn sha256_to_end<R: Read>(reader: &mut R) -> Result<[u8; 32]> {
     let mut hasher = Sha256::new();
     std::io::copy(reader, &mut hasher)?;
     Ok(hasher.finalize().into())
