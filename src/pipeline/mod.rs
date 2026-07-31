@@ -1102,6 +1102,29 @@ impl GraphMembershipSpool {
     }
 }
 
+/// Budgets for sorters that fill concurrently while the SPO merge is drained.
+///
+/// Triples mode has no membership spool, so a requested permutation collector
+/// gets the whole budget. In quads mode, membership collection always runs and
+/// shares the budget with the optional POS/OPS collector.
+fn stage6_concurrent_sort_budgets(
+    total: usize,
+    include_graphs: bool,
+    collect_permutations: bool,
+) -> (usize, usize) {
+    let total = total.max(1);
+    match (include_graphs, collect_permutations) {
+        (true, true) => {
+            let permutations = (total / 2).max(1);
+            let memberships = total.saturating_sub(permutations).max(1);
+            (permutations, memberships)
+        }
+        (true, false) => (0, total),
+        (false, true) => (total, 0),
+        (false, false) => (0, 0),
+    }
+}
+
 /// Stage 6 record collector.
 ///
 /// Triples mode never reads the graph column, so it sorts bare 24-byte
@@ -1598,18 +1621,18 @@ pub fn run_pipeline(
     // Stage 6: External sort + BitmapTriples construction
     tracing::info!("Stage 6: Sorting global-ID quad memberships in SPO+G order");
 
-    // Integrated permutation or graph indexing adds a second pair of external
-    // sorts (POS and OPS) that fill while this sorter's drained buffer still
-    // holds its capacity, so the stage-5/6 sort budget is split between them.
-    let perm_sort_budget = if permutation_maps.is_some() || prepare_graph_index {
-        stage56_budget.sort_budget_bytes / 2
-    } else {
-        0
-    };
-    let spo_sort_budget = stage56_budget
-        .sort_budget_bytes
-        .saturating_sub(perm_sort_budget)
-        .max(std::mem::size_of::<IdQuad>());
+    // The SPO sort finishes before any derived sort starts, and each match arm
+    // drops its drained input buffer before filling the later sorters. It can
+    // therefore use the whole stage budget. During a quads build, however, the
+    // graph-major membership sorter and an optional POS/OPS collector fill at
+    // the same time, so those two must share that budget.
+    let collect_permutations = permutation_maps.is_some() || prepare_graph_index;
+    let (perm_sort_budget, membership_sort_budget) = stage6_concurrent_sort_budgets(
+        stage56_budget.sort_budget_bytes,
+        include_graphs,
+        collect_permutations,
+    );
+    let spo_sort_budget = stage56_budget.sort_budget_bytes.max(1);
 
     // Collect statements into the external sorter, tracking max IDs for
     // BitmapTriples bit widths.
@@ -1679,6 +1702,9 @@ pub fn run_pipeline(
             mut buffer,
         } => {
             let sorted_quads = sorter.finish(&mut buffer)?;
+            // `finish` drains the vector but deliberately retains its capacity.
+            // Release it before the membership and permutation sorters begin.
+            drop(buffer);
             push_stage_metric(
                 &mut stage_metrics,
                 "Stage 6 external sort",
@@ -1698,11 +1724,8 @@ pub fn run_pipeline(
                 .graphs
                 .checked_add(1)
                 .context("graph layer count overflow")?;
-            let mut membership_spool = GraphMembershipSpool::new(
-                temp_dir,
-                graph_layer_count,
-                stage56_budget.sort_budget_bytes,
-            )?;
+            let mut membership_spool =
+                GraphMembershipSpool::new(temp_dir, graph_layer_count, membership_sort_budget)?;
 
             let union_triples = QuadUnionIterator::new(sorted_quads, |triple, membership| {
                 membership_spool.push(membership)?;
@@ -1735,6 +1758,9 @@ pub fn run_pipeline(
             mut buffer,
         } => {
             let sorted_triples = sorter.finish(&mut buffer)?;
+            // The optional permutation collector is the only large resident
+            // sorter in this phase, so do not keep the drained SPO capacity.
+            drop(buffer);
             push_stage_metric(
                 &mut stage_metrics,
                 "Stage 6 external sort",
@@ -1803,6 +1829,14 @@ pub fn run_pipeline(
 mod tests {
     use super::*;
     use std::io::BufReader;
+
+    #[test]
+    fn concurrent_stage6_sorters_share_one_budget() {
+        assert_eq!(stage6_concurrent_sort_budgets(100, true, true), (50, 50));
+        assert_eq!(stage6_concurrent_sort_budgets(100, true, false), (0, 100));
+        assert_eq!(stage6_concurrent_sort_budgets(100, false, true), (100, 0));
+        assert_eq!(stage6_concurrent_sort_budgets(100, false, false), (0, 0));
+    }
 
     #[test]
     fn direct_graph_spool_emits_graph_major_concatenated_frames() {

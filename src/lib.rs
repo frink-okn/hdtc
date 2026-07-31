@@ -177,11 +177,17 @@ pub fn run() -> Result<()> {
         (_, 1) => EnvFilter::new("debug"),
         (_, _) => EnvFilter::new("trace"),
     };
-    tracing_subscriber::fmt()
+    if let Err(error) = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
         .with_target(false)
-        .init();
+        .try_init()
+    {
+        // Embedders commonly install their own process-global subscriber before
+        // invoking a library entry point. Keep their subscriber and preserve
+        // `run`'s Result-based failure contract instead of panicking.
+        tracing::debug!(%error, "Using existing tracing subscriber");
+    }
 
     if let Some((old, target)) = raised_fd_limit {
         tracing::debug!(old, target, "Raised file descriptor limit");
@@ -1250,7 +1256,12 @@ fn validate_hdt_file(args: cli::ValidateArgs, benchmark: bool) -> Result<()> {
     match index::validate_hdt_triples(&args.hdt_file) {
         Ok(()) => {
             let sidecar_path = quads::canonical_sidecar_path(&args.hdt_file);
-            if sidecar_path.exists() {
+            let graph_index_path = graph_index::canonical_path(&args.hdt_file);
+            // Strict graph-index validation includes strict validation of both
+            // parents and reuses the sidecar's position-major membership stream.
+            // Running the standalone sidecar validator first would externally
+            // sort every membership twice.
+            if sidecar_path.exists() && !graph_index_path.exists() {
                 tracing::info!("Validating graph sidecar: {}", sidecar_path.display());
                 let temp_dir = match &args.temp_dir {
                     Some(path) => {
@@ -1279,9 +1290,11 @@ fn validate_hdt_file(args: cli::ValidateArgs, benchmark: bool) -> Result<()> {
                     args.memory_limit.as_bytes(),
                 )?;
             }
-            let graph_index_path = graph_index::canonical_path(&args.hdt_file);
             if graph_index_path.exists() {
-                tracing::info!("Validating graph index: {}", graph_index_path.display());
+                tracing::info!(
+                    "Validating graph sidecar and graph index: {}",
+                    graph_index_path.display()
+                );
                 let temp_dir = match &args.temp_dir {
                     Some(path) => {
                         std::fs::create_dir_all(path)?;
