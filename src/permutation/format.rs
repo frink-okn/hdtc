@@ -50,12 +50,9 @@ pub(crate) fn align64(value: u64) -> Result<u64> {
         .context("permutation-index alignment overflow")
 }
 
-pub(crate) fn packed_len(count: u64, width: u8) -> Result<u64> {
-    count
-        .checked_mul(u64::from(width))
-        .context("packed section bit-length overflow")
-        .map(|bits| bits.div_ceil(8))
-}
+/// Bit-packed regions round to a whole byte the same way here as in every other
+/// format this crate writes, so the rule lives in one place.
+pub(crate) use crate::io::packed_len;
 
 pub(crate) fn id_width(maximum: u64) -> u8 {
     if maximum == 0 {

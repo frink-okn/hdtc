@@ -25,7 +25,7 @@ use std::time::Instant;
 use writer::write_index_streaming;
 
 const PFC_SECTION_TYPE: u8 = 0x02;
-const DICTIONARY_FOUR_FORMAT: &str = "<http://purl.org/HDT/hdt#dictionaryFour>";
+use crate::hdt::sections::DICTIONARY_FOUR_FORMAT;
 
 fn read_vbyte_from_reader<R: Read>(reader: &mut R) -> Result<u64> {
     let mut value: u64 = 0;

@@ -2,8 +2,9 @@ use super::format::*;
 use crate::dictionary::DictCounts;
 use crate::hdt::artifacts::SourceIdentity;
 use crate::hdt::reader::{BitmapTriplesScanner, HdtSectionOffsets};
-use crate::io::crc_utils::{CRC32C_ALGO, crc8, crc32c};
-use crate::io::{ControlInfo, ControlType, StreamingBitmapEncoder, StreamingLogArrayEncoder};
+use crate::hdt::sections::scan_hdt_sections;
+use crate::io::crc_utils::{CRC32C_ALGO, crc32c};
+use crate::io::{StreamingBitmapEncoder, StreamingLogArrayEncoder};
 use crate::sort::{ExternalSorter, Sortable};
 use crate::triples::BitmapTriplesFiles;
 use crate::triples::id_triple::IdTriple;
@@ -13,9 +14,6 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use tempfile::{NamedTempFile, TempPath};
-
-const DICTIONARY_FOUR_FORMAT: &str = "<http://purl.org/HDT/hdt#dictionaryFour>";
-const TRIPLES_BITMAP_FORMAT: &str = "<http://purl.org/HDT/hdt#triplesBitmap>";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PositionMaps {
@@ -44,235 +42,61 @@ pub(crate) struct HdtMetadata {
     pub bitmap_z: RawBitmap,
 }
 
-fn read_bitmap<R: Read + Seek>(reader: &mut R, path: &Path) -> Result<(u64, u64, u64)> {
-    let section_start = reader.stream_position()?;
-    let mut preamble = vec![0u8; 1];
-    reader.read_exact(&mut preamble)?;
-    ensure!(preamble[0] == 1, "invalid HDT bitmap section type");
-    let bits = read_vbyte_recording(reader, &mut preamble)?;
-    let mut stored_crc = [0u8; 1];
-    reader.read_exact(&mut stored_crc)?;
-    ensure!(
-        crc8(&preamble) == stored_crc[0],
-        "HDT bitmap preamble CRC8 mismatch"
-    );
-    let data_offset = reader.stream_position()?;
-    let data_len = bits.div_ceil(8);
-    reader.seek(SeekFrom::Current(
-        i64::try_from(data_len).context("bitmap is too large to seek")?,
-    ))?;
-    let mut data_crc = [0u8; 4];
-    reader
-        .read_exact(&mut data_crc)
-        .with_context(|| format!("truncated bitmap in {}", path.display()))?;
-    Ok((section_start, data_offset, bits))
-}
-
-fn read_array<R: Read + Seek>(reader: &mut R, path: &Path) -> Result<(u64, u64, u8)> {
-    let section_start = reader.stream_position()?;
-    let mut preamble = vec![0u8; 2];
-    reader.read_exact(&mut preamble)?;
-    ensure!(preamble[0] == 1, "invalid HDT LogArray section type");
-    let width = preamble[1];
-    ensure!(width <= 64, "invalid HDT LogArray width");
-    let entries = read_vbyte_recording(reader, &mut preamble)?;
-    let mut stored_crc = [0u8; 1];
-    reader.read_exact(&mut stored_crc)?;
-    ensure!(
-        crc8(&preamble) == stored_crc[0],
-        "HDT LogArray preamble CRC8 mismatch"
-    );
-    let data_len = packed_len(entries, width)?;
-    reader.seek(SeekFrom::Current(
-        i64::try_from(data_len).context("LogArray is too large to seek")?,
-    ))?;
-    let mut data_crc = [0u8; 4];
-    reader
-        .read_exact(&mut data_crc)
-        .with_context(|| format!("truncated LogArray in {}", path.display()))?;
-    Ok((section_start, entries, width))
-}
-
-fn read_vbyte_recording<R: Read>(reader: &mut R, bytes: &mut Vec<u8>) -> Result<u64> {
-    let mut value = 0u64;
-    let mut shift = 0u32;
-    loop {
-        let mut byte = [0u8; 1];
-        reader.read_exact(&mut byte)?;
-        bytes.push(byte[0]);
-        value |= u64::from(byte[0] & 0x7f) << shift;
-        if byte[0] & 0x80 != 0 {
-            return Ok(value);
-        }
-        shift += 7;
-        ensure!(shift < 64, "invalid VByte in HDT section preamble");
-    }
-}
-
-/// Read the counts needed by the permutation format and seek past a PFC
-/// section without materializing its block-offset LogArray. The normal PFC
-/// reader expands those offsets for random term access; this structural scan
-/// only needs the string count and the position of the following section.
-fn skip_pfc_section<R: Read + Seek>(reader: &mut R, section_name: &str) -> Result<u64> {
-    let mut preamble = vec![0u8; 1];
-    reader.read_exact(&mut preamble)?;
-    ensure!(preamble[0] == 2, "invalid {section_name} PFC section type");
-    let string_count = read_vbyte_recording(reader, &mut preamble)?;
-    let buffer_length = read_vbyte_recording(reader, &mut preamble)?;
-    let block_size = read_vbyte_recording(reader, &mut preamble)?;
-    ensure!(block_size > 0, "invalid {section_name} PFC block size");
-    let mut stored_crc = [0u8; 1];
-    reader.read_exact(&mut stored_crc)?;
-    ensure!(
-        crc8(&preamble) == stored_crc[0],
-        "{section_name} PFC preamble CRC8 mismatch"
-    );
-
-    let mut offsets_preamble = vec![0u8; 2];
-    reader.read_exact(&mut offsets_preamble)?;
-    ensure!(
-        offsets_preamble[0] == 1,
-        "invalid {section_name} PFC offsets LogArray type"
-    );
-    let offsets_width = offsets_preamble[1];
-    ensure!(
-        offsets_width <= 64,
-        "invalid {section_name} PFC offsets width"
-    );
-    let offsets_count = read_vbyte_recording(reader, &mut offsets_preamble)?;
-    reader.read_exact(&mut stored_crc)?;
-    ensure!(
-        crc8(&offsets_preamble) == stored_crc[0],
-        "{section_name} PFC offsets preamble CRC8 mismatch"
-    );
-    let expected_offsets = string_count
-        .div_ceil(block_size)
-        .checked_add(1)
-        .context("PFC block-offset count overflow")?;
-    ensure!(
-        offsets_count == expected_offsets,
-        "unexpected {section_name} PFC block-offset count"
-    );
-
-    let offsets_length = packed_len(offsets_count, offsets_width)?;
-    let bytes_to_skip = offsets_length
-        .checked_add(4)
-        .and_then(|length| length.checked_add(buffer_length))
-        .and_then(|length| length.checked_add(4))
-        .context("PFC section length overflow")?;
-    reader.seek(SeekFrom::Current(
-        i64::try_from(bytes_to_skip).context("PFC section is too large to seek")?,
-    ))?;
-    Ok(string_count)
-}
-
+/// Locate everything in a host HDT that building a sidecar needs.
+///
+/// The structural walk itself is [`scan_hdt_sections`] — the same preamble-only
+/// scan the mapped readers downstream use, so there is one implementation of
+/// "where is BitmapY" rather than one per consumer. This adds what is specific
+/// to sidecar construction: the identifier-space sizes the permutation header
+/// records, and the file-length check that catches a truncated source.
 pub(crate) fn scan_hdt(path: &Path) -> Result<HdtMetadata> {
     let file =
         File::open(path).with_context(|| format!("Failed to open HDT file {}", path.display()))?;
     let file_length = file.metadata()?.len();
     let mut reader = BufReader::with_capacity(256 * 1024, file);
 
-    let global =
-        ControlInfo::read_from(&mut reader).context("Failed to read HDT global control info")?;
+    let sections = scan_hdt_sections(&mut reader)
+        .with_context(|| format!("Failed to scan HDT file {}", path.display()))?;
     ensure!(
-        global.control_type == ControlType::Global,
-        "expected HDT global control info"
-    );
-    let header =
-        ControlInfo::read_from(&mut reader).context("Failed to read HDT header control info")?;
-    ensure!(
-        header.control_type == ControlType::Header,
-        "expected HDT header control info"
-    );
-    let header_length: u64 = header
-        .get_property("length")
-        .context("HDT header is missing length")?
-        .parse()
-        .context("invalid HDT header length")?;
-    reader.seek(SeekFrom::Current(
-        i64::try_from(header_length).context("HDT header is too large")?,
-    ))?;
-    let data_offset = reader.stream_position()?;
-
-    let dictionary = ControlInfo::read_from(&mut reader)
-        .context("Failed to read HDT dictionary control info")?;
-    ensure!(
-        dictionary.control_type == ControlType::Dictionary,
-        "expected HDT dictionary control info"
-    );
-    ensure!(
-        dictionary.format == DICTIONARY_FOUR_FORMAT,
-        "unsupported HDT dictionary format: {}",
-        dictionary.format
-    );
-    let shared = skip_pfc_section(&mut reader, "shared")?;
-    let subjects_only = skip_pfc_section(&mut reader, "subjects")?;
-    let predicates = skip_pfc_section(&mut reader, "predicates")?;
-    let objects_only = skip_pfc_section(&mut reader, "objects")?;
-
-    let triples_ci =
-        ControlInfo::read_from(&mut reader).context("Failed to read HDT triples control info")?;
-    ensure!(
-        triples_ci.control_type == ControlType::Triples,
-        "expected HDT triples control info"
-    );
-    ensure!(
-        triples_ci.format == TRIPLES_BITMAP_FORMAT,
-        "unsupported HDT triples format: {}",
-        triples_ci.format
-    );
-    let triples_order: u64 = triples_ci
-        .get_property("order")
-        .context("HDT triples control info is missing order")?
-        .parse()
-        .context("invalid HDT triples order")?;
-    ensure!(
-        triples_order == 1,
-        "permutation indexes require SPO-ordered HDT triples"
-    );
-
-    let (by_start, by_data, by_bits) = read_bitmap(&mut reader, path)?;
-    let (bz_start, bz_data, bz_bits) = read_bitmap(&mut reader, path)?;
-    let (ay_start, ay_entries, _) = read_array(&mut reader, path)?;
-    let (az_start, az_entries, _) = read_array(&mut reader, path)?;
-    ensure!(by_bits == ay_entries, "HDT BitmapY/ArrayY length mismatch");
-    ensure!(bz_bits == az_entries, "HDT BitmapZ/ArrayZ length mismatch");
-    ensure!(
-        reader.stream_position()? == file_length,
+        sections.end() == file_length,
         "trailing or truncated bytes after HDT triples"
     );
 
-    let subjects = shared
-        .checked_add(subjects_only)
+    let subjects = sections
+        .shared
+        .string_count
+        .checked_add(sections.subjects.string_count)
         .context("subject count overflow")?;
-    let objects = shared
-        .checked_add(objects_only)
+    let objects = sections
+        .shared
+        .string_count
+        .checked_add(sections.objects.string_count)
         .context("object count overflow")?;
     Ok(HdtMetadata {
-        data_offset,
+        data_offset: sections.data_offset,
         file_length,
-        triples: az_entries,
-        sp_pairs: ay_entries,
+        triples: sections.num_triples(),
+        sp_pairs: sections.num_sp_pairs(),
         subjects,
-        predicates,
+        predicates: sections.predicates.string_count,
         objects,
         offsets: HdtSectionOffsets {
-            num_triples: az_entries,
-            num_sp_pairs: ay_entries,
-            by_start,
-            bz_start,
-            ay_start,
-            az_start,
+            num_triples: sections.num_triples(),
+            num_sp_pairs: sections.num_sp_pairs(),
+            by_start: sections.bitmap_y.section_start,
+            bz_start: sections.bitmap_z.section_start,
+            ay_start: sections.array_y.section_start,
+            az_start: sections.array_z.section_start,
         },
         bitmap_y: RawBitmap {
             path: path.to_path_buf(),
-            data_offset: by_data,
-            bits: by_bits,
+            data_offset: sections.bitmap_y.data_start,
+            bits: sections.bitmap_y.num_bits,
         },
         bitmap_z: RawBitmap {
             path: path.to_path_buf(),
-            data_offset: bz_data,
-            bits: bz_bits,
+            data_offset: sections.bitmap_z.data_start,
+            bits: sections.bitmap_z.num_bits,
         },
     })
 }
@@ -1274,35 +1098,4 @@ pub fn finish_prepared_index(
     assembler.encode_ops(ops)?;
     drop(collector.ops_sorter);
     assembler.finish(output)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::dictionary::pfc::PfcEncoder;
-    use std::io::Cursor;
-
-    #[test]
-    fn structural_pfc_skip_preserves_counts_and_next_section_position() {
-        for terms in [&[][..], &["alpha", "beta", "gamma"][..]] {
-            let mut encoder = PfcEncoder::with_block_size(2);
-            for term in terms {
-                encoder.push(*term);
-            }
-            let mut section = Vec::new();
-            encoder.write_to(&mut section).unwrap();
-            let section_length = section.len() as u64;
-            section.extend_from_slice(b"next");
-
-            let mut reader = Cursor::new(section);
-            assert_eq!(
-                skip_pfc_section(&mut reader, "test").unwrap(),
-                terms.len() as u64
-            );
-            assert_eq!(reader.position(), section_length);
-            let mut next = [0u8; 4];
-            reader.read_exact(&mut next).unwrap();
-            assert_eq!(&next, b"next");
-        }
-    }
 }

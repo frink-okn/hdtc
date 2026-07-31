@@ -4,9 +4,12 @@
 //! decoding blocks sequentially. O(block_size) memory — no seeking needed.
 
 use crate::io::crc_utils::crc8;
-use crate::io::{LogArrayReader, decode_vbyte, encode_vbyte, read_vbyte};
-use anyhow::{Context, Result, bail};
-use std::io::Read;
+use crate::io::{
+    LogArrayReader, LogArraySection, decode_vbyte, encode_vbyte, read_vbyte, read_vbyte_recording,
+    scan_log_array_section, verify_preamble_crc8,
+};
+use anyhow::{Context, Result, bail, ensure};
+use std::io::{Read, Seek, SeekFrom};
 
 const PFC_SECTION_TYPE: u8 = 0x02;
 
@@ -282,19 +285,157 @@ impl<R: Read> Iterator for PfcSectionIterator<R> {
     }
 }
 
+/// Where a PFC section's parts are and what shape they have, from preambles.
+///
+/// Produced by [`scan_pfc_section`], which reads no payload byte — neither a
+/// block offset nor a term.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PfcSection {
+    /// Offset of the section, i.e. of its type byte.
+    pub section_start: u64,
+    /// Terms in the section; ids run `1..=string_count`.
+    pub string_count: u64,
+    /// Terms per block. Only a block's first term is stored uncompressed.
+    pub block_size: u64,
+    /// The `LogArray` of block start offsets into the string buffer, with a
+    /// sentinel entry holding [`buffer_length`](Self::buffer_length).
+    pub offsets: LogArraySection,
+    /// Offset of the front-coded string buffer.
+    pub buffer_start: u64,
+    /// Length of the string buffer in bytes.
+    pub buffer_length: u64,
+    /// Offset just past the buffer's CRC32C — where the next section begins.
+    pub section_end: u64,
+}
+
+/// Locate a PFC section's block offsets and string buffer from its preambles,
+/// leaving `reader` past the section.
+///
+/// Verifies both preamble CRC8s and that the block-offset count matches the
+/// string count, but reads **no payload**: on a large dictionary the
+/// block-offset array alone runs to millions of entries, which is why
+/// [`PfcSectionHeader::read_from`] — which materializes it — must not be on a
+/// mapped reader's open path (KGF doc 20 §20.4). The sentinel check that reader
+/// performs needs a payload read and so belongs to verification rather than to
+/// open.
+pub fn scan_pfc_section<R: Read + Seek>(reader: &mut R, section_name: &str) -> Result<PfcSection> {
+    let section_start = reader.stream_position()?;
+
+    let mut preamble = vec![0u8; 1];
+    reader.read_exact(&mut preamble)?;
+    ensure!(
+        preamble[0] == PFC_SECTION_TYPE,
+        "invalid dictionary section type for {section_name}: expected {PFC_SECTION_TYPE:#04x}, got {:#04x}",
+        preamble[0]
+    );
+    let string_count = read_vbyte_recording(reader, &mut preamble)?;
+    let buffer_length = read_vbyte_recording(reader, &mut preamble)?;
+    let block_size = read_vbyte_recording(reader, &mut preamble)?;
+    ensure!(block_size > 0, "invalid {section_name} PFC block size 0");
+    verify_preamble_crc8(reader, &preamble, &format!("{section_name} PFC"))?;
+
+    let offsets = scan_log_array_section(reader)
+        .with_context(|| format!("Failed to scan {section_name} PFC block offsets"))?;
+    let expected_offsets = string_count
+        .div_ceil(block_size)
+        .checked_add(1)
+        .context("PFC block-offset count overflow")?;
+    ensure!(
+        offsets.num_entries == expected_offsets,
+        "unexpected {section_name} PFC block-offset count: got {}, expected {expected_offsets}",
+        offsets.num_entries
+    );
+
+    let buffer_start = reader.stream_position()?;
+    let skip = buffer_length
+        .checked_add(4)
+        .context("PFC string buffer length overflow")?;
+    let section_end = reader.seek(SeekFrom::Current(
+        i64::try_from(skip).context("PFC string buffer is too large to seek")?,
+    ))?;
+
+    Ok(PfcSection {
+        section_start,
+        string_count,
+        block_size,
+        offsets,
+        buffer_start,
+        buffer_length,
+        section_end,
+    })
+}
+
 /// Read and skip a PFC section, returning its string count.
 ///
 /// Useful when you need to skip past a section without decoding all terms.
-/// Uses `Seek` to skip the string buffer efficiently without allocation.
-pub fn skip_pfc_section<R: Read + std::io::Seek>(
-    reader: &mut R,
-    section_name: &str,
-) -> Result<u64> {
-    let header = PfcSectionHeader::read_from(reader, section_name)?;
-    let string_count = header.string_count;
+/// A thin wrapper over [`scan_pfc_section`]; use that when the offsets matter.
+pub fn skip_pfc_section<R: Read + Seek>(reader: &mut R, section_name: &str) -> Result<u64> {
+    Ok(scan_pfc_section(reader, section_name)?.string_count)
+}
 
-    // Skip the string buffer + CRC32C
-    reader.seek(std::io::SeekFrom::Current(header.buffer_length as i64 + 4))?;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dictionary::pfc::PfcEncoder;
+    use std::io::Cursor;
 
-    Ok(string_count)
+    /// The scan must describe a section the encoder just wrote, and land exactly
+    /// on what follows it — the property every walk built from it depends on.
+    #[test]
+    fn scanning_a_section_locates_its_parts_and_the_next_section() {
+        for terms in [&[][..], &["alpha", "beta", "gamma"][..]] {
+            let mut encoder = PfcEncoder::with_block_size(2);
+            for term in terms {
+                encoder.push(*term);
+            }
+            let mut section = Vec::new();
+            encoder.write_to(&mut section).unwrap();
+            let section_length = section.len() as u64;
+            section.extend_from_slice(b"next");
+
+            let mut reader = Cursor::new(section);
+            let scanned = scan_pfc_section(&mut reader, "test").unwrap();
+
+            assert_eq!(scanned.section_start, 0);
+            assert_eq!(scanned.string_count, terms.len() as u64);
+            assert_eq!(scanned.block_size, 2);
+            assert_eq!(
+                scanned.offsets.num_entries,
+                (terms.len() as u64).div_ceil(2) + 1,
+                "one offset per block plus the sentinel"
+            );
+            // The three parts are contiguous: preamble, block offsets, buffer.
+            assert!(scanned.offsets.section_start > scanned.section_start);
+            assert_eq!(
+                scanned.offsets.section_end, scanned.buffer_start,
+                "the string buffer follows the block offsets"
+            );
+            assert_eq!(scanned.section_end, section_length);
+            assert_eq!(reader.position(), section_length);
+
+            let mut next = [0u8; 4];
+            reader.read_exact(&mut next).unwrap();
+            assert_eq!(&next, b"next");
+        }
+    }
+
+    /// A materializing read of the same section must agree with the scan, since
+    /// the two parse the same preamble for different consumers.
+    #[test]
+    fn the_scan_and_the_materializing_reader_agree() {
+        let mut encoder = PfcEncoder::with_block_size(4);
+        for term in ["alpha", "beta", "delta", "epsilon", "gamma"] {
+            encoder.push(term);
+        }
+        let mut section = Vec::new();
+        encoder.write_to(&mut section).unwrap();
+
+        let scanned = scan_pfc_section(&mut Cursor::new(section.clone()), "test").unwrap();
+        let header = PfcSectionHeader::read_from(&mut Cursor::new(section), "test").unwrap();
+
+        assert_eq!(scanned.string_count, header.string_count);
+        assert_eq!(scanned.block_size, header.block_size);
+        assert_eq!(scanned.buffer_length, header.buffer_length);
+        assert_eq!(scanned.offsets.num_entries, header.offsets.len() as u64);
+    }
 }

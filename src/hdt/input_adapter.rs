@@ -20,8 +20,7 @@ use std::fs::File;
 use std::io::{BufReader, Cursor, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-const DICTIONARY_FOUR_FORMAT: &str = "<http://purl.org/HDT/hdt#dictionaryFour>";
-const TRIPLES_BITMAP_FORMAT: &str = "<http://purl.org/HDT/hdt#triplesBitmap>";
+use crate::hdt::sections::{DICTIONARY_FOUR_FORMAT, TRIPLES_BITMAP_FORMAT};
 
 /// Metadata extracted from scanning an HDT file.
 #[derive(Debug, Clone)]

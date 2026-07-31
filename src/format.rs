@@ -14,8 +14,9 @@
 //! and would eventually get subtly wrong:
 //!
 //! - **Section location and framing** — control info, VByte, the LogArray and
-//!   Bitmap section preambles, the PFC preamble and its block-offset array.
-//!   A mapped reader needs these to find regions before it maps anything.
+//!   Bitmap section preambles, the PFC preamble and its block-offset array, and
+//!   [`scan_hdt_sections`], the whole-file walk they compose into. A mapped
+//!   reader needs these to find regions before it maps anything.
 //! - **Identity** — [`sha256_to_end`], so a sidecar's binding to its HDT is
 //!   verified by one implementation rather than two.
 //! - **Sidecar directories** — [`PermutationHeader`] and [`PermutationSection`]
@@ -45,10 +46,25 @@
 // ---------------------------------------------------------------------------
 // io primitives — section framing
 // ---------------------------------------------------------------------------
+//
+// The `scan_*` forms report where a section's *payload* begins, which is what a
+// reader that maps regions needs; the older `skip_*` forms report only where the
+// section begins and are kept for callers that stream past it. Both read
+// preambles only.
 
 pub use crate::io::{
-    BitmapReader, ControlInfo, ControlType, LogArrayReader, decode_vbyte, encode_vbyte, read_vbyte,
-    skip_bitmap_section, skip_log_array_section,
+    BitmapReader, BitmapSection, ControlInfo, ControlType, LogArrayReader, LogArraySection,
+    decode_vbyte, encode_vbyte, packed_len, read_vbyte, scan_bitmap_section,
+    scan_log_array_section, skip_bitmap_section, skip_log_array_section,
+};
+
+// ---------------------------------------------------------------------------
+// HDT file structure
+// ---------------------------------------------------------------------------
+
+pub use crate::hdt::sections::{
+    DICTIONARY_FOUR_FORMAT, HdtSections, TRIPLES_BITMAP_FORMAT, TRIPLES_ORDER_SPO,
+    scan_hdt_sections,
 };
 
 // ---------------------------------------------------------------------------
@@ -56,7 +72,9 @@ pub use crate::io::{
 // ---------------------------------------------------------------------------
 
 pub use crate::dictionary::DictCounts;
-pub use crate::hdt::pfc_reader::{PfcSectionHeader, PfcSectionIterator, skip_pfc_section};
+pub use crate::hdt::pfc_reader::{
+    PfcSection, PfcSectionHeader, PfcSectionIterator, scan_pfc_section, skip_pfc_section,
+};
 
 /// SHA-256 over the remainder of a reader, the identity digest every sidecar
 /// binds to its HDT with (`docs/permutation-index-format.md` §9,

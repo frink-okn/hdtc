@@ -23,8 +23,7 @@ use std::io::{BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 const PFC_SECTION_TYPE: u8 = 0x02;
-const DICTIONARY_FOUR_FORMAT: &str = "<http://purl.org/HDT/hdt#dictionaryFour>";
-const TRIPLES_BITMAP_FORMAT: &str = "<http://purl.org/HDT/hdt#triplesBitmap>";
+use crate::hdt::sections::{DICTIONARY_FOUR_FORMAT, TRIPLES_BITMAP_FORMAT};
 
 // ---------------------------------------------------------------------------
 // HDT identity digest

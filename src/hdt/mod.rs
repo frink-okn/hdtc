@@ -8,6 +8,7 @@ pub(crate) mod keyset;
 pub(crate) mod pfc_reader;
 pub(crate) mod reader;
 pub(crate) mod search;
+pub(crate) mod sections;
 pub(crate) mod sketch;
 pub(crate) mod text_search;
 pub(crate) mod void;
