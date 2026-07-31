@@ -86,9 +86,9 @@ pub use crate::hdt::reader::sha256_to_end;
 // ---------------------------------------------------------------------------
 
 pub use crate::permutation::{
-    Header as PermutationHeader, PermutationComponent, PermutationIndex, PermutationSectionKind,
-    Section as PermutationSection, canonical_path as permutation_index_path,
-    validate_permutation_index,
+    Header as PermutationHeader, PermutationComponent, PermutationIndex, PermutationIndexOpenError,
+    PermutationSectionKind, Section as PermutationSection,
+    canonical_path as permutation_index_path, validate_permutation_index,
 };
 
 // ---------------------------------------------------------------------------

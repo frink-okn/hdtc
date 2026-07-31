@@ -13,4 +13,4 @@ pub use builder::{
     PermutationCollector, PositionMaps, create_permutation_index, finish_prepared_index,
 };
 pub use format::{Header, PermutationComponent, PermutationSectionKind, Section, canonical_path};
-pub use reader::{PermutationIndex, validate_permutation_index};
+pub use reader::{PermutationIndex, PermutationIndexOpenError, validate_permutation_index};

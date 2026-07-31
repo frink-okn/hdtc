@@ -9,6 +9,37 @@ use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
+/// Which phase prevented a permutation index from opening.
+///
+/// Callers that expose artifact-specific diagnostics can distinguish a corrupt
+/// sidecar from one bound to a different HDT without inspecting error text.
+#[derive(Debug, thiserror::Error)]
+pub enum PermutationIndexOpenError {
+    /// The sidecar header, directory, or region metadata is malformed.
+    #[error("invalid permutation index: {source:#}")]
+    Sidecar {
+        /// The format-layer failure.
+        #[source]
+        source: anyhow::Error,
+    },
+
+    /// The associated HDT could not be scanned for structural metadata.
+    #[error("invalid source HDT: {source:#}")]
+    Source {
+        /// The HDT scan failure.
+        #[source]
+        source: anyhow::Error,
+    },
+
+    /// Both artifacts are well-formed enough to inspect, but do not agree.
+    #[error("permutation index does not bind to its source HDT: {source:#}")]
+    Binding {
+        /// The failed cross-artifact check.
+        #[source]
+        source: anyhow::Error,
+    },
+}
+
 #[derive(Debug, Clone)]
 pub struct PermutationIndex {
     path: PathBuf,
@@ -21,13 +52,22 @@ impl PermutationIndex {
     /// metadata and the cheap source binding (dictionary counts, triple count,
     /// and suffix length); strict validation additionally hashes both files and
     /// checks every payload and semantic invariant.
-    pub fn open(path: &Path, hdt_path: &Path) -> Result<Self> {
-        let (header, sections) = read_header_and_sections(path)?;
-        let hdt = scan_hdt(hdt_path)?;
-        validate_source_metadata(&header, &hdt)?;
-        validate_section_metadata(&header, &sections, false)?;
-        validate_spo_shapes(&sections, &hdt)?;
-        validate_canonical_regions(path, &header, &sections, false)?;
+    pub fn open(
+        path: &Path,
+        hdt_path: &Path,
+    ) -> std::result::Result<Self, PermutationIndexOpenError> {
+        let (header, sections) = read_header_and_sections(path)
+            .map_err(|source| PermutationIndexOpenError::Sidecar { source })?;
+        let hdt =
+            scan_hdt(hdt_path).map_err(|source| PermutationIndexOpenError::Source { source })?;
+        validate_source_metadata(&header, &hdt)
+            .map_err(|source| PermutationIndexOpenError::Binding { source })?;
+        validate_section_metadata(&header, &sections, false)
+            .map_err(|source| PermutationIndexOpenError::Sidecar { source })?;
+        validate_spo_shapes(&sections, &hdt)
+            .map_err(|source| PermutationIndexOpenError::Binding { source })?;
+        validate_canonical_regions(path, &header, &sections, false)
+            .map_err(|source| PermutationIndexOpenError::Sidecar { source })?;
         Ok(Self {
             path: path.to_path_buf(),
             header,
@@ -147,10 +187,6 @@ impl PermutationIndex {
 
 fn validate_source_metadata(header: &Header, hdt: &HdtMetadata) -> Result<()> {
     ensure!(
-        header.pos_pairs == header.ops_pairs,
-        "POS/OPS pair-count mismatch"
-    );
-    ensure!(
         header.triples == hdt.triples,
         "permutation/HDT triple-count mismatch"
     );
@@ -249,6 +285,10 @@ fn validate_section_metadata(
     sections: &[Section],
     strict_unknown: bool,
 ) -> Result<()> {
+    ensure!(
+        header.pos_pairs == header.ops_pairs,
+        "POS/OPS pair-count mismatch"
+    );
     let present: HashSet<u32> = sections
         .iter()
         .map(|section| section.section_type)

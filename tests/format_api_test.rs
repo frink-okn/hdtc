@@ -11,8 +11,8 @@ mod common;
 
 use common::{REPRESENTATIVE_NT, write_file};
 use hdtc::format::{
-    PermutationComponent, PermutationIndex, PermutationSectionKind, packed_len,
-    permutation_index_path, scan_hdt_sections, sha256_to_end,
+    PermutationComponent, PermutationIndex, PermutationIndexOpenError, PermutationSectionKind,
+    packed_len, permutation_index_path, scan_hdt_sections, sha256_to_end,
 };
 use std::fs::File;
 use std::io::{BufReader, Seek, SeekFrom};
@@ -31,9 +31,13 @@ const CORE_KINDS: [PermutationSectionKind; 8] = [
 ];
 
 fn build_fixture(temp: &Path) -> PathBuf {
+    build_fixture_from(temp, REPRESENTATIVE_NT)
+}
+
+fn build_fixture_from(temp: &Path, source: &str) -> PathBuf {
     let input = temp.join("input.nt");
     let hdt = temp.join("data.hdt");
-    write_file(&input, REPRESENTATIVE_NT.as_bytes());
+    write_file(&input, source.as_bytes());
 
     let output = Command::new(env!("CARGO_BIN_EXE_hdtc"))
         .args([
@@ -55,6 +59,29 @@ fn build_fixture(temp: &Path) -> PathBuf {
         String::from_utf8_lossy(&output.stderr)
     );
     hdt
+}
+
+#[test]
+fn open_distinguishes_a_foreign_hdt_from_a_malformed_sidecar() {
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    let first_hdt = build_fixture(first.path());
+    let second_hdt = build_fixture_from(
+        second.path(),
+        "<http://example.org/s> <http://example.org/p> <http://example.org/o> .\n",
+    );
+
+    let error = PermutationIndex::open(&permutation_index_path(&first_hdt), &second_hdt)
+        .expect_err("a sidecar from another HDT must not bind");
+    assert!(matches!(error, PermutationIndexOpenError::Binding { .. }));
+
+    let sidecar = permutation_index_path(&first_hdt);
+    let bytes = std::fs::read(&sidecar).unwrap();
+    let truncated = first.path().join("truncated.hdt.perm");
+    std::fs::write(&truncated, &bytes[..300]).unwrap();
+    let error = PermutationIndex::open(&truncated, &first_hdt)
+        .expect_err("a truncated sidecar must be classified separately");
+    assert!(matches!(error, PermutationIndexOpenError::Sidecar { .. }));
 }
 
 #[test]
