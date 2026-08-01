@@ -11,9 +11,10 @@ mod common;
 
 use common::{REPRESENTATIVE_NT, write_file};
 use hdtc::format::{
-    GraphIndex, GraphIndexOpenError, PermutationComponent, PermutationIndex,
-    PermutationIndexOpenError, PermutationSectionKind, graph_index_path, packed_len,
-    permutation_index_path, scan_hdt_sections, sha256_to_end,
+    GraphIndex, GraphIndexOpenError, ParsedLiteral, PermutationComponent, PermutationIndex,
+    PermutationIndexOpenError, PermutationSectionKind, PfcSectionHeader, PfcSectionIterator,
+    encode_literal, graph_index_path, packed_len, parse_literal, permutation_index_path,
+    scan_hdt_sections, sha256_to_end,
 };
 use std::fs::File;
 use std::io::{BufReader, Seek, SeekFrom};
@@ -344,5 +345,68 @@ fn the_hdt_scan_describes_every_section_well_enough_to_map_it() {
         sha256_to_end(&mut source).unwrap(),
         header.source_digest,
         "the scan's data_offset must be where identity digests begin"
+    );
+}
+
+/// The dictionary's spelling of a term, in both published directions.
+///
+/// A downstream reader resolving a request term to an id has to write the term
+/// the way the builder wrote it, then read back what it finds. So the contract
+/// is not just that [`parse_literal`] and [`encode_literal`] invert each other
+/// — it is that both agree with the bytes actually in a built dictionary. A
+/// divergence here returns *fewer rows* rather than an error: the lookup misses
+/// a term that is present, and nothing downstream can tell.
+#[test]
+fn both_directions_of_a_dictionary_term_agree_with_the_bytes_hdtc_wrote() {
+    let temp = tempfile::tempdir().unwrap();
+    let hdt = build_fixture(temp.path());
+
+    let mut reader = BufReader::new(File::open(&hdt).unwrap());
+    let sections = scan_hdt_sections(&mut reader).expect("scan HDT sections");
+
+    reader
+        .seek(SeekFrom::Start(sections.objects.section_start))
+        .unwrap();
+    let header = PfcSectionHeader::read_from(&mut reader, "objects").expect("objects preamble");
+    let terms: Vec<Vec<u8>> = PfcSectionIterator::new(&mut reader, header, "objects")
+        .collect::<Result<_, _>>()
+        .expect("decode objects section");
+
+    let (mut plain, mut tagged, mut typed, mut iris) = (0, 0, 0, 0);
+    for term in &terms {
+        let parsed: ParsedLiteral<'_> = match parse_literal(term) {
+            Some(parsed) => parsed,
+            None => {
+                iris += 1;
+                continue;
+            }
+        };
+        let text = |bytes: &[u8]| String::from_utf8(bytes.to_vec()).expect("UTF-8 term part");
+        let language = parsed.language.map(&text);
+        let datatype = parsed.datatype.map(&text);
+        match (&language, &datatype) {
+            (Some(_), _) => tagged += 1,
+            (None, Some(_)) => typed += 1,
+            (None, None) => plain += 1,
+        }
+
+        let rewritten = encode_literal(
+            &text(parsed.value),
+            language.as_deref(),
+            datatype.as_deref(),
+        );
+        assert_eq!(
+            rewritten.as_bytes(),
+            term.as_slice(),
+            "re-encoding {} does not reproduce the stored term",
+            String::from_utf8_lossy(term)
+        );
+    }
+
+    // Not vacuous: the fixture must have exercised every literal shape, or a
+    // rewrite rule could be wrong for a shape no term happened to have.
+    assert!(
+        plain > 0 && tagged > 0 && typed > 0 && iris > 0,
+        "the fixture must cover plain, tagged and typed literals and a non-literal, saw {plain}/{tagged}/{typed}/{iris}"
     );
 }

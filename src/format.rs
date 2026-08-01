@@ -76,6 +76,16 @@ pub use crate::hdt::pfc_reader::{
     PfcSection, PfcSectionHeader, PfcSectionIterator, scan_pfc_section, skip_pfc_section,
 };
 
+// How a term is spelled once it is in the dictionary, in both directions.
+// `docs/text-index-format.md` §3.1 is normative for the split, and
+// `encode_literal` is its inverse. A downstream reader that resolves a request
+// term to an id needs the writing direction too: encode by a different rule and
+// the lookup misses a term that is present, which is a wrong answer rather than
+// a corrupt file, so nothing downstream detects it.
+
+pub use crate::dictionary::term::{XSD_STRING, encode_literal};
+pub use crate::text::analyzer::{ParsedLiteral, parse_literal};
+
 /// SHA-256 over the remainder of a reader, the identity digest every sidecar
 /// binds to its HDT with (`docs/permutation-index-format.md` §9,
 /// `docs/graphs-sidecar-format.md` §10).
