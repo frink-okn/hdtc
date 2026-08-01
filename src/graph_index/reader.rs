@@ -129,7 +129,29 @@ impl GraphIndex {
         Self::open(&canonical_path(hdt_path), hdt_path)
     }
 
-    pub fn open(path: &Path, hdt_path: &Path) -> std::result::Result<Self, GraphIndexOpenError> {
+    /// Check that a graph index is well-formed and belongs to `hdt_path` and
+    /// its graphs sidecar, without opening the layer sets.
+    ///
+    /// This is what a caller that only needs to *accept or refuse a bundle*
+    /// wants: it reads the same headers, section directory, footer, and
+    /// cross-artifact bindings as [`open`](Self::open), but stops before the
+    /// two [`EmbeddedLayerSetReader`]s, which are per-query machinery and cost
+    /// a file handle each. KGF's `Store::open` uses it, since graph scoping is
+    /// a later milestone but a bundle carrying an index that does not bind must
+    /// still be refused at open (KGF doc 20 §20.8).
+    pub fn verify_binding(
+        path: &Path,
+        hdt_path: &Path,
+    ) -> std::result::Result<(), GraphIndexOpenError> {
+        Self::read_bound(path, hdt_path).map(|_| ())
+    }
+
+    /// The header and section directory of a graph index that has been checked
+    /// against its parent artifacts.
+    fn read_bound(
+        path: &Path,
+        hdt_path: &Path,
+    ) -> std::result::Result<(File, Header, Vec<Section>), GraphIndexOpenError> {
         let sidecar_path = canonical_sidecar_path(hdt_path);
 
         let (file, header, sections) = (|| -> Result<_> {
@@ -171,6 +193,13 @@ impl GraphIndex {
             Ok(())
         })()
         .map_err(|source| GraphIndexOpenError::Binding { source })?;
+
+        Ok((file, header, sections))
+    }
+
+    pub fn open(path: &Path, hdt_path: &Path) -> std::result::Result<Self, GraphIndexOpenError> {
+        let sidecar_path = canonical_sidecar_path(hdt_path);
+        let (file, header, sections) = Self::read_bound(path, hdt_path)?;
 
         let (pos_layers, ops_layers) = (|| -> Result<_> {
             let pos_layers = if header.flags & HAS_POS_LAYERS != 0 {
