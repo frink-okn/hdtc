@@ -31,7 +31,17 @@ pub fn decode_vbyte(data: &[u8]) -> io::Result<(u64, usize)> {
     let mut shift = 0u32;
 
     for (i, &byte) in data.iter().enumerate() {
-        value |= ((byte & 0x7F) as u64) << shift;
+        let payload = u64::from(byte & 0x7F);
+        // A u64's tenth VByte group has room for only bit 63. Without this
+        // check, payloads 2..=127 are truncated by the shift and alias smaller
+        // values (for example, nine zero groups followed by 0x82 decodes as 0).
+        if shift == 63 && payload > 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "VByte value exceeds u64 range",
+            ));
+        }
+        value |= payload << shift;
         if byte & 0x80 != 0 {
             // MSB=1: last byte
             return Ok((value, i + 1));
@@ -185,6 +195,19 @@ mod tests {
         let data = [0x00u8];
         let mut cursor = Cursor::new(&data[..]);
         assert!(read_vbyte(&mut cursor).is_err());
+    }
+
+    #[test]
+    fn test_decode_rejects_overflow_in_tenth_group() {
+        let mut encoded = [0u8; 10];
+        encoded[9] = 0x82;
+
+        let decoded = decode_vbyte(&encoded).expect_err("2 << 63 does not fit u64");
+        assert_eq!(decoded.kind(), io::ErrorKind::InvalidData);
+
+        let mut cursor = Cursor::new(encoded);
+        let streamed = read_vbyte(&mut cursor).expect_err("stream decoder must agree");
+        assert_eq!(streamed.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
