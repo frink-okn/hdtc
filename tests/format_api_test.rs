@@ -11,8 +11,9 @@ mod common;
 
 use common::{REPRESENTATIVE_NT, write_file};
 use hdtc::format::{
-    PermutationComponent, PermutationIndex, PermutationIndexOpenError, PermutationSectionKind,
-    packed_len, permutation_index_path, scan_hdt_sections, sha256_to_end,
+    GraphIndex, GraphIndexOpenError, PermutationComponent, PermutationIndex,
+    PermutationIndexOpenError, PermutationSectionKind, graph_index_path, packed_len,
+    permutation_index_path, scan_hdt_sections, sha256_to_end,
 };
 use std::fs::File;
 use std::io::{BufReader, Seek, SeekFrom};
@@ -61,6 +62,35 @@ fn build_fixture_from(temp: &Path, source: &str) -> PathBuf {
     hdt
 }
 
+fn build_graph_fixture_from(temp: &Path, source: &str) -> PathBuf {
+    let input = temp.join("input.nq");
+    let hdt = temp.join("data.hdt");
+    write_file(&input, source.as_bytes());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_hdtc"))
+        .args([
+            "create",
+            input.to_str().unwrap(),
+            "-o",
+            hdt.to_str().unwrap(),
+            "--mode",
+            "quads",
+            "--graphs-index",
+            "--temp-dir",
+            temp.join("work").to_str().unwrap(),
+            "--memory-limit",
+            "64M",
+        ])
+        .output()
+        .expect("run hdtc");
+    assert!(
+        output.status.success(),
+        "hdtc create failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    hdt
+}
+
 #[test]
 fn open_distinguishes_a_foreign_hdt_from_a_malformed_sidecar() {
     let first = tempfile::tempdir().unwrap();
@@ -82,6 +112,36 @@ fn open_distinguishes_a_foreign_hdt_from_a_malformed_sidecar() {
     let error = PermutationIndex::open(&truncated, &first_hdt)
         .expect_err("a truncated sidecar must be classified separately");
     assert!(matches!(error, PermutationIndexOpenError::Sidecar { .. }));
+}
+
+#[test]
+fn graph_open_distinguishes_foreign_parents_from_a_malformed_index() {
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    let first_hdt = build_graph_fixture_from(first.path(), "<urn:s> <urn:p> <urn:o> <urn:g> .\n");
+    let second_hdt = build_graph_fixture_from(
+        second.path(),
+        concat!(
+            "<urn:s> <urn:p> <urn:o> <urn:g> .\n",
+            "<urn:extra> <urn:p> <urn:o> <urn:other> .\n",
+        ),
+    );
+
+    let error = match GraphIndex::open(&graph_index_path(&first_hdt), &second_hdt) {
+        Err(error) => error,
+        Ok(_) => panic!("an index from another HDT must not bind"),
+    };
+    assert!(matches!(error, GraphIndexOpenError::Binding { .. }));
+
+    let index = graph_index_path(&first_hdt);
+    let bytes = std::fs::read(&index).unwrap();
+    let truncated = first.path().join("truncated.hdt.graphs.idx");
+    std::fs::write(&truncated, &bytes[..300]).unwrap();
+    let error = match GraphIndex::open(&truncated, &first_hdt) {
+        Err(error) => error,
+        Ok(_) => panic!("a truncated graph index must be classified separately"),
+    };
+    assert!(matches!(error, GraphIndexOpenError::Index { .. }));
 }
 
 #[test]

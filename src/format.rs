@@ -96,7 +96,8 @@ pub use crate::permutation::{
 // ---------------------------------------------------------------------------
 
 pub use crate::graph_index::{
-    GraphIndex, GraphIndexSpace, canonical_path as graph_index_path, validate_graph_index,
+    GraphIndex, GraphIndexOpenError, GraphIndexSpace, canonical_path as graph_index_path,
+    validate_graph_index,
 };
 
 // ---------------------------------------------------------------------------
