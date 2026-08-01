@@ -25,9 +25,16 @@ pub const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
 /// `xsd:string` is dropped for the same reason: RDF 1.1 makes `"a"` and
 /// `"a"^^xsd:string` the same term, so writing the long form would put a second
 /// entry in the dictionary for a term that is already there.
+///
+/// A language tag is lowercased. BCP 47 tags are case-insensitive and the RDF
+/// parsers fold them on the way in, so the dictionary already holds `"x"@en`
+/// for an input written `"x"@EN`. Folding here rather than trusting the caller
+/// is what stops a reader resolving `@EN` from missing that term — a lookup
+/// returning nothing, which no error reports and no checksum catches. Tags are
+/// ASCII by BCP 47, so the folding is too.
 pub fn encode_literal(value: &str, language: Option<&str>, datatype: Option<&str>) -> String {
     match (language, datatype) {
-        (Some(language), _) => format!("\"{value}\"@{language}"),
+        (Some(language), _) => format!("\"{value}\"@{}", language.to_ascii_lowercase()),
         (None, Some(datatype)) if datatype != XSD_STRING => {
             format!("\"{value}\"^^<{datatype}>")
         }
@@ -59,9 +66,10 @@ mod tests {
             let parsed = parse_literal(term.as_bytes())
                 .unwrap_or_else(|| panic!("{term} is not recognised as a literal"));
             assert_eq!(parsed.value, value.as_bytes(), "value of {term}");
+            let expected_language = language.map(str::to_ascii_lowercase);
             assert_eq!(
                 parsed.language,
-                language.map(str::as_bytes),
+                expected_language.as_deref().map(str::as_bytes),
                 "language of {term}"
             );
             let expected_datatype = datatype.filter(|d| *d != XSD_STRING);
@@ -79,6 +87,16 @@ mod tests {
             encode_literal("a", None, None),
             encode_literal("a", None, Some(XSD_STRING)),
         );
+    }
+
+    #[test]
+    fn a_language_tag_is_folded_to_the_case_the_dictionary_holds() {
+        // The parsers fold on ingest, so `"x"@EN` is stored `"x"@en`. A caller
+        // that passed the tag through unchanged would look up a term that is
+        // not there and be told, truthfully and uselessly, that it is absent.
+        assert_eq!(encode_literal("x", Some("EN"), None), "\"x\"@en");
+        assert_eq!(encode_literal("x", Some("en-GB"), None), "\"x\"@en-gb");
+        assert_eq!(encode_literal("x", Some("en"), None), "\"x\"@en");
     }
 
     #[test]
