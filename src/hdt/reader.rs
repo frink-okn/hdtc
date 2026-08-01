@@ -10,8 +10,8 @@
 
 use crate::io::crc_utils::crc8;
 use crate::io::{
-    ControlInfo, ControlType, LogArrayReader, StreamingBitmapDecoder, StreamingLogArrayDecoder,
-    decode_vbyte, encode_vbyte, read_vbyte, skip_bitmap_section, skip_log_array_section,
+    ControlInfo, LogArrayReader, StreamingBitmapDecoder, StreamingLogArrayDecoder, decode_vbyte,
+    encode_vbyte, read_vbyte,
 };
 use anyhow::{Context, Result, bail};
 use oxrdfio::{RdfFormat, RdfParser};
@@ -23,7 +23,8 @@ use std::io::{BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 const PFC_SECTION_TYPE: u8 = 0x02;
-use crate::hdt::sections::{DICTIONARY_FOUR_FORMAT, TRIPLES_BITMAP_FORMAT};
+use crate::hdt::pfc_reader::PfcSection;
+use crate::hdt::sections::scan_hdt_sections;
 
 // ---------------------------------------------------------------------------
 // HDT identity digest
@@ -500,40 +501,20 @@ pub fn open_hdt(
         .with_context(|| format!("Failed to open HDT file {}", hdt_path.display()))?;
     let mut reader = BufReader::with_capacity(256 * 1024, file);
 
-    let global_ci =
-        ControlInfo::read_from(&mut reader).context("Failed to read global control info")?;
-    if global_ci.control_type != ControlType::Global {
-        bail!("Expected global control info at start of HDT file");
-    }
+    // One structural walk locates every section; the dictionary indexes are
+    // then built by seeking back to the four PFC sections it recorded. The
+    // walk also checks the formats, the SPO ordering, and that each level's
+    // bitmap and array agree on their length.
+    let sections = scan_hdt_sections(&mut reader)
+        .with_context(|| format!("Failed to scan HDT file {}", hdt_path.display()))?;
 
-    let header_ci =
-        ControlInfo::read_from(&mut reader).context("Failed to read header control info")?;
-    if header_ci.control_type != ControlType::Header {
-        bail!("Expected header control info");
-    }
-    let header_len: usize = header_ci
-        .get_property("length")
-        .and_then(|s| s.parse().ok())
-        .context("Missing or invalid header length in control info")?;
-
-    let mut header_buf = vec![0u8; header_len];
-    reader
-        .read_exact(&mut header_buf)
-        .context("Failed to read header section")?;
-    let header_text = String::from_utf8(header_buf).context("Header content is not valid UTF-8")?;
+    let header_text = sections.read_header(&mut reader)?;
     let num_triples = parse_num_triples_from_header(&header_text)
         .context("Failed to parse triple count from header metadata")?;
-
-    let dict_ci =
-        ControlInfo::read_from(&mut reader).context("Failed to read dictionary control info")?;
-    if dict_ci.control_type != ControlType::Dictionary {
-        bail!("Expected dictionary control info");
-    }
-    if dict_ci.format != DICTIONARY_FOUR_FORMAT {
+    if sections.num_triples() != num_triples {
         bail!(
-            "Unsupported dictionary format: {} (expected {})",
-            dict_ci.format,
-            DICTIONARY_FOUR_FORMAT
+            "ArrayZ size mismatch: header has {num_triples} triples but ArrayZ has {} entries",
+            sections.num_triples()
         );
     }
 
@@ -543,75 +524,24 @@ pub fn open_hdt(
     const RESERVED_BYTES: usize = 64 * 1024 * 1024;
     let cache_budget_per_section = memory_limit.saturating_sub(RESERVED_BYTES) / 4;
 
-    let dictionary = DictionaryResolver {
-        shared: PfcSectionIndex::read_from(
-            &mut reader,
-            hdt_path,
-            "shared",
-            cache_budget_per_section,
-        )?,
-        subjects: PfcSectionIndex::read_from(
-            &mut reader,
-            hdt_path,
-            "subjects",
-            cache_budget_per_section,
-        )?,
-        predicates: PfcSectionIndex::read_from(
-            &mut reader,
-            hdt_path,
-            "predicates",
-            cache_budget_per_section,
-        )?,
-        objects: PfcSectionIndex::read_from(
-            &mut reader,
-            hdt_path,
-            "objects",
-            cache_budget_per_section,
-        )?,
+    let mut index_of = |section: &PfcSection, name: &'static str| -> Result<PfcSectionIndex> {
+        reader.seek(SeekFrom::Start(section.section_start))?;
+        PfcSectionIndex::read_from(&mut reader, hdt_path, name, cache_budget_per_section)
     };
-
-    let triples_ci =
-        ControlInfo::read_from(&mut reader).context("Failed to read triples control info")?;
-    if triples_ci.control_type != ControlType::Triples {
-        bail!(
-            "Expected triples control info, found {:?}",
-            triples_ci.control_type
-        );
-    }
-    if triples_ci.format != TRIPLES_BITMAP_FORMAT {
-        bail!(
-            "Unsupported triples format: {} (expected {})",
-            triples_ci.format,
-            TRIPLES_BITMAP_FORMAT
-        );
-    }
-
-    let (by_start, by_bits) = skip_bitmap_section(&mut reader).context("Failed to scan BitmapY")?;
-    let (bz_start, _bz_bits) =
-        skip_bitmap_section(&mut reader).context("Failed to scan BitmapZ")?;
-    let (ay_start, ay_entries, _ay_bpe) =
-        skip_log_array_section(&mut reader).context("Failed to scan ArrayY")?;
-    let (az_start, az_entries, _az_bpe) =
-        skip_log_array_section(&mut reader).context("Failed to scan ArrayZ")?;
-
-    if az_entries != num_triples {
-        bail!(
-            "ArrayZ size mismatch: header has {num_triples} triples but ArrayZ has {az_entries} entries"
-        );
-    }
-    if by_bits != ay_entries {
-        bail!(
-            "BitmapY/ArrayY mismatch: BitmapY has {by_bits} bits but ArrayY has {ay_entries} entries"
-        );
-    }
+    let dictionary = DictionaryResolver {
+        shared: index_of(&sections.shared, "shared")?,
+        subjects: index_of(&sections.subjects, "subjects")?,
+        predicates: index_of(&sections.predicates, "predicates")?,
+        objects: index_of(&sections.objects, "objects")?,
+    };
 
     let offsets = HdtSectionOffsets {
         num_triples,
-        num_sp_pairs: ay_entries,
-        by_start,
-        bz_start,
-        ay_start,
-        az_start,
+        num_sp_pairs: sections.num_sp_pairs(),
+        by_start: sections.bitmap_y.section_start,
+        bz_start: sections.bitmap_z.section_start,
+        ay_start: sections.array_y.section_start,
+        az_start: sections.array_z.section_start,
     };
 
     Ok((offsets, dictionary))

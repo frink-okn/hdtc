@@ -6,8 +6,7 @@
 
 use crate::hdt::pfc_reader::{PfcSectionHeader, PfcSectionIterator};
 use crate::io::{
-    ControlInfo, ControlType, StreamingBitmapDecoder, StreamingLogArrayDecoder,
-    skip_bitmap_section, skip_log_array_section,
+    StreamingBitmapDecoder, StreamingLogArrayDecoder, skip_bitmap_section, skip_log_array_section,
 };
 use crate::pipeline::batch_vocab::Roles;
 use crate::pipeline::vocab_merger::StreamEntry;
@@ -17,10 +16,10 @@ use oxrdfio::{RdfFormat, RdfParser};
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::fs::File;
-use std::io::{BufReader, Cursor, Read, Seek, SeekFrom};
+use std::io::{BufReader, Cursor, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use crate::hdt::sections::{DICTIONARY_FOUR_FORMAT, TRIPLES_BITMAP_FORMAT};
+use crate::hdt::sections::scan_hdt_sections;
 
 /// Metadata extracted from scanning an HDT file.
 #[derive(Debug, Clone)]
@@ -61,83 +60,33 @@ impl HdtInputAdapter {
             .with_context(|| format!("Failed to open HDT file {}", hdt_path.display()))?;
         let mut reader = BufReader::with_capacity(256 * 1024, file);
 
-        // Global control info
-        let global_ci =
-            ControlInfo::read_from(&mut reader).context("Failed to read global control info")?;
-        if global_ci.control_type != ControlType::Global {
-            bail!("Expected global control info at start of HDT file");
-        }
+        let sections = scan_hdt_sections(&mut reader)
+            .with_context(|| format!("Failed to scan HDT file {}", hdt_path.display()))?;
 
-        // Verify HDT cookie/magic if present
-        if let Some(format) = global_ci.format.strip_prefix("") {
-            // format string is the full URI — just check control_type
-            let _ = format;
-        }
-
-        // Header section — skip it
-        let header_ci =
-            ControlInfo::read_from(&mut reader).context("Failed to read header control info")?;
-        if header_ci.control_type != ControlType::Header {
-            bail!("Expected header control info");
-        }
-        let header_len: usize = header_ci
-            .get_property("length")
-            .and_then(|s| s.parse().ok())
-            .context("Missing or invalid header length")?;
-        let mut header_buf = vec![0u8; header_len];
-        reader.read_exact(&mut header_buf)?;
-
-        // Parse triple count and original size from header
-        let header_text = String::from_utf8(header_buf).context("Header not valid UTF-8")?;
+        // The declared counts, which the scan does not read: the original size
+        // exists only in the header, and the triple count is compared with the
+        // structural one below.
+        let header_text = sections.read_header(&mut reader)?;
         let (num_triples, original_size) = parse_header_metadata(&header_text)?;
-
-        // Dictionary control info
-        let dict_ci = ControlInfo::read_from(&mut reader)
-            .context("Failed to read dictionary control info")?;
-        if dict_ci.control_type != ControlType::Dictionary {
-            bail!("Expected dictionary control info");
-        }
-        if dict_ci.format != DICTIONARY_FOUR_FORMAT {
+        if sections.num_triples() != num_triples {
             bail!(
-                "Unsupported dictionary format: {} (expected {})",
-                dict_ci.format,
-                DICTIONARY_FOUR_FORMAT
+                "HDT header declares {num_triples} triples but ArrayZ has {} entries",
+                sections.num_triples()
             );
         }
 
-        // Record each PFC section's file offset, then skip past it
-        let shared_section_offset = reader.stream_position()?;
-        let shared_count = skip_pfc_section(&mut reader, "shared")?;
-        let subjects_section_offset = reader.stream_position()?;
-        let subjects_count = skip_pfc_section(&mut reader, "subjects")?;
-        let predicates_section_offset = reader.stream_position()?;
-        let predicates_count = skip_pfc_section(&mut reader, "predicates")?;
-        let objects_section_offset = reader.stream_position()?;
-        let objects_count = skip_pfc_section(&mut reader, "objects")?;
+        let shared_section_offset = sections.shared.section_start;
+        let shared_count = sections.shared.string_count;
+        let subjects_section_offset = sections.subjects.section_start;
+        let subjects_count = sections.subjects.string_count;
+        let predicates_section_offset = sections.predicates.section_start;
+        let predicates_count = sections.predicates.string_count;
+        let objects_section_offset = sections.objects.section_start;
+        let objects_count = sections.objects.string_count;
 
-        // Triples control info
-        let triples_ci =
-            ControlInfo::read_from(&mut reader).context("Failed to read triples control info")?;
-        if triples_ci.control_type != ControlType::Triples {
-            bail!("Expected triples control info");
-        }
-        if triples_ci.format != TRIPLES_BITMAP_FORMAT {
-            bail!(
-                "Unsupported triples format: {} (expected {})",
-                triples_ci.format,
-                TRIPLES_BITMAP_FORMAT
-            );
-        }
-
-        // Record where the triples data starts (BitmapY is first)
-        let triples_data_offset = reader.stream_position()?;
-
-        // Skip past BitmapY to read ArrayY to get num_sp_pairs
-        let (_by_start, _by_bits) = skip_bitmap_section(&mut reader)?;
-        let (_bz_start, _bz_bits) = skip_bitmap_section(&mut reader)?;
-        let (_ay_start, ay_entries, _ay_bpe) = skip_log_array_section(&mut reader)?;
-
-        let num_sp_pairs = ay_entries;
+        // BitmapY is written first, so the triples data begins where it does.
+        let triples_data_offset = sections.bitmap_y.section_start;
+        let num_sp_pairs = sections.num_sp_pairs();
 
         tracing::info!(
             "HDT input {}: {} triples, {} shared, {} subjects, {} predicates, {} objects",
@@ -859,10 +808,6 @@ impl HdtTripleReader {
             .context("ArrayZ CRC32C verification failed")?;
         Ok(())
     }
-}
-
-fn skip_pfc_section<R: Read + Seek>(reader: &mut R, section_name: &str) -> Result<u64> {
-    crate::hdt::pfc_reader::skip_pfc_section(reader, section_name)
 }
 
 /// Parse header metadata from the HDT header RDF.

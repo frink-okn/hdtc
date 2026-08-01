@@ -9,8 +9,8 @@ mod writer;
 
 use crate::io::log_array::bits_for;
 use crate::io::{
-    ControlInfo, ControlType, LogArrayReader, StreamingBitmapDecoder, StreamingBitmapEncoder,
-    StreamingLogArrayDecoder, StreamingLogArrayEncoder,
+    StreamingBitmapDecoder, StreamingBitmapEncoder, StreamingLogArrayDecoder,
+    StreamingLogArrayEncoder,
 };
 use crate::sort::{ExternalSorter, Sortable};
 use crate::triples::{StreamingBitmapResult, StreamingLogArrayResult};
@@ -24,56 +24,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 use writer::write_index_streaming;
 
-const PFC_SECTION_TYPE: u8 = 0x02;
-use crate::hdt::sections::DICTIONARY_FOUR_FORMAT;
-
-fn read_vbyte_from_reader<R: Read>(reader: &mut R) -> Result<u64> {
-    let mut value: u64 = 0;
-    let mut shift = 0u32;
-    let mut byte_buf = [0u8; 1];
-
-    loop {
-        reader.read_exact(&mut byte_buf)?;
-        let byte = byte_buf[0];
-        value |= ((byte & 0x7F) as u64) << shift;
-        if byte & 0x80 != 0 {
-            return Ok(value);
-        }
-        shift += 7;
-        if shift >= 64 {
-            bail!("Invalid VByte: value exceeds u64 range");
-        }
-    }
-}
-
-fn skip_pfc_section<R: Read + Seek>(reader: &mut R) -> Result<()> {
-    let mut section_type = [0u8; 1];
-    reader.read_exact(&mut section_type)?;
-    if section_type[0] != PFC_SECTION_TYPE {
-        bail!(
-            "Invalid dictionary section type: expected 0x{PFC_SECTION_TYPE:02x}, got 0x{:02x}",
-            section_type[0]
-        );
-    }
-
-    let _string_count = read_vbyte_from_reader(reader)?;
-    let buffer_length = read_vbyte_from_reader(reader)?;
-    let _block_size = read_vbyte_from_reader(reader)?;
-
-    let mut crc8 = [0u8; 1];
-    reader.read_exact(&mut crc8)?;
-
-    let _block_offsets = LogArrayReader::read_from(reader)?;
-
-    reader
-        .seek(SeekFrom::Current(buffer_length as i64))
-        .context("Failed to skip PFC string buffer")?;
-
-    let mut crc32 = [0u8; 4];
-    reader.read_exact(&mut crc32)?;
-
-    Ok(())
-}
+use crate::hdt::sections::{TRIPLES_ORDER_SPO, scan_hdt_sections};
 
 fn parse_num_triples_from_header(header: &str) -> Result<u64> {
     const VOID_TRIPLES: &str = "http://rdfs.org/ns/void#triples";
@@ -121,53 +72,6 @@ fn parse_num_triples_from_header(header: &str) -> Result<u64> {
     }
 }
 
-/// Skip a bitmap section, recording its starting file offset.
-/// Returns (section_start_offset, num_bits).
-fn skip_bitmap_section<R: Read + Seek>(reader: &mut R) -> Result<(u64, u64)> {
-    let section_start = reader.stream_position()?;
-
-    // Read preamble: type(1) + VByte(num_bits) + CRC8(1)
-    let mut type_byte = [0u8; 1];
-    reader.read_exact(&mut type_byte)?;
-
-    let num_bits = read_vbyte_from_reader(reader)?;
-
-    let mut crc8 = [0u8; 1];
-    reader.read_exact(&mut crc8)?;
-
-    // Skip data + CRC32C
-    let data_bytes = num_bits.div_ceil(8);
-    reader.seek(SeekFrom::Current(data_bytes as i64 + 4))?;
-
-    Ok((section_start, num_bits))
-}
-
-/// Skip a log array section, recording its starting file offset.
-/// Returns (section_start_offset, num_entries, bits_per_entry).
-fn skip_log_array_section<R: Read + Seek>(reader: &mut R) -> Result<(u64, u64, u8)> {
-    let section_start = reader.stream_position()?;
-
-    // Read preamble: type(1) + bits_per_entry(1) + VByte(num_entries) + CRC8(1)
-    let mut type_byte = [0u8; 1];
-    reader.read_exact(&mut type_byte)?;
-
-    let mut bits_byte = [0u8; 1];
-    reader.read_exact(&mut bits_byte)?;
-    let bits_per_entry = bits_byte[0];
-
-    let num_entries = read_vbyte_from_reader(reader)?;
-
-    let mut crc8 = [0u8; 1];
-    reader.read_exact(&mut crc8)?;
-
-    // Skip data + CRC32C
-    let total_bits = num_entries * bits_per_entry as u64;
-    let data_bytes = total_bits.div_ceil(8);
-    reader.seek(SeekFrom::Current(data_bytes as i64 + 4))?;
-
-    Ok((section_start, num_entries, bits_per_entry))
-}
-
 /// Create HDT index file (.hdt.index.v1-1) from an existing HDT file.
 ///
 /// Uses streaming decoders to read BitmapTriples with O(1) memory instead of
@@ -187,84 +91,40 @@ pub fn create_index(hdt_path: &Path, memory_budget: usize, temp_dir: &Path) -> R
         .with_context(|| format!("Failed to open HDT file {}", hdt_path.display()))?;
     let mut reader = BufReader::with_capacity(256 * 1024, file);
 
-    let global_ci =
-        ControlInfo::read_from(&mut reader).context("Failed to read global control info")?;
-    if global_ci.control_type != ControlType::Global {
-        bail!("Expected global control info at start of HDT file");
-    }
-
-    let header_ci =
-        ControlInfo::read_from(&mut reader).context("Failed to read header control info")?;
-    if header_ci.control_type != ControlType::Header {
-        bail!("Expected header control info");
-    }
-    let header_len: usize = header_ci
-        .get_property("length")
-        .and_then(|s| s.parse().ok())
-        .context("Missing or invalid header length in control info")?;
-
-    let mut header_buf = vec![0u8; header_len];
-    reader
-        .read_exact(&mut header_buf)
-        .context("Failed to read header section")?;
-    let header_text = String::from_utf8(header_buf).context("Header content is not valid UTF-8")?;
-    let num_triples = parse_num_triples_from_header(&header_text)
-        .context("Failed to parse triple count from header metadata")?;
-
-    let dict_ci =
-        ControlInfo::read_from(&mut reader).context("Failed to read dictionary control info")?;
-    if dict_ci.control_type != ControlType::Dictionary {
-        bail!("Expected dictionary control info");
-    }
-    if dict_ci.format != DICTIONARY_FOUR_FORMAT {
-        bail!(
-            "Unsupported dictionary format: {} (expected {})",
-            dict_ci.format,
-            DICTIONARY_FOUR_FORMAT
-        );
-    }
-
-    tracing::debug!("Skipping 4 PFC dictionary sections");
-    let dict_start = Instant::now();
-    for i in 0..4 {
-        skip_pfc_section(&mut reader)
-            .with_context(|| format!("Failed to skip dictionary section {}", i + 1))?;
-    }
+    let scan_start = Instant::now();
+    let sections = scan_hdt_sections(&mut reader)
+        .with_context(|| format!("Failed to scan HDT file {}", hdt_path.display()))?;
     tracing::debug!(
-        "Dictionary skipped in {:.3}s",
-        dict_start.elapsed().as_secs_f64()
+        "HDT structure scanned in {:.3}s",
+        scan_start.elapsed().as_secs_f64()
     );
 
-    let triples_ci =
-        ControlInfo::read_from(&mut reader).context("Failed to read triples control info")?;
-    if triples_ci.control_type != ControlType::Triples {
+    let header_text = sections.read_header(&mut reader)?;
+    let num_triples = parse_num_triples_from_header(&header_text)
+        .context("Failed to parse triple count from header metadata")?;
+    // The index records the header's count, so it must be the structural one.
+    if sections.num_triples() != num_triples {
         bail!(
-            "Expected triples control info, found {:?}",
-            triples_ci.control_type
+            "HDT header declares {num_triples} triples but ArrayZ has {} entries",
+            sections.num_triples()
         );
     }
-    let triples_order: u64 = triples_ci
-        .get_property("order")
-        .and_then(|s| s.parse().ok())
-        .context("Missing or invalid triples order")?;
+    // `scan_hdt_sections` refuses anything but SPO, so the order it records is
+    // the only one an index can be written for.
+    let triples_order = TRIPLES_ORDER_SPO;
 
     tracing::info!("Decoded main HDT: {num_triples} triples");
 
-    // Scan BitmapTriples sections: BitmapY, BitmapZ, ArrayY, ArrayZ
-    // We skip BitmapY (not needed) and record start offsets of the other three.
-    let (_by_start, _by_bits) =
-        skip_bitmap_section(&mut reader).context("Failed to scan BitmapY")?;
-    let (bz_start, _bz_bits) =
-        skip_bitmap_section(&mut reader).context("Failed to scan BitmapZ")?;
-    let (ay_start, ay_entries, ay_bpe) =
-        skip_log_array_section(&mut reader).context("Failed to scan ArrayY")?;
-    let (az_start, _az_entries, az_bpe) =
-        skip_log_array_section(&mut reader).context("Failed to scan ArrayZ")?;
-
-    let num_sp_pairs = ay_entries;
+    // BitmapY is not needed; the other three are streamed from their offsets.
+    let bz_start = sections.bitmap_z.section_start;
+    let ay_start = sections.array_y.section_start;
+    let az_start = sections.array_z.section_start;
+    let num_sp_pairs = sections.num_sp_pairs();
 
     tracing::debug!(
-        "BitmapTriples: ArrayY={ay_entries} entries ({ay_bpe}bpe), ArrayZ={num_triples} entries ({az_bpe}bpe)"
+        "BitmapTriples: ArrayY={num_sp_pairs} entries ({}bpe), ArrayZ={num_triples} entries ({}bpe)",
+        sections.array_y.bits_per_entry,
+        sections.array_z.bits_per_entry
     );
 
     drop(reader); // Done scanning
@@ -576,69 +436,25 @@ pub fn validate_hdt_triples(hdt_path: &Path) -> Result<()> {
         .with_context(|| format!("Failed to open HDT file {}", hdt_path.display()))?;
     let mut reader = BufReader::with_capacity(256 * 1024, file);
 
-    let global_ci =
-        ControlInfo::read_from(&mut reader).context("Failed to read global control info")?;
-    if global_ci.control_type != ControlType::Global {
-        bail!("Expected global control info at start of HDT file");
-    }
+    let sections = scan_hdt_sections(&mut reader)
+        .with_context(|| format!("Failed to scan HDT file {}", hdt_path.display()))?;
 
-    let header_ci =
-        ControlInfo::read_from(&mut reader).context("Failed to read header control info")?;
-    if header_ci.control_type != ControlType::Header {
-        bail!("Expected header control info");
-    }
-    let header_len: usize = header_ci
-        .get_property("length")
-        .and_then(|s| s.parse().ok())
-        .context("Missing or invalid header length in control info")?;
-
-    let mut header_buf = vec![0u8; header_len];
-    reader
-        .read_exact(&mut header_buf)
-        .context("Failed to read header section")?;
-    let header_text = String::from_utf8(header_buf).context("Header content is not valid UTF-8")?;
+    let header_text = sections.read_header(&mut reader)?;
     let num_triples = parse_num_triples_from_header(&header_text)
         .context("Failed to parse triple count from header metadata")?;
-
-    let dict_ci =
-        ControlInfo::read_from(&mut reader).context("Failed to read dictionary control info")?;
-    if dict_ci.control_type != ControlType::Dictionary {
-        bail!("Expected dictionary control info");
-    }
-    if dict_ci.format != DICTIONARY_FOUR_FORMAT {
+    if sections.num_triples() != num_triples {
         bail!(
-            "Unsupported dictionary format: {} (expected {})",
-            dict_ci.format,
-            DICTIONARY_FOUR_FORMAT
-        );
-    }
-
-    for i in 0..4 {
-        skip_pfc_section(&mut reader)
-            .with_context(|| format!("Failed to skip dictionary section {}", i + 1))?;
-    }
-
-    let triples_ci =
-        ControlInfo::read_from(&mut reader).context("Failed to read triples control info")?;
-    if triples_ci.control_type != ControlType::Triples {
-        bail!(
-            "Expected triples control info, found {:?}",
-            triples_ci.control_type
+            "HDT header declares {num_triples} triples but ArrayZ has {} entries",
+            sections.num_triples()
         );
     }
 
     tracing::info!("Decoded main HDT: {num_triples} triples");
 
-    let (_by_start, _by_bits) =
-        skip_bitmap_section(&mut reader).context("Failed to scan BitmapY")?;
-    let (bz_start, _bz_bits) =
-        skip_bitmap_section(&mut reader).context("Failed to scan BitmapZ")?;
-    let (ay_start, ay_entries, _ay_bpe) =
-        skip_log_array_section(&mut reader).context("Failed to scan ArrayY")?;
-    let (az_start, _az_entries, _az_bpe) =
-        skip_log_array_section(&mut reader).context("Failed to scan ArrayZ")?;
-
-    let num_sp_pairs = ay_entries;
+    let bz_start = sections.bitmap_z.section_start;
+    let ay_start = sections.array_y.section_start;
+    let az_start = sections.array_z.section_start;
+    let num_sp_pairs = sections.num_sp_pairs();
 
     drop(reader);
 
