@@ -375,7 +375,7 @@ fn common_prefix_len(a: &str, b: &str) -> usize {
 mod tests {
     use super::*;
     use crate::io::log_array::LogArrayReader;
-    use crate::io::vbyte::decode_vbyte;
+    use crate::io::vbyte::{decode_vbyte, read_vbyte_recording};
     use std::io::{Cursor, Read};
 
     /// Decoder for reading a PFC dictionary section (test-only for now).
@@ -392,9 +392,9 @@ mod tests {
             reader.read_exact(&mut type_byte)?;
             preamble_buf.push(type_byte[0]);
 
-            let string_count = read_vbyte_tracking(reader, &mut preamble_buf)?;
-            let buffer_length = read_vbyte_tracking(reader, &mut preamble_buf)?;
-            let _block_size = read_vbyte_tracking(reader, &mut preamble_buf)?;
+            let string_count = read_vbyte_recording(reader, &mut preamble_buf)?;
+            let buffer_length = read_vbyte_recording(reader, &mut preamble_buf)?;
+            let _block_size = read_vbyte_recording(reader, &mut preamble_buf)?;
 
             let mut crc_byte = [0u8; 1];
             reader.read_exact(&mut crc_byte)?;
@@ -479,30 +479,6 @@ mod tests {
             }
         }
         false
-    }
-
-    fn read_vbyte_tracking<R: Read>(reader: &mut R, buf: &mut Vec<u8>) -> io::Result<u64> {
-        let mut value: u64 = 0;
-        let mut shift = 0u32;
-        let mut byte_buf = [0u8; 1];
-
-        loop {
-            reader.read_exact(&mut byte_buf)?;
-            let byte = byte_buf[0];
-            buf.push(byte);
-            value |= ((byte & 0x7F) as u64) << shift;
-            if byte & 0x80 != 0 {
-                // MSB=1: last byte
-                return Ok(value);
-            }
-            shift += 7;
-            if shift >= 64 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "VByte value exceeds u64 range",
-                ));
-            }
-        }
     }
 
     #[test]
