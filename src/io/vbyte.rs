@@ -58,28 +58,48 @@ pub fn write_vbyte<W: Write>(writer: &mut W, value: u64) -> io::Result<usize> {
     Ok(bytes.len())
 }
 
-/// Read a VByte-encoded value from a reader.
-pub fn read_vbyte<R: Read>(reader: &mut R) -> io::Result<u64> {
-    let mut value: u64 = 0;
-    let mut shift = 0u32;
-    let mut buf = [0u8; 1];
+/// Longest VByte encoding of a `u64`: seven data bits per byte.
+const MAX_VBYTE_BYTES: usize = 10;
 
+/// Read one VByte from `reader`, handing each consumed byte to `record`.
+///
+/// The only place this crate turns a byte *stream* into a VByte. Framing — how
+/// many bytes the encoding claims — is the one bit test below; the value is
+/// [`decode_vbyte`]'s to produce, so a stream reader and a slice reader cannot
+/// drift on what the same bytes mean.
+fn read_vbyte_with<R: Read>(reader: &mut R, mut record: impl FnMut(u8)) -> io::Result<u64> {
+    let mut encoded = [0u8; MAX_VBYTE_BYTES];
+    let mut len = 0;
     loop {
-        reader.read_exact(&mut buf)?;
-        let byte = buf[0];
-        value |= ((byte & 0x7F) as u64) << shift;
-        if byte & 0x80 != 0 {
+        let mut byte = [0u8; 1];
+        reader.read_exact(&mut byte)?;
+        record(byte[0]);
+        encoded[len] = byte[0];
+        len += 1;
+        if byte[0] & 0x80 != 0 {
             // MSB=1: last byte
-            return Ok(value);
+            return decode_vbyte(&encoded[..len]).map(|(value, _)| value);
         }
-        shift += 7;
-        if shift >= 64 {
+        if len == MAX_VBYTE_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "VByte value exceeds u64 range",
             ));
         }
     }
+}
+
+/// Read a VByte-encoded value from a reader.
+pub fn read_vbyte<R: Read>(reader: &mut R) -> io::Result<u64> {
+    read_vbyte_with(reader, |_| {})
+}
+
+/// Read a VByte, appending the bytes it consumed to `recorded`.
+///
+/// Section preambles are checksummed after the fact with a CRC8 over the bytes
+/// as they appeared on disk, so a reader that parses one has to keep them.
+pub fn read_vbyte_recording<R: Read>(reader: &mut R, recorded: &mut Vec<u8>) -> io::Result<u64> {
+    read_vbyte_with(reader, |byte| recorded.push(byte))
 }
 
 #[cfg(test)]

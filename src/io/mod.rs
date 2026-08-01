@@ -13,7 +13,7 @@ pub use control::{ControlInfo, ControlType};
 pub use log_array::{
     LogArrayReader, LogArrayWriter, StreamingLogArrayDecoder, StreamingLogArrayEncoder,
 };
-pub use vbyte::{decode_vbyte, encode_vbyte, read_vbyte};
+pub use vbyte::{decode_vbyte, encode_vbyte, read_vbyte, read_vbyte_recording};
 
 use crate::io::crc_utils::crc8;
 use anyhow::{Context, Result, ensure};
@@ -146,24 +146,6 @@ pub fn skip_log_array_section<R: Read + Seek>(reader: &mut R) -> Result<(u64, u6
         section.num_entries,
         section.bits_per_entry,
     ))
-}
-
-/// Read a VByte, appending the bytes it consumed to `bytes` so that a preamble
-/// can be checksummed after the fact.
-pub(crate) fn read_vbyte_recording<R: Read>(reader: &mut R, bytes: &mut Vec<u8>) -> Result<u64> {
-    let mut value = 0u64;
-    let mut shift = 0u32;
-    loop {
-        let mut byte = [0u8; 1];
-        reader.read_exact(&mut byte)?;
-        bytes.push(byte[0]);
-        value |= u64::from(byte[0] & 0x7f) << shift;
-        if byte[0] & 0x80 != 0 {
-            return Ok(value);
-        }
-        shift += 7;
-        ensure!(shift < 64, "invalid VByte in section preamble");
-    }
 }
 
 /// Consume the CRC8 that follows a preamble and check it against `preamble`.
