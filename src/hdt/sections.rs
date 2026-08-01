@@ -89,6 +89,26 @@ impl HdtSections {
     pub fn end(&self) -> u64 {
         self.array_z.section_end
     }
+
+    /// Read back the header's N-Triples blob.
+    ///
+    /// [`scan_hdt_sections`] seeks past the header rather than buffering it,
+    /// since most readers only need to know where the data begins. Callers that
+    /// want what the header *declares* — `void:triples`, the original size —
+    /// come back for it here, once, with the extent the scan already recorded.
+    ///
+    /// Leaves `reader` at [`data_offset`](Self::data_offset), not at
+    /// [`end`](Self::end).
+    pub fn read_header<R: Read + Seek>(&self, reader: &mut R) -> Result<String> {
+        let length = usize::try_from(self.data_offset - self.header_offset)
+            .context("HDT header is too large to buffer")?;
+        reader.seek(SeekFrom::Start(self.header_offset))?;
+        let mut bytes = vec![0u8; length];
+        reader
+            .read_exact(&mut bytes)
+            .context("Failed to read the HDT header")?;
+        String::from_utf8(bytes).context("HDT header is not valid UTF-8")
+    }
 }
 
 /// Walk an HDT from the start of `reader`, recording where every section is.
