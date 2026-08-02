@@ -410,3 +410,82 @@ fn both_directions_of_a_dictionary_term_agree_with_the_bytes_hdtc_wrote() {
         "the fixture must cover plain, tagged and typed literals and a non-literal, saw {plain}/{tagged}/{typed}/{iris}"
     );
 }
+
+/// The text-index surface a downstream server needs, exercised the same way.
+///
+/// KGF's `o.text` resolves hits through the OPS permutation, so what it needs
+/// from here is narrow and load-bearing: query and rank, the manifest the
+/// service descriptor republishes, and a binding check — because an index built
+/// from a different HDT returns object IDs that resolve to real terms in the
+/// wrong dictionary, which no checksum on the query path would catch.
+#[test]
+fn the_text_surface_queries_describes_and_binds() {
+    use hdtc::format::{
+        TextQuery, TextSearcher, default_text_index_path, verify_text_index_binding,
+    };
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let hdt = build_fixture(temp.path());
+    let index = default_text_index_path(&hdt);
+    assert!(
+        index
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .ends_with(".text"),
+        "the default path is what a bundle is laid out around"
+    );
+
+    let built = Command::new(env!("CARGO_BIN_EXE_hdtc"))
+        .args(["text", hdt.to_str().unwrap()])
+        .output()
+        .expect("run hdtc text");
+    assert!(
+        built.status.success(),
+        "hdtc text failed: {}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    assert!(index.is_dir(), "a text index is a directory, not a file");
+
+    let searcher = TextSearcher::open(&index).expect("open the index");
+
+    // The manifest is what a consumer republishes rather than restating: how
+    // much was indexed, and what was left out.
+    let manifest = searcher.manifest();
+    assert!(manifest.indexed_docs > 0, "the fixture has literals");
+    assert!(manifest.literals_scanned >= manifest.indexed_docs);
+
+    // A hit is an object dictionary ID and nothing else, which is what makes
+    // it resolvable through a permutation the caller already has.
+    let hits = searcher
+        .search(
+            &TextQuery {
+                text: searcher
+                    .analyze("Alice")
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "alice".to_owned()),
+                ..TextQuery::default()
+            },
+            10,
+        )
+        .expect("search");
+    assert!(!hits.is_empty(), "the fixture holds a literal to find");
+    assert!(hits.iter().all(|hit| hit.object_id > 0));
+
+    // And the binding: this index against its own HDT, and against another.
+    verify_text_index_binding(&index, &hdt).expect("an index binds to its own source");
+
+    let other_temp = tempfile::tempdir().expect("temp dir");
+    let other = build_fixture_from(
+        other_temp.path(),
+        "<http://example.org/x> <http://example.org/p> \"a different graph\" .\n",
+    );
+    let error = verify_text_index_binding(&index, &other)
+        .expect_err("an index must not bind to an HDT it was not built from");
+    assert!(
+        error.to_string().contains("binding mismatch"),
+        "unexpected error: {error}"
+    );
+}

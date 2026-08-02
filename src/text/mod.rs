@@ -34,9 +34,45 @@ pub use analyzer::{
     DEFAULT_MAX_LITERAL_BYTES, DEFAULT_UNTAGGED_LANGUAGE, DatatypeExclusions, normalize_language,
 };
 pub use builder::{TextConfig, create_text_index};
+pub use manifest::{LanguageCount, TextManifest};
 pub use searcher::{MatchKind, MatchMode, TextHit, TextQuery, TextSearcher};
 
 use std::path::{Path, PathBuf};
+
+/// Fail unless the index at `dir` was built from the HDT at `hdt_path`.
+///
+/// **Costs a pass over the HDT's payload**, because that is what the binding
+/// is: the manifest records a SHA-256 over the dictionary-and-triples suffix,
+/// and the index holds no cheaper witness to compare instead. So this belongs
+/// where the other whole-file checks go — publication, ingest, `hdtc verify` —
+/// and not on a query path.
+///
+/// Worth stating that this is a weaker position than the other
+/// dictionary-derived sidecars are in. `.hdt.perm` records dictionary counts, a
+/// triple count and a suffix length, so
+/// [`PermutationIndex::open`](crate::permutation::PermutationIndex::open)
+/// rejects a foreign sidecar for the price of a header read, before it answers
+/// anything. A text index has no equivalent, so a consumer that must not answer
+/// from a foreign index has to be *told* its bundle was verified rather than
+/// establish it at open.
+pub fn verify_text_index_binding(dir: &Path, hdt_path: &Path) -> anyhow::Result<()> {
+    use anyhow::{Context, ensure};
+
+    let manifest = manifest::TextManifest::read(dir).with_context(|| {
+        format!(
+            "Failed to read the text index manifest in {}",
+            dir.display()
+        )
+    })?;
+    let digest = crate::hdt::reader::hdt_data_digest(hdt_path)?;
+    ensure!(
+        digest == manifest.source_digest,
+        "Text index {} was not built from {}: source SHA-256 binding mismatch",
+        dir.display(),
+        hdt_path.display()
+    );
+    Ok(())
+}
 
 /// Directory suffix a text index is published under beside its HDT.
 pub const TEXT_INDEX_SUFFIX: &str = ".text";

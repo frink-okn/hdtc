@@ -115,7 +115,7 @@ pub use crate::graph_index::{
 // ---------------------------------------------------------------------------
 
 pub use crate::text::{
-    DEFAULT_MAX_LITERAL_BYTES, DEFAULT_UNTAGGED_LANGUAGE, DatatypeExclusions, MatchKind, MatchMode,
-    TEXT_INDEX_SUFFIX, TextHit, TextQuery, TextSearcher, default_text_index_path,
-    normalize_language,
+    DEFAULT_MAX_LITERAL_BYTES, DEFAULT_UNTAGGED_LANGUAGE, DatatypeExclusions, LanguageCount,
+    MatchKind, MatchMode, TEXT_INDEX_SUFFIX, TextHit, TextManifest, TextQuery, TextSearcher,
+    default_text_index_path, normalize_language, verify_text_index_binding,
 };

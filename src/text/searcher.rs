@@ -150,6 +150,16 @@ impl TextSearcher {
         })
     }
 
+    /// What the build recorded about this index.
+    ///
+    /// A consumer that publishes its own description of the index — which
+    /// literals were left out and why, which languages are present — should
+    /// report what the build actually did rather than restate the configuration
+    /// it was asked for.
+    pub fn manifest(&self) -> &TextManifest {
+        &self.manifest
+    }
+
     /// Analyze a query string into tokens, using the index's own chain.
     ///
     /// Build and query go through the same [`TextAnalyzer`], which is what
