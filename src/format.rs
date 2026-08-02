@@ -21,6 +21,8 @@
 //!   verified by one implementation rather than two.
 //! - **Sidecar directories** — [`PermutationHeader`] and [`PermutationSection`]
 //!   describe `.hdt.perm`'s regions precisely enough to map them directly.
+//! - **Bounded work**, so a service can spend a published budget rather than
+//!   discover a query's cost after paying it: [`TextSearcher::count_up_to`].
 //! - **Read-side runtime logic that must not be duplicated**, of which the
 //!   load-bearing case is the text analyzer. `/search` is correct only if query
 //!   analysis is the same code that built the index; a divergence here does not

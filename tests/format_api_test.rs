@@ -474,6 +474,36 @@ fn the_text_surface_queries_describes_and_binds() {
     assert!(!hits.is_empty(), "the fixture holds a literal to find");
     assert!(hits.iter().all(|hit| hit.object_id > 0));
 
+    // A bounded count agrees with the unbounded one below the bound, and says
+    // so when it stops early — which is what lets a caller with a published
+    // work budget spend it rather than learn the cost afterwards.
+    let query = TextQuery {
+        text: "alice".to_owned(),
+        ..TextQuery::default()
+    };
+    let total = searcher.count(&query).expect("count") as u64;
+    assert!(total > 1, "the fixture holds several literals naming Alice");
+    assert_eq!(
+        searcher
+            .count_up_to(&query, total + 1)
+            .expect("count_up_to"),
+        (total, false),
+        "a bound above the total is exact"
+    );
+    assert_eq!(
+        searcher.count_up_to(&query, total).expect("count_up_to"),
+        (total, true),
+        "a bound at the total stops on the last one"
+    );
+    assert_eq!(
+        searcher.count_up_to(&query, 1).expect("count_up_to"),
+        (1, true)
+    );
+    assert_eq!(
+        searcher.count_up_to(&query, 0).expect("count_up_to"),
+        (0, true)
+    );
+
     // And the binding: this index against its own HDT, and against another.
     verify_text_index_binding(&index, &hdt).expect("an index binds to its own source");
 

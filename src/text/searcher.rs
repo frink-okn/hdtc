@@ -185,6 +185,52 @@ impl TextSearcher {
         Ok(searcher.search(&built, &Count)?)
     }
 
+    /// Count matching documents, stopping once `limit` of them are known.
+    ///
+    /// Returns the count and whether it stopped early — `(n, false)` is exact,
+    /// `(limit, true)` means "at least this many".
+    ///
+    /// [`count`](TextSearcher::count) walks every posting the query matches,
+    /// which is the right answer for a CLI reporting a total and the wrong one
+    /// for a service that has published a bound on the work a request may do:
+    /// a single common token can match millions of literals, and no argument
+    /// to `count` says "stop". This walks the same documents and stops, so a
+    /// caller with a budget can spend it rather than discovering afterwards
+    /// what the query cost.
+    ///
+    /// Iterating the scorers directly rather than through a collector, because
+    /// a Tantivy collector has no way to say "enough" — it sees each document
+    /// and returns nothing until the search is over.
+    pub fn count_up_to(&self, query: &TextQuery, limit: u64) -> Result<(u64, bool)> {
+        let Some(built) = self.union_query(query)? else {
+            return Ok((0, false));
+        };
+        if limit == 0 {
+            return Ok((0, true));
+        }
+
+        let searcher = self.reader.searcher();
+        let weight = built.weight(EnableScoring::disabled_from_searcher(&searcher))?;
+        let mut counted = 0u64;
+        for reader in searcher.segment_readers() {
+            let mut scorer = weight.scorer(reader, 1.0)?;
+            // The union already collapses a document matching both the plain
+            // and the stemmed field, so a document is seen once per segment
+            // and segments do not overlap.
+            let alive = reader.alive_bitset();
+            while scorer.doc() != TERMINATED {
+                if alive.is_none_or(|alive| alive.is_alive(scorer.doc())) {
+                    counted += 1;
+                    if counted >= limit {
+                        return Ok((counted, true));
+                    }
+                }
+                scorer.advance();
+            }
+        }
+        Ok((counted, false))
+    }
+
     /// The `top_k` highest-scoring literals, best first.
     ///
     /// Exact matches come first as a class, then stemmed-only ones. Running the
