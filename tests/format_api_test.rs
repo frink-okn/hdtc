@@ -421,7 +421,8 @@ fn both_directions_of_a_dictionary_term_agree_with_the_bytes_hdtc_wrote() {
 #[test]
 fn the_text_surface_queries_describes_and_binds() {
     use hdtc::format::{
-        TextQuery, TextSearcher, default_text_index_path, verify_text_index_binding,
+        TextMatchPage, TextQuery, TextScanPosition, TextSearch, TextSearcher,
+        default_text_index_path, verify_text_index_binding,
     };
 
     let temp = tempfile::tempdir().expect("temp dir");
@@ -474,15 +475,41 @@ fn the_text_surface_queries_describes_and_binds() {
     assert!(!hits.is_empty(), "the fixture holds a literal to find");
     assert!(hits.iter().all(|hit| hit.object_id > 0));
 
-    // A bounded count agrees with the unbounded one below the bound, and says
-    // so when it stops early — which is what lets a caller with a published
-    // work budget spend it rather than learn the cost afterwards.
     let query = TextQuery {
         text: "alice".to_owned(),
         ..TextQuery::default()
     };
     let total = searcher.count(&query).expect("count") as u64;
     assert!(total > 1, "the fixture holds several literals naming Alice");
+
+    // A server can bound scoring itself rather than only the retained heap.
+    let ranked: TextSearch = searcher
+        .search_up_to(&query, 10, 1)
+        .expect("bounded search");
+    assert_eq!(ranked.examined, 1);
+    assert!(!ranked.complete);
+    assert_eq!(ranked.hits.len(), 1);
+
+    // And it can scan the same matching object set in bounded resumable pages
+    // for an exact count after applying its own statement-pattern constraints.
+    let mut position: Option<TextScanPosition> = None;
+    let mut scanned = Vec::new();
+    loop {
+        let page: TextMatchPage = searcher
+            .scan_matching_objects(&query, position, 1)
+            .expect("scan matching objects");
+        scanned.extend(page.object_ids);
+        if page.complete {
+            break;
+        }
+        let next = page.next.expect("an incomplete scan has a position");
+        position = Some(TextScanPosition::decode(next.encode()));
+    }
+    assert_eq!(scanned.len() as u64, total);
+
+    // A bounded count agrees with the unbounded one below the bound, and says
+    // so when it stops early — which is what lets a caller with a published
+    // work budget spend it rather than learn the cost afterwards.
     assert_eq!(
         searcher
             .count_up_to(&query, total + 1)

@@ -22,7 +22,8 @@
 //! - **Sidecar directories** — [`PermutationHeader`] and [`PermutationSection`]
 //!   describe `.hdt.perm`'s regions precisely enough to map them directly.
 //! - **Bounded work**, so a service can spend a published budget rather than
-//!   discover a query's cost after paying it: [`TextSearcher::count_up_to`].
+//!   discover a query's cost after paying it: [`TextSearcher::search_up_to`]
+//!   and [`TextSearcher::scan_matching_objects`].
 //! - **Read-side runtime logic that must not be duplicated**, of which the
 //!   load-bearing case is the text analyzer. `/search` is correct only if query
 //!   analysis is the same code that built the index; a divergence here does not
@@ -118,6 +119,7 @@ pub use crate::graph_index::{
 
 pub use crate::text::{
     DEFAULT_MAX_LITERAL_BYTES, DEFAULT_UNTAGGED_LANGUAGE, DatatypeExclusions, LanguageCount,
-    MatchKind, MatchMode, TEXT_INDEX_SUFFIX, TextHit, TextManifest, TextQuery, TextSearcher,
-    default_text_index_path, normalize_language, verify_text_index_binding,
+    MatchKind, MatchMode, TEXT_INDEX_SUFFIX, TextHit, TextManifest, TextMatchPage, TextQuery,
+    TextScanPosition, TextSearch, TextSearcher, default_text_index_path, normalize_language,
+    verify_text_index_binding,
 };

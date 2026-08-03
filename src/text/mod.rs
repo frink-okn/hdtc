@@ -35,7 +35,10 @@ pub use analyzer::{
 };
 pub use builder::{TextConfig, create_text_index};
 pub use manifest::{LanguageCount, TextManifest};
-pub use searcher::{MatchKind, MatchMode, TextHit, TextQuery, TextSearcher};
+pub use searcher::{
+    MatchKind, MatchMode, TextHit, TextMatchPage, TextQuery, TextScanPosition, TextSearch,
+    TextSearcher,
+};
 
 use std::path::{Path, PathBuf};
 
