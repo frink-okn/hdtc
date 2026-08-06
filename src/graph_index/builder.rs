@@ -979,9 +979,18 @@ fn append_section(
     indexed_bits: u64,
     span: bool,
 ) -> Result<()> {
-    let (length, payload_crc) = file_crc(&mut file)?;
+    let (length, crc) = if span {
+        // Span sections deliberately have no payload CRC: their nested child
+        // structures cover every non-padding byte and strict validation checks
+        // the padding. Do not stream a potentially enormous region merely to
+        // compute a checksum that the format requires us to discard.
+        let length = file.metadata()?.len();
+        file.seek(SeekFrom::Start(0))?;
+        (length, 0)
+    } else {
+        file_crc(&mut file)?
+    };
     let offset = if length == 0 { 0 } else { *cursor };
-    let crc = if span { 0 } else { payload_crc };
     if length != 0 {
         *cursor = align64(
             cursor

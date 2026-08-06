@@ -10,7 +10,7 @@
 //! Data size is ceil(total_bits / 8) bytes (byte-packed, NOT padded to 64-bit words).
 
 use crate::io::crc_utils::{crc8, crc32c};
-use crate::io::vbyte::encode_vbyte;
+use crate::io::vbyte::{encode_vbyte, read_vbyte_recording};
 use std::io::{self, Read, Write};
 
 /// Format type byte for LogArray.
@@ -291,7 +291,7 @@ impl<R: Read> StreamingLogArrayDecoder<R> {
         preamble_buf.push(bits_per_entry);
 
         // VByte(num_entries)
-        let num_entries = read_vbyte_tracking(&mut reader, &mut preamble_buf)?;
+        let num_entries = read_vbyte_recording(&mut reader, &mut preamble_buf)?;
 
         // CRC8
         let mut crc_byte = [0u8; 1];
@@ -483,7 +483,7 @@ impl LogArrayReader {
         preamble_buf.push(bits_per_entry);
 
         // Read num_entries VByte
-        let num_entries = read_vbyte_tracking(reader, &mut preamble_buf)?;
+        let num_entries = read_vbyte_recording(reader, &mut preamble_buf)?;
 
         // Read and verify CRC8
         let mut crc_byte = [0u8; 1];
@@ -577,34 +577,8 @@ impl LogArrayReader {
     }
 
     /// Whether the array is empty.
-    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.num_entries == 0
-    }
-}
-
-/// Read a VByte value from a reader, appending raw bytes to a tracking buffer.
-fn read_vbyte_tracking<R: Read>(reader: &mut R, buf: &mut Vec<u8>) -> io::Result<u64> {
-    let mut value: u64 = 0;
-    let mut shift = 0u32;
-    let mut byte_buf = [0u8; 1];
-
-    loop {
-        reader.read_exact(&mut byte_buf)?;
-        let byte = byte_buf[0];
-        buf.push(byte);
-        value |= ((byte & 0x7F) as u64) << shift;
-        if byte & 0x80 != 0 {
-            // MSB=1: last byte
-            return Ok(value);
-        }
-        shift += 7;
-        if shift >= 64 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "VByte value exceeds u64 range",
-            ));
-        }
     }
 }
 
@@ -612,6 +586,23 @@ fn read_vbyte_tracking<R: Read>(reader: &mut R, buf: &mut Vec<u8>) -> io::Result
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    /// A preamble whose `num_entries` VByte overflows `u64` must be refused,
+    /// not aliased down to a smaller count — this reader shares
+    /// `decode_vbyte`'s range check rather than restating it.
+    #[test]
+    fn overflowing_num_entries_is_refused() {
+        // Type, bits_per_entry, then nine empty groups and payload 2 in the
+        // tenth: only bit 63 fits, so shifting would silently produce 0.
+        let mut section = vec![TYPE_LOG, 8];
+        section.extend_from_slice(&[0u8; 9]);
+        section.push(0x82);
+
+        let error = StreamingLogArrayDecoder::new(Cursor::new(section))
+            .err()
+            .expect("an overflowing entry count must not decode");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
 
     #[test]
     fn test_bits_for() {

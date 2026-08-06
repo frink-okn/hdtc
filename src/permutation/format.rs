@@ -12,30 +12,81 @@ pub(crate) const SUPERBLOCK_BITS: u32 = 4096;
 pub(crate) const SUBBLOCK_BITS: u32 = 512;
 pub(crate) const REQUIRED: u32 = 1;
 
-pub(crate) const POS_ARRAY_Y: u32 = 0x0101;
-pub(crate) const POS_BITMAP_Y: u32 = 0x0102;
-pub(crate) const POS_ARRAY_Z: u32 = 0x0103;
-pub(crate) const POS_BITMAP_Z: u32 = 0x0104;
-pub(crate) const POS_Y_SUPER: u32 = 0x0105;
-pub(crate) const POS_Y_SUB: u32 = 0x0106;
-pub(crate) const POS_Z_SUPER: u32 = 0x0107;
-pub(crate) const POS_Z_SUB: u32 = 0x0108;
-pub(crate) const POS_MAP: u32 = 0x0109;
+/// A permutation-index component encoded in the high byte of a section type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+#[non_exhaustive]
+pub enum PermutationComponent {
+    /// Predicate, object, subject order.
+    Pos = 0x01,
+    /// Object, predicate, subject order.
+    Ops = 0x02,
+    /// Subject, predicate, object order from the host HDT.
+    Spo = 0x03,
+}
 
-pub(crate) const OPS_ARRAY_Y: u32 = 0x0201;
-pub(crate) const OPS_BITMAP_Y: u32 = 0x0202;
-pub(crate) const OPS_ARRAY_Z: u32 = 0x0203;
-pub(crate) const OPS_BITMAP_Z: u32 = 0x0204;
-pub(crate) const OPS_Y_SUPER: u32 = 0x0205;
-pub(crate) const OPS_Y_SUB: u32 = 0x0206;
-pub(crate) const OPS_Z_SUPER: u32 = 0x0207;
-pub(crate) const OPS_Z_SUB: u32 = 0x0208;
-pub(crate) const OPS_MAP: u32 = 0x0209;
+impl PermutationComponent {
+    /// Compose the wire-level section type for this component and region kind.
+    pub const fn section_type(self, kind: PermutationSectionKind) -> u32 {
+        ((self as u32) << 8) | kind as u32
+    }
+}
 
-pub(crate) const SPO_Y_SUPER: u32 = 0x0305;
-pub(crate) const SPO_Y_SUB: u32 = 0x0306;
-pub(crate) const SPO_Z_SUPER: u32 = 0x0307;
-pub(crate) const SPO_Z_SUB: u32 = 0x0308;
+/// A permutation-index region kind encoded in the low byte of a section type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+#[non_exhaustive]
+pub enum PermutationSectionKind {
+    /// Level-2 value array.
+    ArrayY = 0x01,
+    /// Bitmap over the level-2 array.
+    BitmapY = 0x02,
+    /// Level-3 value array.
+    ArrayZ = 0x03,
+    /// Bitmap over the level-3 array.
+    BitmapZ = 0x04,
+    /// Superblock ranks for the level-2 bitmap.
+    BitmapYSuperrank = 0x05,
+    /// Subblock ranks for the level-2 bitmap.
+    BitmapYSubrank = 0x06,
+    /// Superblock ranks for the level-3 bitmap.
+    BitmapZSuperrank = 0x07,
+    /// Subblock ranks for the level-3 bitmap.
+    BitmapZSubrank = 0x08,
+    /// Optional permutation-position to SPO-position map.
+    PositionMap = 0x09,
+}
+
+use PermutationComponent::{Ops, Pos, Spo};
+use PermutationSectionKind::{
+    ArrayY, ArrayZ, BitmapY, BitmapYSubrank, BitmapYSuperrank, BitmapZ, BitmapZSubrank,
+    BitmapZSuperrank, PositionMap,
+};
+
+pub(crate) const POS_ARRAY_Y: u32 = Pos.section_type(ArrayY);
+pub(crate) const POS_BITMAP_Y: u32 = Pos.section_type(BitmapY);
+pub(crate) const POS_ARRAY_Z: u32 = Pos.section_type(ArrayZ);
+pub(crate) const POS_BITMAP_Z: u32 = Pos.section_type(BitmapZ);
+pub(crate) const POS_Y_SUPER: u32 = Pos.section_type(BitmapYSuperrank);
+pub(crate) const POS_Y_SUB: u32 = Pos.section_type(BitmapYSubrank);
+pub(crate) const POS_Z_SUPER: u32 = Pos.section_type(BitmapZSuperrank);
+pub(crate) const POS_Z_SUB: u32 = Pos.section_type(BitmapZSubrank);
+pub(crate) const POS_MAP: u32 = Pos.section_type(PositionMap);
+
+pub(crate) const OPS_ARRAY_Y: u32 = Ops.section_type(ArrayY);
+pub(crate) const OPS_BITMAP_Y: u32 = Ops.section_type(BitmapY);
+pub(crate) const OPS_ARRAY_Z: u32 = Ops.section_type(ArrayZ);
+pub(crate) const OPS_BITMAP_Z: u32 = Ops.section_type(BitmapZ);
+pub(crate) const OPS_Y_SUPER: u32 = Ops.section_type(BitmapYSuperrank);
+pub(crate) const OPS_Y_SUB: u32 = Ops.section_type(BitmapYSubrank);
+pub(crate) const OPS_Z_SUPER: u32 = Ops.section_type(BitmapZSuperrank);
+pub(crate) const OPS_Z_SUB: u32 = Ops.section_type(BitmapZSubrank);
+pub(crate) const OPS_MAP: u32 = Ops.section_type(PositionMap);
+
+pub(crate) const SPO_Y_SUPER: u32 = Spo.section_type(BitmapYSuperrank);
+pub(crate) const SPO_Y_SUB: u32 = Spo.section_type(BitmapYSubrank);
+pub(crate) const SPO_Z_SUPER: u32 = Spo.section_type(BitmapZSuperrank);
+pub(crate) const SPO_Z_SUB: u32 = Spo.section_type(BitmapZSubrank);
 
 pub fn canonical_path(hdt_path: &Path) -> PathBuf {
     let mut name: OsString = hdt_path.as_os_str().to_owned();
@@ -50,12 +101,9 @@ pub(crate) fn align64(value: u64) -> Result<u64> {
         .context("permutation-index alignment overflow")
 }
 
-pub(crate) fn packed_len(count: u64, width: u8) -> Result<u64> {
-    count
-        .checked_mul(u64::from(width))
-        .context("packed section bit-length overflow")
-        .map(|bits| bits.div_ceil(8))
-}
+/// Bit-packed regions round to a whole byte the same way here as in every other
+/// format this crate writes, so the rule lives in one place.
+pub(crate) use crate::io::packed_len;
 
 pub(crate) fn id_width(maximum: u64) -> u8 {
     if maximum == 0 {
@@ -154,7 +202,7 @@ pub(crate) fn is_array(section_type: u32) -> bool {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct Header {
+pub struct Header {
     pub flags: u64,
     pub triples: u64,
     pub subjects: u64,
@@ -168,12 +216,14 @@ pub(crate) struct Header {
     pub directory_length: u64,
     pub section_count: u32,
     pub footer_offset: u64,
+    pub superblock_bits: u32,
+    pub subblock_bits: u32,
     pub source_digest: [u8; 32],
     pub header_crc: u32,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct Section {
+pub struct Section {
     pub section_type: u32,
     pub flags: u32,
     pub offset: u64,
@@ -249,6 +299,8 @@ pub(crate) fn parse_header(bytes: &[u8; 256]) -> Result<Header> {
         directory_length: u64_at(bytes, 96),
         section_count: u32_at(bytes, 104),
         footer_offset: u64_at(bytes, 112),
+        superblock_bits: u32_at(bytes, 120),
+        subblock_bits: u32_at(bytes, 124),
         source_digest: bytes[128..160].try_into().unwrap(),
         header_crc: stored_crc,
     })

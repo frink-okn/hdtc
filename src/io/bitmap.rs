@@ -9,7 +9,7 @@
 //! Data size is ceil(num_bits / 8) bytes (byte-packed, NOT padded to 64-bit words).
 
 use crate::io::crc_utils::{crc8, crc32c};
-use crate::io::vbyte::encode_vbyte;
+use crate::io::vbyte::{encode_vbyte, read_vbyte_recording};
 use std::io::{self, Read, Write};
 
 /// Format type byte for Bitmap (same as LogArray uses type 1, bitmap also uses 1
@@ -241,7 +241,7 @@ impl<R: Read> StreamingBitmapDecoder<R> {
         preamble_buf.push(type_byte[0]);
 
         // VByte(num_bits)
-        let num_bits = read_vbyte_tracking(&mut reader, &mut preamble_buf)?;
+        let num_bits = read_vbyte_recording(&mut reader, &mut preamble_buf)?;
 
         // CRC8
         let mut crc_byte = [0u8; 1];
@@ -364,7 +364,7 @@ impl BitmapReader {
         preamble_buf.push(type_byte[0]);
 
         // VByte(num_bits) - read byte by byte tracking into preamble_buf
-        let num_bits = read_vbyte_tracking(reader, &mut preamble_buf)?;
+        let num_bits = read_vbyte_recording(reader, &mut preamble_buf)?;
 
         // Read and verify CRC8
         let mut crc_byte = [0u8; 1];
@@ -500,35 +500,28 @@ impl BitmapReader {
     }
 }
 
-/// Read a VByte value from a reader, appending raw bytes to a tracking buffer.
-fn read_vbyte_tracking<R: Read>(reader: &mut R, buf: &mut Vec<u8>) -> io::Result<u64> {
-    let mut value: u64 = 0;
-    let mut shift = 0u32;
-    let mut byte_buf = [0u8; 1];
-
-    loop {
-        reader.read_exact(&mut byte_buf)?;
-        let byte = byte_buf[0];
-        buf.push(byte);
-        value |= ((byte & 0x7F) as u64) << shift;
-        if byte & 0x80 != 0 {
-            // MSB=1: last byte
-            return Ok(value);
-        }
-        shift += 7;
-        if shift >= 64 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "VByte value exceeds u64 range",
-            ));
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    /// A preamble whose `num_bits` VByte overflows `u64` must be refused, not
+    /// aliased down to a smaller length. This reader shares `decode_vbyte`'s
+    /// range check rather than restating it, which is what makes that true
+    /// here as well as at the slice decoder.
+    #[test]
+    fn overflowing_num_bits_is_refused() {
+        let mut section = vec![TYPE_BITMAP];
+        // Nine empty groups then payload 2 in the tenth: only bit 63 fits, so
+        // shifting would silently produce 0.
+        section.extend_from_slice(&[0u8; 9]);
+        section.push(0x82);
+
+        let error = StreamingBitmapDecoder::new(Cursor::new(section))
+            .err()
+            .expect("an overflowing bit count must not decode");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
 
     #[test]
     fn test_empty_bitmap() {

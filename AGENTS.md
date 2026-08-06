@@ -74,9 +74,19 @@ Key design points:
 
 ## File Structure
 
+The crate has **both a library and a binary target**. `src/main.rs` is a three-line
+wrapper around `hdtc::run()`; everything else lives in the library so downstream
+crates can link the format layer instead of shelling out. The module tree is
+private — `src/format.rs` is the only published surface, and adding to it is a
+deliberate act (see its docs for the stability contract). Its consumer today is
+KGF's `kgf-store` in `../kgf-rs`, which memory-maps the files this crate writes;
+`tests/format_api_test.rs` is what fails when the façade stops serving it.
+
 ```
 src/
-  main.rs          - CLI entry point, pipeline orchestration
+  lib.rs           - Library root, CLI orchestration (`run()`)
+  main.rs          - Binary entry point; wraps `hdtc::run()`
+  format.rs        - Published façade: the format layer downstream crates use
   cli.rs           - CLI argument definitions (clap)
   rdf/             - RDF parsing, input discovery, streaming, compressed input
   dictionary/      - Dictionary construction, PFC encoding

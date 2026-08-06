@@ -78,6 +78,46 @@ pub struct GraphIndex {
     ops_layers: Option<EmbeddedLayerSetReader>,
 }
 
+/// Which phase prevented a graph index from opening.
+///
+/// Callers that expose artifact-specific diagnostics can distinguish a corrupt
+/// index from one bound to different parent artifacts without inspecting error
+/// text.
+#[derive(Debug, thiserror::Error)]
+pub enum GraphIndexOpenError {
+    /// The graph-index header, directory, or region metadata is malformed.
+    #[error("invalid graph index: {source:#}")]
+    Index {
+        /// The format-layer failure.
+        #[source]
+        source: anyhow::Error,
+    },
+
+    /// The associated HDT could not be scanned for structural metadata.
+    #[error("invalid source HDT: {source:#}")]
+    Source {
+        /// The HDT scan failure.
+        #[source]
+        source: anyhow::Error,
+    },
+
+    /// The associated graph sidecar could not be opened.
+    #[error("invalid graph sidecar: {source:#}")]
+    Sidecar {
+        /// The graph-sidecar failure.
+        #[source]
+        source: anyhow::Error,
+    },
+
+    /// The three artifacts are well-formed enough to inspect, but disagree.
+    #[error("graph index does not bind to its parent artifacts: {source:#}")]
+    Binding {
+        /// The failed cross-artifact check.
+        #[source]
+        source: anyhow::Error,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GraphIndexSpace {
     Pos,
@@ -85,77 +125,118 @@ pub enum GraphIndexSpace {
 }
 
 impl GraphIndex {
-    pub fn open_for_hdt(hdt_path: &Path) -> Result<Self> {
+    pub fn open_for_hdt(hdt_path: &Path) -> std::result::Result<Self, GraphIndexOpenError> {
         Self::open(&canonical_path(hdt_path), hdt_path)
     }
 
-    pub fn open(path: &Path, hdt_path: &Path) -> Result<Self> {
-        ensure!(hdt_path.is_file(), "HDT parent is absent");
+    /// Check that a graph index is well-formed and belongs to `hdt_path` and
+    /// its graphs sidecar, without opening the layer sets.
+    ///
+    /// This is what a caller that only needs to *accept or refuse a bundle*
+    /// wants: it reads the same headers, section directory, footer, and
+    /// cross-artifact bindings as [`open`](Self::open), but stops before the
+    /// two [`EmbeddedLayerSetReader`]s, which are per-query machinery and cost
+    /// a file handle each. KGF's `Store::open` uses it, since graph scoping is
+    /// a later milestone but a bundle carrying an index that does not bind must
+    /// still be refused at open (KGF doc 20 §20.8).
+    pub fn verify_binding(
+        path: &Path,
+        hdt_path: &Path,
+    ) -> std::result::Result<(), GraphIndexOpenError> {
+        Self::read_bound(path, hdt_path).map(|_| ())
+    }
+
+    /// The header and section directory of a graph index that has been checked
+    /// against its parent artifacts.
+    fn read_bound(
+        path: &Path,
+        hdt_path: &Path,
+    ) -> std::result::Result<(File, Header, Vec<Section>), GraphIndexOpenError> {
         let sidecar_path = canonical_sidecar_path(hdt_path);
-        ensure!(sidecar_path.is_file(), "graphs-sidecar parent is absent");
-        let mut file = File::open(path)
-            .with_context(|| format!("Failed to open graph index {}", path.display()))?;
-        let file_size = file.metadata()?.len();
-        let header = read_header(&mut file, file_size, false)?;
-        let sections = read_sections(&mut file, &header, false)?;
-        validate_section_set(&header, &sections)?;
-        validate_regions(&header, &sections)?;
-        read_footer(&mut file, &header, false)?;
 
-        let hdt = scan_hdt(hdt_path)?;
-        let sidecar = GraphSidecarReader::open(&sidecar_path, hdt_path)?;
-        ensure!(
-            header.source_digest == sidecar.source_digest()
-                && header.source_data_length == sidecar.source_data_length(),
-            "graph-index/sidecar stored HDT binding mismatch"
-        );
-        ensure!(
-            header.source_data_length == hdt.file_length - hdt.data_offset,
-            "graph-index/HDT data-length mismatch"
-        );
-        ensure!(
-            header.triples == hdt.triples,
-            "graph-index/HDT triple-count mismatch"
-        );
-        ensure!(
-            header.triples == sidecar.triple_count()
-                && header.named_graphs == sidecar.named_graph_count()
-                && header.memberships == sidecar.membership_count(),
-            "graph-index/sidecar count mismatch"
-        );
+        let (file, header, sections) = (|| -> Result<_> {
+            let mut file = File::open(path)
+                .with_context(|| format!("Failed to open graph index {}", path.display()))?;
+            let file_size = file.metadata()?.len();
+            let header = read_header(&mut file, file_size, false)?;
+            let sections = read_sections(&mut file, &header, false)?;
+            validate_section_set(&header, &sections)?;
+            validate_regions(&header, &sections)?;
+            read_footer(&mut file, &header, false)?;
+            Ok((file, header, sections))
+        })()
+        .map_err(|source| GraphIndexOpenError::Index { source })?;
 
-        let pos_layers = if header.flags & HAS_POS_LAYERS != 0 {
-            let directory = section_from(&sections, POS_DIRECTORY)?;
-            let region = section_from(&sections, POS_REGION)?;
-            Some(EmbeddedLayerSetReader::open(
-                path,
-                directory.offset,
-                directory.length,
-                region.offset,
-                region.length,
-                header.triples,
-                header.named_graphs,
-                header.memberships,
-            )?)
-        } else {
-            None
-        };
-        let ops_layers = if header.flags & HAS_OPS_LAYERS != 0 {
-            let directory = section_from(&sections, OPS_DIRECTORY)?;
-            let region = section_from(&sections, OPS_REGION)?;
-            Some(EmbeddedLayerSetReader::open(
-                path,
-                directory.offset,
-                directory.length,
-                region.offset,
-                region.length,
-                header.triples,
-                header.named_graphs,
-                header.memberships,
-            )?)
-        } else {
-            None
-        };
+        let hdt = scan_hdt(hdt_path).map_err(|source| GraphIndexOpenError::Source { source })?;
+        let sidecar = GraphSidecarReader::open(&sidecar_path, hdt_path)
+            .map_err(|source| GraphIndexOpenError::Sidecar { source })?;
+        (|| -> Result<()> {
+            ensure!(
+                header.source_digest == sidecar.source_digest()
+                    && header.source_data_length == sidecar.source_data_length(),
+                "graph-index/sidecar stored HDT binding mismatch"
+            );
+            ensure!(
+                header.source_data_length == hdt.file_length - hdt.data_offset,
+                "graph-index/HDT data-length mismatch"
+            );
+            ensure!(
+                header.triples == hdt.triples,
+                "graph-index/HDT triple-count mismatch"
+            );
+            ensure!(
+                header.triples == sidecar.triple_count()
+                    && header.named_graphs == sidecar.named_graph_count()
+                    && header.memberships == sidecar.membership_count(),
+                "graph-index/sidecar count mismatch"
+            );
+            Ok(())
+        })()
+        .map_err(|source| GraphIndexOpenError::Binding { source })?;
+
+        Ok((file, header, sections))
+    }
+
+    pub fn open(path: &Path, hdt_path: &Path) -> std::result::Result<Self, GraphIndexOpenError> {
+        let sidecar_path = canonical_sidecar_path(hdt_path);
+        let (file, header, sections) = Self::read_bound(path, hdt_path)?;
+
+        let (pos_layers, ops_layers) = (|| -> Result<_> {
+            let pos_layers = if header.flags & HAS_POS_LAYERS != 0 {
+                let directory = section_from(&sections, POS_DIRECTORY)?;
+                let region = section_from(&sections, POS_REGION)?;
+                Some(EmbeddedLayerSetReader::open(
+                    path,
+                    directory.offset,
+                    directory.length,
+                    region.offset,
+                    region.length,
+                    header.triples,
+                    header.named_graphs,
+                    header.memberships,
+                )?)
+            } else {
+                None
+            };
+            let ops_layers = if header.flags & HAS_OPS_LAYERS != 0 {
+                let directory = section_from(&sections, OPS_DIRECTORY)?;
+                let region = section_from(&sections, OPS_REGION)?;
+                Some(EmbeddedLayerSetReader::open(
+                    path,
+                    directory.offset,
+                    directory.length,
+                    region.offset,
+                    region.length,
+                    header.triples,
+                    header.named_graphs,
+                    header.memberships,
+                )?)
+            } else {
+                None
+            };
+            Ok((pos_layers, ops_layers))
+        })()
+        .map_err(|source| GraphIndexOpenError::Index { source })?;
 
         Ok(Self {
             path: path.to_path_buf(),

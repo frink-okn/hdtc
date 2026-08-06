@@ -511,6 +511,17 @@ filtering pre-rank, but this version of the format has no such sidecar. Adding o
 would be additive — a new file beside this index — and would not change this
 format.
 
+The read API therefore separates two bounds that a collector limit must not
+conflate. `top_k` bounds the retained score heap; a candidate limit bounds the
+matching literal documents whose scores are calculated. Reaching the latter
+returns a deterministic ranking over the examined prefix and marks it incomplete.
+It does not claim that an unexamined document could not enter that top-k.
+
+Unranked set operations use a separate resumable scan in immutable
+segment/document order. A scan page returns object dictionary IDs plus an opaque
+position for the next page. The position is an access API detail, not part of the
+on-disk convention and not meaningful against another index.
+
 ### 7.4 Results
 
 Results are RDF triples. Every ranked literal expands to every
@@ -540,9 +551,9 @@ parser.
 | build | one pass over the object dictionary section; no triple pass |
 | build memory | Tantivy's indexing arena, bounded by the configured limit |
 | index size | scales with distinct indexed literals and their token counts |
-| query, bounded ranking | posting-list scan and top-k heap, over distinct literals |
+| query, bounded ranking | at most the candidate limit matching literal documents scored; top-k heap retained independently |
 | query, unlimited ranking | posting-list scan plus bounded external sort, spilling to `--temp-dir` |
-| query, count | unscored posting-list scan; object IDs are resolved in bounded batches |
+| query, count | resumable unscored scan; object IDs are resolved in bounded batches |
 | hit → `(subject, predicate)` | one OPS descent per ranked literal |
 | page fill | ranking cost plus one descent per literal examined (§7.3) |
 

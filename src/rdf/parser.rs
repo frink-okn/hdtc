@@ -1,5 +1,6 @@
 //! Streaming RDF parser wrapping oxrdfio with compression and blank node disambiguation.
 
+use crate::dictionary::term::encode_literal;
 use crate::rdf::input::{Compression, RdfFormat, RdfInput};
 use anyhow::{Context, Result};
 use crossbeam_channel::TrySendError;
@@ -705,8 +706,8 @@ where
 
 /// Convert an oxrdf Term to its HDT dictionary string form.
 ///
-/// URIs are stored without angle brackets. Literals use the HDT convention:
-/// bare datatype URIs without angle brackets in `^^type` annotations.
+/// IRIs are stored without angle brackets; blank nodes keep their `_:` prefix
+/// after input scoping; literals follow [`encode_literal`].
 fn term_to_hdt_string(term: &Term, blank_prefix: &str) -> String {
     match term {
         Term::BlankNode(b) => format!("_:{}{}", blank_prefix, b.as_str()),
@@ -717,19 +718,11 @@ fn term_to_hdt_string(term: &Term, blank_prefix: &str) -> String {
 
 /// Convert a literal to its HDT dictionary string form.
 ///
-/// HDT stores typed literals with angle brackets around the datatype URI:
-/// `"value"^^<http://www.w3.org/2001/XMLSchema#integer>`
+/// The convention itself — angle brackets around a datatype IRI, `xsd:string`
+/// dropped — belongs to [`encode_literal`], which downstream readers share
+/// through [`crate::format`]; this function only adapts oxrdf's literal to it.
 fn literal_to_hdt_string(l: &Literal) -> String {
-    if let Some(lang) = l.language() {
-        format!("\"{}\"@{}", l.value(), lang)
-    } else {
-        let dt = l.datatype().as_str();
-        if dt == "http://www.w3.org/2001/XMLSchema#string" {
-            format!("\"{}\"", l.value())
-        } else {
-            format!("\"{}\"^^<{}>", l.value(), dt)
-        }
-    }
+    encode_literal(l.value(), l.language(), Some(l.datatype().as_str()))
 }
 
 /// Calculate the N-Triples serialization size of a literal without allocating.

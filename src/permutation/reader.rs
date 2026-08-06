@@ -9,6 +9,37 @@ use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
+/// Which phase prevented a permutation index from opening.
+///
+/// Callers that expose artifact-specific diagnostics can distinguish a corrupt
+/// sidecar from one bound to a different HDT without inspecting error text.
+#[derive(Debug, thiserror::Error)]
+pub enum PermutationIndexOpenError {
+    /// The sidecar header, directory, or region metadata is malformed.
+    #[error("invalid permutation index: {source:#}")]
+    Sidecar {
+        /// The format-layer failure.
+        #[source]
+        source: anyhow::Error,
+    },
+
+    /// The associated HDT could not be scanned for structural metadata.
+    #[error("invalid source HDT: {source:#}")]
+    Source {
+        /// The HDT scan failure.
+        #[source]
+        source: anyhow::Error,
+    },
+
+    /// Both artifacts are well-formed enough to inspect, but do not agree.
+    #[error("permutation index does not bind to its source HDT: {source:#}")]
+    Binding {
+        /// The failed cross-artifact check.
+        #[source]
+        source: anyhow::Error,
+    },
+}
+
 #[derive(Debug, Clone)]
 pub struct PermutationIndex {
     path: PathBuf,
@@ -21,18 +52,57 @@ impl PermutationIndex {
     /// metadata and the cheap source binding (dictionary counts, triple count,
     /// and suffix length); strict validation additionally hashes both files and
     /// checks every payload and semantic invariant.
-    pub fn open(path: &Path, hdt_path: &Path) -> Result<Self> {
-        let (header, sections) = read_header_and_sections(path)?;
-        let hdt = scan_hdt(hdt_path)?;
-        validate_source_metadata(&header, &hdt)?;
-        validate_section_metadata(&header, &sections, false)?;
-        validate_spo_shapes(&sections, &hdt)?;
-        validate_canonical_regions(path, &header, &sections, false)?;
+    pub fn open(
+        path: &Path,
+        hdt_path: &Path,
+    ) -> std::result::Result<Self, PermutationIndexOpenError> {
+        let (header, sections) = read_header_and_sections(path)
+            .map_err(|source| PermutationIndexOpenError::Sidecar { source })?;
+        let hdt =
+            scan_hdt(hdt_path).map_err(|source| PermutationIndexOpenError::Source { source })?;
+        validate_source_metadata(&header, &hdt)
+            .map_err(|source| PermutationIndexOpenError::Binding { source })?;
+        validate_section_metadata(&header, &sections, false)
+            .map_err(|source| PermutationIndexOpenError::Sidecar { source })?;
+        validate_spo_shapes(&sections, &hdt)
+            .map_err(|source| PermutationIndexOpenError::Binding { source })?;
+        validate_canonical_regions(path, &header, &sections, false)
+            .map_err(|source| PermutationIndexOpenError::Sidecar { source })?;
         Ok(Self {
             path: path.to_path_buf(),
             header,
             sections,
         })
+    }
+
+    /// The file this index was opened from.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The parsed 256-byte file header.
+    ///
+    /// Exposed for readers that map the file rather than seek it: the header
+    /// carries the identifier-space sizes and pair counts needed to size typed
+    /// views, plus the source binding needed to check the file against its HDT.
+    pub fn header(&self) -> &Header {
+        &self.header
+    }
+
+    /// The section directory, ascending by section type.
+    ///
+    /// Each entry gives a section's absolute payload offset, byte length, entry
+    /// count, element width, and — for the SPO directory sections — the length
+    /// of the HDT bitmap it indexes. That is everything required to build a
+    /// mapped view of a region without re-deriving the layout, and the format's
+    /// mapped-load guarantee (`docs/permutation-index-format.md` §2.1) holds for
+    /// every byte range described here.
+    ///
+    /// This is the integration point for out-of-process mapped readers such as
+    /// KGF's `kgf-store` (KGF doc 20 §20.4). [`triples`](Self::triples) is a
+    /// seek-based path for this crate's CLI and is not on theirs.
+    pub fn sections(&self) -> &[Section] {
+        &self.sections
     }
 
     fn section(&self, section_type: u32) -> Result<&Section> {
@@ -215,6 +285,10 @@ fn validate_section_metadata(
     sections: &[Section],
     strict_unknown: bool,
 ) -> Result<()> {
+    ensure!(
+        header.pos_pairs == header.ops_pairs,
+        "POS/OPS pair-count mismatch"
+    );
     let present: HashSet<u32> = sections
         .iter()
         .map(|section| section.section_type)

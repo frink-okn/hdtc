@@ -11,7 +11,8 @@ use super::analyzer::{
 use super::manifest::TextManifest;
 use super::schema::{FIELD_LANG, FIELD_OBJECT, FIELD_TEXT, FIELD_TEXT_STEMMED, register_tokenizer};
 use anyhow::{Context, Result, ensure};
-use std::cmp::Reverse;
+use std::cmp::{Ordering, Reverse};
+use std::collections::BinaryHeap;
 use std::path::Path;
 use tantivy::collector::{Count, TopDocs};
 use tantivy::query::{
@@ -65,6 +66,123 @@ pub struct TextHit {
     /// Comparable *within* a [`MatchKind`], not across two of them.
     pub score: f32,
     pub kind: MatchKind,
+}
+
+/// A bounded ranked search and what it established about the whole query.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TextSearch {
+    /// The best retained hits, in normative class/score/object order.
+    pub hits: Vec<TextHit>,
+    /// Matching literal documents scored before the search stopped.
+    pub examined: u64,
+    /// `true` when every matching literal document was scored.
+    pub complete: bool,
+}
+
+/// An opaque resume point in an immutable text index.
+///
+/// Positions are meaningful only against the index that issued them. They are
+/// deliberately compact so a stateless caller can carry one in its own cursor,
+/// while the segment/document split remains hdtc's concern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct TextScanPosition(u64);
+
+impl TextScanPosition {
+    /// Restore a position previously returned by [`Self::encode`].
+    pub const fn decode(encoded: u64) -> Self {
+        Self(encoded)
+    }
+
+    /// Compact representation suitable for an enclosing cursor token.
+    pub const fn encode(self) -> u64 {
+        self.0
+    }
+
+    const fn new(segment_ord: u32, doc_id: u32) -> Self {
+        Self((segment_ord as u64) << 32 | doc_id as u64)
+    }
+
+    const fn segment_ord(self) -> u32 {
+        (self.0 >> 32) as u32
+    }
+
+    const fn doc_id(self) -> u32 {
+        self.0 as u32
+    }
+}
+
+/// One bounded page of unranked matching object dictionary IDs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextMatchPage {
+    /// Matching HDT object dictionary IDs in immutable scan order.
+    pub object_ids: Vec<u64>,
+    /// Where the next page begins, when this one spent its limit.
+    pub next: Option<TextScanPosition>,
+    /// `true` when the query was exhausted in this page.
+    pub complete: bool,
+}
+
+/// Heap entry whose greatest member is the worst retained hit.
+#[derive(Debug, Clone, Copy)]
+struct WorstFirst(TextHit);
+
+impl PartialEq for WorstFirst {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.score.to_bits() == other.0.score.to_bits() && self.0.object_id == other.0.object_id
+    }
+}
+
+impl Eq for WorstFirst {}
+
+impl PartialOrd for WorstFirst {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for WorstFirst {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Lower scores and, at a tie, higher object IDs are worse.
+        other
+            .0
+            .score
+            .total_cmp(&self.0.score)
+            .then(self.0.object_id.cmp(&other.0.object_id))
+    }
+}
+
+struct PhaseSearch {
+    hits: Vec<TextHit>,
+    complete: bool,
+}
+
+fn retain(heap: &mut BinaryHeap<WorstFirst>, hit: TextHit, limit: usize) {
+    if limit == 0 {
+        return;
+    }
+    if heap.len() < limit {
+        heap.push(WorstFirst(hit));
+        return;
+    }
+
+    let worst = heap.peek().expect("a full non-empty heap has a member").0;
+    let score_order = hit.score.total_cmp(&worst.score);
+    let better = score_order == Ordering::Greater
+        || (score_order == Ordering::Equal && hit.object_id < worst.object_id);
+    if better {
+        heap.pop();
+        heap.push(WorstFirst(hit));
+    }
+}
+
+fn ordered(heap: BinaryHeap<WorstFirst>) -> Vec<TextHit> {
+    let mut hits: Vec<TextHit> = heap.into_iter().map(|entry| entry.0).collect();
+    hits.sort_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then(a.object_id.cmp(&b.object_id))
+    });
+    hits
 }
 
 /// Which field a query phase targets.
@@ -150,6 +268,16 @@ impl TextSearcher {
         })
     }
 
+    /// What the build recorded about this index.
+    ///
+    /// A consumer that publishes its own description of the index — which
+    /// literals were left out and why, which languages are present — should
+    /// report what the build actually did rather than restate the configuration
+    /// it was asked for.
+    pub fn manifest(&self) -> &TextManifest {
+        &self.manifest
+    }
+
     /// Analyze a query string into tokens, using the index's own chain.
     ///
     /// Build and query go through the same [`TextAnalyzer`], which is what
@@ -175,6 +303,52 @@ impl TextSearcher {
         Ok(searcher.search(&built, &Count)?)
     }
 
+    /// Count matching documents, stopping once `limit` of them are known.
+    ///
+    /// Returns the count and whether it stopped early — `(n, false)` is exact,
+    /// `(limit, true)` means "at least this many".
+    ///
+    /// [`count`](TextSearcher::count) walks every posting the query matches,
+    /// which is the right answer for a CLI reporting a total and the wrong one
+    /// for a service that has published a bound on the work a request may do:
+    /// a single common token can match millions of literals, and no argument
+    /// to `count` says "stop". This walks the same documents and stops, so a
+    /// caller with a budget can spend it rather than discovering afterwards
+    /// what the query cost.
+    ///
+    /// Iterating the scorers directly rather than through a collector, because
+    /// a Tantivy collector has no way to say "enough" — it sees each document
+    /// and returns nothing until the search is over.
+    pub fn count_up_to(&self, query: &TextQuery, limit: u64) -> Result<(u64, bool)> {
+        let Some(built) = self.union_query(query)? else {
+            return Ok((0, false));
+        };
+        if limit == 0 {
+            return Ok((0, true));
+        }
+
+        let searcher = self.reader.searcher();
+        let weight = built.weight(EnableScoring::disabled_from_searcher(&searcher))?;
+        let mut counted = 0u64;
+        for reader in searcher.segment_readers() {
+            let mut scorer = weight.scorer(reader, 1.0)?;
+            // The union already collapses a document matching both the plain
+            // and the stemmed field, so a document is seen once per segment
+            // and segments do not overlap.
+            let alive = reader.alive_bitset();
+            while scorer.doc() != TERMINATED {
+                if alive.is_none_or(|alive| alive.is_alive(scorer.doc())) {
+                    counted += 1;
+                    if counted >= limit {
+                        return Ok((counted, true));
+                    }
+                }
+                scorer.advance();
+            }
+        }
+        Ok((counted, false))
+    }
+
     /// The `top_k` highest-scoring literals, best first.
     ///
     /// Exact matches come first as a class, then stemmed-only ones. Running the
@@ -190,15 +364,173 @@ impl TextSearcher {
         if top_k == 0 {
             return Ok(Vec::new());
         }
-        let mut hits: Vec<TextHit> = Vec::new();
-
+        let mut hits = Vec::new();
         for (built, kind) in self.phase_queries(query)? {
             if hits.len() >= top_k {
                 break;
             }
-            hits.extend(self.run(&built, top_k - hits.len(), kind)?);
+            hits.extend(self.run(&*built, top_k - hits.len(), kind)?);
         }
         Ok(hits)
+    }
+
+    /// Rank at most `candidate_limit` matching literal documents.
+    ///
+    /// Unlike a collector limit, `candidate_limit` bounds documents whose
+    /// scores are calculated, not merely the heap and returned vector. The
+    /// retained heap is independently bounded by `top_k`. When `complete` is
+    /// false, the hits are the deterministic top-k among the examined prefix,
+    /// not a claim about unexamined documents.
+    pub fn search_up_to(
+        &self,
+        query: &TextQuery,
+        top_k: usize,
+        candidate_limit: u64,
+    ) -> Result<TextSearch> {
+        let searcher = self.reader.searcher();
+        let mut examined = 0u64;
+        let mut hits = Vec::new();
+
+        for (built, kind) in self.phase_queries(query)? {
+            // An exact hit always outranks a stemmed-only one. Once the exact
+            // phase has filled the result, the stemmed phase still has to be
+            // walked to establish `complete` and `examined`, but it retains no
+            // hits that cannot enter the answer.
+            let retain = top_k.saturating_sub(hits.len());
+            let phase = self.run_up_to(
+                &searcher,
+                &*built,
+                kind,
+                retain,
+                candidate_limit,
+                &mut examined,
+            )?;
+            hits.extend(phase.hits);
+            if !phase.complete {
+                return Ok(TextSearch {
+                    hits,
+                    examined,
+                    complete: false,
+                });
+            }
+        }
+
+        Ok(TextSearch {
+            hits,
+            examined,
+            complete: true,
+        })
+    }
+
+    /// Return one resumable page of unranked matching object IDs.
+    ///
+    /// The union query yields each document once even when its plain and
+    /// stemmed fields both match. `from` is a position previously returned by
+    /// this index. A page that returns exactly `limit` items conservatively
+    /// carries a continuation; the following page may prove that the last item
+    /// was also the end without examining a candidate past this page's bound.
+    pub fn scan_matching_objects(
+        &self,
+        query: &TextQuery,
+        from: Option<TextScanPosition>,
+        limit: usize,
+    ) -> Result<TextMatchPage> {
+        ensure!(limit > 0, "text match scan limit must be positive");
+        let Some(built) = self.union_query(query)? else {
+            ensure!(
+                from.is_none(),
+                "a query with no indexable tokens has no text scan continuation"
+            );
+            return Ok(TextMatchPage {
+                object_ids: Vec::new(),
+                next: None,
+                complete: true,
+            });
+        };
+
+        let searcher = self.reader.searcher();
+        let segments = searcher.segment_readers();
+        let start = from.unwrap_or_default();
+        let start_segment = usize::try_from(start.segment_ord())
+            .context("text scan segment does not fit this platform")?;
+        ensure!(
+            start_segment < segments.len() || (from.is_none() && segments.is_empty()),
+            "text scan position names segment {}, but the index has {} segments",
+            start_segment,
+            segments.len()
+        );
+        if segments.is_empty() {
+            ensure!(
+                start.doc_id() == 0,
+                "text scan position lies past the end of the index"
+            );
+            return Ok(TextMatchPage {
+                object_ids: Vec::new(),
+                next: None,
+                complete: true,
+            });
+        }
+
+        let weight = built.weight(EnableScoring::disabled_from_searcher(&searcher))?;
+        if from.is_some() {
+            let previous = start
+                .doc_id()
+                .checked_sub(1)
+                .context("text scan position is the beginning, not a continuation")?;
+            let segment = &segments[start_segment];
+            let mut verifier = weight.scorer(segment, 1.0)?;
+            ensure!(
+                verifier.seek(previous) == previous
+                    && segment
+                        .alive_bitset()
+                        .is_none_or(|alive| alive.is_alive(previous)),
+                "text scan position does not follow a matching document"
+            );
+        }
+
+        // Grow only as matches arrive. Callers may publish a very large limit,
+        // and reserving it before the query proves that many matches exist can
+        // turn a harmless sparse query into an allocation failure.
+        let mut object_ids = Vec::new();
+        for (segment_ord, segment) in segments.iter().enumerate().skip(start_segment) {
+            let column = segment
+                .fast_fields()
+                .u64(FIELD_OBJECT)
+                .context("Text index has no object ID column")?;
+            let mut scorer = weight.scorer(segment, 1.0)?;
+            if segment_ord == start_segment && start.doc_id() != 0 {
+                scorer.seek(start.doc_id());
+            }
+            while scorer.doc() != TERMINATED {
+                let doc = scorer.doc();
+                if segment
+                    .alive_bitset()
+                    .is_none_or(|alive| alive.is_alive(doc))
+                {
+                    let object_id = column
+                        .first(doc)
+                        .context("Text index document carries no object ID")?;
+                    object_ids.push(object_id);
+                    if object_ids.len() == limit {
+                        let segment_ord = u32::try_from(segment_ord)
+                            .context("text index has too many segments to resume")?;
+                        let next = TextScanPosition::new(segment_ord, doc + 1);
+                        return Ok(TextMatchPage {
+                            object_ids,
+                            next: Some(next),
+                            complete: false,
+                        });
+                    }
+                }
+                scorer.advance();
+            }
+        }
+
+        Ok(TextMatchPage {
+            object_ids,
+            next: None,
+            complete: true,
+        })
     }
 
     /// Visit every matching object ID without calculating or retaining scores.
@@ -322,7 +654,7 @@ impl TextSearcher {
         Ok(phases)
     }
 
-    /// Collect one phase's hits, ordered by score then object ID.
+    /// Collect one unbounded phase with Tantivy's optimized top-k path.
     fn run(&self, query: &dyn Query, top_k: usize, kind: MatchKind) -> Result<Vec<TextHit>> {
         let searcher = self.reader.searcher();
         // Object ID is part of the collector key, rather than a sort applied
@@ -358,11 +690,65 @@ impl TextSearcher {
         }
         hits.sort_by(|a, b| {
             b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
+                .total_cmp(&a.score)
                 .then(a.object_id.cmp(&b.object_id))
         });
         Ok(hits)
+    }
+
+    /// Scan one ranked phase while retaining only its best `top_k` hits.
+    fn run_up_to(
+        &self,
+        searcher: &tantivy::Searcher,
+        query: &dyn Query,
+        kind: MatchKind,
+        top_k: usize,
+        candidate_limit: u64,
+        examined: &mut u64,
+    ) -> Result<PhaseSearch> {
+        let weight = query.weight(EnableScoring::enabled_from_searcher(searcher))?;
+        // Grow only as matches arrive. A configured limit may be much larger
+        // than the query's result, and reserving it eagerly would spend memory
+        // for candidates that do not exist.
+        let mut heap = BinaryHeap::new();
+
+        for segment in searcher.segment_readers() {
+            let object_ids = segment
+                .fast_fields()
+                .u64(FIELD_OBJECT)
+                .context("Text index has no object ID column")?;
+            let mut scorer = weight.scorer(segment, 1.0)?;
+            while scorer.doc() != TERMINATED {
+                let doc = scorer.doc();
+                if segment
+                    .alive_bitset()
+                    .is_none_or(|alive| alive.is_alive(doc))
+                {
+                    if *examined >= candidate_limit {
+                        return Ok(PhaseSearch {
+                            hits: ordered(heap),
+                            complete: false,
+                        });
+                    }
+                    let object_id = object_ids
+                        .first(doc)
+                        .context("Text index document carries no object ID")?;
+                    let hit = TextHit {
+                        object_id,
+                        score: scorer.score(),
+                        kind,
+                    };
+                    *examined += 1;
+                    retain(&mut heap, hit, top_k);
+                }
+                scorer.advance();
+            }
+        }
+
+        Ok(PhaseSearch {
+            hits: ordered(heap),
+            complete: true,
+        })
     }
 
     /// Assemble one phase's query, or `None` when that phase cannot match —
@@ -623,8 +1009,7 @@ mod tests {
     use crate::text::schema::{SCHEMA_ID, text_schema};
     use tantivy::{IndexWriter, TantivyDocument};
 
-    #[test]
-    fn top_k_applies_the_object_id_tiebreak_before_truncation() -> Result<()> {
+    fn fixture(object_ids: &[u64]) -> Result<(Index, TextSearcher)> {
         let index = Index::create_in_ram(text_schema());
         register_tokenizer(&index);
         let schema = index.schema();
@@ -633,15 +1018,12 @@ mod tests {
         let object_field = schema.get_field(FIELD_OBJECT)?;
         let lang_field = schema.get_field(FIELD_LANG)?;
 
-        // Deliberately make DocAddress order the reverse of object-ID order.
-        // All documents have the same term frequency and length, so their BM25
-        // scores tie exactly at the top-k boundary.
         let mut writer: IndexWriter<TantivyDocument> =
             index.writer_with_num_threads(1, 20 * 1024 * 1024)?;
-        for object_id in [30u64, 20, 10] {
+        for object_id in object_ids {
             let mut document = TantivyDocument::new();
             document.add_text(text_field, "shared");
-            document.add_u64(object_field, object_id);
+            document.add_u64(object_field, *object_id);
             document.add_text(lang_field, UNDETERMINED_LANGUAGE);
             writer.add_document(document)?;
         }
@@ -655,42 +1037,122 @@ mod tests {
             .tokenizers()
             .get(TOKENIZER_NAME)
             .context("hdtc tokenizer was not registered")?;
-        let searcher = TextSearcher {
-            reader,
-            analyzer,
-            manifest: TextManifest {
-                analyzer_id: ANALYZER_ID,
-                schema_id: SCHEMA_ID,
-                tantivy_writer: "test".to_string(),
-                tantivy_index_format: None,
-                source_digest: [0; 32],
-                max_literal_bytes: 4096,
-                untagged_language: None,
-                literals_scanned: 3,
-                indexed_docs: 3,
-                excluded_oversize: 0,
-                excluded_datatype: 0,
-                excluded_no_tokens: 0,
-                exclusions: DatatypeExclusions::default(),
-                languages: Vec::new(),
+        Ok((
+            index,
+            TextSearcher {
+                reader,
+                analyzer,
+                manifest: TextManifest {
+                    analyzer_id: ANALYZER_ID,
+                    schema_id: SCHEMA_ID,
+                    tantivy_writer: "test".to_string(),
+                    tantivy_index_format: None,
+                    source_digest: [0; 32],
+                    max_literal_bytes: 4096,
+                    untagged_language: None,
+                    literals_scanned: object_ids.len() as u64,
+                    indexed_docs: object_ids.len() as u64,
+                    excluded_oversize: 0,
+                    excluded_datatype: 0,
+                    excluded_no_tokens: 0,
+                    exclusions: DatatypeExclusions::default(),
+                    languages: Vec::new(),
+                },
+                text_field,
+                stemmed_field,
+                lang_field,
+                stemmers: Vec::new(),
             },
-            text_field,
-            stemmed_field,
-            lang_field,
-            stemmers: Vec::new(),
-        };
+        ))
+    }
 
-        let hits = searcher.search(
-            &TextQuery {
-                text: "shared".to_string(),
-                ..TextQuery::default()
-            },
-            2,
-        )?;
+    fn shared() -> TextQuery {
+        TextQuery {
+            text: "shared".to_string(),
+            ..TextQuery::default()
+        }
+    }
+
+    #[test]
+    fn top_k_applies_the_object_id_tiebreak_before_truncation() -> Result<()> {
+        // Deliberately make DocAddress order the reverse of object-ID order.
+        // All documents have the same term frequency and length, so their BM25
+        // scores tie exactly at the top-k boundary.
+        let (_index, searcher) = fixture(&[30, 20, 10])?;
+
+        let hits = searcher.search(&shared(), 2)?;
         assert_eq!(
             hits.iter().map(|hit| hit.object_id).collect::<Vec<_>>(),
             [10, 20]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn ranked_search_stops_scoring_at_the_candidate_limit() -> Result<()> {
+        let (_index, searcher) = fixture(&[30, 20, 10])?;
+
+        let bounded = searcher.search_up_to(&shared(), 2, 2)?;
+        assert_eq!(bounded.examined, 2);
+        assert!(!bounded.complete);
+        assert_eq!(
+            bounded
+                .hits
+                .iter()
+                .map(|hit| hit.object_id)
+                .collect::<Vec<_>>(),
+            [20, 30],
+            "an unexamined lower object ID must not enter the heap"
+        );
+
+        let whole = searcher.search_up_to(&shared(), 2, 3)?;
+        assert_eq!(whole.examined, 3);
+        assert!(whole.complete);
+        assert_eq!(
+            whole
+                .hits
+                .iter()
+                .map(|hit| hit.object_id)
+                .collect::<Vec<_>>(),
+            [10, 20]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn matching_object_scan_resumes_without_loss_or_duplication() -> Result<()> {
+        let (_index, searcher) = fixture(&[30, 20, 10])?;
+
+        assert!(
+            searcher
+                .scan_matching_objects(&shared(), Some(TextScanPosition::decode(0)), 2)
+                .is_err(),
+            "the beginning is not a continuation the index issued"
+        );
+        assert!(
+            searcher
+                .scan_matching_objects(
+                    &TextQuery {
+                        text: "!!!".to_owned(),
+                        ..TextQuery::default()
+                    },
+                    Some(TextScanPosition::decode(1)),
+                    2,
+                )
+                .is_err(),
+            "a tokenless query cannot have issued a continuation"
+        );
+
+        let first = searcher.scan_matching_objects(&shared(), None, 2)?;
+        assert_eq!(first.object_ids, [30, 20]);
+        assert!(!first.complete);
+        let next = first.next.expect("a full page carries a position");
+        assert_eq!(TextScanPosition::decode(next.encode()), next);
+
+        let second = searcher.scan_matching_objects(&shared(), Some(next), 2)?;
+        assert_eq!(second.object_ids, [10]);
+        assert!(second.complete);
+        assert_eq!(second.next, None);
         Ok(())
     }
 }
