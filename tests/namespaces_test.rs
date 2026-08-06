@@ -65,6 +65,8 @@ fn reports_role_counts_residuals_and_graph_distinct_union() {
     );
 
     let document: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(output.stdout.ends_with(b"\n"));
+    assert!(!output.stdout.ends_with(b"\n\n"));
     assert_eq!(document["roles"]["subject"]["distinct_iris"], 2);
     assert_eq!(document["roles"]["subject"]["matched"], 2);
     assert_eq!(document["roles"]["subject"]["residual"], 0);
@@ -133,7 +135,9 @@ fn writes_yaml_without_examples_to_a_file() {
     assert!(output.stdout.is_empty());
 
     let bytes = std::fs::read(result_path).unwrap();
-    let document: serde_yaml::Value = serde_yaml::from_slice(&bytes).unwrap();
+    assert!(bytes.ends_with(b"\n"));
+    assert!(!bytes.ends_with(b"\n\n"));
+    let document: serde_norway::Value = serde_norway::from_slice(&bytes).unwrap();
     let rows = document["namespaces"].as_sequence().unwrap();
     assert!(rows.iter().all(|row| row.get("example").is_none()));
     assert_eq!(rows[2]["distinct_iris"].as_u64(), Some(4));

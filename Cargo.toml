@@ -15,7 +15,8 @@ xz2 = "0.1"
 rayon = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-serde_yaml = "0.9"
+# Maintained fork of the archived serde_yaml crate.
+serde_norway = "0.9"
 tempfile = "3"
 thiserror = "2"
 tracing = "0.1"

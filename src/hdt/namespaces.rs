@@ -124,7 +124,12 @@ pub fn write_namespace_inventory(config: NamespaceConfig<'_>) -> Result<Namespac
     let unique_namespaces: BTreeSet<&str> = prefixes.values().map(String::as_str).collect();
     let mut metrics_by_namespace = BTreeMap::new();
     for namespace in unique_namespaces {
-        let metrics = namespace_metrics(&mut dictionary, &iri_ranges, namespace)?;
+        let metrics = namespace_metrics(
+            &mut dictionary,
+            &iri_ranges,
+            namespace,
+            config.include_examples,
+        )?;
         metrics_by_namespace.insert(namespace.to_owned(), metrics);
     }
 
@@ -180,10 +185,7 @@ pub fn write_namespace_inventory(config: NamespaceConfig<'_>) -> Result<Namespac
             subject: metrics.subject,
             predicate: metrics.predicate,
             object: metrics.object,
-            example: config
-                .include_examples
-                .then(|| metrics.example.clone())
-                .flatten(),
+            example: metrics.example.clone(),
         });
     }
 
@@ -201,13 +203,13 @@ pub fn write_namespace_inventory(config: NamespaceConfig<'_>) -> Result<Namespac
         NamespaceOutputFormat::Json => {
             serde_json::to_writer_pretty(&mut writer, &document)
                 .context("Failed to serialize namespace inventory as JSON")?;
+            writer.write_all(b"\n")?;
         }
         NamespaceOutputFormat::Yaml => {
-            serde_yaml::to_writer(&mut writer, &document)
+            serde_norway::to_writer(&mut writer, &document)
                 .context("Failed to serialize namespace inventory as YAML")?;
         }
     }
-    writer.write_all(b"\n")?;
     writer.flush()?;
 
     Ok(NamespaceSummary {
@@ -220,23 +222,32 @@ fn namespace_metrics(
     dictionary: &mut DictionaryResolver,
     iri_ranges: &[Vec<Range<u64>>; 4],
     namespace: &str,
+    include_example: bool,
 ) -> Result<NamespaceMetrics> {
     let namespace_bytes = namespace.as_bytes();
-    let shared = section_match(&mut dictionary.shared, &iri_ranges[SHARED], namespace_bytes)?;
+    let shared = section_match(
+        &mut dictionary.shared,
+        &iri_ranges[SHARED],
+        namespace_bytes,
+        include_example,
+    )?;
     let subjects = section_match(
         &mut dictionary.subjects,
         &iri_ranges[SUBJECTS],
         namespace_bytes,
+        include_example,
     )?;
     let predicates = section_match(
         &mut dictionary.predicates,
         &iri_ranges[PREDICATES],
         namespace_bytes,
+        include_example,
     )?;
     let objects = section_match(
         &mut dictionary.objects,
         &iri_ranges[OBJECTS],
         namespace_bytes,
+        include_example,
     )?;
 
     let section_ranges = [
@@ -323,11 +334,12 @@ fn section_match(
     section: &mut PfcSectionIndex,
     iri_ranges: &[Range<u64>],
     namespace: &[u8],
+    include_example: bool,
 ) -> Result<SectionMatch> {
     let prefix_range = section.prefix_range(namespace)?;
     let ranges = intersect_range(prefix_range, iri_ranges);
     let count = ranges_len(&ranges)?;
-    let example = if let Some(first) = ranges.first() {
+    let example = if include_example && let Some(first) = ranges.first() {
         let mut value = Vec::new();
         section.get_bytes(first.start, &mut value)?;
         Some(value)
@@ -428,7 +440,7 @@ fn load_prefix_tables(paths: &[PathBuf]) -> Result<BTreeMap<String, String>> {
         let table: BTreeMap<String, String> = match extension.as_deref() {
             Some("json") => serde_json::from_slice(&bytes)
                 .with_context(|| format!("Invalid JSON prefix table {}", path.display()))?,
-            Some("yaml" | "yml") => serde_yaml::from_slice(&bytes)
+            Some("yaml" | "yml") => serde_norway::from_slice(&bytes)
                 .with_context(|| format!("Invalid YAML prefix table {}", path.display()))?,
             _ => bail!(
                 "Prefix table {} must have a .json, .yaml, or .yml extension",
