@@ -7,6 +7,7 @@
 use super::reader::{DictionaryResolver, PfcSectionIndex, make_writer, open_hdt};
 use anyhow::{Context, Result, bail, ensure};
 use oxrdf::NamedNode;
+use same_file::Handle;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -105,6 +106,7 @@ pub fn write_namespace_inventory(config: NamespaceConfig<'_>) -> Result<Namespac
         "At least one --prefixes table is required"
     );
     let prefixes = load_prefix_tables(config.prefix_paths)?;
+    ensure_output_does_not_alias_input(config.output_path, config.hdt_path, config.prefix_paths)?;
     let prefix_count = prefixes.len();
 
     let (_, mut dictionary) = open_hdt(config.hdt_path, config.memory_limit)
@@ -426,6 +428,46 @@ fn ranges_len(ranges: &[Range<u64>]) -> Result<u64> {
 
 fn checked_sum(left: u64, right: u64) -> Result<u64> {
     left.checked_add(right).context("Namespace count overflow")
+}
+
+fn ensure_output_does_not_alias_input(
+    output_path: Option<&Path>,
+    hdt_path: &Path,
+    prefix_paths: &[PathBuf],
+) -> Result<()> {
+    let Some(output_path) = output_path else {
+        return Ok(());
+    };
+    let output = match Handle::from_path(output_path) {
+        Ok(output) => output,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("Failed to inspect output path {}", output_path.display())
+            });
+        }
+    };
+
+    let hdt = Handle::from_path(hdt_path)
+        .with_context(|| format!("Failed to inspect input HDT {}", hdt_path.display()))?;
+    ensure!(
+        output != hdt,
+        "Output path {} refers to input HDT {}; choose a different output path",
+        output_path.display(),
+        hdt_path.display()
+    );
+
+    for prefix_path in prefix_paths {
+        let prefix = Handle::from_path(prefix_path)
+            .with_context(|| format!("Failed to inspect prefix table {}", prefix_path.display()))?;
+        ensure!(
+            output != prefix,
+            "Output path {} refers to prefix table {}; choose a different output path",
+            output_path.display(),
+            prefix_path.display()
+        );
+    }
+    Ok(())
 }
 
 fn load_prefix_tables(paths: &[PathBuf]) -> Result<BTreeMap<String, String>> {

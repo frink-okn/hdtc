@@ -167,3 +167,28 @@ fn rejects_non_mapping_prefix_tables() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("Invalid JSON prefix table"));
 }
+
+#[test]
+fn refuses_output_paths_that_alias_inputs_without_modifying_them() {
+    let temp = tempfile::tempdir().unwrap();
+    let (hdt, yaml, json) = build_fixture(temp.path());
+    let hdt_before = std::fs::read(&hdt).unwrap();
+    let yaml_before = std::fs::read(&yaml).unwrap();
+
+    let same_hdt = run_namespaces(&hdt, &yaml, &json, &["--output", hdt.to_str().unwrap()]);
+    assert!(!same_hdt.status.success());
+    assert!(String::from_utf8_lossy(&same_hdt.stderr).contains("refers to input HDT"));
+    assert_eq!(std::fs::read(&hdt).unwrap(), hdt_before);
+
+    let prefix_alias = temp.path().join("prefix-alias.yaml");
+    std::fs::hard_link(&yaml, &prefix_alias).unwrap();
+    let same_prefix = run_namespaces(
+        &hdt,
+        &yaml,
+        &json,
+        &["--output", prefix_alias.to_str().unwrap()],
+    );
+    assert!(!same_prefix.status.success());
+    assert!(String::from_utf8_lossy(&same_prefix.stderr).contains("refers to prefix table"));
+    assert_eq!(std::fs::read(&yaml).unwrap(), yaml_before);
+}
