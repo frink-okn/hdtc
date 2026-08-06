@@ -17,6 +17,7 @@ Development of hdtc is done primarily through Claude Code.
 - **Two query indexes** — standard FoQ `.hdt.index.v1-1` and memory-mapped POS/OPS `.hdt.perm` indexes enable efficient `? P ?`, `? ? O`, and `? P O` queries
 - **Graph index** — optional `.hdt.graphs.idx` POS/OPS layer sets scope index-side patterns to a graph; optional SPO transpose sections accelerate membership counts and graph projection
 - **VoID statistics** — compute dataset-level, property, and class partition statistics as N-Triples
+- **Namespace inventories** — count distinct subject, predicate, object, and graph-wide IRIs against curated YAML or JSON prefix tables
 - **Structural validation** — walk an HDT's triple structures and checksums, plus discovered graph and permutation sidecars, end to end
 - **Resilient parsing** — skips malformed triples with warnings, reports total skipped at the end
 - **[Named graphs](#named-graphs)** — optional packed `<data.hdt>.graphs` sidecars preserve N-Quads/TriG datasets while the standard HDT remains the deduplicated triples union
@@ -463,24 +464,76 @@ Partition URIs are generated using MD5 hashes of the corresponding class, proper
 `hdtc namespaces` counts distinct dictionary IRIs that begin with namespaces
 from one or more flat YAML/JSON `prefix: namespace` maps. Later tables override
 earlier prefix names, which lets a dataset-specific table override a shared
-registry table:
+registry table. For example, `prefixes.yaml` could contain:
+
+```yaml
+schema: "https://schema.org/"
+foaf: "http://xmlns.com/foaf/0.1/"
+ex: "http://example.org/"
+```
+
+Run the inventory against an HDT and write JSON to a file:
+
+```sh
+hdtc namespaces data.hdt \
+  --prefixes prefixes.yaml \
+  --output namespaces.json
+```
+
+The output document has this shape (counts and digest abbreviated here):
+
+```json
+{
+  "prefix_table": {
+    "source": "prefixes.yaml",
+    "version": "sha256:..."
+  },
+  "roles": {
+    "subject": { "distinct_iris": 120, "matched": 110, "residual": 10 },
+    "predicate": { "distinct_iris": 30, "matched": 28, "residual": 2 },
+    "object": { "distinct_iris": 95, "matched": 90, "residual": 5 }
+  },
+  "namespaces": [
+    {
+      "prefix": "ex",
+      "namespace": "http://example.org/",
+      "distinct_iris": 42,
+      "subject": 35,
+      "predicate": 4,
+      "object": 20,
+      "example": "http://example.org/Example"
+    }
+  ]
+}
+```
+
+For each namespace, `subject`, `predicate`, and `object` count the distinct IRIs
+used in that role. `distinct_iris` is the de-duplicated union across all three
+roles, so an IRI used as both a subject and an object is counted once. Namespace
+matching is lexical and includes every IRI beginning with the configured
+namespace string. Prefixes with no matches are omitted; blank nodes and
+literals are never counted.
+
+The top-level `roles` summaries report the total number of distinct IRIs in
+each role, the number matched by at least one configured namespace, and the
+unmatched `residual`. Overlapping namespaces are unioned before `matched` and
+`residual` are calculated, preventing double counting. `prefix_table.version`
+is a stable SHA-256 identity for the fully merged prefix map.
+
+The command defaults to JSON and includes the lexically first matching IRI as
+an example. Use `--format yaml` for YAML or `--no-example` to omit examples.
+Repeat `--prefixes` to merge tables in command-line order:
 
 ```sh
 hdtc namespaces data.hdt \
   --prefixes registry-prefixes.yaml \
-  --prefixes dataset-prefixes.json \
-  --output namespaces.json
+  --prefixes dataset-overrides.json \
+  --format yaml \
+  --no-example
 ```
 
-Each emitted namespace has subject, predicate, object, and `distinct_iris`
-counts. `distinct_iris` is the de-duplicated graph-wide union: an IRI used in
-multiple roles is counted once. The document also includes per-role total,
-matched, and residual IRI counts; overlapping namespaces are merged before the
-residual is calculated. Blank nodes and literals are excluded.
-
-The command defaults to JSON and includes the lexically first matching IRI as
-an example. Use `--format yaml` for YAML or `--no-example` to omit examples.
-Counting reads only the sorted HDT dictionary, never the triples.
+Counting reads only the sorted HDT dictionary, never the triples. Output goes
+to stdout unless `--output` is supplied.
 
 ### Header: Dumping or modifying header triples
 
@@ -629,6 +682,21 @@ Named-graph options (`-m quads`, `--graph-map`, `--default-graph`,
 | `-m, --memory-limit SIZE` | `4G`                         | Soft memory limit for dictionary caches (e.g. `4G`, `2000M`)        |
 | `-v, --verbose`           | —                            | Increase log verbosity (`-v` debug, `-vv` trace)                    |
 | `-q, --quiet`             | —                            | Suppress all output except errors                                   |
+
+### Namespaces: All options
+
+| Option                    | Default      | Description                                                          |
+| ------------------------- | ------------ | -------------------------------------------------------------------- |
+| `<HDT_FILE>`              | _(required)_ | Path to an existing HDT file                                         |
+| `--prefixes TABLE`        | _(required)_ | YAML or JSON prefix map; repeatable, with later files overriding keys |
+| `-o, --output PATH`       | stdout       | Write the inventory to a file                                        |
+| `--format FORMAT`         | `json`       | Output format: `json` or `yaml`                                      |
+| `--example`               | on           | Include the lexically first matching IRI for each namespace           |
+| `--no-example`            | off          | Omit example IRIs                                                     |
+| `-m, --memory-limit SIZE` | `4G`         | Soft memory limit for dictionary caches (e.g. `4G`, `2000M`)         |
+| `--benchmark`             | off          | Emit namespace-counting timing                                       |
+| `-v, --verbose`           | —            | Increase log verbosity (`-v` debug, `-vv` trace)                     |
+| `-q, --quiet`             | —            | Suppress all output except errors                                    |
 
 ### Header: All options
 
