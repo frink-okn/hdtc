@@ -5,6 +5,7 @@ pub(crate) mod header_vocab;
 pub(crate) mod index_reader;
 pub(crate) mod input_adapter;
 pub(crate) mod keyset;
+pub(crate) mod namespaces;
 pub(crate) mod pfc_reader;
 pub(crate) mod reader;
 pub(crate) mod search;
@@ -16,6 +17,7 @@ pub(crate) mod writer;
 
 pub use header::run_header_command;
 pub use keyset::{KeyRole, KeysetConfig, KeysetEncoding, create_keysets};
+pub use namespaces::{NamespaceConfig, NamespaceOutputFormat, write_namespace_inventory};
 pub use search::{SearchQuery, parse_search_query, search_hdt_streaming};
 pub use sketch::{Role as SketchRole, SketchConfig, create_sketches};
 pub use text_search::{TextSearchOptions, search_text_streaming};

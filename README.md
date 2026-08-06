@@ -92,6 +92,12 @@ hdtc validate [OPTIONS] <HDT_FILE>
 hdtc void [OPTIONS] <HDT_FILE>
 ```
 
+### `hdtc namespaces` — Count IRI usage by namespace
+
+```
+hdtc namespaces [OPTIONS] --prefixes <TABLE> <HDT_FILE>
+```
+
 ### `hdtc sketch` — Build membership filters and overlap sketches
 
 ```
@@ -451,6 +457,30 @@ The algorithm uses two sequential passes over the HDT triples plus a dictionary 
 3. **Pass 2** scans all triples again to accumulate per-property and per-class statistics, including datatype and language counts, using the indices from the previous steps.
 
 Partition URIs are generated using MD5 hashes of the corresponding class, property, datatype, or language tag. Blank-node classes (common in OWL ontologies) are automatically filtered out and do not produce class partitions.
+
+### Namespaces: Counting a curated prefix table
+
+`hdtc namespaces` counts distinct dictionary IRIs that begin with namespaces
+from one or more flat YAML/JSON `prefix: namespace` maps. Later tables override
+earlier prefix names, which lets a dataset-specific table override a shared
+registry table:
+
+```sh
+hdtc namespaces data.hdt \
+  --prefixes registry-prefixes.yaml \
+  --prefixes dataset-prefixes.json \
+  --output namespaces.json
+```
+
+Each emitted namespace has subject, predicate, object, and `distinct_iris`
+counts. `distinct_iris` is the de-duplicated graph-wide union: an IRI used in
+multiple roles is counted once. The document also includes per-role total,
+matched, and residual IRI counts; overlapping namespaces are merged before the
+residual is calculated. Blank nodes and literals are excluded.
+
+The command defaults to JSON and includes the lexically first matching IRI as
+an example. Use `--format yaml` for YAML or `--no-example` to omit examples.
+Counting reads only the sorted HDT dictionary, never the triples.
 
 ### Header: Dumping or modifying header triples
 
@@ -1110,6 +1140,7 @@ tests/
   compat_test.rs        Compatibility tests against the hdt crate
   sketch_test.rs        Sketch envelope, role, filter, and edge-case tests
   keyset_test.rs        Key-set envelope, role, encoding, and edge-case tests
+  namespaces_test.rs    Namespace counts, residuals, and serialization tests
   data/                 Sample RDF fixtures
 docs/
   graphs-sidecar-format.md  Normative .graphs sidecar format

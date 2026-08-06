@@ -205,6 +205,7 @@ pub fn run() -> Result<()> {
         cli::Commands::Search(args) => search_hdt(args, benchmark),
         cli::Commands::Validate(args) => validate_hdt_file(args, benchmark),
         cli::Commands::Void(args) => compute_void(args, benchmark),
+        cli::Commands::Namespaces(args) => compute_namespaces(args, benchmark),
         cli::Commands::Sketch(args) => create_sketches(args, benchmark),
         cli::Commands::Keyset(args) => create_keysets(args, benchmark),
         cli::Commands::Text(args) => create_text_index(args, benchmark),
@@ -1053,6 +1054,51 @@ fn compute_void(args: cli::VoidArgs, benchmark: bool) -> Result<()> {
         Some(p) => tracing::info!("Done! {count} VoID triples written to {}", p.display()),
         None => tracing::info!("Done! {count} VoID triples written"),
     }
+    Ok(())
+}
+
+/// Count namespace usage in an HDT dictionary.
+fn compute_namespaces(args: cli::NamespacesArgs, benchmark: bool) -> Result<()> {
+    if !args.hdt_file.is_file() {
+        anyhow::bail!("HDT file not found: {}", args.hdt_file.display());
+    }
+
+    tracing::info!("Counting HDT namespaces: {}", args.hdt_file.display());
+    match &args.output {
+        Some(path) => tracing::info!("Output: {}", path.display()),
+        None => tracing::info!("Output: stdout"),
+    }
+
+    let format = match args.format {
+        cli::NamespaceOutputFormat::Json => hdt::NamespaceOutputFormat::Json,
+        cli::NamespaceOutputFormat::Yaml => hdt::NamespaceOutputFormat::Yaml,
+    };
+    let start = std::time::Instant::now();
+    let summary = hdt::write_namespace_inventory(hdt::NamespaceConfig {
+        hdt_path: &args.hdt_file,
+        prefix_paths: &args.prefixes,
+        output_path: args.output.as_deref(),
+        format,
+        include_examples: args.example || !args.no_example,
+        memory_limit: args.memory_limit.as_bytes(),
+    })?;
+
+    if benchmark {
+        tracing::info!(
+            "Benchmark summary (namespaces): total {:.3}s",
+            start.elapsed().as_secs_f64()
+        );
+    }
+    tracing::info!(
+        "Done! {} namespace(s) emitted from {} prefix entr{}",
+        summary.namespaces_emitted,
+        summary.prefixes_loaded,
+        if summary.prefixes_loaded == 1 {
+            "y"
+        } else {
+            "ies"
+        }
+    );
     Ok(())
 }
 

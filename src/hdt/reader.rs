@@ -91,7 +91,8 @@ pub struct HdtSectionOffsets {
 
 /// Random-access index over a PFC dictionary section.
 ///
-/// Supports ID→term lookup (`get_bytes`) and term→ID lookup (`locate`).
+/// Supports ID→term lookup (`get_bytes`), term→ID lookup (`locate`), and
+/// lower-bound/prefix-range searches.
 /// Block-level LRU cache bounds memory usage.
 pub struct PfcSectionIndex {
     pub section_name: &'static str,
@@ -268,6 +269,72 @@ impl PfcSectionIndex {
         Ok(None)
     }
 
+    /// Return the 1-based insertion position of the first entry not less than `term`.
+    ///
+    /// The returned position is in `1..=string_count + 1`; the final value is the
+    /// past-the-end sentinel. Block heads are binary-searched before decoding the
+    /// single candidate block.
+    pub fn lower_bound(&mut self, term: &[u8]) -> Result<u64> {
+        let past_end = self
+            .string_count
+            .checked_add(1)
+            .context("PFC string count has no past-the-end position")?;
+        if self.string_count == 0 {
+            return Ok(past_end);
+        }
+
+        let n_blocks = self.offsets.len().saturating_sub(1);
+        if n_blocks == 0 {
+            bail!(
+                "Missing block offsets in non-empty {} section",
+                self.section_name
+            );
+        }
+
+        // Upper-bound the block heads, then search the block immediately before
+        // that point. If no block head is <= term, insertion is at the beginning.
+        let mut lo = 0usize;
+        let mut hi = n_blocks;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let first = self.read_first_string_of_block(mid)?;
+            if first.as_slice() <= term {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if lo == 0 {
+            return Ok(1);
+        }
+
+        let block_index = lo - 1;
+        let block_size = self.block_size;
+        let block = self.get_or_decode_block(block_index as u64)?;
+        let entry_index = block.partition_point(|entry| entry.as_slice() < term);
+        let base_id = (block_index as u64)
+            .checked_mul(block_size)
+            .and_then(|value| value.checked_add(1))
+            .context("PFC dictionary ID overflow")?;
+        base_id
+            .checked_add(entry_index as u64)
+            .map(|id| id.min(past_end))
+            .context("PFC dictionary ID overflow")
+    }
+
+    /// Return the half-open 1-based ID range containing entries with `prefix`.
+    pub fn prefix_range(&mut self, prefix: &[u8]) -> Result<std::ops::Range<u64>> {
+        let start = self.lower_bound(prefix)?;
+        let end = match prefix_successor(prefix) {
+            Some(upper) => self.lower_bound(&upper)?,
+            None => self
+                .string_count
+                .checked_add(1)
+                .context("PFC string count has no past-the-end position")?,
+        };
+        Ok(start..end)
+    }
+
     /// Read only the first (verbatim) string of a block, seeking directly.
     fn read_first_string_of_block(&mut self, block_index: usize) -> Result<Vec<u8>> {
         let start = self.offsets[block_index];
@@ -398,6 +465,19 @@ impl PfcSectionIndex {
 
         Ok(entries)
     }
+}
+
+/// Smallest byte string greater than every string beginning with `prefix`.
+/// Returns `None` when no finite upper bound exists.
+fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut upper = prefix.to_vec();
+    while let Some(last) = upper.pop() {
+        if last != u8::MAX {
+            upper.push(last + 1);
+            return Some(upper);
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -933,11 +1013,83 @@ pub fn make_writer(output_path: Option<&Path>) -> Result<OutputWriter> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dictionary::pfc::PfcEncoder;
+    use std::fs::File;
 
     fn write_to_string(f: impl Fn(&mut Vec<u8>) -> std::io::Result<()>) -> String {
         let mut buf = Vec::new();
         f(&mut buf).unwrap();
         String::from_utf8(buf).unwrap()
+    }
+
+    fn pfc_index(
+        strings: &[&str],
+        block_size: usize,
+    ) -> (tempfile::NamedTempFile, PfcSectionIndex) {
+        let mut temp = tempfile::NamedTempFile::new().unwrap();
+        let mut encoder = PfcEncoder::with_block_size(block_size);
+        for value in strings {
+            encoder.push(*value);
+        }
+        encoder.write_to(&mut temp).unwrap();
+        temp.flush().unwrap();
+
+        let mut reader = File::open(temp.path()).unwrap();
+        let index =
+            PfcSectionIndex::read_from(&mut reader, temp.path(), "test", 64 * 1024).unwrap();
+        (temp, index)
+    }
+
+    #[test]
+    fn lower_bound_and_prefix_range_cross_blocks() {
+        let (_temp, mut index) =
+            pfc_index(&["alpha", "beta", "delta", "epsilon", "gamma", "zeta"], 2);
+
+        assert_eq!(index.lower_bound(b"").unwrap(), 1);
+        assert_eq!(index.lower_bound(b"alpha").unwrap(), 1);
+        assert_eq!(index.lower_bound(b"bet").unwrap(), 2);
+        assert_eq!(index.lower_bound(b"beta").unwrap(), 2);
+        assert_eq!(index.lower_bound(b"charlie").unwrap(), 3);
+        assert_eq!(index.lower_bound(b"zzzz").unwrap(), 7);
+        assert_eq!(index.prefix_range(b"").unwrap(), 1..7);
+        assert_eq!(index.prefix_range(b"e").unwrap(), 4..5);
+        assert_eq!(index.prefix_range(b"g").unwrap(), 5..6);
+        assert_eq!(index.prefix_range(b"missing").unwrap(), 6..6);
+    }
+
+    #[test]
+    fn lower_bound_matches_a_sequential_search() {
+        let strings = [
+            "aa0", "aa1", "aa2", "ab0", "ab1", "ba0", "ba1", "ba2", "bb0", "ca0", "za0",
+        ];
+        let (_temp, mut index) = pfc_index(&strings, 3);
+        for query in ["", "a", "aa0", "aa15", "ab", "b", "ba2", "bc", "ca0", "zz"] {
+            let expected =
+                strings.partition_point(|value| value.as_bytes() < query.as_bytes()) as u64 + 1;
+            assert_eq!(index.lower_bound(query.as_bytes()).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn prefix_ranges_handle_empty_sections_and_max_bytes() {
+        let (_temp, mut empty) = pfc_index(&[], 4);
+        assert_eq!(empty.lower_bound(b"anything").unwrap(), 1);
+        assert_eq!(empty.prefix_range(b"").unwrap(), 1..1);
+        assert_eq!(empty.prefix_range(&[u8::MAX]).unwrap(), 1..1);
+        assert_eq!(prefix_successor(&[b'a', u8::MAX]), Some(vec![b'b']));
+        assert_eq!(prefix_successor(&[u8::MAX]), None);
+    }
+
+    #[test]
+    fn prefix_ranges_compare_unicode_as_utf8_bytes() {
+        let (_temp, mut index) = pfc_index(
+            &["http://x.example/a", "http://x.example/éclair", "urn:z"],
+            2,
+        );
+        assert_eq!(
+            index.prefix_range("http://x.example/é".as_bytes()).unwrap(),
+            2..3
+        );
     }
 
     #[test]
