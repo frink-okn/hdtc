@@ -98,6 +98,12 @@ pub enum KeysetEncoding {
     Raw,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum NamespaceOutputFormat {
+    Json,
+    Yaml,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, ValueEnum)]
 pub enum PermutationPositionMap {
     Pos,
@@ -189,6 +195,9 @@ pub enum Commands {
 
     /// Compute VoID statistics for an HDT file and output as N-Triples
     Void(VoidArgs),
+
+    /// Count distinct IRI usage against one or more prefix tables
+    Namespaces(NamespacesArgs),
 
     /// Build role-specific membership filters and overlap sketches
     Sketch(SketchArgs),
@@ -496,6 +505,36 @@ pub struct VoidArgs {
     /// The analysis data structures (subject→class index, partition statistics) use
     /// additional memory proportional to the number of typed subjects and class/property
     /// combinations in the dataset.
+    #[arg(short = 'm', long, value_name = "SIZE", default_value = "4G")]
+    pub memory_limit: MemorySize,
+}
+
+#[derive(Debug, Parser)]
+pub struct NamespacesArgs {
+    /// Path to the existing HDT file
+    pub hdt_file: PathBuf,
+
+    /// YAML or JSON prefix-to-namespace map; later files override earlier keys
+    #[arg(long, required = true, value_name = "TABLE")]
+    pub prefixes: Vec<PathBuf>,
+
+    /// Write results to file instead of stdout
+    #[arg(short, long, value_name = "PATH")]
+    pub output: Option<PathBuf>,
+
+    /// Output serialization format
+    #[arg(long, value_enum, default_value = "json")]
+    pub format: NamespaceOutputFormat,
+
+    /// Include a lexically first matching IRI for each namespace (the default)
+    #[arg(long, conflicts_with = "no_example")]
+    pub example: bool,
+
+    /// Omit example IRIs
+    #[arg(long = "no-example", conflicts_with = "example")]
+    pub no_example: bool,
+
+    /// Soft memory limit for dictionary caches (e.g. 4G, 2000M)
     #[arg(short = 'm', long, value_name = "SIZE", default_value = "4G")]
     pub memory_limit: MemorySize,
 }
