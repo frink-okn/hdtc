@@ -181,21 +181,19 @@ pub enum PartitionDistinctScope {
 // ---------------------------------------------------------------------------
 
 #[derive(Default)]
-struct PartitionStats {
-    triple_count: u64,
+struct DistinctStats {
     distinct_subjects: u64,
     distinct_objects: u64,
     last_subject: u64,
     last_object: u64,
 }
 
-impl PartitionStats {
+impl DistinctStats {
     /// Record a triple from the SPO scan. IDs are monotonic in subject order, so
     /// one last-seen scalar is enough to count distinct subjects exactly.
     #[inline]
-    fn add_spo(&mut self, subject_id: u64, count_subject: bool) {
-        self.triple_count += 1;
-        if count_subject && self.last_subject != subject_id {
+    fn add_subject(&mut self, subject_id: u64) {
+        if self.last_subject != subject_id {
             self.last_subject = subject_id;
             self.distinct_subjects += 1;
         }
@@ -214,24 +212,55 @@ impl PartitionStats {
 
 #[derive(Default)]
 struct PropPartitionData {
-    stats: PartitionStats,
+    triple_count: u64,
     /// Target class breakdown: `None` = untyped objects (literals or object-only URIs).
-    target_classes: HashMap<Option<u64>, PartitionStats>,
+    target_classes: HashMap<Option<u64>, u64>,
     /// Datatype/language breakdown for literal objects.
     /// Key is a DatatypeIndex entry ID (>0); non-literals are excluded.
-    target_datatypes: HashMap<u16, PartitionStats>,
-    /// Aggregate statistics for the rdf:langString datatype partition.
-    lang_string: PartitionStats,
+    target_datatypes: HashMap<u16, u64>,
 }
 
-type DatasetPropData = PartitionStats;
+#[derive(Default)]
+struct DatasetPropData {
+    triple_count: u64,
+}
 
 #[derive(Default)]
 struct ClassPartitionData {
     entity_count: u64,
-    stats: PartitionStats,
     /// Property partitions within this class: predicate_id → data.
     prop_partitions: HashMap<u64, PropPartitionData>,
+}
+
+#[derive(Default)]
+struct PropPartitionDistinctData {
+    stats: DistinctStats,
+    target_classes: HashMap<Option<u64>, DistinctStats>,
+    target_datatypes: HashMap<u16, DistinctStats>,
+    lang_string: DistinctStats,
+}
+
+#[derive(Default)]
+struct ClassPartitionDistinctData {
+    stats: DistinctStats,
+    prop_partitions: HashMap<u64, PropPartitionDistinctData>,
+}
+
+/// Optional distinct-count state, kept outside the core count maps so an
+/// index-free run retains the original compact value layouts. The nested map
+/// is absent for the `dataset-properties` scope.
+struct PartitionDistinctData {
+    dataset_prop_data: HashMap<u64, DistinctStats>,
+    class_partitions: Option<HashMap<u64, ClassPartitionDistinctData>>,
+}
+
+impl PartitionDistinctData {
+    fn new(scope: PartitionDistinctScope) -> Self {
+        Self {
+            dataset_prop_data: HashMap::new(),
+            class_partitions: (scope == PartitionDistinctScope::All).then(HashMap::new),
+        }
+    }
 }
 
 /// Collected statistics from both analysis passes, ready for serialization.
@@ -244,9 +273,15 @@ struct VoidStats {
     class_partitions: HashMap<u64, ClassPartitionData>,
 }
 
+struct StatsPassResult {
+    dataset_prop_data: HashMap<u64, DatasetPropData>,
+    class_partitions: HashMap<u64, ClassPartitionData>,
+    distinct_data: Option<PartitionDistinctData>,
+}
+
 impl ClassPartitionData {
     fn total_triples(&self) -> u64 {
-        self.stats.triple_count
+        self.prop_partitions.values().map(|p| p.triple_count).sum()
     }
 }
 
@@ -620,14 +655,10 @@ fn run_stats_pass(
     class_combo_index: &ClassComboIndex,
     datatype_index: &DatatypeIndex,
     distinct_scope: Option<PartitionDistinctScope>,
-) -> Result<(
-    HashMap<u64, DatasetPropData>,
-    HashMap<u64, ClassPartitionData>,
-)> {
+) -> Result<StatsPassResult> {
     let mut dataset_prop_data: HashMap<u64, DatasetPropData> = HashMap::new();
     let mut class_partitions: HashMap<u64, ClassPartitionData> = HashMap::new();
-    let count_dataset_subjects = distinct_scope.is_some();
-    let count_all_subjects = distinct_scope == Some(PartitionDistinctScope::All);
+    let mut distinct_data = distinct_scope.map(PartitionDistinctData::new);
 
     let mut scanner =
         BitmapTriplesScanner::new(offsets, hdt_path).context("open scanner for Pass 2")?;
@@ -644,10 +675,14 @@ fn run_stats_pass(
         let dt_id = datatype_index.get(o_id);
 
         // Dataset-level property count and datatype accumulation.
-        dataset_prop_data
-            .entry(p_id)
-            .or_default()
-            .add_spo(s_id, count_dataset_subjects);
+        dataset_prop_data.entry(p_id).or_default().triple_count += 1;
+        if let Some(distinct) = distinct_data.as_mut() {
+            distinct
+                .dataset_prop_data
+                .entry(p_id)
+                .or_default()
+                .add_subject(s_id);
+        }
 
         // Subject type lookup (update cache on subject change).
         if s_id != prev_subject_id {
@@ -680,29 +715,51 @@ fn run_stats_pass(
         // Record this triple in every class partition the subject belongs to.
         for &class_id in current_subject_classes {
             let cp = class_partitions.entry(class_id).or_default();
-            cp.stats.add_spo(s_id, count_all_subjects);
             let pp = cp.prop_partitions.entry(p_id).or_default();
-            pp.stats.add_spo(s_id, count_all_subjects);
+            pp.triple_count += 1;
             if dt_id > 0 {
-                pp.target_datatypes
-                    .entry(dt_id)
-                    .or_default()
-                    .add_spo(s_id, count_all_subjects);
-                if datatype_index.is_language(dt_id) {
-                    pp.lang_string.add_spo(s_id, count_all_subjects);
-                }
+                *pp.target_datatypes.entry(dt_id).or_insert(0) += 1;
             }
             if obj_classes.is_empty() {
-                pp.target_classes
-                    .entry(None)
-                    .or_default()
-                    .add_spo(s_id, count_all_subjects);
+                *pp.target_classes.entry(None).or_insert(0) += 1;
             } else {
                 for &obj_class_id in obj_classes {
-                    pp.target_classes
-                        .entry(Some(obj_class_id))
+                    *pp.target_classes.entry(Some(obj_class_id)).or_insert(0) += 1;
+                }
+            }
+
+            if let Some(distinct_classes) = distinct_data
+                .as_mut()
+                .and_then(|distinct| distinct.class_partitions.as_mut())
+            {
+                let distinct_cp = distinct_classes.entry(class_id).or_default();
+                distinct_cp.stats.add_subject(s_id);
+                let distinct_pp = distinct_cp.prop_partitions.entry(p_id).or_default();
+                distinct_pp.stats.add_subject(s_id);
+                if dt_id > 0 {
+                    distinct_pp
+                        .target_datatypes
+                        .entry(dt_id)
                         .or_default()
-                        .add_spo(s_id, count_all_subjects);
+                        .add_subject(s_id);
+                    if datatype_index.is_language(dt_id) {
+                        distinct_pp.lang_string.add_subject(s_id);
+                    }
+                }
+                if obj_classes.is_empty() {
+                    distinct_pp
+                        .target_classes
+                        .entry(None)
+                        .or_default()
+                        .add_subject(s_id);
+                } else {
+                    for &obj_class_id in obj_classes {
+                        distinct_pp
+                            .target_classes
+                            .entry(Some(obj_class_id))
+                            .or_default()
+                            .add_subject(s_id);
+                    }
                 }
             }
         }
@@ -716,7 +773,11 @@ fn run_stats_pass(
         }
     }
 
-    Ok((dataset_prop_data, class_partitions))
+    Ok(StatsPassResult {
+        dataset_prop_data,
+        class_partitions,
+        distinct_data,
+    })
 }
 
 /// Scan the permutation sidecar in OPS order and add exact distinct-object
@@ -727,24 +788,21 @@ fn run_distinct_object_pass(
     nb_shared: u64,
     class_combo_index: &ClassComboIndex,
     datatype_index: &DatatypeIndex,
-    distinct_scope: PartitionDistinctScope,
-    dataset_prop_data: &mut HashMap<u64, DatasetPropData>,
-    class_partitions: &mut HashMap<u64, ClassPartitionData>,
+    distinct_data: &mut PartitionDistinctData,
 ) -> Result<()> {
     let mut scanner = index
         .all_triples(PermutationComponent::Ops)
         .context("Failed to open OPS permutation scan")?;
-    let count_all = distinct_scope == PartitionDistinctScope::All;
-
     let mut processed = 0u64;
     for triple in &mut scanner {
         let (s_id, p_id, o_id) = triple.context("Failed to scan OPS permutation")?;
-        dataset_prop_data
+        distinct_data
+            .dataset_prop_data
             .get_mut(&p_id)
             .with_context(|| format!("OPS permutation contains unknown predicate ID {p_id}"))?
             .add_object(o_id);
 
-        if count_all {
+        if let Some(distinct_classes) = distinct_data.class_partitions.as_mut() {
             let subject_classes = class_combo_index.classes(s_id);
             if !subject_classes.is_empty() {
                 let dt_id = datatype_index.get(o_id);
@@ -755,25 +813,31 @@ fn run_distinct_object_pass(
                 };
 
                 for &class_id in subject_classes {
-                    let cp = class_partitions.get_mut(&class_id).with_context(|| {
+                    let distinct_cp = distinct_classes.get_mut(&class_id).with_context(|| {
                         format!("OPS permutation references unknown class ID {class_id}")
                     })?;
-                    cp.stats.add_object(o_id);
-                    let pp = cp.prop_partitions.get_mut(&p_id).with_context(|| {
+                    distinct_cp.stats.add_object(o_id);
+                    let distinct_pp =
+                        distinct_cp
+                            .prop_partitions
+                            .get_mut(&p_id)
+                            .with_context(|| {
                         format!(
                             "OPS permutation references unknown property ID {p_id} in class {class_id}"
                         )
                     })?;
-                    pp.stats.add_object(o_id);
+                    distinct_pp.stats.add_object(o_id);
 
                     if object_classes.is_empty() {
-                        pp.target_classes
+                        distinct_pp
+                            .target_classes
                             .get_mut(&None)
                             .context("missing untyped target-class partition")?
                             .add_object(o_id);
                     } else {
                         for &object_class_id in object_classes {
-                            pp.target_classes
+                            distinct_pp
+                                .target_classes
                                 .get_mut(&Some(object_class_id))
                                 .with_context(|| {
                                     format!(
@@ -785,14 +849,15 @@ fn run_distinct_object_pass(
                     }
 
                     if dt_id > 0 {
-                        pp.target_datatypes
+                        distinct_pp
+                            .target_datatypes
                             .get_mut(&dt_id)
                             .with_context(|| {
                                 format!("missing datatype partition for entry ID {dt_id}")
                             })?
                             .add_object(o_id);
                         if datatype_index.is_language(dt_id) {
-                            pp.lang_string.add_object(o_id);
+                            distinct_pp.lang_string.add_object(o_id);
                         }
                     }
                 }
@@ -813,7 +878,7 @@ fn run_distinct_object_pass(
 // Serialization
 // ---------------------------------------------------------------------------
 
-fn write_distinct_counts(w: &mut impl Write, node: &str, stats: &PartitionStats) -> Result<u64> {
+fn write_distinct_counts(w: &mut impl Write, node: &str, stats: &DistinctStats) -> Result<u64> {
     nt(
         w,
         node,
@@ -830,9 +895,9 @@ fn write_distinct_counts(w: &mut impl Write, node: &str, stats: &PartitionStats)
 }
 
 #[derive(Clone, Copy)]
-struct PartitionWriteOptions {
+struct PartitionWriteOptions<'a> {
     use_blank_nodes: bool,
-    write_distinct: bool,
+    distinct: Option<&'a PropPartitionDistinctData>,
 }
 
 /// Emit datatype and language partitions for a property partition's `target_datatypes` map.
@@ -847,7 +912,7 @@ fn write_datatype_partitions(
     prop_part_node: &str,
     prop_partition: &PropPartitionData,
     datatype_index: &DatatypeIndex,
-    options: PartitionWriteOptions,
+    options: PartitionWriteOptions<'_>,
     bnode_counter: &mut u64,
 ) -> Result<u64> {
     let target_datatypes = &prop_partition.target_datatypes;
@@ -860,6 +925,7 @@ fn write_datatype_partitions(
     // Separate entries into non-langString datatypes and language tags.
     let mut datatype_entries: Vec<u16> = Vec::new();
     let mut lang_entries: Vec<u16> = Vec::new();
+    let mut lang_total = 0u64;
 
     let mut sorted_ids: Vec<u16> = target_datatypes.keys().copied().collect();
     sorted_ids.sort_unstable();
@@ -867,6 +933,7 @@ fn write_datatype_partitions(
     for &entry_id in &sorted_ids {
         if datatype_index.is_language(entry_id) {
             lang_entries.push(entry_id);
+            lang_total += target_datatypes[&entry_id];
         } else {
             datatype_entries.push(entry_id);
         }
@@ -874,7 +941,7 @@ fn write_datatype_partitions(
 
     // Emit non-langString datatype partitions.
     for entry_id in &datatype_entries {
-        let stats = &target_datatypes[entry_id];
+        let count = target_datatypes[entry_id];
         let dt_iri = datatype_index.datatype_iri(*entry_id);
         let dt_part_uri = format!("{prop_part_uri}/datatype/{}", md5_hex(dt_iri));
         let dt_part_node =
@@ -886,15 +953,14 @@ fn write_datatype_partitions(
         written += 1;
         nt(w, &dt_part_node, VOIDEXT_DATATYPE, &format!("<{dt_iri}>"))?;
         written += 1;
-        nt(
-            w,
-            &dt_part_node,
-            VOID_TRIPLES,
-            &int_node(stats.triple_count),
-        )?;
+        nt(w, &dt_part_node, VOID_TRIPLES, &int_node(count))?;
         written += 1;
-        if options.write_distinct {
-            written += write_distinct_counts(w, &dt_part_node, stats)?;
+        if let Some(distinct) = options.distinct {
+            let distinct_stats = distinct
+                .target_datatypes
+                .get(entry_id)
+                .context("missing distinct datatype partition")?;
+            written += write_distinct_counts(w, &dt_part_node, distinct_stats)?;
         }
     }
 
@@ -915,20 +981,15 @@ fn write_datatype_partitions(
             &format!("<{RDF_LANG_STRING}>"),
         )?;
         written += 1;
-        nt(
-            w,
-            &dt_part_node,
-            VOID_TRIPLES,
-            &int_node(prop_partition.lang_string.triple_count),
-        )?;
+        nt(w, &dt_part_node, VOID_TRIPLES, &int_node(lang_total))?;
         written += 1;
-        if options.write_distinct {
-            written += write_distinct_counts(w, &dt_part_node, &prop_partition.lang_string)?;
+        if let Some(distinct) = options.distinct {
+            written += write_distinct_counts(w, &dt_part_node, &distinct.lang_string)?;
         }
 
         // Nested language partitions.
         for entry_id in &lang_entries {
-            let stats = &target_datatypes[entry_id];
+            let count = target_datatypes[entry_id];
             let lang_tag = datatype_index.language_tag(*entry_id);
             let lang_part_uri = format!("{dt_part_uri}/language/{}", md5_hex(lang_tag));
             let lang_part_node =
@@ -950,15 +1011,14 @@ fn write_datatype_partitions(
                 &format!("\"{lang_tag}\""),
             )?;
             written += 1;
-            nt(
-                w,
-                &lang_part_node,
-                VOID_TRIPLES,
-                &int_node(stats.triple_count),
-            )?;
+            nt(w, &lang_part_node, VOID_TRIPLES, &int_node(count))?;
             written += 1;
-            if options.write_distinct {
-                written += write_distinct_counts(w, &lang_part_node, stats)?;
+            if let Some(distinct) = options.distinct {
+                let distinct_stats = distinct
+                    .target_datatypes
+                    .get(entry_id)
+                    .context("missing distinct language partition")?;
+                written += write_distinct_counts(w, &lang_part_node, distinct_stats)?;
             }
         }
     }
@@ -976,7 +1036,7 @@ fn write_void_triples(
     stats: &VoidStats,
     datatype_index: &DatatypeIndex,
     resolver: &mut DictionaryResolver,
-    distinct_scope: Option<PartitionDistinctScope>,
+    distinct_data: Option<&PartitionDistinctData>,
 ) -> Result<u64> {
     let mut written: u64 = 0;
     let mut bnode_counter: u64 = 0;
@@ -1039,8 +1099,12 @@ fn write_void_triples(
         written += 1;
         nt(w, &part_node, VOID_TRIPLES, &int_node(dpd.triple_count))?;
         written += 1;
-        if distinct_scope.is_some() {
-            written += write_distinct_counts(w, &part_node, dpd)?;
+        if let Some(distinct) = distinct_data {
+            let distinct_stats = distinct
+                .dataset_prop_data
+                .get(pred_id)
+                .context("missing dataset property distinct statistics")?;
+            written += write_distinct_counts(w, &part_node, distinct_stats)?;
         }
     }
 
@@ -1055,6 +1119,14 @@ fn write_void_triples(
 
     for class_id in &class_ids {
         let cp = &stats.class_partitions[class_id];
+        let distinct_cp = distinct_data
+            .and_then(|distinct| distinct.class_partitions.as_ref())
+            .map(|classes| {
+                classes
+                    .get(class_id)
+                    .context("missing class partition distinct statistics")
+            })
+            .transpose()?;
 
         // Resolve the class IRI (class_id is an object ID in the HDT dictionary).
         class_buf.clear();
@@ -1087,8 +1159,8 @@ fn write_void_triples(
             &int_node(cp.total_triples()),
         )?;
         written += 1;
-        if distinct_scope == Some(PartitionDistinctScope::All) {
-            written += write_distinct_counts(w, &class_part_node, &cp.stats)?;
+        if let Some(distinct_cp) = distinct_cp {
+            written += write_distinct_counts(w, &class_part_node, &distinct_cp.stats)?;
         }
 
         // Nested property partitions within this class.
@@ -1097,6 +1169,14 @@ fn write_void_triples(
 
         for prop_id in &prop_ids {
             let pp = &cp.prop_partitions[prop_id];
+            let distinct_pp = distinct_cp
+                .map(|distinct_cp| {
+                    distinct_cp
+                        .prop_partitions
+                        .get(prop_id)
+                        .context("missing class property distinct statistics")
+                })
+                .transpose()?;
 
             term_buf.clear();
             resolver.predicate_term(*prop_id, &mut term_buf)?;
@@ -1119,15 +1199,10 @@ fn write_void_triples(
             written += 1;
             nt(w, &prop_part_node, VOID_PROPERTY, &format!("<{pred_iri}>"))?;
             written += 1;
-            nt(
-                w,
-                &prop_part_node,
-                VOID_TRIPLES,
-                &int_node(pp.stats.triple_count),
-            )?;
+            nt(w, &prop_part_node, VOID_TRIPLES, &int_node(pp.triple_count))?;
             written += 1;
-            if distinct_scope == Some(PartitionDistinctScope::All) {
-                written += write_distinct_counts(w, &prop_part_node, &pp.stats)?;
+            if let Some(distinct_pp) = distinct_pp {
+                written += write_distinct_counts(w, &prop_part_node, &distinct_pp.stats)?;
             }
 
             // Target class partitions (objectClassPartition).
@@ -1136,7 +1211,7 @@ fn write_void_triples(
             target_keys.sort_unstable_by_key(|k| k.unwrap_or(u64::MAX));
 
             for target_class_opt in &target_keys {
-                let target_stats = &pp.target_classes[target_class_opt];
+                let target_count = pp.target_classes[target_class_opt];
 
                 // Resolve target class IRI (if typed).
                 let target_iri_opt: Option<String> = if let Some(tc_id) = target_class_opt {
@@ -1170,15 +1245,14 @@ fn write_void_triples(
                     nt(w, &target_part_node, VOID_CLASS, &format!("<{tc_iri}>"))?;
                     written += 1;
                 }
-                nt(
-                    w,
-                    &target_part_node,
-                    VOID_TRIPLES,
-                    &int_node(target_stats.triple_count),
-                )?;
+                nt(w, &target_part_node, VOID_TRIPLES, &int_node(target_count))?;
                 written += 1;
-                if distinct_scope == Some(PartitionDistinctScope::All) {
-                    written += write_distinct_counts(w, &target_part_node, target_stats)?;
+                if let Some(distinct_pp) = distinct_pp {
+                    let distinct_stats = distinct_pp
+                        .target_classes
+                        .get(target_class_opt)
+                        .context("missing target-class distinct statistics")?;
+                    written += write_distinct_counts(w, &target_part_node, distinct_stats)?;
                 }
             }
 
@@ -1191,7 +1265,7 @@ fn write_void_triples(
                 datatype_index,
                 PartitionWriteOptions {
                     use_blank_nodes,
-                    write_distinct: distinct_scope == Some(PartitionDistinctScope::All),
+                    distinct: distinct_pp,
                 },
                 &mut bnode_counter,
             )?;
@@ -1292,7 +1366,11 @@ pub fn compute_void(
 
     // Pass 2: full triple scan — dataset-level property counts and class partitions.
     tracing::info!("Pass 2: scanning all triples for statistics...");
-    let (mut dataset_prop_data, mut class_partitions) = run_stats_pass(
+    let StatsPassResult {
+        dataset_prop_data,
+        mut class_partitions,
+        mut distinct_data,
+    } = run_stats_pass(
         hdt_path,
         &offsets,
         nb_shared,
@@ -1301,16 +1379,14 @@ pub fn compute_void(
         distinct_scope,
     )?;
 
-    if let Some(scope) = distinct_scope {
+    if let Some(distinct_data) = distinct_data.as_mut() {
         tracing::info!("Scanning OPS permutation for exact distinct-object counts...");
         run_distinct_object_pass(
             permutation_index.as_ref().unwrap(),
             nb_shared,
             &class_combo_index,
             &datatype_index,
-            scope,
-            &mut dataset_prop_data,
-            &mut class_partitions,
+            distinct_data,
         )?;
     }
 
@@ -1349,8 +1425,28 @@ pub fn compute_void(
         &stats,
         &datatype_index,
         &mut resolver,
-        distinct_scope,
+        distinct_data.as_ref(),
     )?;
 
     Ok(written)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::mem::size_of;
+
+    #[test]
+    fn core_partition_values_do_not_embed_distinct_trackers() {
+        assert_eq!(size_of::<DatasetPropData>(), size_of::<u64>());
+        assert_eq!(
+            size_of::<PropPartitionData>(),
+            size_of::<u64>()
+                + size_of::<HashMap<Option<u64>, u64>>()
+                + size_of::<HashMap<u16, u64>>()
+        );
+
+        let dataset_only = PartitionDistinctData::new(PartitionDistinctScope::DatasetProperties);
+        assert!(dataset_only.class_partitions.is_none());
+    }
 }
