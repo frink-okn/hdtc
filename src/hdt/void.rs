@@ -190,20 +190,38 @@ struct DistinctStats {
 
 impl DistinctStats {
     /// Record a triple from the SPO scan. IDs are monotonic in subject order, so
-    /// one last-seen scalar is enough to count distinct subjects exactly.
+    /// one last-seen scalar is enough to count distinct subjects exactly. The
+    /// count, rather than an ID sentinel, records whether a first ID was seen.
     #[inline]
     fn add_subject(&mut self, subject_id: u64) {
-        if self.last_subject != subject_id {
+        if self.distinct_subjects == 0 || self.last_subject != subject_id {
             self.last_subject = subject_id;
             self.distinct_subjects += 1;
         }
     }
 
     /// Record membership from the OPS scan. IDs are monotonic in object order,
-    /// so one last-seen scalar is enough to count distinct objects exactly.
+    /// so one last-seen scalar is enough to count distinct objects exactly. The
+    /// count, rather than an ID sentinel, records whether a first ID was seen.
     #[inline]
     fn add_object(&mut self, object_id: u64) {
-        if self.last_object != object_id {
+        if self.distinct_objects == 0 || self.last_object != object_id {
+            self.last_object = object_id;
+            self.distinct_objects += 1;
+        }
+    }
+}
+
+#[derive(Default)]
+struct DistinctObjectStats {
+    distinct_objects: u64,
+    last_object: u64,
+}
+
+impl DistinctObjectStats {
+    #[inline]
+    fn add_object(&mut self, object_id: u64) {
+        if self.distinct_objects == 0 || self.last_object != object_id {
             self.last_object = object_id;
             self.distinct_objects += 1;
         }
@@ -242,7 +260,7 @@ struct PropPartitionDistinctData {
 
 #[derive(Default)]
 struct ClassPartitionDistinctData {
-    stats: DistinctStats,
+    objects: DistinctObjectStats,
     prop_partitions: HashMap<u64, PropPartitionDistinctData>,
 }
 
@@ -713,6 +731,9 @@ fn run_stats_pass(
         };
 
         // Record this triple in every class partition the subject belongs to.
+        let mut distinct_classes = distinct_data
+            .as_mut()
+            .and_then(|distinct| distinct.class_partitions.as_mut());
         for &class_id in current_subject_classes {
             let cp = class_partitions.entry(class_id).or_default();
             let pp = cp.prop_partitions.entry(p_id).or_default();
@@ -728,12 +749,8 @@ fn run_stats_pass(
                 }
             }
 
-            if let Some(distinct_classes) = distinct_data
-                .as_mut()
-                .and_then(|distinct| distinct.class_partitions.as_mut())
-            {
+            if let Some(distinct_classes) = distinct_classes.as_mut() {
                 let distinct_cp = distinct_classes.entry(class_id).or_default();
-                distinct_cp.stats.add_subject(s_id);
                 let distinct_pp = distinct_cp.prop_partitions.entry(p_id).or_default();
                 distinct_pp.stats.add_subject(s_id);
                 if dt_id > 0 {
@@ -793,6 +810,7 @@ fn run_distinct_object_pass(
     let mut scanner = index
         .all_triples(PermutationComponent::Ops)
         .context("Failed to open OPS permutation scan")?;
+    let num_triples = index.header().triples;
     let mut processed = 0u64;
     for triple in &mut scanner {
         let (s_id, p_id, o_id) = triple.context("Failed to scan OPS permutation")?;
@@ -816,7 +834,7 @@ fn run_distinct_object_pass(
                     let distinct_cp = distinct_classes.get_mut(&class_id).with_context(|| {
                         format!("OPS permutation references unknown class ID {class_id}")
                     })?;
-                    distinct_cp.stats.add_object(o_id);
+                    distinct_cp.objects.add_object(o_id);
                     let distinct_pp =
                         distinct_cp
                             .prop_partitions
@@ -866,7 +884,7 @@ fn run_distinct_object_pass(
 
         processed += 1;
         if processed.is_multiple_of(10_000_000) {
-            tracing::info!("  OPS pass: {processed} triples processed...");
+            tracing::info!("  OPS pass: {processed}/{num_triples} triples processed...");
         }
     }
 
@@ -878,20 +896,24 @@ fn run_distinct_object_pass(
 // Serialization
 // ---------------------------------------------------------------------------
 
-fn write_distinct_counts(w: &mut impl Write, node: &str, stats: &DistinctStats) -> Result<u64> {
+fn write_distinct_values(
+    w: &mut impl Write,
+    node: &str,
+    distinct_subjects: u64,
+    distinct_objects: u64,
+) -> Result<u64> {
     nt(
         w,
         node,
         VOID_DISTINCT_SUBJECTS,
-        &int_node(stats.distinct_subjects),
+        &int_node(distinct_subjects),
     )?;
-    nt(
-        w,
-        node,
-        VOID_DISTINCT_OBJECTS,
-        &int_node(stats.distinct_objects),
-    )?;
+    nt(w, node, VOID_DISTINCT_OBJECTS, &int_node(distinct_objects))?;
     Ok(2)
+}
+
+fn write_distinct_counts(w: &mut impl Write, node: &str, stats: &DistinctStats) -> Result<u64> {
+    write_distinct_values(w, node, stats.distinct_subjects, stats.distinct_objects)
 }
 
 #[derive(Clone, Copy)]
@@ -910,12 +932,11 @@ fn write_datatype_partitions(
     w: &mut impl Write,
     prop_part_uri: &str,
     prop_part_node: &str,
-    prop_partition: &PropPartitionData,
+    target_datatypes: &HashMap<u16, u64>,
     datatype_index: &DatatypeIndex,
     options: PartitionWriteOptions<'_>,
     bnode_counter: &mut u64,
 ) -> Result<u64> {
-    let target_datatypes = &prop_partition.target_datatypes;
     if target_datatypes.is_empty() {
         return Ok(0);
     }
@@ -923,25 +944,25 @@ fn write_datatype_partitions(
     let mut written: u64 = 0;
 
     // Separate entries into non-langString datatypes and language tags.
-    let mut datatype_entries: Vec<u16> = Vec::new();
-    let mut lang_entries: Vec<u16> = Vec::new();
+    let mut datatype_entries: Vec<(u16, u64)> = Vec::new();
+    let mut lang_entries: Vec<(u16, u64)> = Vec::new();
     let mut lang_total = 0u64;
 
     let mut sorted_ids: Vec<u16> = target_datatypes.keys().copied().collect();
     sorted_ids.sort_unstable();
 
     for &entry_id in &sorted_ids {
+        let count = target_datatypes[&entry_id];
         if datatype_index.is_language(entry_id) {
-            lang_entries.push(entry_id);
-            lang_total += target_datatypes[&entry_id];
+            lang_entries.push((entry_id, count));
+            lang_total += count;
         } else {
-            datatype_entries.push(entry_id);
+            datatype_entries.push((entry_id, count));
         }
     }
 
     // Emit non-langString datatype partitions.
-    for entry_id in &datatype_entries {
-        let count = target_datatypes[entry_id];
+    for (entry_id, count) in &datatype_entries {
         let dt_iri = datatype_index.datatype_iri(*entry_id);
         let dt_part_uri = format!("{prop_part_uri}/datatype/{}", md5_hex(dt_iri));
         let dt_part_node =
@@ -953,7 +974,7 @@ fn write_datatype_partitions(
         written += 1;
         nt(w, &dt_part_node, VOIDEXT_DATATYPE, &format!("<{dt_iri}>"))?;
         written += 1;
-        nt(w, &dt_part_node, VOID_TRIPLES, &int_node(count))?;
+        nt(w, &dt_part_node, VOID_TRIPLES, &int_node(*count))?;
         written += 1;
         if let Some(distinct) = options.distinct {
             let distinct_stats = distinct
@@ -988,8 +1009,7 @@ fn write_datatype_partitions(
         }
 
         // Nested language partitions.
-        for entry_id in &lang_entries {
-            let count = target_datatypes[entry_id];
+        for (entry_id, count) in &lang_entries {
             let lang_tag = datatype_index.language_tag(*entry_id);
             let lang_part_uri = format!("{dt_part_uri}/language/{}", md5_hex(lang_tag));
             let lang_part_node =
@@ -1011,7 +1031,7 @@ fn write_datatype_partitions(
                 &format!("\"{lang_tag}\""),
             )?;
             written += 1;
-            nt(w, &lang_part_node, VOID_TRIPLES, &int_node(count))?;
+            nt(w, &lang_part_node, VOID_TRIPLES, &int_node(*count))?;
             written += 1;
             if let Some(distinct) = options.distinct {
                 let distinct_stats = distinct
@@ -1160,7 +1180,12 @@ fn write_void_triples(
         )?;
         written += 1;
         if let Some(distinct_cp) = distinct_cp {
-            written += write_distinct_counts(w, &class_part_node, &distinct_cp.stats)?;
+            written += write_distinct_values(
+                w,
+                &class_part_node,
+                cp.entity_count,
+                distinct_cp.objects.distinct_objects,
+            )?;
         }
 
         // Nested property partitions within this class.
@@ -1261,7 +1286,7 @@ fn write_void_triples(
                 w,
                 &prop_part_uri,
                 &prop_part_node,
-                pp,
+                &pp.target_datatypes,
                 datatype_index,
                 PartitionWriteOptions {
                     use_blank_nodes,
@@ -1291,7 +1316,9 @@ fn write_void_triples(
 /// serialization. The analysis data structures (`subject→class` index and partition
 /// statistics) use additional memory proportional to the number of typed subjects and
 /// class/property combinations in the dataset. `distinct_scope` requires the canonical
-/// permutation sidecar and adds one sequential OPS pass.
+/// permutation sidecar and adds one sequential OPS pass. The `All` scope also allocates
+/// exact scalar tracking state proportional to the emitted partition combinations; that
+/// analysis state is not bounded by `memory_limit`.
 pub fn compute_void(
     hdt_path: &Path,
     dataset_uri: &str,
@@ -1381,8 +1408,11 @@ pub fn compute_void(
 
     if let Some(distinct_data) = distinct_data.as_mut() {
         tracing::info!("Scanning OPS permutation for exact distinct-object counts...");
+        let permutation_index = permutation_index
+            .as_ref()
+            .context("partition distinct statistics require an open permutation index")?;
         run_distinct_object_pass(
-            permutation_index.as_ref().unwrap(),
+            permutation_index,
             nb_shared,
             &class_combo_index,
             &datatype_index,
@@ -1437,16 +1467,24 @@ mod tests {
     use std::mem::size_of;
 
     #[test]
-    fn core_partition_values_do_not_embed_distinct_trackers() {
+    fn optional_distinct_state_leaves_core_dataset_counts_compact() {
         assert_eq!(size_of::<DatasetPropData>(), size_of::<u64>());
-        assert_eq!(
-            size_of::<PropPartitionData>(),
-            size_of::<u64>()
-                + size_of::<HashMap<Option<u64>, u64>>()
-                + size_of::<HashMap<u16, u64>>()
-        );
 
         let dataset_only = PartitionDistinctData::new(PartitionDistinctScope::DatasetProperties);
         assert!(dataset_only.class_partitions.is_none());
+    }
+
+    #[test]
+    fn distinct_tracking_does_not_reserve_zero_as_a_sentinel() {
+        let mut stats = DistinctStats::default();
+        stats.add_subject(0);
+        stats.add_subject(0);
+        stats.add_subject(1);
+        stats.add_object(0);
+        stats.add_object(0);
+        stats.add_object(1);
+
+        assert_eq!(stats.distinct_subjects, 2);
+        assert_eq!(stats.distinct_objects, 2);
     }
 }

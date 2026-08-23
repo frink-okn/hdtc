@@ -509,7 +509,9 @@ pub struct VoidArgs {
     /// Controls the PFC block cache used for term resolution during serialization.
     /// The analysis data structures (subject→class index, partition statistics) use
     /// additional memory proportional to the number of typed subjects and class/property
-    /// combinations in the dataset.
+    /// combinations in the dataset. With --partition-distinct-counts=all, the exact
+    /// distinct trackers add memory proportional to all emitted partition combinations;
+    /// that analysis memory is not bounded by this option.
     #[arg(short = 'm', long, value_name = "SIZE", default_value = "4G")]
     pub memory_limit: MemorySize,
 }

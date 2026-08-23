@@ -453,11 +453,16 @@ hdtc void data.hdt --partition-distinct-counts dataset-properties
 
 Use `--partition-distinct-counts all` to add the counts to every emitted class,
 property, object-class, datatype, and language partition. Both scopes require the
-canonical `.hdt.perm` sidecar. This keeps the counts exact and bounded-memory:
-subjects are counted during the existing SPO pass, while objects are counted in
-one sequential OPS permutation pass.
+canonical `.hdt.perm` sidecar. This keeps the counts exact without retaining sets
+of all IDs: subjects are counted during the existing SPO pass, while objects are
+counted in one sequential OPS permutation pass. The `all`
+scope still maintains a scalar tracker for every emitted partition combination;
+that memory is proportional to partition cardinality and is not governed by
+`--memory-limit`.
 
-The algorithm uses two sequential passes over the HDT triples plus a dictionary scan (no index required):
+The default algorithm uses two sequential passes over the HDT triples plus a
+dictionary scan and requires no index. Requesting partition distinct counts adds
+an index-backed third pass:
 
 1. **Pass 1** scans all triples to identify `rdf:type` relationships, building a subject-to-class index.
 2. **Datatype index** — a sequential scan of the object-only dictionary section extracts each literal's datatype or language tag, building a compact 2-byte-per-entry index. Shared-section terms are skipped (literals can never be subjects, so shared terms are always URIs or blank nodes).
