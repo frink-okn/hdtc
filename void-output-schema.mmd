@@ -9,36 +9,50 @@ classDiagram
   class DatasetPropertyPartition {
     void:property : IRI
     void:triples : xsd:integer
+    void:distinctSubjects : xsd:integer
+    void:distinctObjects : xsd:integer
   }
 
   class ClassPartition {
     void:class : IRI
     void:entities : xsd:integer
     void:triples : xsd:integer
+    void:distinctSubjects : xsd:integer
+    void:distinctObjects : xsd:integer
   }
 
   class ClassPropertyPartition {
     void:property : IRI
     void:triples : xsd:integer
+    void:distinctSubjects : xsd:integer
+    void:distinctObjects : xsd:integer
   }
 
   class ObjectClassPartition {
     void:class : IRI
     void:triples : xsd:integer
+    void:distinctSubjects : xsd:integer
+    void:distinctObjects : xsd:integer
   }
 
   class UntypedObjectPartition {
     void:triples : xsd:integer
+    void:distinctSubjects : xsd:integer
+    void:distinctObjects : xsd:integer
   }
 
   class DatatypePartition {
     voidext:datatype : IRI
     void:triples : xsd:integer
+    void:distinctSubjects : xsd:integer
+    void:distinctObjects : xsd:integer
   }
 
   class LanguagePartition {
     voidext:language : xsd:string
     void:triples : xsd:integer
+    void:distinctSubjects : xsd:integer
+    void:distinctObjects : xsd:integer
   }
 
   Dataset "1" --> "0..*" DatasetPropertyPartition : void#58;propertyPartition
@@ -50,10 +64,10 @@ classDiagram
   DatatypePartition "1" --> "0..*" LanguagePartition : voidext#58;languagePartition
 
   note for Dataset "rdf:type void:Dataset"
-  note for DatasetPropertyPartition "rdf:type void:Dataset"
-  note for ClassPartition "rdf:type void:Dataset"
-  note for ClassPropertyPartition "rdf:type void:Dataset"
-  note for ObjectClassPartition "rdf:type void:Dataset"
-  note for UntypedObjectPartition "rdf:type void:Dataset"
-  note for DatatypePartition "rdf:type void:Dataset"
-  note for LanguagePartition "rdf:type void:Dataset"
+  note for DatasetPropertyPartition "rdf:type void:Dataset<br/>distinct counts require .hdt.perm<br/>scope dataset-properties or all"
+  note for ClassPartition "rdf:type void:Dataset<br/>distinct counts require .hdt.perm<br/>scope all"
+  note for ClassPropertyPartition "rdf:type void:Dataset<br/>distinct counts require .hdt.perm<br/>scope all"
+  note for ObjectClassPartition "rdf:type void:Dataset<br/>distinct counts require .hdt.perm<br/>scope all"
+  note for UntypedObjectPartition "rdf:type void:Dataset<br/>distinct counts require .hdt.perm<br/>scope all"
+  note for DatatypePartition "rdf:type void:Dataset<br/>distinct counts require .hdt.perm<br/>scope all"
+  note for LanguagePartition "rdf:type void:Dataset<br/>distinct counts require .hdt.perm<br/>scope all"

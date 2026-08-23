@@ -104,6 +104,14 @@ pub enum PermutationPositionMap {
     Ops,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum VoidPartitionDistinctScope {
+    /// Dataset-level property partitions only
+    DatasetProperties,
+    /// Every emitted partition
+    All,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, ValueEnum)]
 pub enum GraphIndexPositionSpace {
     Pos,
@@ -489,6 +497,12 @@ pub struct VoidArgs {
     /// Use blank nodes for partition identifiers instead of URI references
     #[arg(long)]
     pub use_blank_nodes: bool,
+
+    /// Add exact distinct subject/object counts to the selected partitions
+    ///
+    /// Requires the canonical .hdt.perm sidecar for an object-ordered scan.
+    #[arg(long, value_enum, value_name = "SCOPE")]
+    pub partition_distinct_counts: Option<VoidPartitionDistinctScope>,
 
     /// Soft memory limit for dictionary caches (e.g. 4G, 2000M)
     ///

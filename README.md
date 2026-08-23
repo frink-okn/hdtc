@@ -420,7 +420,7 @@ Compute [VoID](https://www.w3.org/TR/void/) (Vocabulary of Interlinked Datasets)
 The output includes:
 
 - **Dataset-level statistics** — total triples, distinct subjects, distinct objects, number of properties
-- **Property partitions** — triple count per predicate
+- **Property partitions** — triple count per predicate, with optional exact distinct subject/object counts
 - **Class partitions** — entity count and triple count per `rdf:type` class, with nested property partitions
 - **Object class partitions** — per-property target class breakdown (using the [void-ext](http://ldf.fi/void-ext) `objectClassPartition` extension), within class-level property partitions
 - **Datatype partitions** — per-property breakdown of literal objects by RDF datatype (e.g., `xsd:integer`, `xsd:string`) using the void-ext `datatypePartition` extension, within class-level property partitions
@@ -444,11 +444,25 @@ Use blank nodes instead of URI references for partition identifiers:
 hdtc void data.hdt --dataset-uri http://example.org/mydataset --use-blank-nodes
 ```
 
+Add exact distinct subject and object counts to dataset-level property partitions:
+
+```sh
+hdtc perm data.hdt
+hdtc void data.hdt --partition-distinct-counts dataset-properties
+```
+
+Use `--partition-distinct-counts all` to add the counts to every emitted class,
+property, object-class, datatype, and language partition. Both scopes require the
+canonical `.hdt.perm` sidecar. This keeps the counts exact and bounded-memory:
+subjects are counted during the existing SPO pass, while objects are counted in
+one sequential OPS permutation pass.
+
 The algorithm uses two sequential passes over the HDT triples plus a dictionary scan (no index required):
 
 1. **Pass 1** scans all triples to identify `rdf:type` relationships, building a subject-to-class index.
 2. **Datatype index** — a sequential scan of the object-only dictionary section extracts each literal's datatype or language tag, building a compact 2-byte-per-entry index. Shared-section terms are skipped (literals can never be subjects, so shared terms are always URIs or blank nodes).
 3. **Pass 2** scans all triples again to accumulate per-property and per-class statistics, including datatype and language counts, using the indices from the previous steps.
+4. **Optional OPS pass** scans the permutation sidecar when `--partition-distinct-counts` is requested, adding exact distinct-object counts without per-partition object sets.
 
 Partition URIs are generated using MD5 hashes of the corresponding class, property, datatype, or language tag. Blank-node classes (common in OWL ontologies) are automatically filtered out and do not produce class partitions.
 
@@ -596,6 +610,7 @@ Named-graph options (`-m quads`, `--graph-map`, `--default-graph`,
 | `--dataset-uri URI`       | `http://example.org/dataset` | URI identifying the dataset being described                         |
 | `-o, --output PATH`       | stdout                       | Write VoID N-Triples to file instead of stdout                      |
 | `--use-blank-nodes`       | off                          | Use blank nodes for partition identifiers instead of URI references |
+| `--partition-distinct-counts SCOPE` | off                 | Add exact distinct subject/object counts; `dataset-properties` or `all` (requires `.hdt.perm`) |
 | `-m, --memory-limit SIZE` | `4G`                         | Soft memory limit for dictionary caches (e.g. `4G`, `2000M`)        |
 | `-v, --verbose`           | —                            | Increase log verbosity (`-v` debug, `-vv` trace)                    |
 | `-q, --quiet`             | —                            | Suppress all output except errors                                   |

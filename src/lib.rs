@@ -1033,6 +1033,12 @@ fn compute_void(args: cli::VoidArgs, benchmark: bool) -> Result<()> {
 
     let start = std::time::Instant::now();
     let memory_limit = args.memory_limit.as_bytes();
+    let distinct_scope = args.partition_distinct_counts.map(|scope| match scope {
+        cli::VoidPartitionDistinctScope::DatasetProperties => {
+            hdt::PartitionDistinctScope::DatasetProperties
+        }
+        cli::VoidPartitionDistinctScope::All => hdt::PartitionDistinctScope::All,
+    });
 
     let count = hdt::compute_void(
         &args.hdt_file,
@@ -1040,6 +1046,7 @@ fn compute_void(args: cli::VoidArgs, benchmark: bool) -> Result<()> {
         args.output.as_deref(),
         args.use_blank_nodes,
         memory_limit,
+        distinct_scope,
     )?;
 
     if benchmark {

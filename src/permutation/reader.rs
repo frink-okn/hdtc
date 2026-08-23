@@ -183,6 +183,24 @@ impl PermutationIndex {
             z_end,
         )
     }
+
+    /// Stream every triple from one of the materialized permutation orders.
+    pub(crate) fn all_triples(
+        &self,
+        component: PermutationComponent,
+    ) -> Result<FullPermutationTriples> {
+        ensure!(
+            matches!(
+                component,
+                PermutationComponent::Pos | PermutationComponent::Ops
+            ),
+            "only POS and OPS are materialized in the permutation index"
+        );
+        Ok(FullPermutationTriples {
+            component: component as u32,
+            decoder: FullDecoder::new(self, component as u32)?,
+        })
+    }
 }
 
 fn validate_source_metadata(header: &Header, hdt: &HdtMetadata) -> Result<()> {
@@ -817,6 +835,30 @@ struct FullDecoder {
     bitmap_y: BareBitmapReader,
     array_z: BarePackedReader,
     bitmap_z: BareBitmapReader,
+}
+
+pub(crate) struct FullPermutationTriples {
+    component: u32,
+    decoder: FullDecoder,
+}
+
+impl Iterator for FullPermutationTriples {
+    type Item = Result<(u64, u64, u64)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.decoder.next_entry() {
+            Ok(Some((entry, _, _))) => {
+                let triple = if self.component == PermutationComponent::Pos as u32 {
+                    (entry.third, entry.first, entry.second)
+                } else {
+                    (entry.third, entry.second, entry.first)
+                };
+                Some(Ok(triple))
+            }
+            Ok(None) => None,
+            Err(error) => Some(Err(error)),
+        }
+    }
 }
 
 impl FullDecoder {
