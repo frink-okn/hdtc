@@ -800,13 +800,29 @@ fn run_stats_pass(
 /// Scan the permutation sidecar in OPS order and add exact distinct-object
 /// counts. Because every partition sees object IDs monotonically, each one only
 /// needs a last-seen object scalar rather than a set of all its objects.
+///
+/// `class_combo_index` is required only when `distinct_data` carries the nested
+/// class hierarchy (the `all` scope). A `dataset-properties` run attributes
+/// objects by predicate alone, so it passes `None` and the caller releases the
+/// index — 4 bytes per subject — before this pass rather than after it.
 fn run_distinct_object_pass(
     index: &PermutationIndex,
     nb_shared: u64,
-    class_combo_index: &ClassComboIndex,
+    class_combo_index: Option<&ClassComboIndex>,
     datatype_index: &DatatypeIndex,
     distinct_data: &mut PartitionDistinctData,
 ) -> Result<()> {
+    // Hoisted out of the scan: the nested class map and the combo index are
+    // present together or absent together.
+    let class_combo_index = if distinct_data.class_partitions.is_some() {
+        Some(
+            class_combo_index
+                .context("class partition distinct counts require the subject-to-class index")?,
+        )
+    } else {
+        None
+    };
+
     let mut scanner = index
         .all_triples(PermutationComponent::Ops)
         .context("Failed to open OPS permutation scan")?;
@@ -820,7 +836,9 @@ fn run_distinct_object_pass(
             .with_context(|| format!("OPS permutation contains unknown predicate ID {p_id}"))?
             .add_object(o_id);
 
-        if let Some(distinct_classes) = distinct_data.class_partitions.as_mut() {
+        if let (Some(distinct_classes), Some(class_combo_index)) =
+            (distinct_data.class_partitions.as_mut(), class_combo_index)
+        {
             let subject_classes = class_combo_index.classes(s_id);
             if !subject_classes.is_empty() {
                 let dt_id = datatype_index.get(o_id);
@@ -1406,6 +1424,17 @@ pub fn compute_void(
         distinct_scope,
     )?;
 
+    // Only the `all` scope attributes OPS-ordered triples to class partitions.
+    // Every other run is done with the index here, so release it now: at 4 bytes
+    // per subject it is the largest allocation this command makes, and holding
+    // it across a full extra pass costs gigabytes on large datasets for nothing.
+    let class_combo_index = if distinct_scope == Some(PartitionDistinctScope::All) {
+        Some(class_combo_index)
+    } else {
+        drop(class_combo_index);
+        None
+    };
+
     if let Some(distinct_data) = distinct_data.as_mut() {
         tracing::info!("Scanning OPS permutation for exact distinct-object counts...");
         let permutation_index = permutation_index
@@ -1414,13 +1443,13 @@ pub fn compute_void(
         run_distinct_object_pass(
             permutation_index,
             nb_shared,
-            &class_combo_index,
+            class_combo_index.as_ref(),
             &datatype_index,
             distinct_data,
         )?;
     }
 
-    // Release the class combo index (no longer needed after the optional OPS pass).
+    // Release the class combo index (unused after the optional OPS pass).
     drop(class_combo_index);
 
     // Merge entity counts into class_partitions.
@@ -1472,6 +1501,24 @@ mod tests {
 
         let dataset_only = PartitionDistinctData::new(PartitionDistinctScope::DatasetProperties);
         assert!(dataset_only.class_partitions.is_none());
+    }
+
+    /// `compute_void` releases the subject-to-class index before the OPS pass for
+    /// every scope but `All`, while `run_distinct_object_pass` demands the index
+    /// whenever the nested class hierarchy is present. Both key off the scope, so
+    /// the hierarchy must exist for `All` and only for `All`.
+    #[test]
+    fn nested_class_hierarchy_is_allocated_exactly_for_the_all_scope() {
+        assert!(
+            PartitionDistinctData::new(PartitionDistinctScope::All)
+                .class_partitions
+                .is_some()
+        );
+        assert!(
+            PartitionDistinctData::new(PartitionDistinctScope::DatasetProperties)
+                .class_partitions
+                .is_none()
+        );
     }
 
     #[test]
