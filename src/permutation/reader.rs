@@ -183,6 +183,25 @@ impl PermutationIndex {
             z_end,
         )
     }
+
+    /// Stream every triple from one of the materialized permutation orders.
+    pub(crate) fn all_triples(
+        &self,
+        component: PermutationComponent,
+    ) -> Result<FullPermutationTriples> {
+        ensure!(
+            matches!(
+                component,
+                PermutationComponent::Pos | PermutationComponent::Ops
+            ),
+            "only POS and OPS are materialized in the permutation index"
+        );
+        Ok(FullPermutationTriples {
+            component,
+            decoder: FullDecoder::new(self, component as u32)?,
+            finished: false,
+        })
+    }
 }
 
 fn validate_source_metadata(header: &Header, hdt: &HdtMetadata) -> Result<()> {
@@ -819,6 +838,43 @@ struct FullDecoder {
     bitmap_z: BareBitmapReader,
 }
 
+pub(crate) struct FullPermutationTriples {
+    component: PermutationComponent,
+    decoder: FullDecoder,
+    finished: bool,
+}
+
+fn permutation_entry_as_spo(component: PermutationComponent, entry: PermEntry) -> (u64, u64, u64) {
+    match component {
+        PermutationComponent::Pos => (entry.third, entry.first, entry.second),
+        PermutationComponent::Ops => (entry.third, entry.second, entry.first),
+        PermutationComponent::Spo => unreachable!("SPO is not materialized in the sidecar"),
+    }
+}
+
+impl Iterator for FullPermutationTriples {
+    type Item = Result<(u64, u64, u64)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished {
+            return None;
+        }
+        match self.decoder.next_entry() {
+            Ok(Some((entry, _, _))) => Some(Ok(permutation_entry_as_spo(self.component, entry))),
+            Ok(None) => {
+                self.finished = true;
+                None
+            }
+            Err(error) => {
+                self.finished = true;
+                Some(Err(error))
+            }
+        }
+    }
+}
+
+impl std::iter::FusedIterator for FullPermutationTriples {}
+
 impl FullDecoder {
     fn new(index: &PermutationIndex, component: u32) -> Result<Self> {
         let base = component << 8;
@@ -1112,4 +1168,101 @@ pub fn validate_permutation_index(
     let ops = collector.finish_ops()?;
     validate_permutation_semantics(&index, 2, ops)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn packed_reader(path: &Path, offset: u64, entry_count: u64) -> BarePackedReader {
+        BarePackedReader::new(
+            path,
+            &Section {
+                section_type: 0,
+                flags: 0,
+                offset,
+                length: entry_count,
+                entry_count,
+                bits_per_entry: 8,
+                payload_crc: 0,
+                parameter: 0,
+                indexed_bits: 0,
+            },
+            0,
+            entry_count,
+        )
+        .unwrap()
+    }
+
+    fn one_entry_iterator(
+        component: PermutationComponent,
+        first: u64,
+        second: u8,
+        third: u8,
+    ) -> (tempfile::NamedTempFile, FullPermutationTriples) {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&[0, 1, third, 1]).unwrap();
+        let path = file.path();
+        let decoder = FullDecoder {
+            remaining: 1,
+            first,
+            current_second: u64::from(second),
+            array_y: packed_reader(path, 0, 0),
+            bitmap_y: BareBitmapReader {
+                reader: packed_reader(path, 1, 1),
+            },
+            array_z: packed_reader(path, 2, 1),
+            bitmap_z: BareBitmapReader {
+                reader: packed_reader(path, 3, 1),
+            },
+        };
+        (
+            file,
+            FullPermutationTriples {
+                component,
+                decoder,
+                finished: false,
+            },
+        )
+    }
+
+    #[test]
+    fn full_permutation_iterator_restores_spo_for_both_orders() {
+        let (_pos_file, mut pos) = one_entry_iterator(PermutationComponent::Pos, 17, 23, 31);
+        let (_ops_file, mut ops) = one_entry_iterator(PermutationComponent::Ops, 23, 17, 31);
+
+        assert_eq!(pos.next().unwrap().unwrap(), (31, 17, 23));
+        assert_eq!(ops.next().unwrap().unwrap(), (31, 17, 23));
+        assert!(pos.next().is_none());
+        assert!(ops.next().is_none());
+    }
+
+    #[test]
+    fn full_permutation_iterator_is_fused_after_decode_error() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = file.path();
+        let decoder = FullDecoder {
+            remaining: 1,
+            first: 1,
+            current_second: 1,
+            array_y: packed_reader(path, 0, 0),
+            bitmap_y: BareBitmapReader {
+                reader: packed_reader(path, 0, 1),
+            },
+            array_z: packed_reader(path, 0, 1),
+            bitmap_z: BareBitmapReader {
+                reader: packed_reader(path, 0, 1),
+            },
+        };
+        let mut triples = FullPermutationTriples {
+            component: PermutationComponent::Ops,
+            decoder,
+            finished: false,
+        };
+
+        assert!(matches!(triples.next(), Some(Err(_))));
+        assert!(triples.next().is_none());
+        assert!(triples.next().is_none());
+    }
 }

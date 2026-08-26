@@ -110,6 +110,14 @@ pub enum PermutationPositionMap {
     Ops,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum VoidPartitionDistinctScope {
+    /// Dataset-level property partitions only
+    DatasetProperties,
+    /// Every emitted partition
+    All,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, ValueEnum)]
 pub enum GraphIndexPositionSpace {
     Pos,
@@ -499,12 +507,20 @@ pub struct VoidArgs {
     #[arg(long)]
     pub use_blank_nodes: bool,
 
+    /// Add exact distinct subject/object counts to the selected partitions
+    ///
+    /// Requires the canonical .hdt.perm sidecar for an object-ordered scan.
+    #[arg(long, value_enum, value_name = "SCOPE")]
+    pub partition_distinct_counts: Option<VoidPartitionDistinctScope>,
+
     /// Soft memory limit for dictionary caches (e.g. 4G, 2000M)
     ///
     /// Controls the PFC block cache used for term resolution during serialization.
     /// The analysis data structures (subject→class index, partition statistics) use
     /// additional memory proportional to the number of typed subjects and class/property
-    /// combinations in the dataset.
+    /// combinations in the dataset. With --partition-distinct-counts=all, the exact
+    /// distinct trackers add memory proportional to all emitted partition combinations;
+    /// that analysis memory is not bounded by this option.
     #[arg(short = 'm', long, value_name = "SIZE", default_value = "4G")]
     pub memory_limit: MemorySize,
 }

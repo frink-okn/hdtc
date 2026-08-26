@@ -6,7 +6,7 @@
 mod common;
 
 use common::write_file;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::process::Command;
 
@@ -75,6 +75,25 @@ fn make_hdt(temp_dir: &Path, content: &str, name: &str) -> std::path::PathBuf {
     );
 
     hdt_path
+}
+
+fn add_permutation_index(temp_dir: &Path, hdt_path: &Path, name: &str) {
+    let work_dir = temp_dir.join(format!("{name}_perm_work"));
+    let output = Command::new(env!("CARGO_BIN_EXE_hdtc"))
+        .args([
+            "perm",
+            hdt_path.to_str().unwrap(),
+            "--temp-dir",
+            work_dir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute hdtc perm");
+
+    assert!(
+        output.status.success(),
+        "hdtc perm failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 /// Run `hdtc void` and return (success, stdout, stderr).
@@ -300,6 +319,163 @@ fn test_void_property_partitions() {
             "Property partition {part} missing void:triples"
         );
     }
+}
+
+#[test]
+fn test_void_dataset_property_distinct_counts() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let hdt_path = make_hdt(temp_dir.path(), VOID_NT, "void_property_distinct");
+    add_permutation_index(temp_dir.path(), &hdt_path, "void_property_distinct");
+
+    let (ok, stdout, stderr) = run_void(
+        &hdt_path,
+        &[
+            "--dataset-uri",
+            "http://example.org/ds",
+            "--partition-distinct-counts",
+            "dataset-properties",
+        ],
+    );
+    assert!(ok, "hdtc void failed: {stderr}");
+
+    let triples = parse_ntriples(&stdout);
+    let smap = subject_map(&triples);
+    let ds = "<http://example.org/ds>";
+    let type_part = find_property_partition(
+        &triples,
+        &smap,
+        ds,
+        "<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>",
+    )
+    .unwrap();
+    assert_eq!(
+        get_void_int(
+            &smap,
+            &type_part,
+            "http://rdfs.org/ns/void#distinctSubjects"
+        ),
+        Some(3)
+    );
+    assert_eq!(
+        get_void_int(&smap, &type_part, "http://rdfs.org/ns/void#distinctObjects"),
+        Some(2)
+    );
+
+    let name_part =
+        find_property_partition(&triples, &smap, ds, "<http://example.org/name>").unwrap();
+    assert_eq!(
+        get_void_int(
+            &smap,
+            &name_part,
+            "http://rdfs.org/ns/void#distinctSubjects"
+        ),
+        Some(4)
+    );
+    assert_eq!(
+        get_void_int(&smap, &name_part, "http://rdfs.org/ns/void#distinctObjects"),
+        Some(4)
+    );
+
+    let class_part =
+        find_class_partition(&triples, &smap, ds, "<http://example.org/Person>").unwrap();
+    assert_eq!(
+        get_void_int(
+            &smap,
+            &class_part,
+            "http://rdfs.org/ns/void#distinctSubjects"
+        ),
+        None,
+        "dataset-properties scope must not add counts to nested partitions"
+    );
+}
+
+#[test]
+fn test_void_all_partition_distinct_counts() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let hdt_path = make_hdt(temp_dir.path(), VOID_NT, "void_all_distinct");
+    add_permutation_index(temp_dir.path(), &hdt_path, "void_all_distinct");
+
+    let (ok, stdout, stderr) = run_void(
+        &hdt_path,
+        &[
+            "--dataset-uri",
+            "http://example.org/ds",
+            "--partition-distinct-counts",
+            "all",
+        ],
+    );
+    assert!(ok, "hdtc void failed: {stderr}");
+
+    let triples = parse_ntriples(&stdout);
+    let smap = subject_map(&triples);
+    let ds = "<http://example.org/ds>";
+    let person = find_class_partition(&triples, &smap, ds, "<http://example.org/Person>").unwrap();
+    assert_eq!(
+        get_void_int(&smap, &person, "http://rdfs.org/ns/void#distinctSubjects"),
+        Some(3)
+    );
+    assert_eq!(
+        get_void_int(&smap, &person, "http://rdfs.org/ns/void#distinctObjects"),
+        Some(8)
+    );
+
+    let person_name =
+        find_property_partition(&triples, &smap, &person, "<http://example.org/name>").unwrap();
+    assert_eq!(
+        get_void_int(
+            &smap,
+            &person_name,
+            "http://rdfs.org/ns/void#distinctSubjects"
+        ),
+        Some(3)
+    );
+    assert_eq!(
+        get_void_int(
+            &smap,
+            &person_name,
+            "http://rdfs.org/ns/void#distinctObjects"
+        ),
+        Some(3)
+    );
+
+    let partition_links = [
+        "http://rdfs.org/ns/void#propertyPartition",
+        "http://rdfs.org/ns/void#classPartition",
+        "http://ldf.fi/void-ext#objectClassPartition",
+        "http://ldf.fi/void-ext#datatypePartition",
+        "http://ldf.fi/void-ext#languagePartition",
+    ];
+    let partition_nodes: HashSet<&str> = triples
+        .iter()
+        .filter(|(_, predicate, _)| partition_links.contains(&predicate.as_str()))
+        .map(|(_, _, object)| object.as_str())
+        .collect();
+    assert!(!partition_nodes.is_empty());
+    for node in partition_nodes {
+        assert!(
+            get_void_int(&smap, node, "http://rdfs.org/ns/void#distinctSubjects").is_some(),
+            "partition {node} is missing void:distinctSubjects"
+        );
+        assert!(
+            get_void_int(&smap, node, "http://rdfs.org/ns/void#distinctObjects").is_some(),
+            "partition {node} is missing void:distinctObjects"
+        );
+    }
+}
+
+#[test]
+fn test_void_partition_distinct_counts_require_permutation() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let hdt_path = make_hdt(temp_dir.path(), VOID_NT, "void_distinct_no_perm");
+    let (ok, _, stderr) = run_void(
+        &hdt_path,
+        &["--partition-distinct-counts", "dataset-properties"],
+    );
+    assert!(!ok);
+    assert!(
+        stderr.contains("partition distinct counts require permutation index"),
+        "unexpected error: {stderr}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1597,6 +1773,77 @@ fn find_language_partition(
                 })
             })
         })
+}
+
+#[test]
+fn test_void_all_distinct_counts_for_language_partitions() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let hdt_path = make_hdt(temp_dir.path(), DATATYPE_NT, "void_language_distinct");
+    add_permutation_index(temp_dir.path(), &hdt_path, "void_language_distinct");
+    let (ok, stdout, stderr) = run_void(
+        &hdt_path,
+        &[
+            "--dataset-uri",
+            "http://example.org/ds",
+            "--partition-distinct-counts",
+            "all",
+        ],
+    );
+    assert!(ok, "hdtc void failed: {stderr}");
+
+    let triples = parse_ntriples(&stdout);
+    let smap = subject_map(&triples);
+    let person = find_class_partition(
+        &triples,
+        &smap,
+        "<http://example.org/ds>",
+        "<http://example.org/Person>",
+    )
+    .unwrap();
+    let label =
+        find_property_partition(&triples, &smap, &person, "<http://example.org/label>").unwrap();
+    let lang_string = find_datatype_partition(
+        &triples,
+        &smap,
+        &label,
+        "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString",
+    )
+    .unwrap();
+    assert_eq!(
+        get_void_int(
+            &smap,
+            &lang_string,
+            "http://rdfs.org/ns/void#distinctSubjects"
+        ),
+        Some(2)
+    );
+    assert_eq!(
+        get_void_int(
+            &smap,
+            &lang_string,
+            "http://rdfs.org/ns/void#distinctObjects"
+        ),
+        Some(3)
+    );
+
+    let en = find_language_partition(&triples, &smap, &lang_string, "en").unwrap();
+    assert_eq!(
+        get_void_int(&smap, &en, "http://rdfs.org/ns/void#distinctSubjects"),
+        Some(2)
+    );
+    assert_eq!(
+        get_void_int(&smap, &en, "http://rdfs.org/ns/void#distinctObjects"),
+        Some(2)
+    );
+    let es = find_language_partition(&triples, &smap, &lang_string, "es").unwrap();
+    assert_eq!(
+        get_void_int(&smap, &es, "http://rdfs.org/ns/void#distinctSubjects"),
+        Some(1)
+    );
+    assert_eq!(
+        get_void_int(&smap, &es, "http://rdfs.org/ns/void#distinctObjects"),
+        Some(1)
+    );
 }
 
 // ---------------------------------------------------------------------------
