@@ -11,10 +11,12 @@ mod common;
 
 use common::{REPRESENTATIVE_NT, write_file};
 use hdtc::format::{
-    GraphIndex, GraphIndexOpenError, ParsedLiteral, PermutationComponent, PermutationIndex,
-    PermutationIndexOpenError, PermutationSectionKind, PfcSectionHeader, PfcSectionIterator,
-    encode_literal, graph_index_path, packed_len, parse_literal, permutation_index_path,
-    scan_hdt_sections, sha256_to_end,
+    GraphIndex, GraphIndexOpenError, KeyRole, KeysetEncoding, KeysetHeader, KeysetOpenError,
+    ParsedLiteral, PermutationComponent, PermutationIndex, PermutationIndexOpenError,
+    PermutationSectionKind, PfcSectionHeader, PfcSectionIterator, SketchBody, SketchHeader,
+    SketchKind, SketchOpenError, encode_literal, graph_index_path, keyset_path, packed_len,
+    parse_literal, permutation_index_path, read_keyset_header, read_sketch_header,
+    scan_hdt_sections, sha256_to_end, sketch_path,
 };
 use std::fs::File;
 use std::io::{BufReader, Seek, SeekFrom};
@@ -90,6 +92,109 @@ fn build_graph_fixture_from(temp: &Path, source: &str) -> PathBuf {
         String::from_utf8_lossy(&output.stderr)
     );
     hdt
+}
+
+#[test]
+fn dictionary_artifact_headers_are_available_through_the_public_facade() {
+    fn assert_public_error<E: std::error::Error>() {}
+    assert_public_error::<SketchOpenError>();
+    assert_public_error::<KeysetOpenError>();
+
+    let temp = tempfile::tempdir().unwrap();
+    let hdt = build_fixture(temp.path());
+    let filters = temp.path().join("filters");
+    let keysets = temp.path().join("keysets");
+
+    let sketch = Command::new(env!("CARGO_BIN_EXE_hdtc"))
+        .arg("sketch")
+        .arg(&hdt)
+        .args(["--k", "16", "--roles", "subjects,objects", "--output-dir"])
+        .arg(&filters)
+        .arg("--temp-dir")
+        .arg(temp.path().join("sketch-work"))
+        .output()
+        .expect("run hdtc sketch");
+    assert!(
+        sketch.status.success(),
+        "hdtc sketch failed:\n{}",
+        String::from_utf8_lossy(&sketch.stderr)
+    );
+
+    let keyset = Command::new(env!("CARGO_BIN_EXE_hdtc"))
+        .arg("keyset")
+        .arg(&hdt)
+        .args([
+            "--roles",
+            "subjects-only,objects-only,shared",
+            "--output-dir",
+        ])
+        .arg(&keysets)
+        .arg("--temp-dir")
+        .arg(temp.path().join("keyset-work"))
+        .output()
+        .expect("run hdtc keyset");
+    assert!(
+        keyset.status.success(),
+        "hdtc keyset failed:\n{}",
+        String::from_utf8_lossy(&keyset.stderr)
+    );
+
+    let subjects_filter: SketchHeader = read_sketch_header(&sketch_path(
+        &filters,
+        SketchKind::Filter,
+        KeyRole::Subjects,
+    ))
+    .expect("read subjects filter header");
+    let objects_filter: SketchHeader =
+        read_sketch_header(&sketch_path(&filters, SketchKind::Filter, KeyRole::Objects))
+            .expect("read objects filter header");
+    for (header, role) in [
+        (&subjects_filter, KeyRole::Subjects),
+        (&objects_filter, KeyRole::Objects),
+    ] {
+        assert_eq!(header.kind, SketchKind::Filter);
+        assert_eq!(header.role, role);
+        assert_eq!(header.format_version, 1);
+        assert_eq!(header.convention_id, 1);
+        assert_eq!(header.hash_id, 1);
+        assert!(matches!(header.body, SketchBody::Filter { .. }));
+    }
+    for role in [KeyRole::Subjects, KeyRole::Objects] {
+        let minhash = read_sketch_header(&sketch_path(&filters, SketchKind::MinHash, role))
+            .expect("read MinHash header");
+        assert_eq!(minhash.kind, SketchKind::MinHash);
+        assert_eq!(minhash.role, role);
+        assert_eq!(minhash.format_version, 1);
+        assert_eq!(minhash.convention_id, 1);
+        assert_eq!(minhash.hash_id, 1);
+        assert!(matches!(minhash.body, SketchBody::MinHash { k: 16, .. }));
+    }
+
+    let subjects_only: KeysetHeader =
+        read_keyset_header(&keyset_path(&keysets, KeyRole::SubjectsOnly)).unwrap();
+    let objects_only = read_keyset_header(&keyset_path(&keysets, KeyRole::ObjectsOnly)).unwrap();
+    let shared = read_keyset_header(&keyset_path(&keysets, KeyRole::Shared)).unwrap();
+    for (header, role) in [
+        (&subjects_only, KeyRole::SubjectsOnly),
+        (&objects_only, KeyRole::ObjectsOnly),
+        (&shared, KeyRole::Shared),
+    ] {
+        assert_eq!(header.role, role);
+        assert_eq!(header.format_version, 1);
+        assert_eq!(header.convention_id, 1);
+        assert_eq!(header.hash_id, 1);
+        assert_eq!(header.encoding, KeysetEncoding::EliasFano);
+        assert_eq!(header.source_digest, subjects_filter.source_digest);
+    }
+
+    assert_eq!(
+        shared.key_count + subjects_only.key_count,
+        subjects_filter.key_count
+    );
+    assert_eq!(
+        shared.key_count + objects_only.key_count,
+        objects_filter.key_count
+    );
 }
 
 #[test]

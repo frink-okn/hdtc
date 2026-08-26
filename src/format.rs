@@ -21,6 +21,8 @@
 //!   verified by one implementation rather than two.
 //! - **Sidecar directories** — [`PermutationHeader`] and [`PermutationSection`]
 //!   describe `.hdt.perm`'s regions precisely enough to map them directly.
+//!   [`SketchHeader`] and [`KeysetHeader`] validate and expose the metadata of
+//!   the dictionary-derived artifacts under `filters/` and `keysets/`.
 //! - **Bounded work**, so a service can spend a published budget rather than
 //!   discover a query's cost after paying it: [`TextSearcher::search_up_to`]
 //!   and [`TextSearcher::scan_matching_objects`].
@@ -111,6 +113,22 @@ pub use crate::permutation::{
 pub use crate::graph_index::{
     GraphIndex, GraphIndexOpenError, GraphIndexSpace, canonical_path as graph_index_path,
     validate_graph_index,
+};
+
+// ---------------------------------------------------------------------------
+// Sketch artifacts (filters/)
+// ---------------------------------------------------------------------------
+
+pub use crate::hdt::sketch::{
+    SketchBody, SketchHeader, SketchKind, SketchOpenError, read_sketch_header, sketch_path,
+};
+
+// ---------------------------------------------------------------------------
+// Exact key sets (keysets/)
+// ---------------------------------------------------------------------------
+
+pub use crate::hdt::keyset::{
+    KeyRole, KeysetEncoding, KeysetHeader, KeysetOpenError, keyset_path, read_keyset_header,
 };
 
 // ---------------------------------------------------------------------------
