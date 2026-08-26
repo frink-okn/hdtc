@@ -154,6 +154,7 @@ impl SketchFilterBits {
 #[derive(Debug, Parser)]
 #[command(
     name = "hdtc",
+    version,
     about = "HDT Creator - converts RDF files to HDT format",
     long_about = "Converts RDF files in any standard format to HDT (Header, Dictionary, Triples) \
                   binary format. Optimized for very large inputs with bounded memory usage. \
