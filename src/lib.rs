@@ -1121,11 +1121,11 @@ fn create_sketches(args: cli::SketchArgs, benchmark: bool) -> Result<()> {
             .unwrap_or_else(|| Path::new("."))
             .join("filters")
     });
-    let mut roles: Vec<hdt::SketchRole> = Vec::with_capacity(args.roles.len());
+    let mut roles: Vec<hdt::KeyRole> = Vec::with_capacity(args.roles.len());
     for role in &args.roles {
         let role = match role {
-            cli::SketchRole::Subjects => hdt::SketchRole::Subjects,
-            cli::SketchRole::Objects => hdt::SketchRole::Objects,
+            cli::SketchRole::Subjects => hdt::KeyRole::Subjects,
+            cli::SketchRole::Objects => hdt::KeyRole::Objects,
         };
         if !roles.contains(&role) {
             roles.push(role);

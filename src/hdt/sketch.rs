@@ -16,12 +16,15 @@ use super::artifacts::{
     iri_hash, prepare_output_directory, publish_artifacts,
 };
 use super::input_adapter::HdtInputAdapter;
+use super::keyset::KeyRole;
 use super::pfc_reader::PfcSectionIterator;
-use crate::io::crc_utils::Crc32cWriter;
+use crate::io::crc_utils::{
+    Crc32cFilePrefix, Crc32cReadError, Crc32cWriter, read_crc32c_checked_prefix,
+};
 use anyhow::{Context, Result, ensure};
 use std::collections::BTreeSet;
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Write};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
 use xorf::{BinaryFuse8, BinaryFuse16, DmaSerializable};
@@ -50,7 +53,7 @@ pub struct SketchConfig<'a> {
     pub hdt_path: &'a Path,
     pub output_dir: &'a Path,
     pub temp_dir: &'a Path,
-    pub roles: &'a [Role],
+    pub roles: &'a [KeyRole],
     pub k: u32,
     pub filter_bits: u8,
     pub memory_limit: usize,
@@ -61,53 +64,429 @@ pub struct SketchConfig<'a> {
 pub struct SketchSummary {
     pub files_written: usize,
     /// Qualifying IRI count per selected role, in the order they were built.
-    pub role_counts: Vec<(Role, u64)>,
+    pub role_counts: Vec<(KeyRole, u64)>,
 }
 
-/// A dictionary role a sketch can be built for.
+/// Whether a sketch artifact is a membership filter or a MinHash sketch.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Role {
-    Subjects,
-    Objects,
+pub enum SketchKind {
+    Filter,
+    MinHash,
 }
 
-impl Role {
-    fn id(self) -> u8 {
+impl SketchKind {
+    fn extension(self) -> &'static str {
         match self {
-            Self::Subjects => 0,
-            Self::Objects => 1,
+            Self::Filter => "filter",
+            Self::MinHash => "minhash",
+        }
+    }
+}
+
+/// Type-specific fields following a sketch artifact's common header.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SketchBody {
+    Filter {
+        variant: u8,
+        seed: u64,
+        segment_length: u32,
+        segment_length_mask: u32,
+        segment_count_length: u32,
+        fingerprint_len: u64,
+    },
+    MinHash {
+        k: u32,
+        stored_count: u32,
+        saturated: bool,
+    },
+}
+
+/// The validated common and type-specific header of a sketch artifact.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SketchHeader {
+    pub kind: SketchKind,
+    pub format_version: u16,
+    pub convention_id: u16,
+    pub hash_id: u8,
+    pub role: KeyRole,
+    pub key_count: u64,
+    pub source_digest: [u8; 32],
+    pub body: SketchBody,
+}
+
+/// Why a sketch header could not be opened.
+///
+/// `NotSketch` is reserved for a CRC-valid file with a foreign magic value, so
+/// callers can distinguish an unrelated format from a malformed artifact.
+#[non_exhaustive]
+#[derive(Debug, thiserror::Error)]
+pub enum SketchOpenError {
+    #[error("failed to read sketch artifact {path:?}: {source}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("{path:?} is not a sketch artifact (magic {magic:?})")]
+    NotSketch { path: PathBuf, magic: [u8; 4] },
+
+    #[error("invalid sketch artifact {path:?}: {message}")]
+    Invalid { path: PathBuf, message: String },
+}
+
+impl SketchOpenError {
+    fn io(path: &Path, source: io::Error) -> Self {
+        Self::Io {
+            path: path.to_path_buf(),
+            source,
         }
     }
 
-    pub fn file_stem(self) -> &'static str {
-        match self {
-            Self::Subjects => "subjects",
-            Self::Objects => "objects",
+    fn invalid(path: &Path, message: impl Into<String>) -> Self {
+        Self::Invalid {
+            path: path.to_path_buf(),
+            message: message.into(),
         }
     }
 
-    /// The role's own dictionary section, excluding the shared section that
-    /// every role draws from.
-    fn private_terms(
-        self,
-        adapter: &HdtInputAdapter,
-    ) -> Result<PfcSectionIterator<BufReader<File>>> {
-        match self {
-            Self::Subjects => adapter.subject_terms(),
-            Self::Objects => adapter.object_terms(),
+    fn crc(path: &Path, error: Crc32cReadError) -> Self {
+        match error {
+            Crc32cReadError::Io(source) => Self::io(path, source),
+            Crc32cReadError::Invalid(message) => Self::invalid(path, message),
         }
+    }
+}
+
+fn private_terms(
+    role: KeyRole,
+    adapter: &HdtInputAdapter,
+) -> Result<PfcSectionIterator<BufReader<File>>> {
+    match role {
+        KeyRole::Subjects => adapter.subject_terms(),
+        KeyRole::Objects => adapter.object_terms(),
+        _ => Err(anyhow::anyhow!("{} is not a sketch role", role.file_stem())),
+    }
+}
+
+fn private_count(role: KeyRole, adapter: &HdtInputAdapter) -> Result<u64> {
+    match role {
+        KeyRole::Subjects => Ok(adapter.subjects_count),
+        KeyRole::Objects => Ok(adapter.objects_count),
+        _ => Err(anyhow::anyhow!("{} is not a sketch role", role.file_stem())),
+    }
+}
+
+/// Read and validate a `.filter` or `.minhash` header.
+///
+/// The entire file is streamed through CRC32C before any header field is
+/// interpreted. Filter payloads are not retained, while MinHash minima are
+/// subsequently streamed once to verify the required strict ordering.
+pub fn read_sketch_header(path: &Path) -> std::result::Result<SketchHeader, SketchOpenError> {
+    let Crc32cFilePrefix {
+        mut reader,
+        prefix: bytes,
+        prefix_len,
+        file_len,
+    } = read_crc32c_checked_prefix::<96>(path)
+        .map_err(|error| SketchOpenError::crc(path, error))?;
+    if prefix_len < 4 {
+        return Err(SketchOpenError::invalid(
+            path,
+            format!("file is too short for sketch magic ({file_len} bytes including CRC32C)"),
+        ));
     }
 
-    fn private_count(self, adapter: &HdtInputAdapter) -> u64 {
-        match self {
-            Self::Subjects => adapter.subjects_count,
-            Self::Objects => adapter.objects_count,
+    let magic: [u8; 4] = bytes[0..4].try_into().unwrap();
+    let kind = match &magic {
+        b"KGFF" => SketchKind::Filter,
+        b"KGFM" => SketchKind::MinHash,
+        _ => {
+            return Err(SketchOpenError::NotSketch {
+                path: path.to_path_buf(),
+                magic,
+            });
         }
+    };
+    if prefix_len < COMMON_HEADER_LEN {
+        return Err(SketchOpenError::invalid(
+            path,
+            format!(
+                "file is too short for the {COMMON_HEADER_LEN}-byte common header ({file_len} bytes including CRC32C)"
+            ),
+        ));
     }
+
+    let format_version = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
+    if format_version != FORMAT_VERSION {
+        return Err(SketchOpenError::invalid(
+            path,
+            format!("unsupported format_version {format_version}"),
+        ));
+    }
+    let convention_id = u16::from_le_bytes(bytes[6..8].try_into().unwrap());
+    if convention_id != CONVENTION_ID {
+        return Err(SketchOpenError::invalid(
+            path,
+            format!("unsupported convention_id {convention_id}"),
+        ));
+    }
+    let hash_id = bytes[8];
+    if hash_id != HASH_ID_XXH64 {
+        return Err(SketchOpenError::invalid(
+            path,
+            format!("unsupported hash_id {hash_id}"),
+        ));
+    }
+    let role = match bytes[9] {
+        0 => KeyRole::Subjects,
+        1 => KeyRole::Objects,
+        role => {
+            return Err(SketchOpenError::invalid(
+                path,
+                format!("unsupported sketch role {role}"),
+            ));
+        }
+    };
+    if bytes[10..16].iter().any(|&byte| byte != 0) {
+        return Err(SketchOpenError::invalid(
+            path,
+            "reserved common-header bytes are nonzero",
+        ));
+    }
+    let key_count = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
+    let source_digest = bytes[24..56].try_into().unwrap();
+
+    let body = match kind {
+        SketchKind::Filter => parse_filter_header(path, &bytes, prefix_len, file_len)?,
+        SketchKind::MinHash => {
+            parse_minhash_header(path, &mut reader, &bytes, prefix_len, file_len, key_count)?
+        }
+    };
+
+    Ok(SketchHeader {
+        kind,
+        format_version,
+        convention_id,
+        hash_id,
+        role,
+        key_count,
+        source_digest,
+        body,
+    })
+}
+
+/// Return the conventional sketch-artifact path inside a `filters` output
+/// directory.
+///
+/// The sketch format defines only the [`KeyRole::Subjects`] and
+/// [`KeyRole::Objects`] roles; readers reject other role ids even if a caller
+/// constructs such a path.
+pub fn sketch_path(dir: &Path, kind: SketchKind, role: KeyRole) -> PathBuf {
+    dir.join(format!("{}.{}", role.file_stem(), kind.extension()))
+}
+
+fn parse_filter_header(
+    path: &Path,
+    bytes: &[u8; 96],
+    prefix_len: usize,
+    file_len: u64,
+) -> std::result::Result<SketchBody, SketchOpenError> {
+    const FILTER_HEADER_LEN: usize = 96;
+    if prefix_len < FILTER_HEADER_LEN {
+        return Err(SketchOpenError::invalid(
+            path,
+            format!(
+                "file is too short for the {FILTER_HEADER_LEN}-byte filter header ({file_len} bytes including CRC32C)"
+            ),
+        ));
+    }
+
+    let variant = bytes[56];
+    if !matches!(variant, 8 | 16) {
+        return Err(SketchOpenError::invalid(
+            path,
+            format!("unsupported filter variant {variant}"),
+        ));
+    }
+    if bytes[57..64].iter().any(|&byte| byte != 0) || bytes[84..88] != [0; 4] {
+        return Err(SketchOpenError::invalid(
+            path,
+            "reserved filter-header bytes are nonzero",
+        ));
+    }
+
+    let seed = u64::from_le_bytes(bytes[64..72].try_into().unwrap());
+    let segment_length = u32::from_le_bytes(bytes[72..76].try_into().unwrap());
+    let segment_length_mask = u32::from_le_bytes(bytes[76..80].try_into().unwrap());
+    let segment_count_length = u32::from_le_bytes(bytes[80..84].try_into().unwrap());
+    let fingerprint_len = u64::from_le_bytes(bytes[88..96].try_into().unwrap());
+
+    if !(4..=262_144).contains(&segment_length) || !segment_length.is_power_of_two() {
+        return Err(SketchOpenError::invalid(
+            path,
+            format!("segment_length {segment_length} is not a power of two in [4, 262144]"),
+        ));
+    }
+    if segment_length_mask != segment_length - 1 {
+        return Err(SketchOpenError::invalid(
+            path,
+            format!("segment_length_mask {segment_length_mask} does not equal segment_length - 1"),
+        ));
+    }
+    if segment_count_length < segment_length || segment_count_length % segment_length != 0 {
+        return Err(SketchOpenError::invalid(
+            path,
+            format!(
+                "segment_count_length {segment_count_length} is not a positive multiple of segment_length {segment_length}"
+            ),
+        ));
+    }
+    let expected_fingerprint_len =
+        u128::from(segment_count_length) + 2 * u128::from(segment_length);
+    if u128::from(fingerprint_len) != expected_fingerprint_len {
+        return Err(SketchOpenError::invalid(
+            path,
+            format!(
+                "fingerprint_len {fingerprint_len} does not equal segment_count_length + 2 * segment_length ({expected_fingerprint_len})"
+            ),
+        ));
+    }
+    if fingerprint_len > u64::from(u32::MAX) {
+        return Err(SketchOpenError::invalid(
+            path,
+            format!("fingerprint_len {fingerprint_len} exceeds the 32-bit index space"),
+        ));
+    }
+    let expected_file_len =
+        FILTER_HEADER_LEN as u128 + u128::from(fingerprint_len) * u128::from(variant / 8) + 4;
+    if u128::from(file_len) != expected_file_len {
+        return Err(SketchOpenError::invalid(
+            path,
+            format!(
+                "file length {file_len} does not match filter header declaration {expected_file_len}"
+            ),
+        ));
+    }
+
+    Ok(SketchBody::Filter {
+        variant,
+        seed,
+        segment_length,
+        segment_length_mask,
+        segment_count_length,
+        fingerprint_len,
+    })
+}
+
+fn parse_minhash_header(
+    path: &Path,
+    reader: &mut BufReader<File>,
+    bytes: &[u8; 96],
+    prefix_len: usize,
+    file_len: u64,
+    key_count: u64,
+) -> std::result::Result<SketchBody, SketchOpenError> {
+    const MINHASH_HEADER_LEN: usize = 72;
+    if prefix_len < MINHASH_HEADER_LEN {
+        return Err(SketchOpenError::invalid(
+            path,
+            format!(
+                "file is too short for the {MINHASH_HEADER_LEN}-byte MinHash header ({file_len} bytes including CRC32C)"
+            ),
+        ));
+    }
+
+    let k = u32::from_le_bytes(bytes[56..60].try_into().unwrap());
+    let stored_count = u32::from_le_bytes(bytes[60..64].try_into().unwrap());
+    let saturated_byte = bytes[64];
+    if k < 2 {
+        return Err(SketchOpenError::invalid(
+            path,
+            format!("MinHash k {k} is less than 2"),
+        ));
+    }
+    if stored_count > k {
+        return Err(SketchOpenError::invalid(
+            path,
+            format!("stored_count {stored_count} exceeds k {k}"),
+        ));
+    }
+    if u64::from(stored_count) > key_count {
+        return Err(SketchOpenError::invalid(
+            path,
+            format!("stored_count {stored_count} exceeds key_count {key_count}"),
+        ));
+    }
+    if !matches!(saturated_byte, 0 | 1) {
+        return Err(SketchOpenError::invalid(
+            path,
+            format!("saturated must be 0 or 1, found {saturated_byte}"),
+        ));
+    }
+    let saturated = saturated_byte == 1;
+    if saturated != (stored_count == k) {
+        return Err(SketchOpenError::invalid(
+            path,
+            format!("saturated={saturated_byte} disagrees with stored_count == k"),
+        ));
+    }
+    if bytes[65..72].iter().any(|&byte| byte != 0) {
+        return Err(SketchOpenError::invalid(
+            path,
+            "reserved MinHash-header bytes are nonzero",
+        ));
+    }
+
+    let expected_file_len = MINHASH_HEADER_LEN as u128 + u128::from(stored_count) * 8 + 4;
+    if u128::from(file_len) != expected_file_len {
+        return Err(SketchOpenError::invalid(
+            path,
+            format!(
+                "file length {file_len} does not match MinHash header declaration {expected_file_len}"
+            ),
+        ));
+    }
+
+    reader
+        .seek(SeekFrom::Start(MINHASH_HEADER_LEN as u64))
+        .map_err(|source| SketchOpenError::io(path, source))?;
+    let mut previous = None;
+    let mut index = 0u32;
+    let mut remaining = stored_count;
+    let mut encoded = [0u8; 64 * 1024];
+    while remaining != 0 {
+        let values = remaining.min((encoded.len() / 8) as u32) as usize;
+        let bytes = &mut encoded[..values * 8];
+        reader
+            .read_exact(bytes)
+            .map_err(|source| SketchOpenError::io(path, source))?;
+        for chunk in bytes.chunks_exact(8) {
+            let minimum = u64::from_le_bytes(chunk.try_into().unwrap());
+            if previous.is_some_and(|value| value >= minimum) {
+                return Err(SketchOpenError::invalid(
+                    path,
+                    format!("MinHash minima are not strictly ascending at index {index}"),
+                ));
+            }
+            previous = Some(minimum);
+            index += 1;
+        }
+        remaining -= values as u32;
+    }
+
+    Ok(SketchBody::MinHash {
+        k,
+        stored_count,
+        saturated,
+    })
 }
 
 struct RoleAccumulator {
-    role: Role,
+    role: KeyRole,
     keys: KeySpool,
     /// Largest key count whose filter build still fits `memory_limit`.
     max_keys: u64,
@@ -117,7 +496,7 @@ struct RoleAccumulator {
 }
 
 impl RoleAccumulator {
-    fn new(role: Role, config: SketchConfig<'_>, max_keys: u64, k: usize) -> Result<Self> {
+    fn new(role: KeyRole, config: SketchConfig<'_>, max_keys: u64, k: usize) -> Result<Self> {
         Ok(Self {
             role,
             keys: KeySpool::new(config.temp_dir, role.file_stem())?,
@@ -161,10 +540,11 @@ impl RoleAccumulator {
         let expected_minima = key_count.min(self.k as u64) as usize;
         if minima.len() != expected_minima {
             tracing::warn!(
-                "{} XXH64 collision(s) among the smallest {} hashes; overlap estimates from this \
+                "{} role has {} XXH64 collision(s) among its smallest {} hashes; overlap estimates from this \
                  sketch treat the colliding IRIs as one",
+                self.role.file_stem(),
                 expected_minima - minima.len(),
-                self.role.file_stem()
+                expected_minima
             );
         }
         Ok(RoleData {
@@ -176,7 +556,7 @@ impl RoleAccumulator {
 }
 
 struct RoleData {
-    role: Role,
+    role: KeyRole,
     keys: SpooledKeys,
     minima: Vec<u64>,
 }
@@ -200,6 +580,10 @@ pub fn create_sketches(config: SketchConfig<'_>) -> Result<SketchSummary> {
         !config.roles.is_empty(),
         "At least one sketch role must be selected"
     );
+    ensure!(
+        config.roles.iter().all(|role| role.is_sketch_role()),
+        "Sketch artifacts support only the subjects and objects roles"
+    );
 
     prepare_output_directory(config.output_dir)?;
     let mut targets = Vec::with_capacity(config.roles.len() * 2);
@@ -215,11 +599,11 @@ pub fn create_sketches(config: SketchConfig<'_>) -> Result<SketchSummary> {
         .roles
         .iter()
         .map(|role| {
-            adapter
+            Ok(adapter
                 .shared_count
-                .saturating_add(role.private_count(&adapter))
+                .saturating_add(private_count(*role, &adapter)?))
         })
-        .collect();
+        .collect::<Result<_>>()?;
     ensure_minhash_accumulator_memory(&dictionary_counts, config.k, config.memory_limit)?;
 
     let k = usize::try_from(config.k).context("MinHash k does not fit this platform")?;
@@ -245,7 +629,7 @@ pub fn create_sketches(config: SketchConfig<'_>) -> Result<SketchSummary> {
         }
     }
     for accumulator in &mut accumulators {
-        let terms = accumulator.role.private_terms(&adapter)?;
+        let terms = private_terms(accumulator.role, &adapter)?;
         for term in terms {
             if let Some(hash) = iri_hash(&term?) {
                 accumulator.add_hash(hash)?;
@@ -278,10 +662,10 @@ pub fn create_sketches(config: SketchConfig<'_>) -> Result<SketchSummary> {
 
 /// The `(filter, minhash)` paths for one role. The single place artifact names
 /// are formed, so the no-clobber precheck and publication cannot diverge.
-fn artifact_paths(output_dir: &Path, role: Role) -> (PathBuf, PathBuf) {
+fn artifact_paths(output_dir: &Path, role: KeyRole) -> (PathBuf, PathBuf) {
     (
-        output_dir.join(format!("{}.filter", role.file_stem())),
-        output_dir.join(format!("{}.minhash", role.file_stem())),
+        sketch_path(output_dir, SketchKind::Filter, role),
+        sketch_path(output_dir, SketchKind::MinHash, role),
     )
 }
 
@@ -323,10 +707,15 @@ fn stage_role_artifacts(
 
 fn common_header(
     magic: &[u8; 4],
-    role: Role,
+    role: KeyRole,
     key_count: u64,
     source_digest: &[u8; 32],
-) -> [u8; COMMON_HEADER_LEN] {
+) -> Result<[u8; COMMON_HEADER_LEN]> {
+    ensure!(
+        role.is_sketch_role(),
+        "{} is not a sketch role",
+        role.file_stem()
+    );
     let mut header = [0u8; COMMON_HEADER_LEN];
     header[0..4].copy_from_slice(magic);
     header[4..6].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
@@ -335,7 +724,7 @@ fn common_header(
     header[9] = role.id();
     header[16..24].copy_from_slice(&key_count.to_le_bytes());
     header[24..56].copy_from_slice(source_digest);
-    header
+    Ok(header)
 }
 
 fn write_filter_file(
@@ -349,7 +738,12 @@ fn write_filter_file(
     // in a sketch role is a hash collision.
     let keys = data.keys.read_sorted_distinct()?;
     let mut writer = Crc32cWriter::new(BufWriter::with_capacity(256 * 1024, file));
-    writer.write_all(&common_header(b"KGFF", data.role, key_count, source_digest))?;
+    writer.write_all(&common_header(
+        b"KGFF",
+        data.role,
+        key_count,
+        source_digest,
+    )?)?;
     writer.write_all(&[filter_bits])?;
     writer.write_all(&[0u8; 7])?;
 
@@ -460,7 +854,7 @@ fn write_minhash_file(
         data.role,
         data.key_count(),
         source_digest,
-    ))?;
+    )?)?;
     writer.write_all(&k.to_le_bytes())?;
     writer.write_all(&stored_count.to_le_bytes())?;
     writer.write_all(&[saturated])?;
@@ -506,10 +900,13 @@ fn max_filter_keys(k: u32, filter_bits: u8, memory_limit: usize) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use super::KeyRole as Role;
     use super::*;
     use sha2::{Digest, Sha256};
     use std::io::{Read, Seek};
     use xxhash_rust::xxh64::xxh64;
+
+    type HeaderMutation = (&'static str, fn(&mut Vec<u8>));
 
     /// Shown when the bytes xorf produces for a fixed key set stop matching the
     /// published vectors — the situation the exact version pin in Cargo.toml
@@ -542,6 +939,226 @@ path. The version pin, not this test, is the actual guard.";
             filter_bits: 8,
             memory_limit: 4 << 30,
         }
+    }
+
+    fn with_crc(mut body: Vec<u8>) -> Vec<u8> {
+        body.extend_from_slice(&crate::io::crc_utils::crc32c(&body).to_le_bytes());
+        body
+    }
+
+    fn write_reader_fixture(temp: &Path, name: &str, body: Vec<u8>) -> PathBuf {
+        let path = temp.join(name);
+        std::fs::write(&path, with_crc(body)).unwrap();
+        path
+    }
+
+    fn empty_filter_body() -> Vec<u8> {
+        let mut body = common_header(b"KGFF", Role::Subjects, 0, &[0x5a; 32])
+            .unwrap()
+            .to_vec();
+        body.push(8);
+        body.extend_from_slice(&[0; 7]);
+        body.extend_from_slice(&0u64.to_le_bytes());
+        body.extend_from_slice(&4u32.to_le_bytes());
+        body.extend_from_slice(&3u32.to_le_bytes());
+        body.extend_from_slice(&4u32.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&12u64.to_le_bytes());
+        body.extend_from_slice(&[0; 12]);
+        body
+    }
+
+    fn minhash_body() -> Vec<u8> {
+        let mut body = common_header(b"KGFM", Role::Objects, 3, &[0x5a; 32])
+            .unwrap()
+            .to_vec();
+        body.extend_from_slice(&3u32.to_le_bytes());
+        body.extend_from_slice(&3u32.to_le_bytes());
+        body.push(1);
+        body.extend_from_slice(&[0; 7]);
+        for minimum in [1u64, 2, 3] {
+            body.extend_from_slice(&minimum.to_le_bytes());
+        }
+        body
+    }
+
+    fn expect_invalid_reader_body(temp: &Path, name: &str, body: Vec<u8>) {
+        let path = write_reader_fixture(temp, name, body);
+        assert!(
+            matches!(
+                read_sketch_header(&path),
+                Err(SketchOpenError::Invalid { .. })
+            ),
+            "{name} should be rejected as an invalid sketch"
+        );
+    }
+
+    #[test]
+    fn header_reader_parses_the_frozen_sketch_vectors() {
+        let temp = tempfile::tempdir().unwrap();
+        let keys: Vec<u64> = (0..100)
+            .map(|index| {
+                xxh64(
+                    format!("https://example.org/resource/{index:03}").as_bytes(),
+                    0,
+                )
+            })
+            .collect();
+        let filter = BinaryFuse8::try_from(&keys).unwrap();
+        let mut descriptor = [0u8; FILTER_DESCRIPTOR_LEN];
+        filter.dma_copy_descriptor_to(&mut descriptor);
+        let mut filter_body = common_header(b"KGFF", Role::Subjects, 100, &[0x5a; 32])
+            .unwrap()
+            .to_vec();
+        filter_body.push(8);
+        filter_body.extend_from_slice(&[0; 7]);
+        filter_body.extend_from_slice(&descriptor);
+        filter_body.extend_from_slice(&0u32.to_le_bytes());
+        filter_body.extend_from_slice(&(filter.fingerprints.len() as u64).to_le_bytes());
+        filter_body.extend_from_slice(&filter.fingerprints);
+        let filter_path = write_reader_fixture(temp.path(), "subjects.filter", filter_body);
+
+        let parsed = read_sketch_header(&filter_path).unwrap();
+        assert_eq!(parsed.kind, SketchKind::Filter);
+        assert_eq!(parsed.format_version, 1);
+        assert_eq!(parsed.convention_id, 1);
+        assert_eq!(parsed.hash_id, 1);
+        assert_eq!(parsed.role, KeyRole::Subjects);
+        assert_eq!(parsed.key_count, 100);
+        assert_eq!(parsed.source_digest, [0x5a; 32]);
+        assert_eq!(
+            parsed.body,
+            SketchBody::Filter {
+                variant: 8,
+                seed: 0x910a_2dec_8902_5cc1,
+                segment_length: 64,
+                segment_length_mask: 63,
+                segment_count_length: 64,
+                fingerprint_len: 192,
+            }
+        );
+        assert_eq!(
+            sketch_path(temp.path(), SketchKind::Filter, KeyRole::Subjects),
+            filter_path
+        );
+
+        let minima: [u64; 5] = [
+            0x00cc_3131_e8f7_a0c5,
+            0x0da9_8875_b72f_df91,
+            0x35c5_f517_a376_fed8,
+            0x45c6_4ad7_8fde_51e4,
+            0xaf5a_5827_fae0_76d7,
+        ];
+        let mut minhash_body = common_header(b"KGFM", Role::Subjects, 5, &[0x5a; 32])
+            .unwrap()
+            .to_vec();
+        minhash_body.extend_from_slice(&16u32.to_le_bytes());
+        minhash_body.extend_from_slice(&5u32.to_le_bytes());
+        minhash_body.push(0);
+        minhash_body.extend_from_slice(&[0; 7]);
+        for minimum in minima {
+            minhash_body.extend_from_slice(&minimum.to_le_bytes());
+        }
+        let minhash_path = write_reader_fixture(temp.path(), "subjects.minhash", minhash_body);
+        let parsed = read_sketch_header(&minhash_path).unwrap();
+        assert_eq!(parsed.kind, SketchKind::MinHash);
+        assert_eq!(parsed.key_count, 5);
+        assert_eq!(
+            parsed.body,
+            SketchBody::MinHash {
+                k: 16,
+                stored_count: 5,
+                saturated: false,
+            }
+        );
+    }
+
+    #[test]
+    fn header_reader_enforces_every_sketch_reader_rule() {
+        let temp = tempfile::tempdir().unwrap();
+
+        let mut bad_crc = with_crc(empty_filter_body());
+        *bad_crc.last_mut().unwrap() ^= 1;
+        let bad_crc_path = temp.path().join("bad-crc.filter");
+        std::fs::write(&bad_crc_path, bad_crc).unwrap();
+        let error = read_sketch_header(&bad_crc_path).unwrap_err();
+        assert!(error.to_string().contains("CRC32C mismatch"));
+
+        let mut foreign = empty_filter_body();
+        foreign[0..4].copy_from_slice(b"NOPE");
+        let foreign_path = write_reader_fixture(temp.path(), "foreign.filter", foreign);
+        assert!(matches!(
+            read_sketch_header(&foreign_path),
+            Err(SketchOpenError::NotSketch { .. })
+        ));
+
+        let filter_mutations: Vec<HeaderMutation> = vec![
+            ("version", |body| body[4] = 2),
+            ("convention", |body| body[6] = 2),
+            ("hash", |body| body[8] = 2),
+            ("role", |body| body[9] = 2),
+            ("common-reserved", |body| body[10] = 1),
+            ("variant", |body| body[56] = 7),
+            ("filter-reserved", |body| body[57] = 1),
+            ("descriptor-reserved", |body| body[84] = 1),
+            ("segment-length", |body| {
+                body[72..76].copy_from_slice(&3u32.to_le_bytes())
+            }),
+            ("segment-mask", |body| {
+                body[76..80].copy_from_slice(&2u32.to_le_bytes())
+            }),
+            ("segment-count", |body| {
+                body[80..84].copy_from_slice(&5u32.to_le_bytes())
+            }),
+            ("fingerprint-length", |body| {
+                body[88..96].copy_from_slice(&11u64.to_le_bytes())
+            }),
+            ("file-length", |body| body.push(0)),
+        ];
+        for (name, mutate) in filter_mutations {
+            let mut body = empty_filter_body();
+            mutate(&mut body);
+            expect_invalid_reader_body(temp.path(), name, body);
+        }
+
+        // §5.3's exact-arithmetic trap: the u32 fields would wrap the expected
+        // fingerprint length to a small value if added at their stored width.
+        let mut overflow = empty_filter_body();
+        overflow[80..84].copy_from_slice(&0xffff_fffcu32.to_le_bytes());
+        overflow[88..96].copy_from_slice(&4u64.to_le_bytes());
+        overflow.truncate(96);
+        overflow.extend_from_slice(&[0; 4]);
+        assert_eq!(0xffff_fffcu32.wrapping_add(2 * 4), 4);
+        expect_invalid_reader_body(temp.path(), "fingerprint-u32-overflow", overflow);
+
+        let minhash_mutations: Vec<HeaderMutation> = vec![
+            ("minhash-k", |body| {
+                body[56..60].copy_from_slice(&1u32.to_le_bytes())
+            }),
+            ("stored-over-k", |body| {
+                body[56..60].copy_from_slice(&2u32.to_le_bytes())
+            }),
+            ("stored-over-keys", |body| {
+                body[16..24].copy_from_slice(&2u64.to_le_bytes())
+            }),
+            ("saturation", |body| body[64] = 0),
+            ("saturation-byte", |body| body[64] = 2),
+            ("minhash-reserved", |body| body[65] = 1),
+            ("minima-order", |body| {
+                body[80..88].copy_from_slice(&1u64.to_le_bytes())
+            }),
+            ("minhash-file-length", |body| body.push(0)),
+        ];
+        for (name, mutate) in minhash_mutations {
+            let mut body = minhash_body();
+            mutate(&mut body);
+            expect_invalid_reader_body(temp.path(), name, body);
+        }
+
+        let mut advisory_digest = empty_filter_body();
+        advisory_digest[24..56].fill(0xff);
+        let path = write_reader_fixture(temp.path(), "advisory-digest.filter", advisory_digest);
+        assert_eq!(read_sketch_header(&path).unwrap().source_digest, [0xff; 32]);
     }
 
     #[test]
@@ -682,6 +1299,21 @@ path. The version pin, not this test, is the actual guard.";
     }
 
     #[test]
+    fn non_sketch_roles_are_rejected_without_writing_or_panicking() {
+        let temp = tempfile::tempdir().unwrap();
+        let roles = [KeyRole::Predicates];
+        let output_dir = temp.path().join("filters");
+        let config = SketchConfig {
+            output_dir: &output_dir,
+            ..test_config(temp.path(), &roles)
+        };
+        let error = create_sketches(config).unwrap_err();
+        assert!(error.to_string().contains("only the subjects and objects"));
+        assert!(!output_dir.exists());
+        assert!(common_header(b"KGFF", KeyRole::Shared, 0, &[0; 32]).is_err());
+    }
+
+    #[test]
     fn max_filter_keys_reserves_the_minhash_and_caps_at_the_fuse_ceiling() {
         // 4 GiB budget, k=65536: 2 MiB reserved for the bottom-k, rest at 48 B/key.
         assert_eq!(
@@ -718,7 +1350,7 @@ path. The version pin, not this test, is the actual guard.";
     #[test]
     fn common_header_has_stable_layout() {
         let digest = [0x5a; 32];
-        let header = common_header(b"KGFM", Role::Objects, 42, &digest);
+        let header = common_header(b"KGFM", Role::Objects, 42, &digest).unwrap();
         assert_eq!(&header[0..4], b"KGFM");
         assert_eq!(u16::from_le_bytes(header[4..6].try_into().unwrap()), 1);
         assert_eq!(u16::from_le_bytes(header[6..8].try_into().unwrap()), 1);

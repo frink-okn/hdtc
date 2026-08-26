@@ -27,10 +27,10 @@ use super::artifacts::{
 };
 use super::input_adapter::HdtInputAdapter;
 use crate::io::BitPacker;
-use crate::io::crc_utils::Crc32cWriter;
+use crate::io::crc_utils::{Crc32cReadError, Crc32cWriter, read_crc32c_checked_prefix};
 use anyhow::{Context, Result, ensure};
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
 
@@ -57,6 +57,7 @@ pub struct KeysetConfig<'a> {
 }
 
 /// A dictionary role a key set can be built for.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyRole {
     /// Qualifying IRIs in `Shared ∪ Subjects`.
@@ -74,7 +75,7 @@ pub enum KeyRole {
 }
 
 impl KeyRole {
-    fn id(self) -> u8 {
+    pub(super) fn id(self) -> u8 {
         match self {
             Self::Subjects => 0,
             Self::Objects => 1,
@@ -83,6 +84,22 @@ impl KeyRole {
             Self::SubjectsOnly => 4,
             Self::ObjectsOnly => 5,
         }
+    }
+
+    fn from_id(id: u8) -> Option<Self> {
+        match id {
+            0 => Some(Self::Subjects),
+            1 => Some(Self::Objects),
+            2 => Some(Self::Predicates),
+            3 => Some(Self::Shared),
+            4 => Some(Self::SubjectsOnly),
+            5 => Some(Self::ObjectsOnly),
+            _ => None,
+        }
+    }
+
+    pub(super) fn is_sketch_role(self) -> bool {
+        matches!(self, Self::Subjects | Self::Objects)
     }
 
     pub fn file_stem(self) -> &'static str {
@@ -118,6 +135,7 @@ impl KeyRole {
 }
 
 /// How a key set's payload is encoded.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeysetEncoding {
     /// Raw sorted `u64` array — 8 bytes per key, `mmap` + binary search.
@@ -140,6 +158,233 @@ impl KeysetEncoding {
             Self::EliasFano => "elias-fano",
         }
     }
+
+    fn from_id(id: u8) -> Option<Self> {
+        match id {
+            0 => Some(Self::Raw),
+            1 => Some(Self::EliasFano),
+            _ => None,
+        }
+    }
+}
+
+/// The validated 96-byte header of a `.keys` artifact.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeysetHeader {
+    pub format_version: u16,
+    pub convention_id: u16,
+    pub hash_id: u8,
+    pub role: KeyRole,
+    pub encoding: KeysetEncoding,
+    pub low_width: u8,
+    pub key_count: u64,
+    pub min_key: u64,
+    pub max_key: u64,
+    pub payload_len: u64,
+    pub source_digest: [u8; 32],
+}
+
+/// Why a key-set header could not be opened.
+///
+/// `NotKeyset` is reserved for a CRC-valid file with a foreign magic value, so
+/// callers can distinguish an unrelated format from a malformed `.keys` file.
+#[non_exhaustive]
+#[derive(Debug, thiserror::Error)]
+pub enum KeysetOpenError {
+    #[error("failed to read key-set artifact {path:?}: {source}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("{path:?} is not a key-set artifact (magic {magic:?})")]
+    NotKeyset { path: PathBuf, magic: [u8; 8] },
+
+    #[error("invalid key-set artifact {path:?}: {message}")]
+    Invalid { path: PathBuf, message: String },
+}
+
+impl KeysetOpenError {
+    fn io(path: &Path, source: io::Error) -> Self {
+        Self::Io {
+            path: path.to_path_buf(),
+            source,
+        }
+    }
+
+    fn invalid(path: &Path, message: impl Into<String>) -> Self {
+        Self::Invalid {
+            path: path.to_path_buf(),
+            message: message.into(),
+        }
+    }
+
+    fn crc(path: &Path, error: Crc32cReadError) -> Self {
+        match error {
+            Crc32cReadError::Io(source) => Self::io(path, source),
+            Crc32cReadError::Invalid(message) => Self::invalid(path, message),
+        }
+    }
+}
+
+/// Read and validate a `.keys` header.
+///
+/// The entire file is streamed through CRC32C before any header field is
+/// interpreted. Payload bytes are not decoded or retained.
+pub fn read_keyset_header(path: &Path) -> std::result::Result<KeysetHeader, KeysetOpenError> {
+    let checked = read_crc32c_checked_prefix::<HEADER_LEN>(path)
+        .map_err(|error| KeysetOpenError::crc(path, error))?;
+    let bytes = checked.prefix;
+    let file_len = checked.file_len;
+    if checked.prefix_len < MAGIC.len() {
+        return Err(KeysetOpenError::invalid(
+            path,
+            format!("file is too short for key-set magic ({file_len} bytes including CRC32C)"),
+        ));
+    }
+
+    let magic: [u8; 8] = bytes[0..8].try_into().unwrap();
+    if &magic != MAGIC {
+        return Err(KeysetOpenError::NotKeyset {
+            path: path.to_path_buf(),
+            magic,
+        });
+    }
+    if checked.prefix_len < HEADER_LEN {
+        return Err(KeysetOpenError::invalid(
+            path,
+            format!(
+                "file is too short for the {HEADER_LEN}-byte header ({file_len} bytes including CRC32C)"
+            ),
+        ));
+    }
+
+    let format_version = u16::from_le_bytes(bytes[8..10].try_into().unwrap());
+    if format_version != FORMAT_VERSION {
+        return Err(KeysetOpenError::invalid(
+            path,
+            format!("unsupported format_version {format_version}"),
+        ));
+    }
+    let convention_id = u16::from_le_bytes(bytes[10..12].try_into().unwrap());
+    if convention_id != CONVENTION_ID {
+        return Err(KeysetOpenError::invalid(
+            path,
+            format!("unsupported convention_id {convention_id}"),
+        ));
+    }
+    let hash_id = bytes[12];
+    if hash_id != HASH_ID_XXH64 {
+        return Err(KeysetOpenError::invalid(
+            path,
+            format!("unsupported hash_id {hash_id}"),
+        ));
+    }
+    let role = KeyRole::from_id(bytes[13])
+        .ok_or_else(|| KeysetOpenError::invalid(path, format!("unsupported role {}", bytes[13])))?;
+    let encoding = KeysetEncoding::from_id(bytes[14]).ok_or_else(|| {
+        KeysetOpenError::invalid(path, format!("unsupported encoding {}", bytes[14]))
+    })?;
+    if bytes[80..96].iter().any(|&byte| byte != 0) {
+        return Err(KeysetOpenError::invalid(
+            path,
+            "reserved header bytes are nonzero",
+        ));
+    }
+
+    let low_width = bytes[15];
+    let key_count = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
+    let min_key = u64::from_le_bytes(bytes[24..32].try_into().unwrap());
+    let max_key = u64::from_le_bytes(bytes[32..40].try_into().unwrap());
+    let declared_payload_len = u64::from_le_bytes(bytes[40..48].try_into().unwrap());
+    let source_digest = bytes[48..80].try_into().unwrap();
+
+    let expected_file_len = HEADER_LEN as u128 + u128::from(declared_payload_len) + 4;
+    if u128::from(file_len) != expected_file_len {
+        return Err(KeysetOpenError::invalid(
+            path,
+            format!("file length {file_len} does not match header declaration {expected_file_len}"),
+        ));
+    }
+
+    let expected_payload_len = match encoding {
+        KeysetEncoding::Raw => {
+            if low_width != 0 {
+                return Err(KeysetOpenError::invalid(
+                    path,
+                    format!("raw encoding requires low_width 0, found {low_width}"),
+                ));
+            }
+            u128::from(key_count) * 8
+        }
+        KeysetEncoding::EliasFano if key_count == 0 => {
+            if low_width != 0 {
+                return Err(KeysetOpenError::invalid(
+                    path,
+                    format!("empty Elias-Fano encoding requires low_width 0, found {low_width}"),
+                ));
+            }
+            0
+        }
+        KeysetEncoding::EliasFano => {
+            let expected_low_width = elias_fano_low_width(key_count);
+            if low_width != expected_low_width {
+                return Err(KeysetOpenError::invalid(
+                    path,
+                    format!(
+                        "Elias-Fano low_width {low_width} does not match key_count {key_count} (expected {expected_low_width})"
+                    ),
+                ));
+            }
+            u128::from(
+                payload_len(encoding, key_count, low_width)
+                    .map_err(|error| KeysetOpenError::invalid(path, error.to_string()))?,
+            )
+        }
+    };
+    if u128::from(declared_payload_len) != expected_payload_len {
+        return Err(KeysetOpenError::invalid(
+            path,
+            format!(
+                "payload_len {declared_payload_len} does not match {encoding:?} sizing rule (expected {expected_payload_len})"
+            ),
+        ));
+    }
+
+    if key_count == 0 {
+        if min_key != 0 || max_key != 0 {
+            return Err(KeysetOpenError::invalid(
+                path,
+                "an empty key set requires min_key = max_key = 0",
+            ));
+        }
+    } else if min_key > max_key {
+        return Err(KeysetOpenError::invalid(
+            path,
+            format!("min_key {min_key} exceeds max_key {max_key}"),
+        ));
+    }
+
+    Ok(KeysetHeader {
+        format_version,
+        convention_id,
+        hash_id,
+        role,
+        encoding,
+        low_width,
+        key_count,
+        min_key,
+        max_key,
+        payload_len: declared_payload_len,
+        source_digest,
+    })
+}
+
+/// Return the conventional `.keys` path inside a key-set output directory.
+pub fn keyset_path(dir: &Path, role: KeyRole) -> PathBuf {
+    dir.join(format!("{}.keys", role.file_stem()))
 }
 
 /// What one role's key set cost to build and to store.
@@ -184,7 +429,7 @@ pub fn create_keysets(config: KeysetConfig<'_>) -> Result<KeysetSummary> {
     let targets: Vec<PathBuf> = config
         .roles
         .iter()
-        .map(|&role| artifact_path(config.output_dir, role))
+        .map(|&role| keyset_path(config.output_dir, role))
         .collect();
     ensure_targets_absent(&targets)?;
 
@@ -264,7 +509,7 @@ pub fn create_keysets(config: KeysetConfig<'_>) -> Result<KeysetSummary> {
         file.as_file().sync_all()?;
         staged.push(StagedArtifact {
             file,
-            target: artifact_path(config.output_dir, role),
+            target: keyset_path(config.output_dir, role),
         });
         roles.push(KeysetRoleSummary {
             role,
@@ -309,12 +554,6 @@ where
         }
     }
     Ok(())
-}
-
-/// The `.keys` path for one role. The single place artifact names are formed,
-/// so the no-clobber precheck and publication cannot diverge.
-fn artifact_path(output_dir: &Path, role: KeyRole) -> PathBuf {
-    output_dir.join(format!("{}.keys", role.file_stem()))
 }
 
 struct RoleAccumulator {
@@ -613,6 +852,186 @@ fn write_elias_fano_payload<W: Write, S: KeySource>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    type HeaderMutation = (&'static str, fn(&mut Vec<u8>));
+
+    fn with_crc(mut body: Vec<u8>) -> Vec<u8> {
+        body.extend_from_slice(&crate::io::crc_utils::crc32c(&body).to_le_bytes());
+        body
+    }
+
+    fn write_reader_fixture(temp: &Path, name: &str, body: Vec<u8>) -> PathBuf {
+        let path = temp.join(name);
+        std::fs::write(&path, with_crc(body)).unwrap();
+        path
+    }
+
+    fn raw_reader_body() -> Vec<u8> {
+        let mut body = header(
+            KeyRole::Subjects,
+            KeysetEncoding::Raw,
+            0,
+            2,
+            1,
+            2,
+            16,
+            &[0x5a; 32],
+        )
+        .to_vec();
+        body.extend_from_slice(&1u64.to_le_bytes());
+        body.extend_from_slice(&2u64.to_le_bytes());
+        body
+    }
+
+    fn expect_invalid_reader_body(temp: &Path, name: &str, body: Vec<u8>) {
+        let path = write_reader_fixture(temp, name, body);
+        assert!(
+            matches!(
+                read_keyset_header(&path),
+                Err(KeysetOpenError::Invalid { .. })
+            ),
+            "{name} should be rejected as an invalid key set"
+        );
+    }
+
+    #[test]
+    fn header_reader_parses_the_frozen_raw_vector() {
+        let temp = tempfile::tempdir().unwrap();
+        let keys = [
+            0x00cc_3131_e8f7_a0c5,
+            0x0da9_8875_b72f_df91,
+            0x35c5_f517_a376_fed8,
+            0x45c6_4ad7_8fde_51e4,
+            0xaf5a_5827_fae0_76d7,
+        ];
+        let mut body = header(
+            KeyRole::Subjects,
+            KeysetEncoding::Raw,
+            0,
+            5,
+            keys[0],
+            keys[4],
+            40,
+            &[0x5a; 32],
+        )
+        .to_vec();
+        for key in keys {
+            body.extend_from_slice(&key.to_le_bytes());
+        }
+        let path = write_reader_fixture(temp.path(), "subjects.keys", body);
+
+        let parsed = read_keyset_header(&path).unwrap();
+        assert_eq!(parsed.format_version, 1);
+        assert_eq!(parsed.convention_id, 1);
+        assert_eq!(parsed.hash_id, 1);
+        assert_eq!(parsed.role, KeyRole::Subjects);
+        assert_eq!(parsed.encoding, KeysetEncoding::Raw);
+        assert_eq!(parsed.low_width, 0);
+        assert_eq!(parsed.key_count, 5);
+        assert_eq!(parsed.min_key, keys[0]);
+        assert_eq!(parsed.max_key, keys[4]);
+        assert_eq!(parsed.payload_len, 40);
+        assert_eq!(parsed.source_digest, [0x5a; 32]);
+        assert_eq!(keyset_path(temp.path(), KeyRole::Subjects), path);
+    }
+
+    #[test]
+    fn header_reader_enforces_every_keyset_reader_rule() {
+        let temp = tempfile::tempdir().unwrap();
+
+        let mut bad_crc = with_crc(raw_reader_body());
+        *bad_crc.last_mut().unwrap() ^= 1;
+        let bad_crc_path = temp.path().join("bad-crc.keys");
+        std::fs::write(&bad_crc_path, bad_crc).unwrap();
+        let error = read_keyset_header(&bad_crc_path).unwrap_err();
+        assert!(error.to_string().contains("CRC32C mismatch"));
+
+        let foreign = b"NOTKEYS\0".to_vec();
+        let foreign_path = write_reader_fixture(temp.path(), "foreign.keys", foreign);
+        assert!(matches!(
+            read_keyset_header(&foreign_path),
+            Err(KeysetOpenError::NotKeyset { .. })
+        ));
+
+        let mutations: Vec<HeaderMutation> = vec![
+            ("version", |body| body[8] = 2),
+            ("convention", |body| body[10] = 2),
+            ("hash", |body| body[12] = 2),
+            ("role", |body| body[13] = 6),
+            ("encoding", |body| body[14] = 2),
+            ("reserved", |body| body[80] = 1),
+            ("raw-low-width", |body| body[15] = 1),
+            ("raw-payload-size", |body| {
+                body[16..24].copy_from_slice(&1u64.to_le_bytes())
+            }),
+            ("range-order", |body| {
+                body[24..32].copy_from_slice(&3u64.to_le_bytes())
+            }),
+            ("file-size", |body| body.push(0)),
+        ];
+        for (name, mutate) in mutations {
+            let mut body = raw_reader_body();
+            mutate(&mut body);
+            expect_invalid_reader_body(temp.path(), name, body);
+        }
+
+        let empty = || {
+            header(
+                KeyRole::Shared,
+                KeysetEncoding::EliasFano,
+                0,
+                0,
+                0,
+                0,
+                0,
+                &[0; 32],
+            )
+            .to_vec()
+        };
+        let empty_path = write_reader_fixture(temp.path(), "empty.keys", empty());
+        assert_eq!(read_keyset_header(&empty_path).unwrap().key_count, 0);
+
+        let mut bad_empty_width = empty();
+        bad_empty_width[15] = 1;
+        expect_invalid_reader_body(temp.path(), "empty-width", bad_empty_width);
+        let mut bad_empty_range = empty();
+        bad_empty_range[24] = 1;
+        expect_invalid_reader_body(temp.path(), "empty-range", bad_empty_range);
+
+        let mut elias = header(
+            KeyRole::Objects,
+            KeysetEncoding::EliasFano,
+            61,
+            5,
+            1,
+            2,
+            48,
+            &[0; 32],
+        )
+        .to_vec();
+        elias.resize(HEADER_LEN + 48, 0);
+        let valid_elias = read_keyset_header(&write_reader_fixture(
+            temp.path(),
+            "valid-elias.keys",
+            elias.clone(),
+        ))
+        .unwrap();
+        assert_eq!(valid_elias.encoding, KeysetEncoding::EliasFano);
+        assert_eq!(valid_elias.low_width, 61);
+        assert_eq!(valid_elias.key_count, 5);
+        assert_eq!(valid_elias.payload_len, 48);
+        let mut bad_elias_width = elias.clone();
+        bad_elias_width[15] = 60;
+        expect_invalid_reader_body(temp.path(), "elias-width", bad_elias_width);
+        let mut bad_elias_size = elias;
+        bad_elias_size[16..24].copy_from_slice(&4u64.to_le_bytes());
+        expect_invalid_reader_body(temp.path(), "elias-payload-size", bad_elias_size);
+
+        let mut advisory_digest = raw_reader_body();
+        advisory_digest[48..80].fill(0xff);
+        let path = write_reader_fixture(temp.path(), "advisory-digest.keys", advisory_digest);
+        assert_eq!(read_keyset_header(&path).unwrap().source_digest, [0xff; 32]);
+    }
 
     /// Decode an Elias-Fano payload back to its key list, from the
     /// specification text rather than from the encoder's internals. If the two

@@ -6,7 +6,9 @@
 //! - CRC32C (poly 0x1EDC6F41): after data payloads
 
 use crc::{CRC_32_ISCSI, Crc};
-use std::io::{self, Write};
+use std::fs::File;
+use std::io::{self, BufReader, Read, Write};
+use std::path::Path;
 
 // CRC8-CCITT: polynomial 0x07
 const CRC8_ALGO: Crc<u8> = Crc::<u8>::new(&crc::Algorithm {
@@ -49,6 +51,91 @@ pub fn crc16(data: &[u8]) -> u16 {
 /// Compute CRC32C over the given data.
 pub fn crc32c(data: &[u8]) -> u32 {
     CRC32C_ALGO.checksum(data)
+}
+
+/// A CRC-verified file and the prefix retained while it was streamed.
+pub(crate) struct Crc32cFilePrefix<const N: usize> {
+    pub reader: BufReader<File>,
+    pub prefix: [u8; N],
+    pub prefix_len: usize,
+    pub file_len: u64,
+}
+
+/// Failure while reading or verifying a CRC32C-trailed file.
+pub(crate) enum Crc32cReadError {
+    Io(io::Error),
+    Invalid(String),
+}
+
+/// Verify a whole CRC32C-trailed file while retaining at most its first `N`
+/// data bytes.
+///
+/// This keeps validation memory-bounded for large sidecars. The returned
+/// reader owns the same open file and may be rewound for format-specific checks
+/// after the CRC has been accepted.
+pub(crate) fn read_crc32c_checked_prefix<const N: usize>(
+    path: &Path,
+) -> Result<Crc32cFilePrefix<N>, Crc32cReadError> {
+    let file = File::open(path).map_err(Crc32cReadError::Io)?;
+    let file_len = file.metadata().map_err(Crc32cReadError::Io)?.len();
+    if file_len < 4 {
+        return Err(Crc32cReadError::Invalid(format!(
+            "file is too short to contain a CRC32C trailer ({file_len} bytes)"
+        )));
+    }
+
+    let data_len = file_len - 4;
+    let mut reader = BufReader::with_capacity(64 * 1024, file);
+    let mut digest = CRC32C_ALGO.digest();
+    let mut prefix = [0u8; N];
+    let mut prefix_len = 0usize;
+    let mut remaining = data_len;
+    let mut buffer = [0u8; 64 * 1024];
+    while remaining != 0 {
+        let wanted = usize::try_from(remaining.min(buffer.len() as u64)).unwrap();
+        let read = reader
+            .read(&mut buffer[..wanted])
+            .map_err(Crc32cReadError::Io)?;
+        if read == 0 {
+            return Err(Crc32cReadError::Io(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "file changed while reading",
+            )));
+        }
+        digest.update(&buffer[..read]);
+        if prefix_len < prefix.len() {
+            let copied = read.min(prefix.len() - prefix_len);
+            prefix[prefix_len..prefix_len + copied].copy_from_slice(&buffer[..copied]);
+            prefix_len += copied;
+        }
+        remaining -= read as u64;
+    }
+
+    let mut trailer = [0u8; 4];
+    reader
+        .read_exact(&mut trailer)
+        .map_err(Crc32cReadError::Io)?;
+    let stored_crc = u32::from_le_bytes(trailer);
+    let computed_crc = digest.finalize();
+    if stored_crc != computed_crc {
+        return Err(Crc32cReadError::Invalid(format!(
+            "CRC32C mismatch: stored {stored_crc:#010x}, computed {computed_crc:#010x}"
+        )));
+    }
+
+    let mut extra = [0u8; 1];
+    if reader.read(&mut extra).map_err(Crc32cReadError::Io)? != 0 {
+        return Err(Crc32cReadError::Invalid(
+            "file grew while its CRC32C was being verified".to_owned(),
+        ));
+    }
+
+    Ok(Crc32cFilePrefix {
+        reader,
+        prefix,
+        prefix_len,
+        file_len,
+    })
 }
 
 /// A writer wrapper that incrementally computes a CRC8 over all bytes written.
