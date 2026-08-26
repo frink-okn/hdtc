@@ -27,10 +27,10 @@ use super::artifacts::{
 };
 use super::input_adapter::HdtInputAdapter;
 use crate::io::BitPacker;
-use crate::io::crc_utils::{CRC32C_ALGO, Crc32cWriter};
+use crate::io::crc_utils::{Crc32cReadError, Crc32cWriter, read_crc32c_checked_prefix};
 use anyhow::{Context, Result, ensure};
 use std::fs::File;
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
 
@@ -57,6 +57,7 @@ pub struct KeysetConfig<'a> {
 }
 
 /// A dictionary role a key set can be built for.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyRole {
     /// Qualifying IRIs in `Shared ∪ Subjects`.
@@ -134,6 +135,7 @@ impl KeyRole {
 }
 
 /// How a key set's payload is encoded.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeysetEncoding {
     /// Raw sorted `u64` array — 8 bytes per key, `mmap` + binary search.
@@ -167,6 +169,7 @@ impl KeysetEncoding {
 }
 
 /// The validated 96-byte header of a `.keys` artifact.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeysetHeader {
     pub format_version: u16,
@@ -186,6 +189,7 @@ pub struct KeysetHeader {
 ///
 /// `NotKeyset` is reserved for a CRC-valid file with a foreign magic value, so
 /// callers can distinguish an unrelated format from a malformed `.keys` file.
+#[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum KeysetOpenError {
     #[error("failed to read key-set artifact {path:?}: {source}")]
@@ -216,6 +220,13 @@ impl KeysetOpenError {
             message: message.into(),
         }
     }
+
+    fn crc(path: &Path, error: Crc32cReadError) -> Self {
+        match error {
+            Crc32cReadError::Io(source) => Self::io(path, source),
+            Crc32cReadError::Invalid(message) => Self::invalid(path, message),
+        }
+    }
 }
 
 /// Read and validate a `.keys` header.
@@ -223,7 +234,16 @@ impl KeysetOpenError {
 /// The entire file is streamed through CRC32C before any header field is
 /// interpreted. Payload bytes are not decoded or retained.
 pub fn read_keyset_header(path: &Path) -> std::result::Result<KeysetHeader, KeysetOpenError> {
-    let (bytes, file_len) = read_crc_checked_header(path)?;
+    let checked = read_crc32c_checked_prefix::<HEADER_LEN>(path)
+        .map_err(|error| KeysetOpenError::crc(path, error))?;
+    let bytes = checked.prefix;
+    let file_len = checked.file_len;
+    if checked.prefix_len < MAGIC.len() {
+        return Err(KeysetOpenError::invalid(
+            path,
+            format!("file is too short for key-set magic ({file_len} bytes including CRC32C)"),
+        ));
+    }
 
     let magic: [u8; 8] = bytes[0..8].try_into().unwrap();
     if &magic != MAGIC {
@@ -231,6 +251,14 @@ pub fn read_keyset_header(path: &Path) -> std::result::Result<KeysetHeader, Keys
             path: path.to_path_buf(),
             magic,
         });
+    }
+    if checked.prefix_len < HEADER_LEN {
+        return Err(KeysetOpenError::invalid(
+            path,
+            format!(
+                "file is too short for the {HEADER_LEN}-byte header ({file_len} bytes including CRC32C)"
+            ),
+        ));
     }
 
     let format_version = u16::from_le_bytes(bytes[8..10].try_into().unwrap());
@@ -270,10 +298,10 @@ pub fn read_keyset_header(path: &Path) -> std::result::Result<KeysetHeader, Keys
     let key_count = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
     let min_key = u64::from_le_bytes(bytes[24..32].try_into().unwrap());
     let max_key = u64::from_le_bytes(bytes[32..40].try_into().unwrap());
-    let payload_len = u64::from_le_bytes(bytes[40..48].try_into().unwrap());
+    let declared_payload_len = u64::from_le_bytes(bytes[40..48].try_into().unwrap());
     let source_digest = bytes[48..80].try_into().unwrap();
 
-    let expected_file_len = HEADER_LEN as u128 + u128::from(payload_len) + 4;
+    let expected_file_len = HEADER_LEN as u128 + u128::from(declared_payload_len) + 4;
     if u128::from(file_len) != expected_file_len {
         return Err(KeysetOpenError::invalid(
             path,
@@ -301,7 +329,7 @@ pub fn read_keyset_header(path: &Path) -> std::result::Result<KeysetHeader, Keys
             0
         }
         KeysetEncoding::EliasFano => {
-            let expected_low_width = (63 - key_count.ilog2()) as u8;
+            let expected_low_width = elias_fano_low_width(key_count);
             if low_width != expected_low_width {
                 return Err(KeysetOpenError::invalid(
                     path,
@@ -310,16 +338,17 @@ pub fn read_keyset_header(path: &Path) -> std::result::Result<KeysetHeader, Keys
                     ),
                 ));
             }
-            let low_bits = u128::from(key_count) * u128::from(low_width);
-            let high_bits = u128::from(key_count) + (1u128 << (64 - u32::from(low_width)));
-            (low_bits.div_ceil(64) + high_bits.div_ceil(64)) * 8
+            u128::from(
+                payload_len(encoding, key_count, low_width)
+                    .map_err(|error| KeysetOpenError::invalid(path, error.to_string()))?,
+            )
         }
     };
-    if u128::from(payload_len) != expected_payload_len {
+    if u128::from(declared_payload_len) != expected_payload_len {
         return Err(KeysetOpenError::invalid(
             path,
             format!(
-                "payload_len {payload_len} does not match {encoding:?} sizing rule (expected {expected_payload_len})"
+                "payload_len {declared_payload_len} does not match {encoding:?} sizing rule (expected {expected_payload_len})"
             ),
         ));
     }
@@ -348,7 +377,7 @@ pub fn read_keyset_header(path: &Path) -> std::result::Result<KeysetHeader, Keys
         key_count,
         min_key,
         max_key,
-        payload_len,
+        payload_len: declared_payload_len,
         source_digest,
     })
 }
@@ -356,73 +385,6 @@ pub fn read_keyset_header(path: &Path) -> std::result::Result<KeysetHeader, Keys
 /// Return the conventional `.keys` path inside a key-set output directory.
 pub fn keyset_path(dir: &Path, role: KeyRole) -> PathBuf {
     dir.join(format!("{}.keys", role.file_stem()))
-}
-
-/// Stream a file through CRC32C and retain only its fixed header.
-fn read_crc_checked_header(
-    path: &Path,
-) -> std::result::Result<([u8; HEADER_LEN], u64), KeysetOpenError> {
-    let file = File::open(path).map_err(|source| KeysetOpenError::io(path, source))?;
-    let file_len = file
-        .metadata()
-        .map_err(|source| KeysetOpenError::io(path, source))?
-        .len();
-    if file_len < 4 {
-        return Err(KeysetOpenError::invalid(
-            path,
-            format!("file is too short to contain a CRC32C trailer ({file_len} bytes)"),
-        ));
-    }
-
-    let data_len = file_len - 4;
-    let mut reader = BufReader::new(file);
-    let mut digest = CRC32C_ALGO.digest();
-    let mut header = [0u8; HEADER_LEN];
-    let mut header_filled = 0usize;
-    let mut remaining = data_len;
-    let mut buffer = [0u8; 64 * 1024];
-    while remaining != 0 {
-        let wanted = usize::try_from(remaining.min(buffer.len() as u64)).unwrap();
-        let read = reader
-            .read(&mut buffer[..wanted])
-            .map_err(|source| KeysetOpenError::io(path, source))?;
-        if read == 0 {
-            return Err(KeysetOpenError::io(
-                path,
-                io::Error::new(io::ErrorKind::UnexpectedEof, "file changed while reading"),
-            ));
-        }
-        digest.update(&buffer[..read]);
-        if header_filled < HEADER_LEN {
-            let copied = read.min(HEADER_LEN - header_filled);
-            header[header_filled..header_filled + copied].copy_from_slice(&buffer[..copied]);
-            header_filled += copied;
-        }
-        remaining -= read as u64;
-    }
-
-    let mut trailer = [0u8; 4];
-    reader
-        .read_exact(&mut trailer)
-        .map_err(|source| KeysetOpenError::io(path, source))?;
-    let stored_crc = u32::from_le_bytes(trailer);
-    let computed_crc = digest.finalize();
-    if stored_crc != computed_crc {
-        return Err(KeysetOpenError::invalid(
-            path,
-            format!("CRC32C mismatch: stored {stored_crc:#010x}, computed {computed_crc:#010x}"),
-        ));
-    }
-    if header_filled < HEADER_LEN {
-        return Err(KeysetOpenError::invalid(
-            path,
-            format!(
-                "file is too short for the {HEADER_LEN}-byte header ({file_len} bytes including CRC32C)"
-            ),
-        ));
-    }
-
-    Ok((header, file_len))
 }
 
 /// What one role's key set cost to build and to store.
@@ -984,8 +946,7 @@ mod tests {
         let error = read_keyset_header(&bad_crc_path).unwrap_err();
         assert!(error.to_string().contains("CRC32C mismatch"));
 
-        let mut foreign = raw_reader_body();
-        foreign[0..8].copy_from_slice(b"NOTKEYS\0");
+        let foreign = b"NOTKEYS\0".to_vec();
         let foreign_path = write_reader_fixture(temp.path(), "foreign.keys", foreign);
         assert!(matches!(
             read_keyset_header(&foreign_path),

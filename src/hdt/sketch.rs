@@ -18,7 +18,9 @@ use super::artifacts::{
 use super::input_adapter::HdtInputAdapter;
 use super::keyset::KeyRole;
 use super::pfc_reader::PfcSectionIterator;
-use crate::io::crc_utils::{CRC32C_ALGO, Crc32cWriter};
+use crate::io::crc_utils::{
+    Crc32cFilePrefix, Crc32cReadError, Crc32cWriter, read_crc32c_checked_prefix,
+};
 use anyhow::{Context, Result, ensure};
 use std::collections::BTreeSet;
 use std::fs::File;
@@ -66,6 +68,7 @@ pub struct SketchSummary {
 }
 
 /// Whether a sketch artifact is a membership filter or a MinHash sketch.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SketchKind {
     Filter,
@@ -82,6 +85,7 @@ impl SketchKind {
 }
 
 /// Type-specific fields following a sketch artifact's common header.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SketchBody {
     Filter {
@@ -100,6 +104,7 @@ pub enum SketchBody {
 }
 
 /// The validated common and type-specific header of a sketch artifact.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SketchHeader {
     pub kind: SketchKind,
@@ -116,6 +121,7 @@ pub struct SketchHeader {
 ///
 /// `NotSketch` is reserved for a CRC-valid file with a foreign magic value, so
 /// callers can distinguish an unrelated format from a malformed artifact.
+#[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum SketchOpenError {
     #[error("failed to read sketch artifact {path:?}: {source}")]
@@ -146,6 +152,13 @@ impl SketchOpenError {
             message: message.into(),
         }
     }
+
+    fn crc(path: &Path, error: Crc32cReadError) -> Self {
+        match error {
+            Crc32cReadError::Io(source) => Self::io(path, source),
+            Crc32cReadError::Invalid(message) => Self::invalid(path, message),
+        }
+    }
 }
 
 fn private_terms(
@@ -155,15 +168,15 @@ fn private_terms(
     match role {
         KeyRole::Subjects => adapter.subject_terms(),
         KeyRole::Objects => adapter.object_terms(),
-        _ => unreachable!("sketch roles are validated before dictionary scanning"),
+        _ => Err(anyhow::anyhow!("{} is not a sketch role", role.file_stem())),
     }
 }
 
-fn private_count(role: KeyRole, adapter: &HdtInputAdapter) -> u64 {
+fn private_count(role: KeyRole, adapter: &HdtInputAdapter) -> Result<u64> {
     match role {
-        KeyRole::Subjects => adapter.subjects_count,
-        KeyRole::Objects => adapter.objects_count,
-        _ => unreachable!("sketch roles are validated before dictionary scanning"),
+        KeyRole::Subjects => Ok(adapter.subjects_count),
+        KeyRole::Objects => Ok(adapter.objects_count),
+        _ => Err(anyhow::anyhow!("{} is not a sketch role", role.file_stem())),
     }
 }
 
@@ -173,7 +186,13 @@ fn private_count(role: KeyRole, adapter: &HdtInputAdapter) -> u64 {
 /// interpreted. Filter payloads are not retained, while MinHash minima are
 /// subsequently streamed once to verify the required strict ordering.
 pub fn read_sketch_header(path: &Path) -> std::result::Result<SketchHeader, SketchOpenError> {
-    let (mut reader, bytes, prefix_len, file_len) = read_crc_checked_prefix(path)?;
+    let Crc32cFilePrefix {
+        mut reader,
+        prefix: bytes,
+        prefix_len,
+        file_len,
+    } = read_crc32c_checked_prefix::<96>(path)
+        .map_err(|error| SketchOpenError::crc(path, error))?;
     if prefix_len < 4 {
         return Err(SketchOpenError::invalid(
             path,
@@ -436,19 +455,27 @@ fn parse_minhash_header(
         .seek(SeekFrom::Start(MINHASH_HEADER_LEN as u64))
         .map_err(|source| SketchOpenError::io(path, source))?;
     let mut previous = None;
-    let mut encoded = [0u8; 8];
-    for index in 0..stored_count {
+    let mut index = 0u32;
+    let mut remaining = stored_count;
+    let mut encoded = [0u8; 64 * 1024];
+    while remaining != 0 {
+        let values = remaining.min((encoded.len() / 8) as u32) as usize;
+        let bytes = &mut encoded[..values * 8];
         reader
-            .read_exact(&mut encoded)
+            .read_exact(bytes)
             .map_err(|source| SketchOpenError::io(path, source))?;
-        let minimum = u64::from_le_bytes(encoded);
-        if previous.is_some_and(|value| value >= minimum) {
-            return Err(SketchOpenError::invalid(
-                path,
-                format!("MinHash minima are not strictly ascending at index {index}"),
-            ));
+        for chunk in bytes.chunks_exact(8) {
+            let minimum = u64::from_le_bytes(chunk.try_into().unwrap());
+            if previous.is_some_and(|value| value >= minimum) {
+                return Err(SketchOpenError::invalid(
+                    path,
+                    format!("MinHash minima are not strictly ascending at index {index}"),
+                ));
+            }
+            previous = Some(minimum);
+            index += 1;
         }
-        previous = Some(minimum);
+        remaining -= values as u32;
     }
 
     Ok(SketchBody::MinHash {
@@ -456,65 +483,6 @@ fn parse_minhash_header(
         stored_count,
         saturated,
     })
-}
-
-/// Stream a file through CRC32C and retain only the longest possible header.
-fn read_crc_checked_prefix(
-    path: &Path,
-) -> std::result::Result<(BufReader<File>, [u8; 96], usize, u64), SketchOpenError> {
-    let file = File::open(path).map_err(|source| SketchOpenError::io(path, source))?;
-    let file_len = file
-        .metadata()
-        .map_err(|source| SketchOpenError::io(path, source))?
-        .len();
-    if file_len < 4 {
-        return Err(SketchOpenError::invalid(
-            path,
-            format!("file is too short to contain a CRC32C trailer ({file_len} bytes)"),
-        ));
-    }
-
-    let data_len = file_len - 4;
-    let mut reader = BufReader::new(file);
-    let mut digest = CRC32C_ALGO.digest();
-    let mut prefix = [0u8; 96];
-    let mut prefix_len = 0usize;
-    let mut remaining = data_len;
-    let mut buffer = [0u8; 64 * 1024];
-    while remaining != 0 {
-        let wanted = usize::try_from(remaining.min(buffer.len() as u64)).unwrap();
-        let read = reader
-            .read(&mut buffer[..wanted])
-            .map_err(|source| SketchOpenError::io(path, source))?;
-        if read == 0 {
-            return Err(SketchOpenError::io(
-                path,
-                io::Error::new(io::ErrorKind::UnexpectedEof, "file changed while reading"),
-            ));
-        }
-        digest.update(&buffer[..read]);
-        if prefix_len < prefix.len() {
-            let copied = read.min(prefix.len() - prefix_len);
-            prefix[prefix_len..prefix_len + copied].copy_from_slice(&buffer[..copied]);
-            prefix_len += copied;
-        }
-        remaining -= read as u64;
-    }
-
-    let mut trailer = [0u8; 4];
-    reader
-        .read_exact(&mut trailer)
-        .map_err(|source| SketchOpenError::io(path, source))?;
-    let stored_crc = u32::from_le_bytes(trailer);
-    let computed_crc = digest.finalize();
-    if stored_crc != computed_crc {
-        return Err(SketchOpenError::invalid(
-            path,
-            format!("CRC32C mismatch: stored {stored_crc:#010x}, computed {computed_crc:#010x}"),
-        ));
-    }
-
-    Ok((reader, prefix, prefix_len, file_len))
 }
 
 struct RoleAccumulator {
@@ -572,10 +540,11 @@ impl RoleAccumulator {
         let expected_minima = key_count.min(self.k as u64) as usize;
         if minima.len() != expected_minima {
             tracing::warn!(
-                "{} XXH64 collision(s) among the smallest {} hashes; overlap estimates from this \
+                "{} role has {} XXH64 collision(s) among its smallest {} hashes; overlap estimates from this \
                  sketch treat the colliding IRIs as one",
+                self.role.file_stem(),
                 expected_minima - minima.len(),
-                self.role.file_stem()
+                expected_minima
             );
         }
         Ok(RoleData {
@@ -630,11 +599,11 @@ pub fn create_sketches(config: SketchConfig<'_>) -> Result<SketchSummary> {
         .roles
         .iter()
         .map(|role| {
-            adapter
+            Ok(adapter
                 .shared_count
-                .saturating_add(private_count(*role, &adapter))
+                .saturating_add(private_count(*role, &adapter)?))
         })
-        .collect();
+        .collect::<Result<_>>()?;
     ensure_minhash_accumulator_memory(&dictionary_counts, config.k, config.memory_limit)?;
 
     let k = usize::try_from(config.k).context("MinHash k does not fit this platform")?;
@@ -741,7 +710,12 @@ fn common_header(
     role: KeyRole,
     key_count: u64,
     source_digest: &[u8; 32],
-) -> [u8; COMMON_HEADER_LEN] {
+) -> Result<[u8; COMMON_HEADER_LEN]> {
+    ensure!(
+        role.is_sketch_role(),
+        "{} is not a sketch role",
+        role.file_stem()
+    );
     let mut header = [0u8; COMMON_HEADER_LEN];
     header[0..4].copy_from_slice(magic);
     header[4..6].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
@@ -750,7 +724,7 @@ fn common_header(
     header[9] = role.id();
     header[16..24].copy_from_slice(&key_count.to_le_bytes());
     header[24..56].copy_from_slice(source_digest);
-    header
+    Ok(header)
 }
 
 fn write_filter_file(
@@ -764,7 +738,12 @@ fn write_filter_file(
     // in a sketch role is a hash collision.
     let keys = data.keys.read_sorted_distinct()?;
     let mut writer = Crc32cWriter::new(BufWriter::with_capacity(256 * 1024, file));
-    writer.write_all(&common_header(b"KGFF", data.role, key_count, source_digest))?;
+    writer.write_all(&common_header(
+        b"KGFF",
+        data.role,
+        key_count,
+        source_digest,
+    )?)?;
     writer.write_all(&[filter_bits])?;
     writer.write_all(&[0u8; 7])?;
 
@@ -875,7 +854,7 @@ fn write_minhash_file(
         data.role,
         data.key_count(),
         source_digest,
-    ))?;
+    )?)?;
     writer.write_all(&k.to_le_bytes())?;
     writer.write_all(&stored_count.to_le_bytes())?;
     writer.write_all(&[saturated])?;
@@ -974,7 +953,9 @@ path. The version pin, not this test, is the actual guard.";
     }
 
     fn empty_filter_body() -> Vec<u8> {
-        let mut body = common_header(b"KGFF", Role::Subjects, 0, &[0x5a; 32]).to_vec();
+        let mut body = common_header(b"KGFF", Role::Subjects, 0, &[0x5a; 32])
+            .unwrap()
+            .to_vec();
         body.push(8);
         body.extend_from_slice(&[0; 7]);
         body.extend_from_slice(&0u64.to_le_bytes());
@@ -988,7 +969,9 @@ path. The version pin, not this test, is the actual guard.";
     }
 
     fn minhash_body() -> Vec<u8> {
-        let mut body = common_header(b"KGFM", Role::Objects, 3, &[0x5a; 32]).to_vec();
+        let mut body = common_header(b"KGFM", Role::Objects, 3, &[0x5a; 32])
+            .unwrap()
+            .to_vec();
         body.extend_from_slice(&3u32.to_le_bytes());
         body.extend_from_slice(&3u32.to_le_bytes());
         body.push(1);
@@ -1024,7 +1007,9 @@ path. The version pin, not this test, is the actual guard.";
         let filter = BinaryFuse8::try_from(&keys).unwrap();
         let mut descriptor = [0u8; FILTER_DESCRIPTOR_LEN];
         filter.dma_copy_descriptor_to(&mut descriptor);
-        let mut filter_body = common_header(b"KGFF", Role::Subjects, 100, &[0x5a; 32]).to_vec();
+        let mut filter_body = common_header(b"KGFF", Role::Subjects, 100, &[0x5a; 32])
+            .unwrap()
+            .to_vec();
         filter_body.push(8);
         filter_body.extend_from_slice(&[0; 7]);
         filter_body.extend_from_slice(&descriptor);
@@ -1064,7 +1049,9 @@ path. The version pin, not this test, is the actual guard.";
             0x45c6_4ad7_8fde_51e4,
             0xaf5a_5827_fae0_76d7,
         ];
-        let mut minhash_body = common_header(b"KGFM", Role::Subjects, 5, &[0x5a; 32]).to_vec();
+        let mut minhash_body = common_header(b"KGFM", Role::Subjects, 5, &[0x5a; 32])
+            .unwrap()
+            .to_vec();
         minhash_body.extend_from_slice(&16u32.to_le_bytes());
         minhash_body.extend_from_slice(&5u32.to_le_bytes());
         minhash_body.push(0);
@@ -1137,10 +1124,11 @@ path. The version pin, not this test, is the actual guard.";
         // §5.3's exact-arithmetic trap: the u32 fields would wrap the expected
         // fingerprint length to a small value if added at their stored width.
         let mut overflow = empty_filter_body();
-        overflow[72..76].copy_from_slice(&262_144u32.to_le_bytes());
-        overflow[76..80].copy_from_slice(&262_143u32.to_le_bytes());
-        overflow[80..84].copy_from_slice(&4_294_705_152u32.to_le_bytes());
-        overflow[88..96].copy_from_slice(&4_295_229_440u64.to_le_bytes());
+        overflow[80..84].copy_from_slice(&0xffff_fffcu32.to_le_bytes());
+        overflow[88..96].copy_from_slice(&4u64.to_le_bytes());
+        overflow.truncate(96);
+        overflow.extend_from_slice(&[0; 4]);
+        assert_eq!(0xffff_fffcu32.wrapping_add(2 * 4), 4);
         expect_invalid_reader_body(temp.path(), "fingerprint-u32-overflow", overflow);
 
         let minhash_mutations: Vec<HeaderMutation> = vec![
@@ -1311,6 +1299,21 @@ path. The version pin, not this test, is the actual guard.";
     }
 
     #[test]
+    fn non_sketch_roles_are_rejected_without_writing_or_panicking() {
+        let temp = tempfile::tempdir().unwrap();
+        let roles = [KeyRole::Predicates];
+        let output_dir = temp.path().join("filters");
+        let config = SketchConfig {
+            output_dir: &output_dir,
+            ..test_config(temp.path(), &roles)
+        };
+        let error = create_sketches(config).unwrap_err();
+        assert!(error.to_string().contains("only the subjects and objects"));
+        assert!(!output_dir.exists());
+        assert!(common_header(b"KGFF", KeyRole::Shared, 0, &[0; 32]).is_err());
+    }
+
+    #[test]
     fn max_filter_keys_reserves_the_minhash_and_caps_at_the_fuse_ceiling() {
         // 4 GiB budget, k=65536: 2 MiB reserved for the bottom-k, rest at 48 B/key.
         assert_eq!(
@@ -1347,7 +1350,7 @@ path. The version pin, not this test, is the actual guard.";
     #[test]
     fn common_header_has_stable_layout() {
         let digest = [0x5a; 32];
-        let header = common_header(b"KGFM", Role::Objects, 42, &digest);
+        let header = common_header(b"KGFM", Role::Objects, 42, &digest).unwrap();
         assert_eq!(&header[0..4], b"KGFM");
         assert_eq!(u16::from_le_bytes(header[4..6].try_into().unwrap()), 1);
         assert_eq!(u16::from_le_bytes(header[6..8].try_into().unwrap()), 1);

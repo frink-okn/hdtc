@@ -16,7 +16,6 @@ pub(crate) mod void;
 pub(crate) mod writer;
 
 pub use header::run_header_command;
-pub use keyset::KeyRole as SketchRole;
 pub use keyset::{KeyRole, KeysetConfig, KeysetEncoding, create_keysets};
 pub use namespaces::{NamespaceConfig, NamespaceOutputFormat, write_namespace_inventory};
 pub use search::{SearchQuery, parse_search_query, search_hdt_streaming};
