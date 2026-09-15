@@ -7,7 +7,7 @@ mod common;
 
 use common::write_file;
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 // ---------------------------------------------------------------------------
@@ -2338,5 +2338,567 @@ fn test_void_mixed_datatypes_single_property() {
     assert_eq!(
         dt_sum, 8,
         "Sum of class-level datatype partition counts ({dt_sum}) should equal 8"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Graph subsets (`--graph-view dataset`)
+// ---------------------------------------------------------------------------
+
+const DS: &str = "http://example.org/ds";
+const EX_G1: &str = "http://example.org/g1";
+const EX_G2: &str = "http://example.org/g2";
+
+/// Quads as (N-Triples statement without the final dot, graph IRI or `None` for the
+/// default graph).
+///
+/// The fixture exercises what makes per-graph statistics differ from the union:
+/// - `alice rdf:type Person` and `alice name "Alice"` are in both the default graph
+///   and g1, and `alice knows bob` is in both g1 and g2 (overlapping memberships);
+/// - typing is graph-local: alice and bob are `Person` in g1 but untyped (alice) or
+///   `Employee` (bob) in g2, which changes class and object-class partitions;
+/// - g2 types carol with a blank node, which must not become a class;
+/// - literals carry datatypes and language tags.
+const GRAPH_QUADS: &[(&str, Option<&str>)] = &[
+    (
+        "<http://example.org/alice> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/Person>",
+        None,
+    ),
+    (
+        "<http://example.org/alice> <http://example.org/name> \"Alice\"",
+        None,
+    ),
+    (
+        "<http://example.org/alice> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/Person>",
+        Some(EX_G1),
+    ),
+    (
+        "<http://example.org/alice> <http://example.org/name> \"Alice\"",
+        Some(EX_G1),
+    ),
+    (
+        "<http://example.org/alice> <http://example.org/knows> <http://example.org/bob>",
+        Some(EX_G1),
+    ),
+    (
+        "<http://example.org/bob> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/Person>",
+        Some(EX_G1),
+    ),
+    (
+        "<http://example.org/bob> <http://example.org/label> \"Bob\"@en",
+        Some(EX_G1),
+    ),
+    (
+        "<http://example.org/bob> <http://example.org/age> \"42\"^^<http://www.w3.org/2001/XMLSchema#integer>",
+        Some(EX_G1),
+    ),
+    (
+        "<http://example.org/alice> <http://example.org/knows> <http://example.org/bob>",
+        Some(EX_G2),
+    ),
+    (
+        "<http://example.org/bob> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/Employee>",
+        Some(EX_G2),
+    ),
+    (
+        "<http://example.org/carol> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/Employee>",
+        Some(EX_G2),
+    ),
+    (
+        "<http://example.org/carol> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> _:anonymousClass",
+        Some(EX_G2),
+    ),
+    (
+        "<http://example.org/carol> <http://example.org/worksWith> <http://example.org/alice>",
+        Some(EX_G2),
+    ),
+    (
+        "<http://example.org/carol> <http://example.org/worksWith> <http://example.org/bob>",
+        Some(EX_G2),
+    ),
+    (
+        "<http://example.org/carol> <http://example.org/label> \"Carol\"@en",
+        Some(EX_G2),
+    ),
+    (
+        "<http://example.org/carol> <http://example.org/label> \"Carola\"@de",
+        Some(EX_G2),
+    ),
+];
+
+fn nquads(quads: &[(&str, Option<&str>)]) -> String {
+    quads
+        .iter()
+        .map(|(triple, graph)| match graph {
+            Some(graph) => format!("{triple} <{graph}> .\n"),
+            None => format!("{triple} .\n"),
+        })
+        .collect()
+}
+
+fn graph_ntriples(quads: &[(&str, Option<&str>)], graph: Option<&str>) -> String {
+    quads
+        .iter()
+        .filter(|(_, g)| *g == graph)
+        .map(|(triple, _)| format!("{triple} .\n"))
+        .collect()
+}
+
+fn md5_hex(value: &str) -> String {
+    format!("{:x}", md5::compute(value.as_bytes()))
+}
+
+/// Build a quads HDT with its `.graphs` sidecar, and optionally the `.perm` and
+/// `.graphs.idx` sidecars the dataset view needs.
+fn make_quads_hdt(temp_dir: &Path, content: &str, name: &str, with_indexes: bool) -> PathBuf {
+    let nq_path = temp_dir.join(format!("{name}.nq"));
+    write_file(&nq_path, content.as_bytes());
+    let hdt_path = temp_dir.join(format!("{name}.hdt"));
+    let work_dir = temp_dir.join(format!("{name}_work"));
+
+    let mut args = vec![
+        "create",
+        nq_path.to_str().unwrap(),
+        "-o",
+        hdt_path.to_str().unwrap(),
+        "--mode",
+        "quads",
+        "--temp-dir",
+        work_dir.to_str().unwrap(),
+    ];
+    if with_indexes {
+        args.extend(["--perm", "--graphs-index"]);
+    }
+    let output = Command::new(env!("CARGO_BIN_EXE_hdtc"))
+        .args(&args)
+        .output()
+        .expect("Failed to execute hdtc create");
+    assert!(
+        output.status.success(),
+        "hdtc create failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    hdt_path
+}
+
+fn line_set(output: &str) -> HashSet<String> {
+    output
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Lines whose subject is `node_iri` or an IRI nested beneath it.
+fn description_lines(lines: &HashSet<String>, node_iri: &str) -> HashSet<String> {
+    let exact = format!("<{node_iri}> ");
+    let nested = format!("<{node_iri}/");
+    lines
+        .iter()
+        .filter(|line| line.starts_with(&exact) || line.starts_with(&nested))
+        .cloned()
+        .collect()
+}
+
+#[test]
+fn test_void_dataset_view_subsets_match_standalone_graph_void() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let quads_hdt = make_quads_hdt(temp_dir.path(), &nquads(GRAPH_QUADS), "quads", true);
+    let (ok, stdout, stderr) = run_void(
+        &quads_hdt,
+        &[
+            "--dataset-uri",
+            DS,
+            "--graph-view",
+            "dataset",
+            "--partition-distinct-counts",
+            "all",
+        ],
+    );
+    assert!(ok, "hdtc void --graph-view dataset failed: {stderr}");
+    let dataset_lines = line_set(&stdout);
+
+    let graphs = [
+        (None, format!("{DS}/default-graph")),
+        (Some(EX_G1), format!("{DS}/graph/{}", md5_hex(EX_G1))),
+        (Some(EX_G2), format!("{DS}/graph/{}", md5_hex(EX_G2))),
+    ];
+    for (index, (graph, subset_uri)) in graphs.iter().enumerate() {
+        let name = format!("graph{index}");
+        let standalone = make_hdt(temp_dir.path(), &graph_ntriples(GRAPH_QUADS, *graph), &name);
+        add_permutation_index(temp_dir.path(), &standalone, &name);
+        let (ok, standalone_stdout, stderr) = run_void(
+            &standalone,
+            &[
+                "--dataset-uri",
+                subset_uri,
+                "--partition-distinct-counts",
+                "all",
+            ],
+        );
+        assert!(ok, "standalone hdtc void failed for {graph:?}: {stderr}");
+
+        let mut subset = description_lines(&dataset_lines, subset_uri);
+        let sd_graph_type = format!(
+            "<{subset_uri}> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> \
+             <http://www.w3.org/ns/sparql-service-description#Graph> ."
+        );
+        assert!(
+            subset.remove(&sd_graph_type),
+            "subset {subset_uri} is not typed sd:Graph"
+        );
+
+        let expected = line_set(&standalone_stdout);
+        let missing: Vec<_> = expected.difference(&subset).collect();
+        let extra: Vec<_> = subset.difference(&expected).collect();
+        assert!(
+            missing.is_empty() && extra.is_empty(),
+            "subset for {graph:?} differs from a standalone run over its triples\n\
+             missing: {missing:#?}\nextra: {extra:#?}"
+        );
+    }
+}
+
+#[test]
+fn test_void_dataset_view_union_matches_union_view() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let quads_hdt = make_quads_hdt(temp_dir.path(), &nquads(GRAPH_QUADS), "quads", true);
+    let common = ["--dataset-uri", DS, "--partition-distinct-counts", "all"];
+
+    let (ok, union_stdout, stderr) = run_void(&quads_hdt, &common);
+    assert!(ok, "union view failed: {stderr}");
+    let mut dataset_args = common.to_vec();
+    dataset_args.extend(["--graph-view", "dataset"]);
+    let (ok, dataset_stdout, stderr) = run_void(&quads_hdt, &dataset_args);
+    assert!(ok, "dataset view failed: {stderr}");
+
+    let dataset_lines = line_set(&dataset_stdout);
+    let subset_link = format!("<{DS}> <http://rdfs.org/ns/void#subset> ");
+    let named_graph_link =
+        format!("<{DS}> <http://www.w3.org/ns/sparql-service-description#namedGraph> ");
+    let sd_dataset_type = format!(
+        "<{DS}> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> \
+         <http://www.w3.org/ns/sparql-service-description#Dataset> ."
+    );
+    let union_part: HashSet<String> = dataset_lines
+        .iter()
+        .filter(|line| {
+            (line.starts_with(&format!("<{DS}> "))
+                || line.starts_with(&format!("<{DS}/property/"))
+                || line.starts_with(&format!("<{DS}/class/")))
+                && !line.starts_with(&subset_link)
+                && !line.starts_with(&named_graph_link)
+                && **line != sd_dataset_type
+        })
+        .cloned()
+        .collect();
+
+    assert_eq!(
+        union_part,
+        line_set(&union_stdout),
+        "the dataset view must describe the union exactly as the union view does"
+    );
+    assert!(dataset_lines.contains(&sd_dataset_type));
+}
+
+#[test]
+fn test_void_dataset_view_links_graph_names() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let quads_hdt = make_quads_hdt(temp_dir.path(), &nquads(GRAPH_QUADS), "quads", true);
+    let (ok, stdout, stderr) = run_void(
+        &quads_hdt,
+        &["--dataset-uri", DS, "--graph-view", "dataset"],
+    );
+    assert!(ok, "hdtc void failed: {stderr}");
+    let triples = parse_ntriples(&stdout);
+    let smap = subject_map(&triples);
+    let ds = format!("<{DS}>");
+
+    let subsets: HashSet<String> = objects_for(&triples, &ds, "http://rdfs.org/ns/void#subset")
+        .into_iter()
+        .collect();
+    let default_subset = format!("<{DS}/default-graph>");
+    let g1_subset = format!("<{DS}/graph/{}>", md5_hex(EX_G1));
+    let g2_subset = format!("<{DS}/graph/{}>", md5_hex(EX_G2));
+    assert_eq!(
+        subsets,
+        HashSet::from([default_subset.clone(), g1_subset.clone(), g2_subset.clone()])
+    );
+
+    // One sd:NamedGraph per named graph, pairing the name with its subset.
+    let named_graphs = objects_for(
+        &triples,
+        &ds,
+        "http://www.w3.org/ns/sparql-service-description#namedGraph",
+    );
+    assert_eq!(named_graphs.len(), 2);
+    for (graph, subset) in [(EX_G1, &g1_subset), (EX_G2, &g2_subset)] {
+        let named = format!("<{DS}/named-graph/{}>", md5_hex(graph));
+        assert!(
+            named_graphs.contains(&named),
+            "missing sd:namedGraph {named}"
+        );
+        assert_eq!(
+            objects_for(
+                &triples,
+                &named,
+                "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+            ),
+            vec!["<http://www.w3.org/ns/sparql-service-description#NamedGraph>"]
+        );
+        assert_eq!(
+            objects_for(
+                &triples,
+                &named,
+                "http://www.w3.org/ns/sparql-service-description#name"
+            ),
+            vec![format!("<{graph}>")]
+        );
+        assert_eq!(
+            objects_for(
+                &triples,
+                &named,
+                "http://www.w3.org/ns/sparql-service-description#graph"
+            ),
+            vec![subset.clone()]
+        );
+    }
+
+    // The default graph is a subset, but not an sd:defaultGraph: a service's default
+    // graph is often the union, so hdtc does not claim either reading.
+    assert!(
+        find_by_predicate(
+            &triples,
+            "http://www.w3.org/ns/sparql-service-description#defaultGraph"
+        )
+        .is_empty()
+    );
+    assert_eq!(get_void_triples_count(&smap, &default_subset), Some(2));
+
+    // Memberships overlap, so subset triple counts sum past the union's.
+    assert_eq!(get_void_triples_count(&smap, &ds), Some(13));
+    assert_eq!(get_void_triples_count(&smap, &g1_subset), Some(6));
+    assert_eq!(get_void_triples_count(&smap, &g2_subset), Some(8));
+
+    // Typing is graph-local: g2 has an Employee partition but no Person partition,
+    // and bob's knows-edge from untyped alice contributes no class partition there.
+    assert!(
+        find_class_partition(&triples, &smap, &g2_subset, "<http://example.org/Employee>")
+            .is_some()
+    );
+    assert!(
+        find_class_partition(&triples, &smap, &g2_subset, "<http://example.org/Person>").is_none()
+    );
+    assert!(
+        find_class_partition(&triples, &smap, &g1_subset, "<http://example.org/Person>").is_some()
+    );
+    assert_eq!(
+        objects_for(
+            &triples,
+            &g2_subset,
+            "http://rdfs.org/ns/void#classPartition"
+        )
+        .len(),
+        1,
+        "the blank-node rdf:type object must not become a class in g2"
+    );
+}
+
+#[test]
+fn test_void_dataset_view_omits_empty_default_graph() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let named_only: Vec<_> = GRAPH_QUADS
+        .iter()
+        .copied()
+        .filter(|(_, graph)| graph.is_some())
+        .collect();
+    let quads_hdt = make_quads_hdt(temp_dir.path(), &nquads(&named_only), "named", true);
+    let (ok, stdout, stderr) = run_void(
+        &quads_hdt,
+        &["--dataset-uri", DS, "--graph-view", "dataset"],
+    );
+    assert!(ok, "hdtc void failed: {stderr}");
+
+    assert!(!stdout.contains(&format!("<{DS}/default-graph")));
+    let triples = parse_ntriples(&stdout);
+    assert_eq!(
+        objects_for(
+            &triples,
+            &format!("<{DS}>"),
+            "http://rdfs.org/ns/void#subset"
+        )
+        .len(),
+        2
+    );
+}
+
+#[test]
+fn test_void_dataset_view_blank_node_graph_name_has_no_sd_name() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let content = "<http://example.org/a> <http://example.org/p> <http://example.org/b> _:graph .\n\
+                   <http://example.org/a> <http://example.org/p> <http://example.org/c> <http://example.org/g> .\n";
+    let quads_hdt = make_quads_hdt(temp_dir.path(), content, "blank_graph", true);
+    let (ok, stdout, stderr) = run_void(
+        &quads_hdt,
+        &["--dataset-uri", DS, "--graph-view", "dataset"],
+    );
+    assert!(ok, "hdtc void failed: {stderr}");
+    let triples = parse_ntriples(&stdout);
+    let ds = format!("<{DS}>");
+
+    assert_eq!(
+        objects_for(&triples, &ds, "http://rdfs.org/ns/void#subset").len(),
+        2,
+        "both graphs get a subset"
+    );
+    let named_graphs = objects_for(
+        &triples,
+        &ds,
+        "http://www.w3.org/ns/sparql-service-description#namedGraph",
+    );
+    assert_eq!(
+        named_graphs,
+        vec![format!(
+            "<{DS}/named-graph/{}>",
+            md5_hex("http://example.org/g")
+        )],
+        "only the IRI-named graph can carry an sd:name"
+    );
+}
+
+#[test]
+fn test_void_dataset_view_blank_node_mode() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let quads_hdt = make_quads_hdt(temp_dir.path(), &nquads(GRAPH_QUADS), "quads", true);
+    let (ok, stdout, stderr) = run_void(
+        &quads_hdt,
+        &[
+            "--dataset-uri",
+            DS,
+            "--graph-view",
+            "dataset",
+            "--use-blank-nodes",
+        ],
+    );
+    assert!(ok, "hdtc void failed: {stderr}");
+    let triples = parse_ntriples(&stdout);
+    let ds = format!("<{DS}>");
+
+    let subsets = objects_for(&triples, &ds, "http://rdfs.org/ns/void#subset");
+    assert_eq!(subsets.len(), 3);
+    assert!(subsets.iter().all(|node| node.starts_with("_:")));
+    let names = find_by_predicate(
+        &triples,
+        "http://www.w3.org/ns/sparql-service-description#name",
+    );
+    assert_eq!(names.len(), 2);
+    assert!(names.iter().all(|(subject, object)| {
+        subject.starts_with("_:") && object.starts_with("<http://example.org/g")
+    }));
+    assert!(
+        !stdout.contains(&format!("<{DS}/")),
+        "no minted IRIs in blank-node mode"
+    );
+}
+
+#[test]
+fn test_void_dataset_view_many_graphs_use_sorted_transpose() {
+    // More graphs than the k-way layer merge accepts forces the external sort.
+    const GRAPHS: usize = 150;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let mut content = String::new();
+    for graph in 0..GRAPHS {
+        // Every graph holds a shared triple plus one of its own.
+        content.push_str(&format!(
+            "<http://example.org/s> <http://example.org/p> <http://example.org/shared> <http://example.org/g{graph}> .\n\
+             <http://example.org/s{graph}> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/C> <http://example.org/g{graph}> .\n"
+        ));
+    }
+    let quads_hdt = make_quads_hdt(temp_dir.path(), &content, "many", true);
+    let sort_dir = temp_dir.path().join("void_sort");
+    let (ok, stdout, stderr) = run_void(
+        &quads_hdt,
+        &[
+            "--dataset-uri",
+            DS,
+            "--graph-view",
+            "dataset",
+            "--temp-dir",
+            sort_dir.to_str().unwrap(),
+        ],
+    );
+    assert!(ok, "hdtc void failed: {stderr}");
+    assert!(
+        stderr.contains("transposing by external sort"),
+        "expected the sorted transpose: {stderr}"
+    );
+
+    let triples = parse_ntriples(&stdout);
+    let smap = subject_map(&triples);
+    let ds = format!("<{DS}>");
+    assert_eq!(get_void_triples_count(&smap, &ds), Some(GRAPHS as u64 + 1));
+    let subsets = objects_for(&triples, &ds, "http://rdfs.org/ns/void#subset");
+    assert_eq!(subsets.len(), GRAPHS);
+    for subset in &subsets {
+        assert_eq!(get_void_triples_count(&smap, subset), Some(2));
+        assert_eq!(
+            get_void_int(&smap, subset, "http://rdfs.org/ns/void#distinctSubjects"),
+            Some(2)
+        );
+        assert_eq!(
+            get_void_int(&smap, subset, "http://rdfs.org/ns/void#distinctObjects"),
+            Some(2)
+        );
+        let class_partition =
+            find_class_partition(&triples, &smap, subset, "<http://example.org/C>").unwrap();
+        assert_eq!(
+            get_void_int(&smap, &class_partition, "http://rdfs.org/ns/void#entities"),
+            Some(1)
+        );
+    }
+}
+
+#[test]
+fn test_void_dataset_view_requires_graph_artifacts() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let dataset_args = ["--dataset-uri", DS, "--graph-view", "dataset"];
+
+    let triples_hdt = make_hdt(temp_dir.path(), VOID_NT, "triples_only");
+    let (ok, _, stderr) = run_void(&triples_hdt, &dataset_args);
+    assert!(!ok);
+    assert!(stderr.contains("graph sidecar"), "{stderr}");
+
+    let bare_quads = make_quads_hdt(temp_dir.path(), &nquads(GRAPH_QUADS), "bare", false);
+    // The union view needs none of the graph artifacts.
+    let (ok, _, stderr) = run_void(&bare_quads, &["--dataset-uri", DS]);
+    assert!(ok, "union view failed: {stderr}");
+
+    let (ok, _, stderr) = run_void(&bare_quads, &dataset_args);
+    assert!(!ok);
+    assert!(stderr.contains("hdtc graphs-index"), "{stderr}");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_hdtc"))
+        .args([
+            "graphs-index",
+            bare_quads.to_str().unwrap(),
+            "--temp-dir",
+            temp_dir.path().join("bare_graphs_work").to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute hdtc graphs-index");
+    assert!(
+        output.status.success(),
+        "hdtc graphs-index failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let (ok, _, stderr) = run_void(&bare_quads, &dataset_args);
+    assert!(!ok);
+    assert!(stderr.contains("hdtc perm"), "{stderr}");
+
+    add_permutation_index(temp_dir.path(), &bare_quads, "bare");
+    let (ok, _, stderr) = run_void(&bare_quads, &dataset_args);
+    assert!(
+        ok,
+        "dataset view failed with every artifact present: {stderr}"
     );
 }

@@ -5,6 +5,7 @@ mod export;
 mod id_quad;
 mod reader;
 mod search;
+pub(crate) mod transpose;
 pub(crate) mod writer;
 
 pub use assignment::{GraphAssignments, SourceGraphAssignment};

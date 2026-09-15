@@ -6,17 +6,15 @@ use crate::io::{StreamingBitmapEncoder, StreamingLogArrayEncoder};
 use crate::permutation::{
     PermEntry, PermutationCollector, PositionMaps, PreparedPermutationAssembler, scan_hdt,
 };
+use crate::quads::transpose::{PositionMajorMemberships, layer_merge_reserve};
 use crate::quads::writer::encode_layer_set;
 use crate::quads::{
-    GraphMembership, GraphSidecarReader, LayerMemberIter, PositionGraphMembership,
-    canonical_sidecar_path,
+    GraphMembership, GraphSidecarReader, PositionGraphMembership, canonical_sidecar_path,
 };
 use crate::sort::{ExternalSorter, MergeIterator, Sortable};
 use crate::triples::BitmapTriplesFiles;
 use crate::triples::id_triple::IdTriple;
 use anyhow::{Context, Result, ensure};
-use std::cmp::Reverse;
-use std::collections::BinaryHeap;
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
@@ -47,10 +45,6 @@ const HAS_MEMBERSHIP_IDS: u64 = 1 << 3;
 const DIRECT_PREPARED_LAYER_LIMIT: u64 = 128;
 const DIRECT_PREPARED_LAYER_BUFFER: usize = 64 * 1024;
 const DIRECT_PREPARED_LAYER_ESTIMATED_BYTES: usize = 2 * 1024 * 1024;
-const LAYER_MERGE_LIMIT: u64 = 128;
-// A chunked layer decodes one 2^POSITION_CHUNK_SHIFT container at a time, so a
-// fully dense container is the resident cost of holding one layer iterator.
-const LAYER_MERGE_ESTIMATED_BYTES: usize = (1 << POSITION_CHUNK_SHIFT) * 8;
 // Memberships per triple past which repeating a triple's key once per
 // membership costs more than the extra sorts the mapping strategy needs.
 const DECORATED_MULTIPLICITY_LIMIT: u64 = 16;
@@ -262,138 +256,6 @@ impl PreparedGraphIndexCollector {
             .checked_add(1)
             .context("prepared graph-index membership count overflow")?;
         Ok(())
-    }
-}
-
-/// Position-major memberships produced by merging the sidecar's layers.
-///
-/// Every layer is already strictly increasing in position, so transposing the
-/// sidecar is a k-way merge rather than a sort of all memberships: nothing
-/// spills, and each layer contributes one buffered iterator.
-struct LayerMergeIter {
-    layers: Vec<LayerMemberIter>,
-    heads: BinaryHeap<Reverse<(u64, usize)>>,
-}
-
-impl LayerMergeIter {
-    fn new(sidecar: &mut GraphSidecarReader, named_graphs: u64) -> Result<Self> {
-        let count = usize::try_from(
-            named_graphs
-                .checked_add(1)
-                .context("layer-merge layer count overflow")?,
-        )
-        .context("layer-merge layer count overflow")?;
-        let mut layers = Vec::with_capacity(count);
-        let mut heads = BinaryHeap::with_capacity(count);
-        for graph in 0..=named_graphs {
-            let mut layer = sidecar.layer_iter(graph)?;
-            if let Some(position) = layer.next().transpose()? {
-                heads.push(Reverse((position, layers.len())));
-            }
-            layers.push(layer);
-        }
-        Ok(Self { layers, heads })
-    }
-}
-
-impl Iterator for LayerMergeIter {
-    type Item = Result<PositionGraphMembership>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let Reverse((position, index)) = self.heads.pop()?;
-        match self.layers[index].next().transpose() {
-            Ok(Some(next)) => self.heads.push(Reverse((next, index))),
-            Ok(None) => {}
-            Err(error) => return Some(Err(error)),
-        }
-        Some(Ok(PositionGraphMembership {
-            position,
-            graph: index as u64,
-        }))
-    }
-}
-
-/// The sidecar's memberships in `(position, graph)` order.
-///
-/// A bounded graph dictionary merges its layers directly. Past that the layers
-/// no longer fit as concurrent iterators, so the memberships go through the
-/// bounded external sort instead.
-enum PositionMajorMemberships {
-    Merged(LayerMergeIter),
-    // The sorter owns the chunk files its iterator reads, so it has to outlive
-    // the merge it handed out.
-    Sorted {
-        // Owns the chunk files its iterator reads, so it outlives the merge.
-        _sorter: ExternalSorter,
-        sorted: MergeIterator<PositionGraphMembership>,
-    },
-}
-
-/// Bytes the k-way layer merge holds resident, or `None` if it does not apply.
-///
-/// The merge keeps one buffered iterator per layer, so its cost is known up
-/// front rather than budgeted as a fraction. Reporting it lets the caller hand
-/// the rest of the budget to the POS/OPS sorts, which is where it does work.
-fn layer_merge_reserve(layer_count: u64, memory_budget: usize) -> Option<usize> {
-    if layer_count > LAYER_MERGE_LIMIT {
-        return None;
-    }
-    let reserve = layer_count
-        .checked_mul(LAYER_MERGE_ESTIMATED_BYTES as u64)
-        .and_then(|bytes| usize::try_from(bytes).ok())?;
-    (reserve <= memory_budget / 2).then_some(reserve)
-}
-
-impl PositionMajorMemberships {
-    fn open(
-        sidecar: &mut GraphSidecarReader,
-        named_graphs: u64,
-        temp_dir: &Path,
-        memory_budget: usize,
-        merge: bool,
-    ) -> Result<Self> {
-        let layer_count = named_graphs
-            .checked_add(1)
-            .context("layer-merge layer count overflow")?;
-        if merge {
-            tracing::info!(layer_count, "Transposing graph layers by k-way merge");
-            return Ok(Self::Merged(LayerMergeIter::new(sidecar, named_graphs)?));
-        }
-        tracing::info!(
-            layer_count,
-            "Graph count exceeds layer-merge resource limit; transposing by external sort"
-        );
-        let mut sorter = ExternalSorter::new(temp_dir, memory_budget.max(1));
-        let mut buffer = Vec::new();
-        let mut memory = 0usize;
-        for graph in 0..=named_graphs {
-            for position in sidecar.layer_iter(graph)? {
-                sorter.push(
-                    PositionGraphMembership {
-                        position: position?,
-                        graph,
-                    },
-                    &mut buffer,
-                    &mut memory,
-                )?;
-            }
-        }
-        let sorted = sorter.finish(&mut buffer)?;
-        Ok(Self::Sorted {
-            _sorter: sorter,
-            sorted,
-        })
-    }
-}
-
-impl Iterator for PositionMajorMemberships {
-    type Item = Result<PositionGraphMembership>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match self {
-            Self::Merged(inner) => inner.next(),
-            Self::Sorted { sorted, .. } => sorted.next(),
-        }
     }
 }
 
