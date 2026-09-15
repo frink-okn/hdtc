@@ -16,7 +16,7 @@ Development of hdtc is done primarily through Claude Code.
 - **Parallel NT/NQ parsing** — newline-safe chunk parsing for N-Triples/N-Quads (including `.gz`, `.bz2`, `.xz`, `.zst`) with bounded in-flight memory
 - **Two query indexes** — standard FoQ `.hdt.index.v1-1` and memory-mapped POS/OPS `.hdt.perm` indexes enable efficient `? P ?`, `? ? O`, and `? P O` queries
 - **Graph index** — optional `.hdt.graphs.idx` POS/OPS layer sets scope index-side patterns to a graph; optional SPO transpose sections accelerate membership counts and graph projection
-- **VoID statistics** — compute dataset-level, property, and class partition statistics as N-Triples
+- **VoID statistics** — compute dataset-level, property, and class partition statistics as N-Triples, optionally with a `void:subset` for every named graph of a quads HDT
 - **Namespace inventories** — count distinct subject, predicate, object, and graph-wide IRIs against curated YAML or JSON prefix tables
 - **Structural validation** — walk an HDT's triple structures and checksums, plus discovered graph and permutation sidecars, end to end
 - **Resilient parsing** — skips malformed triples with warnings, reports total skipped at the end
@@ -467,6 +467,41 @@ scope still maintains a scalar tracker for every emitted partition combination;
 that memory is proportional to partition cardinality and is not governed by
 `--memory-limit`.
 
+#### Describing named graphs
+
+For a quads HDT, `--graph-view dataset` describes the triples union as above and
+adds one `void:subset` per graph of the RDF dataset, each with the full set of
+statistics and partitions:
+
+```sh
+hdtc create data.nq -o data.hdt -m quads --perm --graphs-index
+hdtc void data.hdt --dataset-uri http://example.org/mydataset --graph-view dataset
+```
+
+A graph's subset is exactly what `hdtc void` would emit over that graph's
+triples alone, so class typing is local to the graph, and subset counts need not
+add up to the union's: a triple in two graphs counts in both, and distinct counts
+are set sizes. Subsets are named beneath the dataset IRI
+(`{dataset}/graph/{md5(graph IRI)}`) and linked to their graph names with SPARQL
+Service Description:
+
+```turtle
+<http://example.org/mydataset> void:subset <http://example.org/mydataset/graph/9f2c…> ;
+    sd:namedGraph <http://example.org/mydataset/named-graph/9f2c…> .
+<http://example.org/mydataset/named-graph/9f2c…> a sd:NamedGraph ;
+    sd:name <http://example.org/graph1> ;
+    sd:graph <http://example.org/mydataset/graph/9f2c…> .
+```
+
+The default graph is described, as `{dataset}/default-graph`, only when it holds
+triples. The union's own description is unchanged by this view. The dataset view
+requires the `.graphs` sidecar, `.hdt.perm`, and a `.hdt.graphs.idx` with OPS
+layers, which per-graph distinct objects need. Partition statistics are repeated
+for every graph, so analysis memory grows with graphs × partitions; past 128
+graphs, membership transposes use an external sort in `--temp-dir`. See the
+[VoID description specification](docs/void-format.md) for the complete output
+shape and node-naming scheme.
+
 The default algorithm uses two sequential passes over the HDT triples plus a
 dictionary scan and requires no index. Requesting partition distinct counts adds
 an index-backed third pass:
@@ -475,6 +510,8 @@ an index-backed third pass:
 2. **Datatype index** — a sequential scan of the object-only dictionary section extracts each literal's datatype or language tag, building a compact 2-byte-per-entry index. Shared-section terms are skipped (literals can never be subjects, so shared terms are always URIs or blank nodes).
 3. **Pass 2** scans all triples again to accumulate per-property and per-class statistics, including datatype and language counts, using the indices from the previous steps.
 4. **Optional OPS pass** scans the permutation sidecar when `--partition-distinct-counts` is requested, adding exact distinct-object counts without per-partition object sets.
+
+With `--graph-view dataset`, each pass also joins its scan against the graph memberships in the same order — the `.graphs` sidecar for passes 1 and 2, the OPS layers of `.hdt.graphs.idx` for the OPS pass, which then always runs — and accumulates every graph's statistics alongside the union's.
 
 Partition URIs are generated using MD5 hashes of the corresponding class, property, datatype, or language tag. Blank-node classes (common in OWL ontologies) are automatically filtered out and do not produce class partitions.
 
@@ -699,7 +736,9 @@ Named-graph options (`-m quads`, `--graph-map`, `--default-graph`,
 | `-o, --output PATH`       | stdout                       | Write VoID N-Triples to file instead of stdout                      |
 | `--use-blank-nodes`       | off                          | Use blank nodes for partition identifiers instead of URI references |
 | `--partition-distinct-counts SCOPE` | off                 | Add exact distinct subject/object counts; `dataset-properties` or `all` (requires `.hdt.perm`) |
-| `-m, --memory-limit SIZE` | `4G`                         | Soft memory limit for dictionary caches (e.g. `4G`, `2000M`)        |
+| `--graph-view union\|dataset` | `union`                | Describe the union only, or also one `void:subset` per graph (dataset requires `.graphs`, `.hdt.perm`, `.hdt.graphs.idx`) |
+| `--temp-dir DIR`          | system temp                  | Directory for the external membership sort used past 128 graphs     |
+| `-m, --memory-limit SIZE` | `4G`                         | Soft memory limit for dictionary caches and graph-membership transposes (e.g. `4G`, `2000M`) |
 | `-v, --verbose`           | —                            | Increase log verbosity (`-v` debug, `-vv` trace)                    |
 | `-q, --quiet`             | —                            | Suppress all output except errors                                   |
 
@@ -892,7 +931,8 @@ sidecars.
 Reading a dataset back is covered under
 [Dump](#dump-exporting-the-union-or-dataset) (`--graph-view dataset`) and
 [Search](#search-querying-triples-and-graph-memberships) (four-position
-patterns).
+patterns). [Void](#describing-named-graphs) (`--graph-view dataset`) describes
+each graph with its own VoID statistics.
 
 ### Membership and overlap sketches
 
@@ -1234,6 +1274,7 @@ docs/
   graphs-sidecar-format.md  Normative .graphs sidecar format
   sketch-format.md          Normative .filter / .minhash formats
   keyset-format.md          Normative .keys format
+  void-format.md            Normative VoID output shape and graph subsets
 ```
 
 `hdtc sketch` and `hdtc keyset` derive their artifacts from one pass over an HDT
