@@ -21,5 +21,5 @@ pub use namespaces::{NamespaceConfig, NamespaceOutputFormat, write_namespace_inv
 pub use search::{SearchQuery, parse_search_query, search_hdt_streaming};
 pub use sketch::{SketchConfig, create_sketches};
 pub use text_search::{TextSearchOptions, search_text_streaming};
-pub use void::{PartitionDistinctScope, compute_void};
+pub use void::{PartitionDistinctScope, VoidGraphView, VoidOptions, compute_void};
 pub use writer::write_hdt_streaming;

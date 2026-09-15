@@ -278,7 +278,10 @@ impl GraphIndex {
         self.header.flags & HAS_MEMBERSHIP_IDS != 0
     }
 
-    fn layers_mut(&mut self, space: GraphIndexSpace) -> Result<&mut EmbeddedLayerSetReader> {
+    pub(crate) fn layers_mut(
+        &mut self,
+        space: GraphIndexSpace,
+    ) -> Result<&mut EmbeddedLayerSetReader> {
         match space {
             GraphIndexSpace::Pos => self.pos_layers.as_mut(),
             GraphIndexSpace::Ops => self.ops_layers.as_mut(),

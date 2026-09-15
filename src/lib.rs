@@ -1041,13 +1041,23 @@ fn compute_void(args: cli::VoidArgs, benchmark: bool) -> Result<()> {
         cli::VoidPartitionDistinctScope::All => hdt::PartitionDistinctScope::All,
     });
 
+    let graph_view = match args.graph_view {
+        cli::VoidGraphView::Union => hdt::VoidGraphView::Union,
+        cli::VoidGraphView::Dataset => hdt::VoidGraphView::Dataset,
+    };
+    tracing::info!("Graph view: {:?}", args.graph_view);
+
     let count = hdt::compute_void(
         &args.hdt_file,
-        &args.dataset_uri,
-        args.output.as_deref(),
-        args.use_blank_nodes,
-        memory_limit,
-        distinct_scope,
+        &hdt::VoidOptions {
+            dataset_uri: &args.dataset_uri,
+            output_path: args.output.as_deref(),
+            use_blank_nodes: args.use_blank_nodes,
+            memory_limit,
+            distinct_scope,
+            graph_view,
+            temp_dir: args.temp_dir.as_deref(),
+        },
     )?;
 
     if benchmark {
