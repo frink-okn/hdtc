@@ -27,6 +27,16 @@ use std::sync::{Arc, Condvar, Mutex};
 /// the largest term actually needs.
 pub const DEFAULT_MAX_TERM_BYTES: usize = 256 * 1024 * 1024;
 
+/// What the lexer buffer holds beyond the term itself: the term's delimiters
+/// and the few bytes of lookahead that end it. Added to the bound when a
+/// parser is built, so a term of exactly `--max-term-bytes` is accepted.
+const TERM_SLACK: usize = 4096;
+
+/// How many consecutive interrupted reads are retried before the input is
+/// failed. A signal mid-`read(2)` clears on retry; a reader that reports
+/// `Interrupted` forever would otherwise spin with no diagnostic.
+const MAX_INTERRUPTED_RETRIES: u32 = 1000;
+
 /// Parser parallelism controls.
 #[derive(Debug, Clone)]
 pub struct ParseOptions {
@@ -261,21 +271,79 @@ where
 ///
 /// No term bound applies: `hdtc header` accepts terms up to its own
 /// `--max-term-bytes`, and every reader of a header must accept whatever the
-/// writer wrote, so the header goes through the vendored parser over the full
-/// slice rather than through the registry parser and its fixed 16 MiB buffer.
-/// Strict, not lenient: a malformed header line is an error, never skipped.
+/// writer wrote. What makes that so is `for_slice`: a lexer over a slice has
+/// no buffer to bound, so `with_max_buffer_size` would be inert here, whereas
+/// `for_reader` would reinstate the fixed 16 MiB buffer and break those
+/// headers again. Strict, not lenient: a malformed line is an error, never
+/// skipped.
 pub(crate) fn header_triples(
     text: &[u8],
 ) -> impl Iterator<Item = std::result::Result<Triple, oxttl::TurtleSyntaxError>> + '_ {
-    oxttl::NTriplesParser::new()
-        .with_max_buffer_size(usize::MAX)
-        .for_slice(text)
+    oxttl::NTriplesParser::new().for_slice(text)
+}
+
+/// The counts an HDT header records about its data.
+pub(crate) struct HeaderCounts {
+    /// `void:triples` and `hdt:triplesnumTriples`, which must agree when both
+    /// are present.
+    pub triples: u64,
+    /// `hdt:originalSize`, or zero when absent.
+    pub original_size: u64,
+}
+
+/// Read the counts out of an HDT header. One scan for every reader of the
+/// header, which used to carry four copies of it.
+pub(crate) fn header_counts(text: &[u8]) -> Result<HeaderCounts> {
+    const VOID_TRIPLES: &str = "http://rdfs.org/ns/void#triples";
+    const HDT_TRIPLES_NUM: &str = "http://purl.org/HDT/hdt#triplesnumTriples";
+    const ORIGINAL_SIZE: &str = "http://purl.org/HDT/hdt#originalSize";
+
+    let mut from_void: Option<u64> = None;
+    let mut from_hdt: Option<u64> = None;
+    let mut original_size = 0u64;
+
+    for result in header_triples(text) {
+        let triple = result.context("Invalid N-Triples in HDT header metadata")?;
+        let predicate = triple.predicate.as_str();
+        if predicate != VOID_TRIPLES && predicate != HDT_TRIPLES_NUM && predicate != ORIGINAL_SIZE {
+            continue;
+        }
+        let Term::Literal(literal) = triple.object else {
+            continue;
+        };
+        if predicate == ORIGINAL_SIZE {
+            if let Ok(size) = literal.value().parse::<u64>() {
+                original_size = size;
+            }
+            continue;
+        }
+        let parsed = literal.value().parse::<u64>().with_context(|| {
+            format!("Invalid numeric triple-count literal: {}", literal.value())
+        })?;
+        if predicate == VOID_TRIPLES {
+            from_void = Some(parsed);
+        } else {
+            from_hdt = Some(parsed);
+        }
+    }
+
+    let triples = match (from_void, from_hdt) {
+        (Some(v), Some(h)) if v != h => anyhow::bail!(
+            "Header triple-count mismatch between void:triples ({v}) and hdt:triplesnumTriples ({h})"
+        ),
+        (Some(v), _) => v,
+        (None, Some(h)) => h,
+        (None, None) => anyhow::bail!("Header metadata missing triple-count predicate"),
+    };
+    Ok(HeaderCounts {
+        triples,
+        original_size,
+    })
 }
 
 /// Triples parsed from an RDF input, in oxrdf form (for header serialization).
 pub(crate) struct ParsedTriples {
     pub triples: Vec<Triple>,
-    pub errors: u64,
     /// True if any quad carried a non-default graph (dropped — headers are triples-only).
     pub named_graph_seen: bool,
 }
@@ -287,6 +355,11 @@ pub(crate) struct ParsedTriples {
 /// an HDT header. When `blank_prefix` is non-empty, blank-node labels are
 /// prefixed with it, which keeps blank nodes from different sources disjoint
 /// (used when merging input triples into an existing header).
+///
+/// Strict, and any error ends the parse: what is written into a header is read
+/// back strictly by everything that opens the HDT, so a leniently accepted term
+/// (an IRI with a space) or a skipped line would make the file unreadable or
+/// silently incomplete.
 pub(crate) fn parse_rdf_to_triples(
     input: &RdfInput,
     base_uri: Option<&str>,
@@ -294,17 +367,18 @@ pub(crate) fn parse_rdf_to_triples(
     max_term_bytes: usize,
 ) -> Result<ParsedTriples> {
     let reader = open_input(input)?;
-    let parser = LenientParser::new(input.format, base_uri, max_term_bytes);
+    let parser = FormatParser::new(input.format, base_uri, max_term_bytes, Strictness::Strict);
 
     let mut out = ParsedTriples {
         triples: Vec::new(),
-        errors: 0,
         named_graph_seen: false,
     };
+    let mut interrupted = 0u32;
 
     for result in parser.for_reader(reader) {
         match result {
             Ok(quad) => {
+                interrupted = 0;
                 if !matches!(quad.graph_name, GraphName::DefaultGraph) {
                     out.named_graph_seen = true;
                 }
@@ -313,33 +387,11 @@ pub(crate) fn parse_rdf_to_triples(
                 out.triples
                     .push(Triple::new(subject, quad.predicate, object));
             }
-            Err(e) if e.is_interrupted() => continue,
-            Err(e) if e.is_fatal() => return Err(e.into_fatal(&input.path, max_term_bytes)),
-            Err(e) => {
-                out.errors += 1;
-                if out.errors <= 10 {
-                    tracing::warn!(
-                        "Skipping malformed input in {}: {}",
-                        input.path.display(),
-                        e
-                    );
-                } else if out.errors == 11 {
-                    tracing::warn!(
-                        "Further parse errors in {} will be suppressed",
-                        input.path.display()
-                    );
-                }
+            Err(e) if e.is_interrupted() && interrupted < MAX_INTERRUPTED_RETRIES => {
+                interrupted += 1;
             }
+            Err(e) => return Err(e.into_fatal(&input.path, max_term_bytes)),
         }
-    }
-
-    if out.errors > 0 {
-        tracing::warn!(
-            "{}: parsed {} triples, skipped {} errors",
-            input.path.display(),
-            out.triples.len(),
-            out.errors
-        );
     }
 
     Ok(out)
@@ -408,7 +460,7 @@ fn stream_quads_from_reader<F>(
 where
     F: FnMut(ExtractedQuad) -> Result<()>,
 {
-    let parser = LenientParser::new(input.format, base_uri, max_term_bytes);
+    let parser = FormatParser::new(input.format, base_uri, max_term_bytes, Strictness::Lenient);
 
     let blank_prefix = if disambiguate_blank_nodes {
         format!("f{file_index}_")
@@ -417,10 +469,12 @@ where
     };
     let mut stats = ParseStats::default();
     let mut graph_interner = GraphInterner::default();
+    let mut interrupted = 0u32;
 
     for result in parser.for_reader(reader) {
         match result {
             Ok(quad) => {
+                interrupted = 0;
                 // Calculate original N-Triples size BEFORE adding blank node prefix
                 let original_size = calculate_original_ntriples_size(
                     &quad.subject,
@@ -444,9 +498,12 @@ where
                     graph,
                 })?;
             }
-            Err(e) if e.is_interrupted() => continue,
+            Err(e) if e.is_interrupted() && interrupted < MAX_INTERRUPTED_RETRIES => {
+                interrupted += 1;
+            }
             Err(e) if e.is_fatal() => return Err(e.into_fatal(&input.path, max_term_bytes)),
             Err(e) => {
+                interrupted = 0;
                 stats.errors += 1;
                 if stats.errors <= 10 {
                     tracing::warn!(
@@ -504,7 +561,8 @@ impl ParseError {
     }
 
     /// A read interrupted by a signal. Nothing was consumed, so the same read
-    /// is simply tried again, as every `Read` loop in std does.
+    /// is tried again, as every `Read` loop in std does — up to
+    /// [`MAX_INTERRUPTED_RETRIES`] times in a row, after which it is fatal.
     fn is_interrupted(&self) -> bool {
         self.io_error()
             .is_some_and(|e| e.kind() == io::ErrorKind::Interrupted)
@@ -513,14 +571,14 @@ impl ParseError {
     /// Whether this error ends the input rather than being skipped.
     ///
     /// A syntax error is skippable: the parser has consumed the bad token and
-    /// resynchronises after it. Any other I/O error is not: the reader loop
-    /// reports it without moving the lexer, so asking again yields the same
-    /// error forever. That is also how a term past the buffer bound surfaces,
-    /// and the released oxttl spins on exactly that case, rescanning its full
-    /// buffer per iteration.
+    /// resynchronises after it. An I/O error is not: the reader loop reports
+    /// it without moving the lexer, so asking again yields the same error
+    /// forever. That is also how a term past the buffer bound surfaces, and
+    /// the released oxttl spins on exactly that case, rescanning its full
+    /// buffer per iteration. An interrupted read is the one I/O error retried
+    /// first; the callers give up on it after [`MAX_INTERRUPTED_RETRIES`].
     fn is_fatal(&self) -> bool {
-        self.io_error()
-            .is_some_and(|e| e.kind() != io::ErrorKind::Interrupted)
+        self.io_error().is_some()
     }
 
     /// The lexer refused a single term larger than its buffer — recognised by
@@ -541,6 +599,8 @@ impl ParseError {
             format!(
                 "a single IRI or literal is larger than --max-term-bytes ({max_term_bytes} bytes); raise it"
             )
+        } else if self.is_interrupted() {
+            format!("read interrupted {MAX_INTERRUPTED_RETRIES} times in a row")
         } else {
             "unrecoverable read error".to_owned()
         };
@@ -564,13 +624,23 @@ fn with_base<P: Clone, E>(
     }
 }
 
-/// A lenient parser for one input format, honouring the term-size bound.
+/// Whether a parser skips what it cannot validate or refuses it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Strictness {
+    /// Data loads: malformed statements are skipped and counted.
+    Lenient,
+    /// Header edits: what is written is read back strictly, so nothing that
+    /// would fail that read may be accepted.
+    Strict,
+}
+
+/// A parser for one input format, honouring the term-size bound.
 ///
 /// The Turtle family — Turtle, TriG, N-Triples, N-Quads and N3 — is built from
 /// the vendored oxttl directly, because oxrdfio's generic `RdfParser` offers no
 /// way to set the bound ([`DEFAULT_MAX_TERM_BYTES`]); RDF/XML and JSON-LD go
 /// through oxrdfio as before.
-enum LenientParser {
+enum FormatParser {
     Turtle(oxttl::TurtleParser),
     TriG(oxttl::TriGParser),
     NTriples(oxttl::NTriplesParser),
@@ -627,45 +697,68 @@ fn n3_to_quad(quad: N3Quad) -> std::result::Result<Quad, ParseError> {
     Ok(Quad::new(subject, predicate, object, quad.graph_name))
 }
 
-impl LenientParser {
-    fn new(format: RdfFormat, base_uri: Option<&str>, max_term_bytes: usize) -> Self {
+impl FormatParser {
+    fn new(
+        format: RdfFormat,
+        base_uri: Option<&str>,
+        max_term_bytes: usize,
+        strictness: Strictness,
+    ) -> Self {
+        let lenient = strictness == Strictness::Lenient;
+        // The lexer holds the term plus its delimiters and lookahead, so the
+        // buffer is the bound plus slack: a term of exactly the bound fits.
+        let buffer = max_term_bytes.saturating_add(TERM_SLACK);
         match format {
-            RdfFormat::Turtle => Self::Turtle(with_base(
-                oxttl::TurtleParser::new()
-                    .lenient()
-                    .with_max_buffer_size(max_term_bytes),
-                base_uri,
-                |parser, base| parser.with_base_iri(base),
-            )),
-            RdfFormat::TriG => Self::TriG(with_base(
-                oxttl::TriGParser::new()
-                    .lenient()
-                    .with_max_buffer_size(max_term_bytes),
-                base_uri,
-                |parser, base| parser.with_base_iri(base),
-            )),
-            RdfFormat::NTriples => Self::NTriples(
-                oxttl::NTriplesParser::new()
-                    .lenient()
-                    .with_max_buffer_size(max_term_bytes),
-            ),
-            RdfFormat::NQuads => Self::NQuads(
-                oxttl::NQuadsParser::new()
-                    .lenient()
-                    .with_max_buffer_size(max_term_bytes),
-            ),
-            RdfFormat::N3 => Self::N3(with_base(
-                oxttl::N3Parser::new()
-                    .lenient()
-                    .with_max_buffer_size(max_term_bytes),
-                base_uri,
-                |parser, base| parser.with_base_iri(base),
-            )),
-            other => Self::Generic(with_base(
-                oxrdfio::RdfParser::from_format(to_oxrdf_format(other)).lenient(),
-                base_uri,
-                |parser, base| parser.with_base_iri(base),
-            )),
+            RdfFormat::Turtle => {
+                let mut parser = oxttl::TurtleParser::new().with_max_buffer_size(buffer);
+                if lenient {
+                    parser = parser.lenient();
+                }
+                Self::Turtle(with_base(parser, base_uri, |parser, base| {
+                    parser.with_base_iri(base)
+                }))
+            }
+            RdfFormat::TriG => {
+                let mut parser = oxttl::TriGParser::new().with_max_buffer_size(buffer);
+                if lenient {
+                    parser = parser.lenient();
+                }
+                Self::TriG(with_base(parser, base_uri, |parser, base| {
+                    parser.with_base_iri(base)
+                }))
+            }
+            RdfFormat::NTriples => {
+                let mut parser = oxttl::NTriplesParser::new().with_max_buffer_size(buffer);
+                if lenient {
+                    parser = parser.lenient();
+                }
+                Self::NTriples(parser)
+            }
+            RdfFormat::NQuads => {
+                let mut parser = oxttl::NQuadsParser::new().with_max_buffer_size(buffer);
+                if lenient {
+                    parser = parser.lenient();
+                }
+                Self::NQuads(parser)
+            }
+            RdfFormat::N3 => {
+                let mut parser = oxttl::N3Parser::new().with_max_buffer_size(buffer);
+                if lenient {
+                    parser = parser.lenient();
+                }
+                Self::N3(with_base(parser, base_uri, |parser, base| {
+                    parser.with_base_iri(base)
+                }))
+            }
+            other => {
+                let mut parser = oxrdfio::RdfParser::from_format(to_oxrdf_format(other));
+                if lenient {
+                    parser = parser.lenient();
+                }
+                Self::Generic(with_base(parser, base_uri, |parser, base| {
+                    parser.with_base_iri(base)
+                }))
+            }
         }
     }
 
@@ -791,12 +884,17 @@ where
     let (task_tx, task_rx) = crossbeam_channel::bounded::<ChunkTask>(task_capacity);
     let (result_tx, result_rx) = crossbeam_channel::bounded::<ChunkParsed>(result_capacity);
     let budget = Arc::new(InflightBudget::new(options.max_inflight_bytes));
+    // Raised by the worker that hits a fatal chunk. The others still answer
+    // every queued task, so the producer's sequence numbering stays complete,
+    // but answer it empty rather than parse a build that is already lost.
+    let aborted = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     let mut worker_handles = Vec::with_capacity(chunk_workers);
     for _ in 0..chunk_workers {
         let task_rx = task_rx.clone();
         let result_tx = result_tx.clone();
         let budget = Arc::clone(&budget);
+        let aborted = Arc::clone(&aborted);
         let base_uri = base_uri.map(ToOwned::to_owned);
         let blank_prefix = blank_prefix.clone();
         let format = input.format;
@@ -816,11 +914,25 @@ where
                     error_samples: Vec::new(),
                     fatal: None,
                 };
+                if aborted.load(std::sync::atomic::Ordering::Relaxed) {
+                    budget.release(chunk_len);
+                    if result_tx.send(parsed).is_err() {
+                        return Ok(());
+                    }
+                    continue;
+                }
+                let mut interrupted = 0u32;
 
-                let parser = LenientParser::new(format, base_uri.as_deref(), max_term_bytes);
+                let parser = FormatParser::new(
+                    format,
+                    base_uri.as_deref(),
+                    max_term_bytes,
+                    Strictness::Lenient,
+                );
                 for result in parser.for_reader(task.bytes.as_slice()) {
                     match result {
                         Ok(quad) => {
+                            interrupted = 0;
                             let original_size = calculate_original_ntriples_size(
                                 &quad.subject,
                                 &quad.predicate,
@@ -844,13 +956,17 @@ where
                                 graph,
                             });
                         }
-                        Err(e) if e.is_interrupted() => continue,
+                        Err(e) if e.is_interrupted() && interrupted < MAX_INTERRUPTED_RETRIES => {
+                            interrupted += 1;
+                        }
                         Err(e) => {
                             if e.is_fatal() {
+                                aborted.store(true, std::sync::atomic::Ordering::Relaxed);
                                 parsed.fatal =
                                     Some(format!("{:#}", e.into_fatal(&path, max_term_bytes)));
                                 break;
                             }
+                            interrupted = 0;
                             parsed.stats.errors += 1;
                             if parsed.error_samples.len() < 12 {
                                 parsed.error_samples.push(e.to_string());
@@ -880,6 +996,7 @@ where
     let produce_result = read_newline_chunks(
         reader.as_mut(),
         options.chunk_size_bytes.max(1),
+        options.max_term_bytes,
         |chunk_bytes| {
             budget.acquire(chunk_bytes.len());
             let task = ChunkTask {
@@ -945,28 +1062,46 @@ where
         return Err(e);
     }
 
-    while next_sequence < task_count {
-        let parsed = result_rx
-            .recv()
-            .map_err(|_| anyhow::anyhow!("Chunk parser result channel disconnected"))?;
-        consume_parsed_chunk(
-            input,
-            parsed,
-            &mut pending,
-            &mut next_sequence,
-            &mut stats,
-            &mut logged_errors,
-            &mut suppression_logged,
-            &mut callback,
-        )?;
-    }
+    let drained = (|| -> Result<()> {
+        while next_sequence < task_count {
+            let parsed = result_rx
+                .recv()
+                .map_err(|_| anyhow::anyhow!("Chunk parser result channel disconnected"))?;
+            consume_parsed_chunk(
+                input,
+                parsed,
+                &mut pending,
+                &mut next_sequence,
+                &mut stats,
+                &mut logged_errors,
+                &mut suppression_logged,
+                &mut callback,
+            )?;
+        }
+        Ok(())
+    })();
 
+    // Same discipline as the producer's error path, whichever way the drain
+    // ended: the receiver goes first, so a worker still holding a task cannot
+    // block on a send nobody reads, and every worker is joined so a panic or
+    // an error in one is reported rather than detached.
+    drop(result_rx);
+    let mut worker_failure = None;
     for handle in worker_handles {
         match handle.join() {
             Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(e),
-            Err(_) => return Err(anyhow::anyhow!("Chunk parser worker thread panicked")),
+            Ok(Err(e)) => {
+                worker_failure.get_or_insert(e);
+            }
+            Err(_) => {
+                worker_failure
+                    .get_or_insert(anyhow::anyhow!("Chunk parser worker thread panicked"));
+            }
         }
+    }
+    drained?;
+    if let Some(e) = worker_failure {
+        return Err(e);
     }
 
     if stats.errors > 0 {
@@ -981,9 +1116,18 @@ where
     Ok(stats)
 }
 
+/// The longest line the chunker will buffer for a given term bound: an
+/// N-Triples or N-Quads line holds at most four terms, so a longer line
+/// certainly contains a term past the bound and is refused before it is
+/// buffered whole.
+fn max_line_bytes(max_term_bytes: usize) -> usize {
+    max_term_bytes.saturating_mul(4).saturating_add(TERM_SLACK)
+}
+
 fn read_newline_chunks<F>(
     reader: &mut dyn Read,
     target_chunk_bytes: usize,
+    max_term_bytes: usize,
     mut emit_chunk: F,
 ) -> Result<()>
 where
@@ -991,6 +1135,7 @@ where
 {
     let mut read_buffer = vec![0u8; 1024 * 1024];
     let mut pending = Vec::<u8>::with_capacity(target_chunk_bytes.max(1024 * 1024));
+    let line_cap = max_line_bytes(max_term_bytes);
 
     loop {
         let bytes_read = reader.read(&mut read_buffer)?;
@@ -1005,6 +1150,9 @@ where
                 .position(|&b| b == b'\n')
             {
                 Some(offset) => target_chunk_bytes + offset + 1,
+                None if pending.len() > line_cap => anyhow::bail!(
+                    "a line is longer than {line_cap} bytes, so one of its terms is larger than --max-term-bytes ({max_term_bytes} bytes); raise it"
+                ),
                 None => break,
             };
 
@@ -1193,6 +1341,112 @@ mod tests {
         assert_eq!(stats.errors, 0);
         assert_eq!(quads.len(), 2);
         assert_eq!(quads[0].subject, iri);
+    }
+
+    /// Fails every read the same way, as a truncated gzip member or a bad zstd
+    /// frame does.
+    struct FailingReader;
+
+    impl Read for FailingReader {
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::InvalidData, "bad frame"))
+        }
+    }
+
+    #[test]
+    fn test_persistent_read_error_ends_the_input() {
+        let (_f, input) = make_temp_with(b"", ".nt", RdfFormat::NTriples);
+        let error = stream_quads_from_reader(
+            FailingReader,
+            &input,
+            0,
+            false,
+            None,
+            DEFAULT_MAX_TERM_BYTES,
+            &mut |_| Ok(()),
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("unrecoverable read error"), "{message}");
+        assert!(message.contains("bad frame"), "{message}");
+        assert!(
+            message.contains(&input.path.display().to_string()),
+            "{message}"
+        );
+    }
+
+    /// Reports `Interrupted` on every read, forever.
+    struct AlwaysInterruptedReader;
+
+    impl Read for AlwaysInterruptedReader {
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::from(io::ErrorKind::Interrupted))
+        }
+    }
+
+    #[test]
+    fn test_persistent_interruption_is_capped() {
+        let (_f, input) = make_temp_with(b"", ".nt", RdfFormat::NTriples);
+        let error = stream_quads_from_reader(
+            AlwaysInterruptedReader,
+            &input,
+            0,
+            false,
+            None,
+            DEFAULT_MAX_TERM_BYTES,
+            &mut |_| Ok(()),
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("interrupted"), "{message}");
+        assert!(message.contains("in a row"), "{message}");
+    }
+
+    #[test]
+    fn test_term_of_exactly_the_bound_is_accepted() {
+        let literal = "x".repeat(1024 * 1024);
+        let content = format!(
+            "<http://example.org/s> <http://example.org/big> \"{literal}\" .\n\
+             <http://example.org/s> <http://example.org/p> <http://example.org/o> .\n"
+        );
+        let (_f, input) = make_temp_with(content.as_bytes(), ".ttl", RdfFormat::Turtle);
+        let options = ParseOptions {
+            max_term_bytes: 1024 * 1024,
+            ..ParseOptions::default()
+        };
+        let mut quads = Vec::new();
+        let stats = stream_quads_with_options(&input, 0, false, None, &options, |q| {
+            quads.push(q);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(stats.errors, 0);
+        assert_eq!(quads.len(), 2);
+    }
+
+    #[test]
+    fn test_over_long_line_is_refused_by_the_chunker() {
+        // An N-Triples line holds at most four terms, so a line past four times
+        // the bound must contain an over-bound term; the chunker refuses it
+        // before buffering it whole, ahead of any parser.
+        let literal = "x".repeat(5 * 1024 * 1024);
+        let content = format!("<http://example.org/s> <http://example.org/big> \"{literal}\" .\n");
+        let (_f, input) = make_temp_with(content.as_bytes(), ".nt", RdfFormat::NTriples);
+        let options = ParseOptions {
+            enable_ntnq_parallel: true,
+            chunk_size_bytes: 4096,
+            chunk_workers: 2,
+            max_inflight_bytes: 64 * 1024 * 1024,
+            max_term_bytes: 1024 * 1024,
+        };
+        let error = stream_quads_with_options(&input, 0, false, None, &options, |_| Ok(()))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("a line is longer than"), "{error}");
+        assert!(
+            error.contains("--max-term-bytes (1048576 bytes)"),
+            "{error}"
+        );
     }
 
     #[test]

@@ -138,6 +138,27 @@ impl<R: TokenRecognizer> Lexer<Vec<u8>, R> {
     }
 
     pub fn extend_from_reader(&mut self, reader: &mut impl Read) -> io::Result<()> {
+        let new_start = self.prepare_read()?;
+        let read = reader.read(&mut self.data[new_start..]);
+        self.finish_read(new_start, read)
+    }
+
+    #[cfg(feature = "async-tokio")]
+    pub async fn extend_from_tokio_async_read(
+        &mut self,
+        reader: &mut (impl AsyncRead + Unpin),
+    ) -> io::Result<()> {
+        let new_start = self.prepare_read()?;
+        let read = reader.read(&mut self.data[new_start..]).await;
+        self.finish_read(new_start, read)
+    }
+
+    /// Make room for the next read and return the offset its bytes land at.
+    ///
+    /// Shared by the blocking and async readers so the hdtc changes below have
+    /// one definition: compaction of the consumed prefix before the bound is
+    /// judged, and growth that never carries the buffer past the bound.
+    fn prepare_read(&mut self) -> io::Result<usize> {
         self.shrink_data();
         if self.data.len() >= self.max_buffer_size && self.position.buffer_offset > 0 {
             // Everything before the current token is consumed. Make room for the
@@ -161,62 +182,30 @@ impl<R: TokenRecognizer> Lexer<Vec<u8>, R> {
             // reallocation — but never past the bound: Vec growth can leave
             // capacity above it, and a buffer that overshoots is then shrunk on
             // the next call, which discards bytes and mistakes an empty read for
-            // the end of the input (hdtc backport note).
+            // the end of the input (hdtc addition).
             self.data
                 .resize(min(self.data.capacity(), self.max_buffer_size), 0);
         }
-        let read = match reader.read(&mut self.data[new_start..]) {
-            Ok(read) => read,
-            Err(e) => {
-                // Drop the zero padding, or a retried read — the right response
-                // to an interrupted one — would parse it as data (hdtc addition).
-                self.data.truncate(new_start);
-                return Err(e);
-            }
-        };
-        self.data.truncate(new_start + read);
-        self.is_ending = read == 0;
-        Ok(())
+        Ok(new_start)
     }
 
-    #[cfg(feature = "async-tokio")]
-    pub async fn extend_from_tokio_async_read(
-        &mut self,
-        reader: &mut (impl AsyncRead + Unpin),
-    ) -> io::Result<()> {
-        self.shrink_data();
-        if self.data.len() >= self.max_buffer_size && self.position.buffer_offset > 0 {
-            // Everything before the current token is consumed. Make room for the
-            // token alone before deciding it does not fit, or a bound applies to
-            // a statement's terms together rather than to each (hdtc addition).
-            self.shrink_data_by(self.position.buffer_offset);
-        }
-        if self.data.len() >= self.max_buffer_size {
-            return Err(io::Error::new(
-                io::ErrorKind::OutOfMemory,
-                BufferLimitExceeded {
-                    max_buffer_size: self.max_buffer_size,
-                },
-            ));
-        }
-        let min_end = min(self.data.len() + self.min_buffer_size, self.max_buffer_size);
-        let new_start = self.data.len();
-        self.data.resize(min_end, 0);
-        if self.data.len() < self.data.capacity() {
-            // Same clamp as `extend_from_reader`.
-            self.data
-                .resize(min(self.data.capacity(), self.max_buffer_size), 0);
-        }
-        let read = match reader.read(&mut self.data[new_start..]).await {
-            Ok(read) => read,
+    /// Record the outcome of a read into the space `prepare_read` made.
+    ///
+    /// A failed read truncates the zero padding it had reserved, or a retried
+    /// read — the right response to an interrupted one — would parse it as
+    /// data (hdtc addition).
+    fn finish_read(&mut self, new_start: usize, read: io::Result<usize>) -> io::Result<()> {
+        match read {
+            Ok(read) => {
+                self.data.truncate(new_start + read);
+                self.is_ending = read == 0;
+                Ok(())
+            }
             Err(e) => {
                 self.data.truncate(new_start);
-                return Err(e);
+                Err(e)
             }
-        };
-        self.data.truncate(new_start + read);
-        self.is_ending = read == 0;
-        Ok(())
+        }
     }
 
     fn shrink_data(&mut self) {

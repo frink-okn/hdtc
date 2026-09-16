@@ -631,47 +631,7 @@ pub fn open_hdt(
 // ---------------------------------------------------------------------------
 
 fn parse_num_triples_from_header(header: &str) -> Result<u64> {
-    const VOID_TRIPLES: &str = "http://rdfs.org/ns/void#triples";
-    const HDT_TRIPLES_NUM: &str = "http://purl.org/HDT/hdt#triplesnumTriples";
-
-    let mut value_from_void: Option<u64> = None;
-    let mut value_from_hdt: Option<u64> = None;
-
-    for result in crate::rdf::header_triples(header.as_bytes()) {
-        let triple = result.context("Invalid N-Triples in HDT header metadata")?;
-        let predicate = triple.predicate.as_str();
-
-        if predicate != VOID_TRIPLES && predicate != HDT_TRIPLES_NUM {
-            continue;
-        }
-
-        let oxrdf::Term::Literal(literal) = triple.object else {
-            continue;
-        };
-
-        let parsed = literal.value().parse::<u64>().with_context(|| {
-            format!("Invalid numeric triple-count literal: {}", literal.value())
-        })?;
-
-        if predicate == VOID_TRIPLES {
-            value_from_void = Some(parsed);
-        }
-        if predicate == HDT_TRIPLES_NUM {
-            value_from_hdt = Some(parsed);
-        }
-    }
-
-    match (value_from_void, value_from_hdt) {
-        (Some(v), Some(h)) if v != h => {
-            bail!(
-                "Header triple-count mismatch between void:triples ({v}) and hdt:triplesnumTriples ({h})"
-            )
-        }
-        (Some(v), Some(_)) => Ok(v),
-        (Some(v), None) => Ok(v),
-        (None, Some(h)) => Ok(h),
-        (None, None) => bail!("Header metadata missing triple-count predicate"),
-    }
+    Ok(crate::rdf::header_counts(header.as_bytes())?.triples)
 }
 
 // ---------------------------------------------------------------------------

@@ -210,3 +210,51 @@ fn a_header_term_past_the_old_bound_stays_readable_everywhere() {
         String::from_utf8_lossy(&edited.stderr)
     );
 }
+
+#[test]
+fn header_add_refuses_input_the_readers_would_reject() {
+    // A space in an IRI passes a lenient parse. Every reader of the header is
+    // strict, so accepting it would write a file nothing can open.
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data.nt");
+    std::fs::write(
+        &data,
+        "<http://example.org/s> <http://example.org/p> <http://example.org/o> .\n",
+    )
+    .unwrap();
+    let base = dir.path().join("base.hdt");
+    let output = Command::new(env!("CARGO_BIN_EXE_hdtc"))
+        .args(["create", "-o"])
+        .arg(&base)
+        .arg(&data)
+        .output()
+        .expect("run hdtc create");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let bad = dir.path().join("bad.nt");
+    std::fs::write(
+        &bad,
+        "<http://example.org/meta> <http://example.org/note> <http://example.org/a b> .\n",
+    )
+    .unwrap();
+    let with = dir.path().join("with.hdt");
+    let output = Command::new(env!("CARGO_BIN_EXE_hdtc"))
+        .args(["header", "--add"])
+        .arg(&bad)
+        .arg("-o")
+        .arg(&with)
+        .arg(&base)
+        .output()
+        .expect("run hdtc header --add");
+    assert!(
+        !output.status.success(),
+        "header --add accepted an invalid IRI"
+    );
+    assert!(!with.exists(), "a refused header edit left an output file");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("bad.nt"), "{stderr}");
+}

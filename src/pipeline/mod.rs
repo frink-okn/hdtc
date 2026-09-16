@@ -615,7 +615,14 @@ fn parser_stage(
         .map(|n| n.get())
         .unwrap_or(4)
         .max(1);
-    let max_file_workers_by_budget = (parser_budget_total / MIB).max(1);
+    // Each file worker may hold one term of up to `max_term_bytes` in its lexer
+    // buffer on top of its working set, so the plan reserves that much per
+    // worker; a bigger --memory-limit, or a smaller --max-term-bytes, buys more
+    // parsers. The parallel N-Triples/N-Quads path can hold up to `chunk_workers`
+    // more per file when every chunk carries a maximal term at once, which the
+    // plan does not reserve for.
+    let per_worker_reserve = MIB.saturating_add(parser_parallelism.max_term_bytes);
+    let max_file_workers_by_budget = (parser_budget_total / per_worker_reserve).max(1);
     let default_file_workers = inputs
         .len()
         .min(available_cpus)
@@ -654,6 +661,14 @@ fn parser_stage(
         max_inflight_bytes,
         parser_budget_total
     );
+    if file_workers < inputs.len().min(available_cpus) && file_workers == max_file_workers_by_budget
+    {
+        tracing::info!(
+            "File workers limited to {} by --memory-limit: each may hold a term of --max-term-bytes ({} bytes)",
+            file_workers,
+            parser_parallelism.max_term_bytes
+        );
+    }
 
     let parse_options = ParseOptions {
         enable_ntnq_parallel: true,
@@ -756,9 +771,13 @@ fn parser_stage(
                 });
 
                 // The first failure is the build's error; a later one is either
-                // this abandonment or noise behind it, and is dropped.
-                if parse_result.is_err() && aborted.swap(true, Ordering::Relaxed) {
-                    continue;
+                // this abandonment or noise behind it, and is dropped. Only a
+                // failure may raise the flag: a success must never touch it.
+                if parse_result.is_err() {
+                    let already_aborted = aborted.swap(true, Ordering::Relaxed);
+                    if already_aborted {
+                        continue;
+                    }
                 }
                 if stats_tx.send((file_index, parse_result)).is_err() {
                     return;

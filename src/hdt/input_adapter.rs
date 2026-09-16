@@ -814,50 +814,11 @@ impl HdtTripleReader {
 /// Returns `(num_triples, original_size)`. The triple count is required;
 /// original size defaults to 0 if not present.
 fn parse_header_metadata(header_text: &str) -> Result<(u64, u64)> {
-    const VOID_TRIPLES: &str = "http://rdfs.org/ns/void#triples";
-    const HDT_TRIPLES_NUM: &str = "http://purl.org/HDT/hdt#triplesnumTriples";
-    const ORIGINAL_SIZE: &str = "http://purl.org/HDT/hdt#originalSize";
-
-    let mut triples_from_void: Option<u64> = None;
-    let mut triples_from_hdt: Option<u64> = None;
-    let mut original_size: u64 = 0;
-
-    for result in crate::rdf::header_triples(header_text.as_bytes()) {
-        let triple = result.context("Invalid N-Triples in HDT header metadata")?;
-        let predicate = triple.predicate.as_str();
-
-        let oxrdf::Term::Literal(literal) = triple.object else {
-            continue;
-        };
-
-        if predicate == VOID_TRIPLES {
-            triples_from_void = Some(literal.value().parse::<u64>().with_context(|| {
-                format!("Invalid numeric triple-count literal: {}", literal.value())
-            })?);
-        } else if predicate == HDT_TRIPLES_NUM {
-            triples_from_hdt = Some(literal.value().parse::<u64>().with_context(|| {
-                format!("Invalid numeric triple-count literal: {}", literal.value())
-            })?);
-        } else if predicate == ORIGINAL_SIZE
-            && let Ok(size) = literal.value().parse::<u64>()
-        {
-            original_size = size;
-        }
-    }
-
-    let num_triples = match (triples_from_void, triples_from_hdt) {
-        (Some(v), Some(h)) if v != h => {
-            bail!(
-                "Header triple-count mismatch between void:triples ({v}) and hdt:triplesnumTriples ({h})"
-            )
-        }
-        (Some(v), Some(_)) => v,
-        (Some(v), None) => v,
-        (None, Some(h)) => h,
-        (None, None) => bail!("Header metadata missing triple-count predicate"),
-    };
-
-    Ok((num_triples, original_size))
+    let crate::rdf::HeaderCounts {
+        triples,
+        original_size,
+    } = crate::rdf::header_counts(header_text.as_bytes())?;
+    Ok((triples, original_size))
 }
 
 #[cfg(test)]

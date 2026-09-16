@@ -86,6 +86,10 @@ pub fn run_header_command(
         .context("Failed to parse existing header as N-Triples")?;
     let new_triples = build_new_header(existing, replace, add, dataset_uri, max_term_bytes)?;
     let new_header = serialize_triples(&new_triples)?;
+    // The input was parsed strictly, so this should never fail; it is the
+    // guarantee that nothing written here can make the file unreadable.
+    parse_ntriples_text(&new_header)
+        .context("The assembled header would not parse as N-Triples; nothing was written")?;
 
     // `reader` is positioned at the start of the dictionary section; copy the
     // remaining bytes verbatim after the rewritten header.

@@ -5,7 +5,10 @@
 # hdtc does not build itself. A `[patch]` would apply only to hdtc's own build
 # and break every crate that depends on hdtc. There is no patch section anywhere.
 #
-# Changes from the released 0.2.3, all in `src/toolkit/lexer.rs` unless noted:
+# Changes from the released 0.2.3, all in `src/toolkit/lexer.rs` unless noted.
+# The blocking and async readers share one `prepare_read`/`finish_read` pair,
+# so each change below has a single definition; hdtc does not enable the
+# `async-tokio` feature and never compiles the async reader.
 #
 # 1. Backport of oxigraph commit de4dc5f04: every parser gains
 #    `with_max_buffer_size`, so a caller can raise the 16 MiB bound on a single

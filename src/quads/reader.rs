@@ -2577,27 +2577,7 @@ fn hdt_metadata(path: &Path) -> Result<(u64, u64, u64)> {
 }
 
 fn parse_hdt_triple_count(header: &[u8]) -> Result<u64> {
-    const VOID_TRIPLES: &str = "http://rdfs.org/ns/void#triples";
-    const HDT_TRIPLES: &str = "http://purl.org/HDT/hdt#triplesnumTriples";
-    let mut value = None;
-    for result in crate::rdf::header_triples(header) {
-        let triple = result.context("Invalid HDT header N-Triples")?;
-        if triple.predicate.as_str() != VOID_TRIPLES && triple.predicate.as_str() != HDT_TRIPLES {
-            continue;
-        }
-        let oxrdf::Term::Literal(literal) = triple.object else {
-            continue;
-        };
-        let parsed = literal
-            .value()
-            .parse::<u64>()
-            .context("Invalid HDT triple count")?;
-        if let Some(previous) = value {
-            ensure!(previous == parsed, "Conflicting HDT header triple counts");
-        }
-        value = Some(parsed);
-    }
-    value.context("HDT header has no triple count")
+    Ok(crate::rdf::header_counts(header)?.triples)
 }
 
 fn read_ef_header_from<R: Read + Seek>(file: &mut R, layer: LayerEntry) -> Result<EfHeader> {
