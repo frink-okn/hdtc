@@ -118,6 +118,14 @@ pub enum VoidPartitionDistinctScope {
     All,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum VoidGraphView {
+    /// The N unique triples in the HDT, ignoring dataset graph layers.
+    Union,
+    /// The union plus one void:subset per graph of the sidecar-backed RDF dataset.
+    Dataset,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, ValueEnum)]
 pub enum GraphIndexPositionSpace {
     Pos,
@@ -519,6 +527,19 @@ pub struct VoidArgs {
     #[arg(long, value_enum, value_name = "SCOPE")]
     pub partition_distinct_counts: Option<VoidPartitionDistinctScope>,
 
+    /// Describe the triples union only, or also each graph of the RDF dataset
+    ///
+    /// The dataset view adds one void:subset per graph, linked by SPARQL Service
+    /// Description. It requires the canonical .graphs sidecar, plus .hdt.perm and a
+    /// .graphs.idx with OPS layers for per-graph distinct objects.
+    #[arg(long, value_enum, default_value = "union")]
+    pub graph_view: VoidGraphView,
+
+    /// Directory for the external sort used when a dataset has too many graphs to
+    /// merge their layers directly (default: a self-cleaning system temp dir)
+    #[arg(long, value_name = "DIR")]
+    pub temp_dir: Option<PathBuf>,
+
     /// Soft memory limit for dictionary caches (e.g. 4G, 2000M)
     ///
     /// Controls the PFC block cache used for term resolution during serialization.
@@ -526,7 +547,9 @@ pub struct VoidArgs {
     /// additional memory proportional to the number of typed subjects and class/property
     /// combinations in the dataset. With --partition-distinct-counts=all, the exact
     /// distinct trackers add memory proportional to all emitted partition combinations;
-    /// that analysis memory is not bounded by this option.
+    /// that analysis memory is not bounded by this option. The dataset graph view
+    /// splits this limit with graph-membership transposes and repeats the partition
+    /// statistics for every graph.
     #[arg(short = 'm', long, value_name = "SIZE", default_value = "4G")]
     pub memory_limit: MemorySize,
 }

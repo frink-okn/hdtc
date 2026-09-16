@@ -7,21 +7,33 @@
 //! - Optional OPS pass: Read the permutation sidecar to count distinct objects per partition.
 //! - Serialize results as N-Triples.
 //!
+//! With the `dataset` graph view, the same passes also describe every graph of the
+//! sidecar-backed RDF dataset as a `void:subset`. Each pass joins its scan against the
+//! graph memberships transposed into its own position order — the `.graphs` sidecar
+//! for SPO, the OPS layer set of `.graphs.idx` for OPS — and feeds each membership to
+//! that graph's accumulators. A subset is exactly what a standalone run over the
+//! graph's triples would produce; `docs/void-format.md` specifies the output.
+//!
 //! The algorithm is equivalent to the Python `void-hdt` tool but uses Rust's u64 integer
 //! arithmetic throughout, avoiding the integer overflow that affected hdt-cpp on large inputs
 //! like Wikidata.
 
-use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
+// Partition maps are keyed by dictionary IDs and probed several times per
+// triple, so they use hashbrown's small inlinable hasher rather than SipHash.
+use hashbrown::HashMap;
 
 use super::reader::{
     BitmapTriplesScanner, DictionaryResolver, HdtSectionOffsets, find_literal_boundary,
     make_writer, open_hdt,
 };
+use crate::graph_index::{GraphIndex, GraphIndexSpace};
 use crate::permutation::{self, PermutationComponent, PermutationIndex};
+use crate::quads::transpose::{LayerSource, PositionMajorMemberships, layer_merge_reserve};
+use crate::quads::{GraphSidecarReader, GraphTerm, PositionGraphMembership};
 
 // ---------------------------------------------------------------------------
 // ClassComboIndex: compact subject→classes mapping via combo deduplication
@@ -35,43 +47,143 @@ use crate::permutation::{self, PermutationComponent, PermutationIndex};
 /// nodes) map to the same combo ID.
 ///
 /// Memory: `4 × nb_subjects` bytes + `O(distinct_combos × avg_classes)` for the lookup table.
+///
+/// When graph subsets are described, typing is graph-local — a subject typed `Person` in
+/// one graph is untyped in another — so a combination is a set of `(graph, class)` pairs
+/// rather than of classes. The per-subject cost is unchanged; only the table grows.
 struct ClassComboIndex {
     /// Combo ID for each subject, indexed by subject_id (1-based; index 0 unused).
     /// 0 = untyped.
     subject_combos: Vec<u32>,
-    /// Sorted class IDs for each combo. `combo_to_classes[combo_id - 1]` gives the
-    /// class IDs for `combo_id > 0`.
+    /// Sorted class IDs for each combo, across all graphs. `combo_to_classes[combo_id - 1]`
+    /// gives the class IDs for `combo_id > 0`.
     combo_to_classes: Vec<Vec<u64>>,
+    /// The same combos split by graph. Empty unless graph subsets are described.
+    combo_to_graph_classes: Vec<GraphClasses>,
 }
 
-impl ClassComboIndex {
-    /// Look up the classes for a subject ID.
-    #[inline]
-    fn classes(&self, subject_id: u64) -> &[u64] {
-        let idx = subject_id as usize;
-        if idx < self.subject_combos.len() {
-            let combo_id = self.subject_combos[idx];
-            if combo_id > 0 {
-                return &self.combo_to_classes[combo_id as usize - 1];
-            }
+/// One combo's `(graph, class)` pairs in sorted order, stored as parallel arrays so that
+/// one graph's classes are a contiguous slice.
+struct GraphClasses {
+    graphs: Vec<u64>,
+    classes: Vec<u64>,
+}
+
+impl GraphClasses {
+    fn from_pairs(pairs: &[(u64, u64)]) -> Self {
+        Self {
+            graphs: pairs.iter().map(|&(graph, _)| graph).collect(),
+            classes: pairs.iter().map(|&(_, class)| class).collect(),
         }
-        &[]
     }
 
-    /// Check if a subject is typed (has any `rdf:type`).
     #[inline]
-    fn is_typed(&self, subject_id: u64) -> bool {
-        let idx = subject_id as usize;
-        idx < self.subject_combos.len() && self.subject_combos[idx] > 0
+    fn classes_in(&self, graph: u64) -> &[u64] {
+        let start = self.graphs.partition_point(|&g| g < graph);
+        let end = self.graphs.partition_point(|&g| g <= graph);
+        &self.classes[start..end]
     }
+}
 
+/// The class combinations collected by Pass 1, before non-IRI classes are removed.
+///
+/// Pairs are `(graph, class)`. A union-only run records every class under graph 0.
+struct RawClassCombos {
+    subject_combos: Vec<u32>,
+    combo_pairs: Vec<Vec<(u64, u64)>>,
+}
+
+impl RawClassCombos {
     /// Distinct class IDs across all combos.
     fn distinct_class_ids(&self) -> std::collections::HashSet<u64> {
         let mut set = std::collections::HashSet::new();
-        for classes in &self.combo_to_classes {
-            set.extend(classes.iter().copied());
+        for pairs in &self.combo_pairs {
+            set.extend(pairs.iter().map(|&(_, class)| class));
         }
         set
+    }
+}
+
+/// Which dataset a class lookup answers for.
+#[derive(Clone, Copy)]
+enum ClassScope {
+    /// The triples union: a subject's classes from every graph.
+    Union,
+    /// One graph of the RDF dataset: only that graph's `rdf:type` triples count.
+    Graph(u64),
+}
+
+impl ClassComboIndex {
+    fn new(raw: RawClassCombos, by_graph: bool) -> Self {
+        let combo_to_classes = raw
+            .combo_pairs
+            .iter()
+            .map(|pairs| {
+                let mut classes: Vec<u64> = pairs.iter().map(|&(_, class)| class).collect();
+                classes.sort_unstable();
+                classes.dedup();
+                classes
+            })
+            .collect();
+        let combo_to_graph_classes = if by_graph {
+            raw.combo_pairs
+                .iter()
+                .map(|pairs| GraphClasses::from_pairs(pairs))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Self {
+            subject_combos: raw.subject_combos,
+            combo_to_classes,
+            combo_to_graph_classes,
+        }
+    }
+
+    /// Look up the classes for a subject ID.
+    #[inline]
+    fn classes(&self, subject_id: u64, scope: ClassScope) -> &[u64] {
+        let combo_id = self
+            .subject_combos
+            .get(subject_id as usize)
+            .copied()
+            .unwrap_or(0);
+        if combo_id == 0 {
+            return &[];
+        }
+        let combo = combo_id as usize - 1;
+        match scope {
+            ClassScope::Union => &self.combo_to_classes[combo],
+            ClassScope::Graph(graph) => self.combo_to_graph_classes[combo].classes_in(graph),
+        }
+    }
+}
+
+/// Class lookups for one described dataset.
+#[derive(Clone, Copy)]
+struct ClassLookup<'a> {
+    index: &'a ClassComboIndex,
+    nb_shared: u64,
+    scope: ClassScope,
+}
+
+impl<'a> ClassLookup<'a> {
+    #[inline]
+    fn subject(&self, subject_id: u64) -> &'a [u64] {
+        self.index.classes(subject_id, self.scope)
+    }
+
+    /// Objects with ID > nb_shared are in the object-only section (literals or
+    /// object-only URIs) and can never appear as subjects of rdf:type triples.
+    /// Objects in the shared section (ID <= nb_shared) may be typed: look them up
+    /// in the class combo index (shared IDs appear as both subjects and objects).
+    #[inline]
+    fn object(&self, object_id: u64) -> &'a [u64] {
+        if object_id <= self.nb_shared {
+            self.index.classes(object_id, self.scope)
+        } else {
+            &[]
+        }
     }
 }
 
@@ -154,6 +266,13 @@ const VOID_CLASS_PARTITION: &str = "http://rdfs.org/ns/void#classPartition";
 const VOID_PROPERTY: &str = "http://rdfs.org/ns/void#property";
 const VOID_CLASS: &str = "http://rdfs.org/ns/void#class";
 const VOID_ENTITIES: &str = "http://rdfs.org/ns/void#entities";
+const VOID_SUBSET: &str = "http://rdfs.org/ns/void#subset";
+const SD_DATASET: &str = "http://www.w3.org/ns/sparql-service-description#Dataset";
+const SD_GRAPH_CLASS: &str = "http://www.w3.org/ns/sparql-service-description#Graph";
+const SD_NAMED_GRAPH_CLASS: &str = "http://www.w3.org/ns/sparql-service-description#NamedGraph";
+const SD_NAMED_GRAPH: &str = "http://www.w3.org/ns/sparql-service-description#namedGraph";
+const SD_NAME: &str = "http://www.w3.org/ns/sparql-service-description#name";
+const SD_GRAPH: &str = "http://www.w3.org/ns/sparql-service-description#graph";
 const VOIDEXT_OBJECT_CLASS_PARTITION: &str = "http://ldf.fi/void-ext#objectClassPartition";
 const VOIDEXT_DATATYPE_PARTITION: &str = "http://ldf.fi/void-ext#datatypePartition";
 const VOIDEXT_DATATYPE: &str = "http://ldf.fi/void-ext#datatype";
@@ -174,6 +293,34 @@ pub enum PartitionDistinctScope {
     DatasetProperties,
     /// Every emitted class, property, target-class, datatype, and language partition.
     All,
+}
+
+/// Which view of the HDT the VoID description covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VoidGraphView {
+    /// The HDT's triples union only.
+    Union,
+    /// The union plus one `void:subset` per graph of the sidecar-backed RDF dataset.
+    Dataset,
+}
+
+/// Options for [`compute_void`].
+pub struct VoidOptions<'a> {
+    /// IRI of the described dataset; every minted node IRI extends it.
+    pub dataset_uri: &'a str,
+    /// Output file, or stdout when `None`.
+    pub output_path: Option<&'a Path>,
+    /// Emit blank nodes instead of minted IRIs for partitions and subsets.
+    pub use_blank_nodes: bool,
+    /// Soft memory limit for dictionary caches and graph-membership transposes.
+    pub memory_limit: usize,
+    /// Partition levels that receive exact distinct subject and object counts.
+    pub distinct_scope: Option<PartitionDistinctScope>,
+    /// Whether graph subsets are described.
+    pub graph_view: VoidGraphView,
+    /// Directory for the external sort a many-graph transpose falls back to.
+    /// A self-cleaning directory under the system temp dir is used when `None`.
+    pub temp_dir: Option<&'a Path>,
 }
 
 // ---------------------------------------------------------------------------
@@ -281,17 +428,16 @@ impl PartitionDistinctData {
     }
 }
 
-/// Collected statistics from both analysis passes, ready for serialization.
-struct VoidStats {
-    num_triples: u64,
-    nb_subjects: u64,
-    nb_predicates: u64,
-    nb_objects: u64,
-    dataset_prop_data: HashMap<u64, DatasetPropData>,
-    class_partitions: HashMap<u64, ClassPartitionData>,
+/// The four dataset-level counts heading every dataset description.
+struct DatasetCounts {
+    triples: u64,
+    distinct_subjects: u64,
+    properties: u64,
+    distinct_objects: u64,
 }
 
-struct StatsPassResult {
+/// Partition statistics for one described dataset: the union, or one graph subset.
+struct PartitionStats {
     dataset_prop_data: HashMap<u64, DatasetPropData>,
     class_partitions: HashMap<u64, ClassPartitionData>,
     distinct_data: Option<PartitionDistinctData>,
@@ -301,6 +447,255 @@ impl ClassPartitionData {
     fn total_triples(&self) -> u64 {
         self.prop_partitions.values().map(|p| p.triple_count).sum()
     }
+}
+
+impl PartitionStats {
+    fn new(distinct_scope: Option<PartitionDistinctScope>) -> Self {
+        Self {
+            dataset_prop_data: HashMap::new(),
+            class_partitions: HashMap::new(),
+            distinct_data: distinct_scope.map(PartitionDistinctData::new),
+        }
+    }
+
+    /// Record one triple from the SPO scan.
+    fn record_triple(
+        &mut self,
+        (s_id, p_id, o_id): (u64, u64, u64),
+        dt_id: u16,
+        datatype_index: &DatatypeIndex,
+        classes: ClassLookup<'_>,
+    ) {
+        // Dataset-level property count and datatype accumulation.
+        self.dataset_prop_data.entry(p_id).or_default().triple_count += 1;
+        if let Some(distinct) = self.distinct_data.as_mut() {
+            distinct
+                .dataset_prop_data
+                .entry(p_id)
+                .or_default()
+                .add_subject(s_id);
+        }
+
+        let subject_classes = classes.subject(s_id);
+        if subject_classes.is_empty() {
+            return;
+        }
+        let obj_classes = classes.object(o_id);
+
+        // Record this triple in every class partition the subject belongs to.
+        let mut distinct_classes = self
+            .distinct_data
+            .as_mut()
+            .and_then(|distinct| distinct.class_partitions.as_mut());
+        for &class_id in subject_classes {
+            let cp = self.class_partitions.entry(class_id).or_default();
+            let pp = cp.prop_partitions.entry(p_id).or_default();
+            pp.triple_count += 1;
+            if dt_id > 0 {
+                *pp.target_datatypes.entry(dt_id).or_insert(0) += 1;
+            }
+            if obj_classes.is_empty() {
+                *pp.target_classes.entry(None).or_insert(0) += 1;
+            } else {
+                for &obj_class_id in obj_classes {
+                    *pp.target_classes.entry(Some(obj_class_id)).or_insert(0) += 1;
+                }
+            }
+
+            if let Some(distinct_classes) = distinct_classes.as_mut() {
+                let distinct_cp = distinct_classes.entry(class_id).or_default();
+                let distinct_pp = distinct_cp.prop_partitions.entry(p_id).or_default();
+                distinct_pp.stats.add_subject(s_id);
+                if dt_id > 0 {
+                    distinct_pp
+                        .target_datatypes
+                        .entry(dt_id)
+                        .or_default()
+                        .add_subject(s_id);
+                    if datatype_index.is_language(dt_id) {
+                        distinct_pp.lang_string.add_subject(s_id);
+                    }
+                }
+                if obj_classes.is_empty() {
+                    distinct_pp
+                        .target_classes
+                        .entry(None)
+                        .or_default()
+                        .add_subject(s_id);
+                } else {
+                    for &obj_class_id in obj_classes {
+                        distinct_pp
+                            .target_classes
+                            .entry(Some(obj_class_id))
+                            .or_default()
+                            .add_subject(s_id);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Record one triple from the OPS scan into the distinct-object trackers.
+    ///
+    /// `classes` is required exactly when the nested class hierarchy is tracked.
+    fn record_object(
+        &mut self,
+        (s_id, p_id, o_id): (u64, u64, u64),
+        dt_id: u16,
+        datatype_index: &DatatypeIndex,
+        classes: Option<ClassLookup<'_>>,
+    ) -> Result<()> {
+        let Some(distinct_data) = self.distinct_data.as_mut() else {
+            return Ok(());
+        };
+        distinct_data
+            .dataset_prop_data
+            .get_mut(&p_id)
+            .with_context(|| format!("OPS permutation contains unknown predicate ID {p_id}"))?
+            .add_object(o_id);
+
+        let (Some(distinct_classes), Some(classes)) =
+            (distinct_data.class_partitions.as_mut(), classes)
+        else {
+            return Ok(());
+        };
+        let subject_classes = classes.subject(s_id);
+        if subject_classes.is_empty() {
+            return Ok(());
+        }
+        let object_classes = classes.object(o_id);
+
+        for &class_id in subject_classes {
+            let distinct_cp = distinct_classes.get_mut(&class_id).with_context(|| {
+                format!("OPS permutation references unknown class ID {class_id}")
+            })?;
+            distinct_cp.objects.add_object(o_id);
+            let distinct_pp = distinct_cp
+                .prop_partitions
+                .get_mut(&p_id)
+                .with_context(|| {
+                    format!(
+                        "OPS permutation references unknown property ID {p_id} in class {class_id}"
+                    )
+                })?;
+            distinct_pp.stats.add_object(o_id);
+
+            if object_classes.is_empty() {
+                distinct_pp
+                    .target_classes
+                    .get_mut(&None)
+                    .context("missing untyped target-class partition")?
+                    .add_object(o_id);
+            } else {
+                for &object_class_id in object_classes {
+                    distinct_pp
+                        .target_classes
+                        .get_mut(&Some(object_class_id))
+                        .with_context(|| {
+                            format!("missing target-class partition for class ID {object_class_id}")
+                        })?
+                        .add_object(o_id);
+                }
+            }
+
+            if dt_id > 0 {
+                distinct_pp
+                    .target_datatypes
+                    .get_mut(&dt_id)
+                    .with_context(|| format!("missing datatype partition for entry ID {dt_id}"))?
+                    .add_object(o_id);
+                if datatype_index.is_language(dt_id) {
+                    distinct_pp.lang_string.add_object(o_id);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Set `void:entities` on every class partition from the Pass 1 subject counts.
+    fn apply_entity_counts(&mut self, entity_counts: &HashMap<u64, u64>) {
+        for (class_id, cp) in self.class_partitions.iter_mut() {
+            cp.entity_count = *entity_counts.get(class_id).unwrap_or(&0);
+        }
+    }
+}
+
+/// Statistics for one graph of the RDF dataset.
+struct GraphSubset {
+    /// Memberships seen in the SPO scan.
+    triples: u64,
+    /// Dataset-level distinct subjects (SPO scan) and objects (OPS scan). A graph's
+    /// memberships are a subsequence of each scan, so IDs stay monotonic.
+    distinct: DistinctStats,
+    partitions: PartitionStats,
+    /// Subjects per class, counting only this graph's `rdf:type` triples.
+    entity_counts: HashMap<u64, u64>,
+}
+
+impl GraphSubset {
+    fn counts(&self) -> DatasetCounts {
+        DatasetCounts {
+            triples: self.triples,
+            distinct_subjects: self.distinct.distinct_subjects,
+            properties: self.partitions.dataset_prop_data.len() as u64,
+            distinct_objects: self.distinct.distinct_objects,
+        }
+    }
+}
+
+/// Joins a position-major membership stream to a scan of the same position space.
+struct MembershipJoin {
+    memberships: PositionMajorMemberships,
+    pending: Option<PositionGraphMembership>,
+    graphs: Vec<u64>,
+}
+
+impl MembershipJoin {
+    fn new(mut memberships: PositionMajorMemberships) -> Result<Self> {
+        let pending = memberships.next().transpose()?;
+        Ok(Self {
+            memberships,
+            pending,
+            graphs: Vec::new(),
+        })
+    }
+
+    /// The increasing graph IDs containing `position`. Every position of the scan
+    /// must be requested, in increasing order.
+    fn graphs_at(&mut self, position: u64) -> Result<&[u64]> {
+        self.graphs.clear();
+        while let Some(membership) = self.pending {
+            ensure!(
+                membership.position >= position,
+                "graph membership at position {} was skipped",
+                membership.position
+            );
+            if membership.position != position {
+                break;
+            }
+            self.graphs.push(membership.graph);
+            self.pending = self.memberships.next().transpose()?;
+        }
+        ensure!(
+            !self.graphs.is_empty(),
+            "position {position} has no graph membership"
+        );
+        Ok(&self.graphs)
+    }
+
+    fn finish(self) -> Result<()> {
+        ensure!(
+            self.pending.is_none(),
+            "graph membership position exceeds the triple count"
+        );
+        Ok(())
+    }
+}
+
+/// The per-graph half of a dataset-view pass.
+struct SubsetPass<'a> {
+    join: MembershipJoin,
+    subsets: &'a mut [GraphSubset],
 }
 
 // ---------------------------------------------------------------------------
@@ -347,17 +742,22 @@ fn nt(w: &mut impl Write, s: &str, p: &str, o: &str) -> Result<()> {
 // Pass 1: Build ClassComboIndex from rdf:type triples
 // ---------------------------------------------------------------------------
 
-/// Scan all triples; collect `rdf:type` triples to build a [`ClassComboIndex`].
+/// A union-only scan attributes every triple to one implicit graph.
+const UNION_GRAPHS: &[u64] = &[0];
+
+/// Scan all triples; collect `rdf:type` triples into raw class combinations.
 ///
 /// Exploits SPO ordering: all triples for a subject are contiguous, so we buffer
 /// each subject's class IDs with O(1) memory per subject, then deduplicate via
-/// a combo map.
+/// a combo map. With `memberships`, each class is recorded under every graph
+/// holding its `rdf:type` triple.
 fn build_class_combo_index(
     hdt_path: &Path,
     offsets: &HdtSectionOffsets,
     rdf_type_pred_id: u64,
     nb_subjects: u64,
-) -> Result<ClassComboIndex> {
+    mut memberships: Option<MembershipJoin>,
+) -> Result<RawClassCombos> {
     let alloc_bytes = (nb_subjects as usize + 1) * std::mem::size_of::<u32>();
     tracing::info!(
         "  Allocating class combo index: {:.1} GB for {} subjects",
@@ -366,14 +766,14 @@ fn build_class_combo_index(
     );
 
     let mut subject_combos = vec![0u32; nb_subjects as usize + 1];
-    let mut combo_map: HashMap<Vec<u64>, u32> = HashMap::new();
-    let mut combo_to_classes: Vec<Vec<u64>> = Vec::new();
+    let mut combo_map: HashMap<Vec<(u64, u64)>, u32> = HashMap::new();
+    let mut combo_pairs: Vec<Vec<(u64, u64)>> = Vec::new();
 
     let mut scanner =
         BitmapTriplesScanner::new(offsets, hdt_path).context("open scanner for Pass 1")?;
 
     let mut current_subject: u64 = 0;
-    let mut current_classes: Vec<u64> = Vec::new();
+    let mut current_pairs: Vec<(u64, u64)> = Vec::new();
     let mut scanned: u64 = 0;
     let mut typed_subjects: u64 = 0;
 
@@ -381,37 +781,41 @@ fn build_class_combo_index(
     // Defined inline because closures can't borrow multiple fields mutably.
     macro_rules! finalize_subject {
         () => {
-            if !current_classes.is_empty() {
-                current_classes.sort_unstable();
-                current_classes.dedup();
-                let combo_id = if let Some(&id) = combo_map.get(&current_classes) {
+            if !current_pairs.is_empty() {
+                current_pairs.sort_unstable();
+                current_pairs.dedup();
+                let combo_id = if let Some(&id) = combo_map.get(&current_pairs) {
                     id
                 } else {
                     anyhow::ensure!(
-                        combo_to_classes.len() < u32::MAX as usize,
+                        combo_pairs.len() < u32::MAX as usize,
                         "More than {} unique class combinations; dataset too complex for VoID analysis",
                         u32::MAX
                     );
-                    let id = combo_to_classes.len() as u32 + 1;
-                    let classes = current_classes.clone();
-                    combo_map.insert(classes.clone(), id);
-                    combo_to_classes.push(classes);
+                    let id = combo_pairs.len() as u32 + 1;
+                    let pairs = current_pairs.clone();
+                    combo_map.insert(pairs.clone(), id);
+                    combo_pairs.push(pairs);
                     id
                 };
                 subject_combos[current_subject as usize] = combo_id;
                 typed_subjects += 1;
-                current_classes.clear();
+                current_pairs.clear();
             }
         };
     }
 
     while let Some((s_id, p_id, o_id)) = scanner.next_triple()? {
+        let graphs = match memberships.as_mut() {
+            Some(join) => join.graphs_at(scanned)?,
+            None => UNION_GRAPHS,
+        };
         if s_id != current_subject {
             finalize_subject!();
             current_subject = s_id;
         }
         if p_id == rdf_type_pred_id {
-            current_classes.push(o_id);
+            current_pairs.extend(graphs.iter().map(|&graph| (graph, o_id)));
         }
         scanned += 1;
         if scanned.is_multiple_of(10_000_000) {
@@ -420,31 +824,29 @@ fn build_class_combo_index(
     }
     // Finalize last subject.
     finalize_subject!();
+    if let Some(join) = memberships {
+        join.finish()?;
+    }
 
-    let class_count = {
-        let mut seen = std::collections::HashSet::new();
-        for classes in &combo_to_classes {
-            seen.extend(classes.iter().copied());
-        }
-        seen.len()
+    let raw = RawClassCombos {
+        subject_combos,
+        combo_pairs,
     };
     tracing::info!(
         "  Pass 1 complete: {scanned} triples scanned, {typed_subjects} typed subjects, \
-         {class_count} distinct classes, {} unique class combinations",
-        combo_to_classes.len()
+         {} distinct classes, {} unique class combinations",
+        raw.distinct_class_ids().len(),
+        raw.combo_pairs.len()
     );
 
-    Ok(ClassComboIndex {
-        subject_combos,
-        combo_to_classes,
-    })
+    Ok(raw)
 }
 
 // ---------------------------------------------------------------------------
 // Post–Pass 1: filter non-IRI classes
 // ---------------------------------------------------------------------------
 
-/// Remove non-IRI class IDs (blank nodes, literals) from the class combo index.
+/// Remove non-IRI class IDs (blank nodes, literals) from the raw class combinations.
 ///
 /// The Python `void-hdt` tool only treats `URIRef` objects of `rdf:type` triples as
 /// valid classes.  Blank nodes used as `rdf:type` objects are common in OWL ontologies
@@ -454,11 +856,11 @@ fn build_class_combo_index(
 /// After filtering, combos that become empty are mapped to 0 (untyped), and
 /// duplicate filtered combos are merged.
 fn filter_non_iri_classes(
-    class_combo_index: &mut ClassComboIndex,
+    raw: &mut RawClassCombos,
     resolver: &mut DictionaryResolver,
 ) -> Result<()> {
     // Collect all unique class IDs across all combos.
-    let all_class_ids = class_combo_index.distinct_class_ids();
+    let all_class_ids = raw.distinct_class_ids();
 
     // Resolve each class ID and build set of non-IRI ones.
     let mut non_iri_class_ids = std::collections::HashSet::new();
@@ -481,16 +883,16 @@ fn filter_non_iri_classes(
     );
 
     // Build a remapping: old combo_id → new combo_id.
-    let mut new_combo_map: HashMap<Vec<u64>, u32> = HashMap::new();
-    let mut new_combo_to_classes: Vec<Vec<u64>> = Vec::new();
+    let mut new_combo_map: HashMap<Vec<(u64, u64)>, u32> = HashMap::new();
+    let mut new_combo_pairs: Vec<Vec<(u64, u64)>> = Vec::new();
     // combo_remap[i] = new combo_id for old combo_id (i+1). 0 = became untyped.
-    let mut combo_remap: Vec<u32> = Vec::with_capacity(class_combo_index.combo_to_classes.len());
+    let mut combo_remap: Vec<u32> = Vec::with_capacity(raw.combo_pairs.len());
 
-    for classes in &class_combo_index.combo_to_classes {
-        let filtered: Vec<u64> = classes
+    for pairs in &raw.combo_pairs {
+        let filtered: Vec<(u64, u64)> = pairs
             .iter()
             .copied()
-            .filter(|c| !non_iri_class_ids.contains(c))
+            .filter(|(_, class)| !non_iri_class_ids.contains(class))
             .collect();
 
         if filtered.is_empty() {
@@ -498,23 +900,55 @@ fn filter_non_iri_classes(
         } else if let Some(&id) = new_combo_map.get(&filtered) {
             combo_remap.push(id);
         } else {
-            let id = new_combo_to_classes.len() as u32 + 1;
-            new_combo_to_classes.push(filtered.clone());
+            let id = new_combo_pairs.len() as u32 + 1;
+            new_combo_pairs.push(filtered.clone());
             new_combo_map.insert(filtered, id);
             combo_remap.push(id);
         }
     }
 
     // Remap all subject entries.
-    for combo_id in class_combo_index.subject_combos.iter_mut() {
+    for combo_id in raw.subject_combos.iter_mut() {
         if *combo_id > 0 {
             *combo_id = combo_remap[*combo_id as usize - 1];
         }
     }
 
-    class_combo_index.combo_to_classes = new_combo_to_classes;
+    raw.combo_pairs = new_combo_pairs;
 
     Ok(())
+}
+
+/// Subjects per class: across the union, and per graph when `graph_count` is given.
+///
+/// Every subject sharing a combo has the same classes, so counting subjects per combo
+/// first makes this one pass over the index plus one over the combo table.
+fn class_entity_counts(
+    index: &ClassComboIndex,
+    graph_count: Option<usize>,
+) -> (HashMap<u64, u64>, Vec<HashMap<u64, u64>>) {
+    let mut subjects_per_combo = vec![0u64; index.combo_to_classes.len()];
+    for &combo_id in &index.subject_combos {
+        if combo_id > 0 {
+            subjects_per_combo[combo_id as usize - 1] += 1;
+        }
+    }
+
+    let mut union = HashMap::new();
+    let mut graphs: Vec<HashMap<u64, u64>> = std::iter::repeat_with(HashMap::new)
+        .take(graph_count.unwrap_or(0))
+        .collect();
+    for (combo, &subjects) in subjects_per_combo.iter().enumerate() {
+        for &class_id in &index.combo_to_classes[combo] {
+            *union.entry(class_id).or_insert(0) += subjects;
+        }
+        if let Some(graph_classes) = index.combo_to_graph_classes.get(combo) {
+            for (&graph, &class_id) in graph_classes.graphs.iter().zip(&graph_classes.classes) {
+                *graphs[graph as usize].entry(class_id).or_insert(0) += subjects;
+            }
+        }
+    }
+    (union, graphs)
 }
 
 // ---------------------------------------------------------------------------
@@ -662,7 +1096,8 @@ fn build_datatype_index(
 // Pass 2: Accumulate statistics
 // ---------------------------------------------------------------------------
 
-/// Scan all triples to accumulate:
+/// Scan all triples to accumulate the union's partition statistics, and with
+/// `subsets`, every graph's:
 /// - `dataset_prop_data`: triple and optional distinct-subject counts per predicate ID.
 /// - `class_partitions`: per-class property, target-class, and datatype breakdowns,
 ///   including optional distinct-subject counts.
@@ -673,240 +1108,126 @@ fn run_stats_pass(
     class_combo_index: &ClassComboIndex,
     datatype_index: &DatatypeIndex,
     distinct_scope: Option<PartitionDistinctScope>,
-) -> Result<StatsPassResult> {
-    let mut dataset_prop_data: HashMap<u64, DatasetPropData> = HashMap::new();
-    let mut class_partitions: HashMap<u64, ClassPartitionData> = HashMap::new();
-    let mut distinct_data = distinct_scope.map(PartitionDistinctData::new);
+    mut subsets: Option<SubsetPass<'_>>,
+) -> Result<PartitionStats> {
+    let mut union = PartitionStats::new(distinct_scope);
+    let union_classes = ClassLookup {
+        index: class_combo_index,
+        nb_shared,
+        scope: ClassScope::Union,
+    };
 
     let mut scanner =
         BitmapTriplesScanner::new(offsets, hdt_path).context("open scanner for Pass 2")?;
 
-    // Single-entry subject-type cache exploiting HDT's SPO ordering: consecutive triples
-    // almost always share the same subject, so caching just the last lookup gives ~100%
-    // hit rate with O(1) memory.
-    let mut prev_subject_id = u64::MAX;
-    let mut current_subject_classes: &[u64] = &[];
-
-    let mut processed = 0u64;
-    while let Some((s_id, p_id, o_id)) = scanner.next_triple()? {
+    let mut position = 0u64;
+    while let Some(triple) = scanner.next_triple()? {
         // Datatype lookup for this object (0 = not a literal).
-        let dt_id = datatype_index.get(o_id);
+        let dt_id = datatype_index.get(triple.2);
+        union.record_triple(triple, dt_id, datatype_index, union_classes);
 
-        // Dataset-level property count and datatype accumulation.
-        dataset_prop_data.entry(p_id).or_default().triple_count += 1;
-        if let Some(distinct) = distinct_data.as_mut() {
-            distinct
-                .dataset_prop_data
-                .entry(p_id)
-                .or_default()
-                .add_subject(s_id);
-        }
-
-        // Subject type lookup (update cache on subject change).
-        if s_id != prev_subject_id {
-            prev_subject_id = s_id;
-            current_subject_classes = class_combo_index.classes(s_id);
-        }
-
-        if current_subject_classes.is_empty() {
-            processed += 1;
-            if processed.is_multiple_of(10_000_000) {
-                tracing::info!(
-                    "  Pass 2: {processed}/{} triples processed...",
-                    offsets.num_triples
+        if let Some(pass) = subsets.as_mut() {
+            for &graph in pass.join.graphs_at(position)? {
+                let subset = &mut pass.subsets[graph as usize];
+                subset.triples += 1;
+                subset.distinct.add_subject(triple.0);
+                subset.partitions.record_triple(
+                    triple,
+                    dt_id,
+                    datatype_index,
+                    ClassLookup {
+                        scope: ClassScope::Graph(graph),
+                        ..union_classes
+                    },
                 );
             }
-            continue;
         }
 
-        // Object type lookup.
-        // Objects with ID > nb_shared are in the object-only section (literals or
-        // object-only URIs) and can never appear as subjects of rdf:type triples.
-        // Objects in the shared section (ID <= nb_shared) may be typed: look them up
-        // in the class combo index (shared IDs appear as both subjects and objects).
-        let obj_classes: &[u64] = if o_id <= nb_shared && class_combo_index.is_typed(o_id) {
-            class_combo_index.classes(o_id)
-        } else {
-            &[]
-        };
-
-        // Record this triple in every class partition the subject belongs to.
-        let mut distinct_classes = distinct_data
-            .as_mut()
-            .and_then(|distinct| distinct.class_partitions.as_mut());
-        for &class_id in current_subject_classes {
-            let cp = class_partitions.entry(class_id).or_default();
-            let pp = cp.prop_partitions.entry(p_id).or_default();
-            pp.triple_count += 1;
-            if dt_id > 0 {
-                *pp.target_datatypes.entry(dt_id).or_insert(0) += 1;
-            }
-            if obj_classes.is_empty() {
-                *pp.target_classes.entry(None).or_insert(0) += 1;
-            } else {
-                for &obj_class_id in obj_classes {
-                    *pp.target_classes.entry(Some(obj_class_id)).or_insert(0) += 1;
-                }
-            }
-
-            if let Some(distinct_classes) = distinct_classes.as_mut() {
-                let distinct_cp = distinct_classes.entry(class_id).or_default();
-                let distinct_pp = distinct_cp.prop_partitions.entry(p_id).or_default();
-                distinct_pp.stats.add_subject(s_id);
-                if dt_id > 0 {
-                    distinct_pp
-                        .target_datatypes
-                        .entry(dt_id)
-                        .or_default()
-                        .add_subject(s_id);
-                    if datatype_index.is_language(dt_id) {
-                        distinct_pp.lang_string.add_subject(s_id);
-                    }
-                }
-                if obj_classes.is_empty() {
-                    distinct_pp
-                        .target_classes
-                        .entry(None)
-                        .or_default()
-                        .add_subject(s_id);
-                } else {
-                    for &obj_class_id in obj_classes {
-                        distinct_pp
-                            .target_classes
-                            .entry(Some(obj_class_id))
-                            .or_default()
-                            .add_subject(s_id);
-                    }
-                }
-            }
-        }
-
-        processed += 1;
-        if processed.is_multiple_of(10_000_000) {
+        position += 1;
+        if position.is_multiple_of(10_000_000) {
             tracing::info!(
-                "  Pass 2: {processed}/{} triples processed...",
+                "  Pass 2: {position}/{} triples processed...",
                 offsets.num_triples
             );
         }
     }
+    if let Some(pass) = subsets {
+        pass.join.finish()?;
+    }
 
-    Ok(StatsPassResult {
-        dataset_prop_data,
-        class_partitions,
-        distinct_data,
-    })
+    Ok(union)
 }
 
 /// Scan the permutation sidecar in OPS order and add exact distinct-object
 /// counts. Because every partition sees object IDs monotonically, each one only
 /// needs a last-seen object scalar rather than a set of all its objects.
 ///
-/// `class_combo_index` is required only when `distinct_data` carries the nested
-/// class hierarchy (the `all` scope). A `dataset-properties` run attributes
-/// objects by predicate alone, so it passes `None` and the caller releases the
-/// index — 4 bytes per subject — before this pass rather than after it.
+/// `class_combo_index` is required only when the nested class hierarchy is
+/// tracked (the `all` scope). A `dataset-properties` run attributes objects by
+/// predicate alone, so it passes `None` and the caller releases the index — 4
+/// bytes per subject — before this pass rather than after it.
+///
+/// With `subsets`, each graph additionally counts its dataset-level distinct
+/// objects, which unlike the union's are not a dictionary section size.
 fn run_distinct_object_pass(
     index: &PermutationIndex,
     nb_shared: u64,
     class_combo_index: Option<&ClassComboIndex>,
     datatype_index: &DatatypeIndex,
-    distinct_data: &mut PartitionDistinctData,
+    distinct_scope: Option<PartitionDistinctScope>,
+    union: &mut PartitionStats,
+    mut subsets: Option<SubsetPass<'_>>,
 ) -> Result<()> {
-    // Hoisted out of the scan: the nested class map and the combo index are
+    // Hoisted out of the scan: the nested class maps and the combo index are
     // present together or absent together.
-    let class_combo_index = if distinct_data.class_partitions.is_some() {
-        Some(
-            class_combo_index
-                .context("class partition distinct counts require the subject-to-class index")?,
-        )
-    } else {
-        None
-    };
+    if distinct_scope == Some(PartitionDistinctScope::All) {
+        ensure!(
+            class_combo_index.is_some(),
+            "class partition distinct counts require the subject-to-class index"
+        );
+    }
+    let union_classes = class_combo_index.map(|index| ClassLookup {
+        index,
+        nb_shared,
+        scope: ClassScope::Union,
+    });
 
     let mut scanner = index
         .all_triples(PermutationComponent::Ops)
         .context("Failed to open OPS permutation scan")?;
     let num_triples = index.header().triples;
-    let mut processed = 0u64;
+    let mut position = 0u64;
     for triple in &mut scanner {
-        let (s_id, p_id, o_id) = triple.context("Failed to scan OPS permutation")?;
-        distinct_data
-            .dataset_prop_data
-            .get_mut(&p_id)
-            .with_context(|| format!("OPS permutation contains unknown predicate ID {p_id}"))?
-            .add_object(o_id);
+        let triple = triple.context("Failed to scan OPS permutation")?;
+        let dt_id = datatype_index.get(triple.2);
+        union.record_object(triple, dt_id, datatype_index, union_classes)?;
 
-        if let (Some(distinct_classes), Some(class_combo_index)) =
-            (distinct_data.class_partitions.as_mut(), class_combo_index)
-        {
-            let subject_classes = class_combo_index.classes(s_id);
-            if !subject_classes.is_empty() {
-                let dt_id = datatype_index.get(o_id);
-                let object_classes = if o_id <= nb_shared && class_combo_index.is_typed(o_id) {
-                    class_combo_index.classes(o_id)
-                } else {
-                    &[]
-                };
-
-                for &class_id in subject_classes {
-                    let distinct_cp = distinct_classes.get_mut(&class_id).with_context(|| {
-                        format!("OPS permutation references unknown class ID {class_id}")
-                    })?;
-                    distinct_cp.objects.add_object(o_id);
-                    let distinct_pp =
-                        distinct_cp
-                            .prop_partitions
-                            .get_mut(&p_id)
-                            .with_context(|| {
-                        format!(
-                            "OPS permutation references unknown property ID {p_id} in class {class_id}"
-                        )
-                    })?;
-                    distinct_pp.stats.add_object(o_id);
-
-                    if object_classes.is_empty() {
-                        distinct_pp
-                            .target_classes
-                            .get_mut(&None)
-                            .context("missing untyped target-class partition")?
-                            .add_object(o_id);
-                    } else {
-                        for &object_class_id in object_classes {
-                            distinct_pp
-                                .target_classes
-                                .get_mut(&Some(object_class_id))
-                                .with_context(|| {
-                                    format!(
-                                        "missing target-class partition for class ID {object_class_id}"
-                                    )
-                                })?
-                                .add_object(o_id);
-                        }
-                    }
-
-                    if dt_id > 0 {
-                        distinct_pp
-                            .target_datatypes
-                            .get_mut(&dt_id)
-                            .with_context(|| {
-                                format!("missing datatype partition for entry ID {dt_id}")
-                            })?
-                            .add_object(o_id);
-                        if datatype_index.is_language(dt_id) {
-                            distinct_pp.lang_string.add_object(o_id);
-                        }
-                    }
-                }
+        if let Some(pass) = subsets.as_mut() {
+            for &graph in pass.join.graphs_at(position)? {
+                let subset = &mut pass.subsets[graph as usize];
+                subset.distinct.add_object(triple.2);
+                subset.partitions.record_object(
+                    triple,
+                    dt_id,
+                    datatype_index,
+                    union_classes.map(|classes| ClassLookup {
+                        scope: ClassScope::Graph(graph),
+                        ..classes
+                    }),
+                )?;
             }
         }
 
-        processed += 1;
-        if processed.is_multiple_of(10_000_000) {
-            tracing::info!("  OPS pass: {processed}/{num_triples} triples processed...");
+        position += 1;
+        if position.is_multiple_of(10_000_000) {
+            tracing::info!("  OPS pass: {position}/{num_triples} triples processed...");
         }
     }
+    if let Some(pass) = subsets {
+        pass.join.finish()?;
+    }
 
-    tracing::info!("  OPS pass complete: {processed} triples processed");
+    tracing::info!("  OPS pass complete: {position} triples processed");
     Ok(())
 }
 
@@ -1064,21 +1385,33 @@ fn write_datatype_partitions(
     Ok(written)
 }
 
-/// Serialize all VoID statistics as N-Triples, written to `w`.
+/// Where one dataset description is rooted, and the statements that head it.
+struct DatasetHead<'a> {
+    /// IRI every partition node of this description extends.
+    uri: &'a str,
+    /// The formatted subject node: the IRI, or a blank node in blank-node mode.
+    node: &'a str,
+    types: &'a [&'a str],
+    counts: DatasetCounts,
+}
+
+/// Serialize one dataset description — the union, or one graph subset — as
+/// N-Triples written to `w`.
 ///
 /// Returns the number of N-Triples written.
-fn write_void_triples(
+fn write_dataset_description(
     w: &mut impl Write,
-    dataset_uri: &str,
-    use_blank_nodes: bool,
-    stats: &VoidStats,
+    head: &DatasetHead<'_>,
+    stats: &PartitionStats,
     datatype_index: &DatatypeIndex,
     resolver: &mut DictionaryResolver,
-    distinct_data: Option<&PartitionDistinctData>,
+    use_blank_nodes: bool,
+    bnode_counter: &mut u64,
 ) -> Result<u64> {
     let mut written: u64 = 0;
-    let mut bnode_counter: u64 = 0;
-    let dataset_node = format!("<{dataset_uri}>");
+    let dataset_uri = head.uri;
+    let dataset_node = head.node;
+    let distinct_data = stats.distinct_data.as_ref();
 
     // Reusable term buffer for dictionary lookups.
     let mut term_buf = Vec::<u8>::new();
@@ -1086,29 +1419,32 @@ fn write_void_triples(
     // -----------------------------------------------------------------------
     // 1. Dataset-level statistics
     // -----------------------------------------------------------------------
-    nt(w, &dataset_node, RDF_TYPE, &format!("<{VOID_DATASET}>"))?;
-    written += 1;
-    nt(w, &dataset_node, VOID_TRIPLES, &int_node(stats.num_triples))?;
+    for class in head.types {
+        nt(w, dataset_node, RDF_TYPE, &format!("<{class}>"))?;
+        written += 1;
+    }
+    let counts = &head.counts;
+    nt(w, dataset_node, VOID_TRIPLES, &int_node(counts.triples))?;
     written += 1;
     nt(
         w,
-        &dataset_node,
+        dataset_node,
         VOID_DISTINCT_SUBJECTS,
-        &int_node(stats.nb_subjects),
+        &int_node(counts.distinct_subjects),
     )?;
     written += 1;
     nt(
         w,
-        &dataset_node,
+        dataset_node,
         VOID_PROPERTIES,
-        &int_node(stats.nb_predicates),
+        &int_node(counts.properties),
     )?;
     written += 1;
     nt(
         w,
-        &dataset_node,
+        dataset_node,
         VOID_DISTINCT_OBJECTS,
-        &int_node(stats.nb_objects),
+        &int_node(counts.distinct_objects),
     )?;
     written += 1;
 
@@ -1127,9 +1463,9 @@ fn write_void_triples(
         }
         let pred_iri = String::from_utf8_lossy(&term_buf).into_owned();
         let part_uri = format!("{dataset_uri}/property/{}", md5_hex(&pred_iri));
-        let part_node = make_partition_node(use_blank_nodes, &part_uri, &mut bnode_counter);
+        let part_node = make_partition_node(use_blank_nodes, &part_uri, bnode_counter);
 
-        nt(w, &dataset_node, VOID_PROPERTY_PARTITION, &part_node)?;
+        nt(w, dataset_node, VOID_PROPERTY_PARTITION, &part_node)?;
         written += 1;
         nt(w, &part_node, RDF_TYPE, &format!("<{VOID_DATASET}>"))?;
         written += 1;
@@ -1174,10 +1510,9 @@ fn write_void_triples(
         }
         let class_iri = String::from_utf8_lossy(&class_buf).into_owned();
         let class_part_uri = format!("{dataset_uri}/class/{}", md5_hex(&class_iri));
-        let class_part_node =
-            make_partition_node(use_blank_nodes, &class_part_uri, &mut bnode_counter);
+        let class_part_node = make_partition_node(use_blank_nodes, &class_part_uri, bnode_counter);
 
-        nt(w, &dataset_node, VOID_CLASS_PARTITION, &class_part_node)?;
+        nt(w, dataset_node, VOID_CLASS_PARTITION, &class_part_node)?;
         written += 1;
         nt(w, &class_part_node, RDF_TYPE, &format!("<{VOID_DATASET}>"))?;
         written += 1;
@@ -1229,7 +1564,7 @@ fn write_void_triples(
             let pred_iri = String::from_utf8_lossy(&term_buf).into_owned();
             let prop_part_uri = format!("{class_part_uri}/property/{}", md5_hex(&pred_iri));
             let prop_part_node =
-                make_partition_node(use_blank_nodes, &prop_part_uri, &mut bnode_counter);
+                make_partition_node(use_blank_nodes, &prop_part_uri, bnode_counter);
 
             nt(
                 w,
@@ -1273,7 +1608,7 @@ fn write_void_triples(
                 let hash_input = target_iri_opt.as_deref().unwrap_or(UNTYPED_HASH_INPUT);
                 let target_part_uri = format!("{prop_part_uri}/target/{}", md5_hex(hash_input));
                 let target_part_node =
-                    make_partition_node(use_blank_nodes, &target_part_uri, &mut bnode_counter);
+                    make_partition_node(use_blank_nodes, &target_part_uri, bnode_counter);
 
                 nt(
                     w,
@@ -1310,12 +1645,191 @@ fn write_void_triples(
                     use_blank_nodes,
                     distinct: distinct_pp,
                 },
-                &mut bnode_counter,
+                bnode_counter,
             )?;
         }
     }
 
-    w.flush().context("flush VoID output")?;
+    Ok(written)
+}
+
+// ---------------------------------------------------------------------------
+// Graph subsets
+// ---------------------------------------------------------------------------
+
+/// The artifacts a dataset-view run reads besides the HDT.
+struct DatasetViewInputs {
+    sidecar: GraphSidecarReader,
+    graph_index: GraphIndex,
+    temp_dir: std::path::PathBuf,
+    /// Keeps a self-cleaning temp dir alive for the whole run.
+    _owned_temp_dir: Option<tempfile::TempDir>,
+    /// Memory for one membership transpose; the dictionary cache takes the rest.
+    stream_budget: usize,
+}
+
+impl DatasetViewInputs {
+    fn open(hdt_path: &Path, temp_dir: Option<&Path>, stream_budget: usize) -> Result<Self> {
+        let sidecar_path = crate::quads::canonical_sidecar_path(hdt_path);
+        ensure!(
+            sidecar_path.is_file(),
+            "the dataset graph view requires graph sidecar {}; create the HDT with `--mode quads`",
+            sidecar_path.display()
+        );
+        let sidecar = GraphSidecarReader::open(&sidecar_path, hdt_path)
+            .with_context(|| format!("Failed to open graph sidecar {}", sidecar_path.display()))?;
+
+        let index_path = crate::graph_index::canonical_path(hdt_path);
+        ensure!(
+            index_path.is_file(),
+            "the dataset graph view requires graph index {} for per-graph distinct objects; \
+             create it with `hdtc graphs-index {}`",
+            index_path.display(),
+            hdt_path.display()
+        );
+        let graph_index = GraphIndex::open(&index_path, hdt_path)
+            .with_context(|| format!("Failed to open graph index {}", index_path.display()))?;
+        ensure!(
+            graph_index.has_ops_layers(),
+            "graph index {} has no OPS layer set; rebuild it with `hdtc graphs-index {} --positions pos,ops`",
+            index_path.display(),
+            hdt_path.display()
+        );
+
+        let (temp_dir, owned_temp_dir) = match temp_dir {
+            Some(dir) => {
+                std::fs::create_dir_all(dir)
+                    .with_context(|| format!("Failed to create temp dir {}", dir.display()))?;
+                (dir.to_path_buf(), None)
+            }
+            None => {
+                let owned = tempfile::Builder::new()
+                    .prefix("hdtc-void-")
+                    .tempdir()
+                    .context("Failed to create temp dir")?;
+                (owned.path().to_path_buf(), Some(owned))
+            }
+        };
+
+        Ok(Self {
+            sidecar,
+            graph_index,
+            temp_dir,
+            _owned_temp_dir: owned_temp_dir,
+            stream_budget,
+        })
+    }
+
+    fn named_graphs(&self) -> u64 {
+        self.sidecar.named_graph_count()
+    }
+
+    /// The sidecar's memberships in SPO position order.
+    fn spo_join(&mut self) -> Result<MembershipJoin> {
+        let named_graphs = self.named_graphs();
+        open_join(
+            &mut self.sidecar,
+            named_graphs,
+            &self.temp_dir,
+            self.stream_budget,
+        )
+    }
+
+    /// The graph index's memberships in OPS position order.
+    fn ops_join(&mut self) -> Result<MembershipJoin> {
+        let named_graphs = self.named_graphs();
+        open_join(
+            self.graph_index.layers_mut(GraphIndexSpace::Ops)?,
+            named_graphs,
+            &self.temp_dir,
+            self.stream_budget,
+        )
+    }
+}
+
+/// Transpose a layer set into position order, by k-way merge when its layers fit
+/// the budget as concurrent iterators and by external sort otherwise.
+fn open_join(
+    layers: &mut impl LayerSource,
+    named_graphs: u64,
+    temp_dir: &Path,
+    stream_budget: usize,
+) -> Result<MembershipJoin> {
+    let merge = layer_merge_reserve(named_graphs + 1, stream_budget).is_some();
+    MembershipJoin::new(PositionMajorMemberships::open(
+        layers,
+        named_graphs,
+        temp_dir,
+        stream_budget,
+        merge,
+    )?)
+}
+
+/// Link every graph subset from the dataset and serialize its description.
+///
+/// Subsets are keyed by the MD5 of the graph term: `{dataset}/graph/{md5}` for the
+/// subset and `{dataset}/named-graph/{md5}` for its `sd:NamedGraph`. The default graph
+/// has no term, so it is `{dataset}/default-graph`, and is described only when it
+/// holds triples. A blank-node graph name cannot be an `sd:name`, so such a graph
+/// gets its subset but no `sd:NamedGraph`.
+#[allow(clippy::too_many_arguments)]
+fn write_graph_subsets(
+    w: &mut impl Write,
+    dataset_uri: &str,
+    subsets: &[GraphSubset],
+    sidecar: &mut GraphSidecarReader,
+    datatype_index: &DatatypeIndex,
+    resolver: &mut DictionaryResolver,
+    use_blank_nodes: bool,
+    bnode_counter: &mut u64,
+) -> Result<u64> {
+    let dataset_node = format!("<{dataset_uri}>");
+    let mut written = 0u64;
+    for (graph, subset) in subsets.iter().enumerate() {
+        let name = match sidecar.graph(graph as u64)? {
+            GraphTerm::DefaultGraph if subset.triples == 0 => continue,
+            GraphTerm::DefaultGraph => None,
+            GraphTerm::Named(term) => Some(term),
+        };
+        let subset_uri = match &name {
+            None => format!("{dataset_uri}/default-graph"),
+            Some(term) => format!("{dataset_uri}/graph/{}", md5_hex(term)),
+        };
+        let subset_node = make_partition_node(use_blank_nodes, &subset_uri, bnode_counter);
+
+        nt(w, &dataset_node, VOID_SUBSET, &subset_node)?;
+        written += 1;
+        if let Some(term) = name.as_deref().filter(|term| is_iri(term.as_bytes())) {
+            let named_uri = format!("{dataset_uri}/named-graph/{}", md5_hex(term));
+            let named_node = make_partition_node(use_blank_nodes, &named_uri, bnode_counter);
+            nt(w, &dataset_node, SD_NAMED_GRAPH, &named_node)?;
+            nt(
+                w,
+                &named_node,
+                RDF_TYPE,
+                &format!("<{SD_NAMED_GRAPH_CLASS}>"),
+            )?;
+            nt(w, &named_node, SD_NAME, &format!("<{term}>"))?;
+            nt(w, &named_node, SD_GRAPH, &subset_node)?;
+            written += 4;
+        }
+
+        let head = DatasetHead {
+            uri: &subset_uri,
+            node: &subset_node,
+            types: &[VOID_DATASET, SD_GRAPH_CLASS],
+            counts: subset.counts(),
+        };
+        written += write_dataset_description(
+            w,
+            &head,
+            &subset.partitions,
+            datatype_index,
+            resolver,
+            use_blank_nodes,
+            bnode_counter,
+        )?;
+    }
     Ok(written)
 }
 
@@ -1324,7 +1838,7 @@ fn write_void_triples(
 // ---------------------------------------------------------------------------
 
 /// Compute VoID statistics for the given HDT file and write N-Triples to
-/// `output_path` (or stdout if `None`).
+/// `options.output_path` (or stdout if `None`).
 ///
 /// Returns the number of VoID N-Triples written.
 ///
@@ -1337,30 +1851,58 @@ fn write_void_triples(
 /// permutation sidecar and adds one sequential OPS pass. The `All` scope also allocates
 /// exact scalar tracking state proportional to the emitted partition combinations; that
 /// analysis state is not bounded by `memory_limit`.
-pub fn compute_void(
-    hdt_path: &Path,
-    dataset_uri: &str,
-    output_path: Option<&Path>,
-    use_blank_nodes: bool,
-    memory_limit: usize,
-    distinct_scope: Option<PartitionDistinctScope>,
-) -> Result<u64> {
+///
+/// The `Dataset` graph view requires the `.graphs` sidecar, the permutation sidecar, and
+/// a graph index with OPS layers. It splits `memory_limit` between the dictionary cache
+/// and the membership transposes, and repeats the partition statistics once per graph,
+/// so analysis memory grows with graphs × partitions.
+pub fn compute_void(hdt_path: &Path, options: &VoidOptions<'_>) -> Result<u64> {
+    let by_graph = options.graph_view == VoidGraphView::Dataset;
+    let distinct_scope = options.distinct_scope;
+    let dictionary_budget = if by_graph {
+        options.memory_limit / 2
+    } else {
+        options.memory_limit
+    };
+
     // Open the HDT file and build the dictionary resolver.
     let (offsets, mut resolver) =
-        open_hdt(hdt_path, memory_limit).context("Failed to open HDT file")?;
-    let permutation_index = distinct_scope
-        .map(|_| {
+        open_hdt(hdt_path, dictionary_budget).context("Failed to open HDT file")?;
+    // The sidecar is the dataset view's defining input, so it is checked first.
+    let mut dataset_view = by_graph
+        .then(|| {
+            DatasetViewInputs::open(
+                hdt_path,
+                options.temp_dir,
+                options.memory_limit - dictionary_budget,
+            )
+        })
+        .transpose()?;
+    let needs_ops_pass = distinct_scope.is_some() || by_graph;
+    let permutation_index = needs_ops_pass
+        .then(|| {
             let perm_path = permutation::canonical_path(hdt_path);
             anyhow::ensure!(
                 perm_path.is_file(),
-                "partition distinct counts require permutation index {}; create it with `hdtc perm {}`",
+                "{} require permutation index {}; create it with `hdtc perm {}`",
+                if distinct_scope.is_some() {
+                    "partition distinct counts"
+                } else {
+                    "per-graph distinct objects"
+                },
                 perm_path.display(),
                 hdt_path.display()
             );
-            PermutationIndex::open(&perm_path, hdt_path)
-                .with_context(|| format!("Failed to open permutation index {}", perm_path.display()))
+            PermutationIndex::open(&perm_path, hdt_path).with_context(|| {
+                format!("Failed to open permutation index {}", perm_path.display())
+            })
         })
         .transpose()?;
+    let graph_count = dataset_view
+        .as_ref()
+        .map(|inputs| usize::try_from(inputs.named_graphs() + 1))
+        .transpose()
+        .context("graph count overflow")?;
 
     let nb_shared = resolver.shared.string_count;
     let nb_subjects = nb_shared + resolver.subjects.string_count;
@@ -1372,6 +1914,13 @@ pub fn compute_void(
         "HDT stats: {num_triples} triples, {nb_subjects} subjects, \
          {nb_predicates} predicates, {nb_objects} objects"
     );
+    if let Some(inputs) = dataset_view.as_ref() {
+        tracing::info!(
+            "Graph sidecar: {} named graphs, {} memberships",
+            inputs.named_graphs(),
+            inputs.sidecar.membership_count()
+        );
+    }
 
     // Locate the rdf:type predicate ID in the dictionary.
     let rdf_type_pred_id = resolver
@@ -1379,31 +1928,39 @@ pub fn compute_void(
         .context("Failed to locate rdf:type predicate")?;
 
     // Pass 1: build class combo index from rdf:type triples.
-    let mut class_combo_index = if let Some(type_pred_id) = rdf_type_pred_id {
+    let mut raw_class_combos = if let Some(type_pred_id) = rdf_type_pred_id {
         tracing::info!("Pass 1: scanning rdf:type triples (pred_id={type_pred_id})...");
-        build_class_combo_index(hdt_path, &offsets, type_pred_id, nb_subjects)?
+        let memberships = dataset_view
+            .as_mut()
+            .map(DatasetViewInputs::spo_join)
+            .transpose()?;
+        build_class_combo_index(hdt_path, &offsets, type_pred_id, nb_subjects, memberships)?
     } else {
         tracing::info!("rdf:type predicate not found; skipping class partition analysis");
-        ClassComboIndex {
+        RawClassCombos {
             subject_combos: Vec::new(),
-            combo_to_classes: Vec::new(),
+            combo_pairs: Vec::new(),
         }
     };
 
     // Filter out non-IRI class IDs (blank nodes, literals).
     // The Python tool only considers URIRef classes; blank nodes used as rdf:type
     // objects should not create class partitions or affect type-based counting.
-    filter_non_iri_classes(&mut class_combo_index, &mut resolver)?;
+    filter_non_iri_classes(&mut raw_class_combos, &mut resolver)?;
+    let class_combo_index = ClassComboIndex::new(raw_class_combos, by_graph);
 
     // Compute entity counts per class from the class combo index.
-    let mut class_entity_counts: HashMap<u64, u64> = HashMap::new();
-    for &combo_id in &class_combo_index.subject_combos {
-        if combo_id > 0 {
-            for &class_id in &class_combo_index.combo_to_classes[combo_id as usize - 1] {
-                *class_entity_counts.entry(class_id).or_insert(0) += 1;
-            }
-        }
-    }
+    let (class_entity_counts, graph_entity_counts) =
+        class_entity_counts(&class_combo_index, graph_count);
+    let mut subsets: Vec<GraphSubset> = graph_entity_counts
+        .into_iter()
+        .map(|entity_counts| GraphSubset {
+            triples: 0,
+            distinct: DistinctStats::default(),
+            partitions: PartitionStats::new(distinct_scope),
+            entity_counts,
+        })
+        .collect();
 
     // Build datatype index from object-only dictionary entries.
     tracing::info!("Building datatype index from object-only dictionary...");
@@ -1411,17 +1968,23 @@ pub fn compute_void(
 
     // Pass 2: full triple scan — dataset-level property counts and class partitions.
     tracing::info!("Pass 2: scanning all triples for statistics...");
-    let StatsPassResult {
-        dataset_prop_data,
-        mut class_partitions,
-        mut distinct_data,
-    } = run_stats_pass(
+    let subset_pass = dataset_view
+        .as_mut()
+        .map(|inputs| -> Result<_> {
+            Ok(SubsetPass {
+                join: inputs.spo_join()?,
+                subsets: &mut subsets,
+            })
+        })
+        .transpose()?;
+    let mut union = run_stats_pass(
         hdt_path,
         &offsets,
         nb_shared,
         &class_combo_index,
         &datatype_index,
         distinct_scope,
+        subset_pass,
     )?;
 
     // Only the `all` scope attributes OPS-ordered triples to class partitions.
@@ -1435,57 +1998,88 @@ pub fn compute_void(
         None
     };
 
-    if let Some(distinct_data) = distinct_data.as_mut() {
+    if let Some(permutation_index) = permutation_index.as_ref() {
         tracing::info!("Scanning OPS permutation for exact distinct-object counts...");
-        let permutation_index = permutation_index
-            .as_ref()
-            .context("partition distinct statistics require an open permutation index")?;
+        let subset_pass = dataset_view
+            .as_mut()
+            .map(|inputs| -> Result<_> {
+                Ok(SubsetPass {
+                    join: inputs.ops_join()?,
+                    subsets: &mut subsets,
+                })
+            })
+            .transpose()?;
         run_distinct_object_pass(
             permutation_index,
             nb_shared,
             class_combo_index.as_ref(),
             &datatype_index,
-            distinct_data,
+            distinct_scope,
+            &mut union,
+            subset_pass,
         )?;
     }
 
     // Release the class combo index (unused after the optional OPS pass).
     drop(class_combo_index);
 
-    // Merge entity counts into class_partitions.
-    for (class_id, cp) in class_partitions.iter_mut() {
-        cp.entity_count = *class_entity_counts.get(class_id).unwrap_or(&0);
+    // Merge entity counts into class partitions.
+    union.apply_entity_counts(&class_entity_counts);
+    for subset in &mut subsets {
+        subset.partitions.apply_entity_counts(&subset.entity_counts);
     }
-
-    let stats = VoidStats {
-        num_triples,
-        nb_subjects,
-        nb_predicates,
-        nb_objects,
-        dataset_prop_data,
-        class_partitions,
-    };
 
     tracing::info!(
         "Analysis complete: {} predicates, {} class partitions, {} datatypes, {} languages",
-        stats.dataset_prop_data.len(),
-        stats.class_partitions.len(),
+        union.dataset_prop_data.len(),
+        union.class_partitions.len(),
         datatype_index.datatype_iris.len(),
         datatype_index.language_tags.len(),
     );
 
     // Serialize as N-Triples.
     tracing::info!("Serializing VoID statistics as N-Triples...");
-    let mut writer = make_writer(output_path)?;
-    let written = write_void_triples(
+    let mut writer = make_writer(options.output_path)?;
+    let mut bnode_counter = 0u64;
+    let dataset_node = format!("<{}>", options.dataset_uri);
+    let union_types: &[&str] = if by_graph {
+        &[VOID_DATASET, SD_DATASET]
+    } else {
+        &[VOID_DATASET]
+    };
+    let head = DatasetHead {
+        uri: options.dataset_uri,
+        node: &dataset_node,
+        types: union_types,
+        counts: DatasetCounts {
+            triples: num_triples,
+            distinct_subjects: nb_subjects,
+            properties: nb_predicates,
+            distinct_objects: nb_objects,
+        },
+    };
+    let mut written = write_dataset_description(
         &mut writer,
-        dataset_uri,
-        use_blank_nodes,
-        &stats,
+        &head,
+        &union,
         &datatype_index,
         &mut resolver,
-        distinct_data.as_ref(),
+        options.use_blank_nodes,
+        &mut bnode_counter,
     )?;
+    if let Some(inputs) = dataset_view.as_mut() {
+        written += write_graph_subsets(
+            &mut writer,
+            options.dataset_uri,
+            &subsets,
+            &mut inputs.sidecar,
+            &datatype_index,
+            &mut resolver,
+            options.use_blank_nodes,
+            &mut bnode_counter,
+        )?;
+    }
+    writer.flush().context("flush VoID output")?;
 
     Ok(written)
 }

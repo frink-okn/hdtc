@@ -105,12 +105,14 @@ tests/
   sketch_test.rs      - Sketch envelope, role, filter, and edge-case tests
   keyset_test.rs      - Key-set envelope, role, encoding, and edge-case tests
   text_test.rs        - Text index build, manifest, ranking, and query-filter tests
+  void_test.rs        - VoID partitions, distinct counts, and graph-subset tests
   data/               - Sample RDF fixtures
 docs/
   graphs-sidecar-format.md - Normative .graphs sidecar format
   sketch-format.md         - Normative .filter / .minhash formats
   keyset-format.md         - Normative .keys format
   text-index-format.md     - Normative .text index convention
+  void-format.md           - Normative VoID output shape, node naming, graph subsets
 ```
 
 ### Dictionary-derived sidecar artifacts
@@ -155,6 +157,17 @@ Untagged literals are stemmed as a declared default language (`en` unless
 inconsistent *within* a merged graph — Ubergraph has untagged UBERON labels and
 `@en` GO labels — so the cautious-looking rule would make recall depend on a
 term's source ontology. The assumption is recorded in every manifest.
+
+### VoID descriptions
+
+`hdtc void` emits RDF, not bytes, so `docs/void-format.md` specifies a triple
+set: the partition tree, the `{parent}/{kind}/{md5}` node names, and — with
+`--graph-view dataset` — one `void:subset` per graph of a quads HDT, linked by
+SPARQL Service Description. One rule governs subsets: **a graph's subset is
+exactly what a union-view run over that graph's triples alone would emit**, so
+typing is graph-local and subset counts are not additive. The `void_test.rs`
+oracle builds each graph standalone and compares; any change to per-graph
+accumulation must keep it passing. Union-view output must stay byte-identical.
 
 ## Published formats
 
