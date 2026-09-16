@@ -276,6 +276,7 @@ fn create_hdt(args: cli::CreateArgs, benchmark: bool) -> Result<()> {
         chunk_workers: args.parse_chunk_workers,
         chunk_size_bytes: args.parse_chunk_bytes,
         max_inflight_bytes: args.parse_max_inflight_bytes,
+        max_term_bytes: Some(args.max_term_bytes.as_bytes()),
     };
 
     // Compute base URI: use provided value, or derive from first input file

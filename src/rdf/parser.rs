@@ -4,12 +4,24 @@ use crate::dictionary::term::encode_literal;
 use crate::rdf::input::{Compression, RdfFormat, RdfInput};
 use anyhow::{Context, Result};
 use crossbeam_channel::TrySendError;
-use oxrdf::{BlankNode, GraphName, Literal, NamedOrBlankNode, Term, Triple};
+use oxrdf::{BlankNode, GraphName, Literal, NamedOrBlankNode, Quad, Term, Triple};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::{self, BufReader, Read};
+use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex};
+
+/// Default upper bound, in bytes, on one parsed term (an IRI or a literal).
+///
+/// The Turtle-family lexer buffers a single token at a time and refuses one
+/// larger than its buffer, and the released oxttl hard-codes that bound at
+/// 16 MiB. Real data exceeds it: GADM ships country boundaries as WKT literals
+/// up to 86 MB, and a build over them silently skips exactly those statements.
+/// The vendored oxttl under `vendor/oxttl` exposes the bound; this is what hdtc
+/// passes unless `--max-term-bytes` says otherwise. The buffer grows on demand,
+/// so the cost is per parser and only what the largest term actually needs.
+pub const DEFAULT_MAX_TERM_BYTES: usize = 256 * 1024 * 1024;
 
 /// Parser parallelism controls.
 #[derive(Debug, Clone)]
@@ -18,6 +30,10 @@ pub struct ParseOptions {
     pub chunk_size_bytes: usize,
     pub chunk_workers: usize,
     pub max_inflight_bytes: usize,
+    /// Largest single IRI or literal accepted; an input holding a larger one
+    /// fails, since the lexer cannot skip what it cannot buffer. See
+    /// [`DEFAULT_MAX_TERM_BYTES`].
+    pub max_term_bytes: usize,
 }
 
 impl Default for ParseOptions {
@@ -29,6 +45,7 @@ impl Default for ParseOptions {
                 .map(|n| n.get().max(1))
                 .unwrap_or(4),
             max_inflight_bytes: 256 * 1024 * 1024,
+            max_term_bytes: DEFAULT_MAX_TERM_BYTES,
         }
     }
 }
@@ -45,6 +62,9 @@ struct ChunkParsed {
     quads: Vec<ExtractedQuad>,
     stats: ParseStats,
     error_samples: Vec<String>,
+    /// Set when the chunk hit an error the parser cannot get past
+    /// ([`ParseError::is_fatal`]); the message ends the whole input.
+    fatal: Option<String>,
 }
 
 #[derive(Debug)]
@@ -228,6 +248,7 @@ where
         file_index,
         disambiguate_blank_nodes,
         base_uri,
+        options.max_term_bytes,
         &mut callback,
     )
 }
@@ -253,8 +274,7 @@ pub(crate) fn parse_rdf_to_triples(
     blank_prefix: &str,
 ) -> Result<ParsedTriples> {
     let reader = open_input(input)?;
-    let format = to_oxrdf_format(input.format);
-    let parser = make_lenient_parser(format, base_uri);
+    let parser = LenientParser::new(input.format, base_uri, DEFAULT_MAX_TERM_BYTES);
 
     let mut out = ParsedTriples {
         triples: Vec::new(),
@@ -274,6 +294,9 @@ pub(crate) fn parse_rdf_to_triples(
                     .push(Triple::new(subject, quad.predicate, object));
             }
             Err(e) => {
+                if e.is_fatal() {
+                    return Err(e.into_fatal(&input.path, DEFAULT_MAX_TERM_BYTES));
+                }
                 out.errors += 1;
                 if out.errors <= 10 {
                     tracing::warn!(
@@ -334,14 +357,14 @@ fn stream_quads_sequential<F>(
     file_index: usize,
     disambiguate_blank_nodes: bool,
     base_uri: Option<&str>,
+    max_term_bytes: usize,
     callback: &mut F,
 ) -> Result<ParseStats>
 where
     F: FnMut(ExtractedQuad) -> Result<()>,
 {
     let reader = open_input(input)?;
-    let format = to_oxrdf_format(input.format);
-    let parser = make_lenient_parser(format, base_uri);
+    let parser = LenientParser::new(input.format, base_uri, max_term_bytes);
 
     let blank_prefix = if disambiguate_blank_nodes {
         format!("f{file_index}_")
@@ -378,6 +401,9 @@ where
                 })?;
             }
             Err(e) => {
+                if e.is_fatal() {
+                    return Err(e.into_fatal(&input.path, max_term_bytes));
+                }
                 stats.errors += 1;
                 if stats.errors <= 10 {
                     tracing::warn!(
@@ -407,14 +433,153 @@ where
     Ok(stats)
 }
 
-fn make_lenient_parser(format: oxrdfio::RdfFormat, base_uri: Option<&str>) -> oxrdfio::RdfParser {
-    let mut parser = oxrdfio::RdfParser::from_format(format).lenient();
-    if let Some(base) = base_uri
-        && let Ok(p) = parser.clone().with_base_iri(base)
-    {
-        parser = p;
+/// A parse failure from whichever parser produced it.
+///
+/// Only ever displayed — logged for the first few per input, counted for the
+/// rest — so it carries the original error rather than a formatted string.
+enum ParseError {
+    Turtle(oxttl::TurtleParseError),
+    Rdf(oxrdfio::RdfParseError),
+}
+
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Turtle(e) => e.fmt(f),
+            Self::Rdf(e) => e.fmt(f),
+        }
     }
-    parser
+}
+
+impl ParseError {
+    /// Whether this error ends the input rather than being skipped.
+    ///
+    /// A syntax error is skippable: the parser has consumed the bad token and
+    /// resynchronises after it. An I/O error is not: the reader loop reports it
+    /// without moving the lexer, so asking again yields the same error forever.
+    /// That is also how a term past the buffer bound surfaces — as an
+    /// `OutOfMemory` I/O error from the lexer — and the released oxttl spins on
+    /// exactly that case, rescanning its full buffer per iteration.
+    fn is_fatal(&self) -> bool {
+        matches!(
+            self,
+            Self::Turtle(oxttl::TurtleParseError::Io(_)) | Self::Rdf(oxrdfio::RdfParseError::Io(_))
+        )
+    }
+
+    /// The lexer refused a single term larger than its buffer.
+    fn exceeds_term_bound(&self) -> bool {
+        matches!(
+            self,
+            Self::Turtle(oxttl::TurtleParseError::Io(e)) | Self::Rdf(oxrdfio::RdfParseError::Io(e))
+                if e.kind() == io::ErrorKind::OutOfMemory
+        )
+    }
+
+    /// The error to fail the input with, naming the remedy when there is one.
+    fn into_fatal(self, path: &Path, max_term_bytes: usize) -> anyhow::Error {
+        let hint = if self.exceeds_term_bound() {
+            format!(
+                " — a single IRI or literal is larger than --max-term-bytes ({max_term_bytes} bytes); raise it"
+            )
+        } else {
+            String::new()
+        };
+        anyhow::anyhow!("{}: {self}{hint}", path.display())
+    }
+}
+
+type ParsedQuad = std::result::Result<Quad, ParseError>;
+
+/// A lenient parser for one input format, honouring the term-size bound.
+///
+/// Turtle, TriG, N-Triples and N-Quads are built from oxttl directly, because
+/// oxrdfio's generic `RdfParser` offers no way to set the bound
+/// ([`DEFAULT_MAX_TERM_BYTES`]); the other formats go through oxrdfio as before.
+enum LenientParser {
+    Turtle(oxttl::TurtleParser),
+    TriG(oxttl::TriGParser),
+    NTriples(oxttl::NTriplesParser),
+    NQuads(oxttl::NQuadsParser),
+    Generic(oxrdfio::RdfParser),
+}
+
+impl LenientParser {
+    fn new(format: RdfFormat, base_uri: Option<&str>, max_term_bytes: usize) -> Self {
+        match format {
+            RdfFormat::Turtle => {
+                let mut parser = oxttl::TurtleParser::new()
+                    .lenient()
+                    .with_max_buffer_size(max_term_bytes);
+                if let Some(base) = base_uri
+                    && let Ok(with_base) = parser.clone().with_base_iri(base)
+                {
+                    parser = with_base;
+                }
+                Self::Turtle(parser)
+            }
+            RdfFormat::TriG => {
+                let mut parser = oxttl::TriGParser::new()
+                    .lenient()
+                    .with_max_buffer_size(max_term_bytes);
+                if let Some(base) = base_uri
+                    && let Ok(with_base) = parser.clone().with_base_iri(base)
+                {
+                    parser = with_base;
+                }
+                Self::TriG(parser)
+            }
+            RdfFormat::NTriples => Self::NTriples(
+                oxttl::NTriplesParser::new()
+                    .lenient()
+                    .with_max_buffer_size(max_term_bytes),
+            ),
+            RdfFormat::NQuads => Self::NQuads(
+                oxttl::NQuadsParser::new()
+                    .lenient()
+                    .with_max_buffer_size(max_term_bytes),
+            ),
+            other => {
+                let mut parser = oxrdfio::RdfParser::from_format(to_oxrdf_format(other)).lenient();
+                if let Some(base) = base_uri
+                    && let Ok(with_base) = parser.clone().with_base_iri(base)
+                {
+                    parser = with_base;
+                }
+                Self::Generic(parser)
+            }
+        }
+    }
+
+    fn for_reader<'a>(self, reader: impl Read + 'a) -> Box<dyn Iterator<Item = ParsedQuad> + 'a> {
+        match self {
+            Self::Turtle(parser) => Box::new(parser.for_reader(reader).map(|result| {
+                result
+                    .map(|triple| triple.in_graph(GraphName::DefaultGraph))
+                    .map_err(ParseError::Turtle)
+            })),
+            Self::TriG(parser) => Box::new(
+                parser
+                    .for_reader(reader)
+                    .map(|result| result.map_err(ParseError::Turtle)),
+            ),
+            Self::NTriples(parser) => Box::new(parser.for_reader(reader).map(|result| {
+                result
+                    .map(|triple| triple.in_graph(GraphName::DefaultGraph))
+                    .map_err(ParseError::Turtle)
+            })),
+            Self::NQuads(parser) => Box::new(
+                parser
+                    .for_reader(reader)
+                    .map(|result| result.map_err(ParseError::Turtle)),
+            ),
+            Self::Generic(parser) => Box::new(
+                parser
+                    .for_reader(reader)
+                    .map(|result| result.map_err(ParseError::Rdf)),
+            ),
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -434,6 +599,9 @@ where
     pending.insert(parsed.sequence, parsed);
 
     while let Some(chunk) = pending.remove(next_sequence) {
+        if let Some(message) = chunk.fatal {
+            return Err(anyhow::anyhow!(message));
+        }
         for msg in &chunk.error_samples {
             if *logged_errors < 10 {
                 tracing::warn!(
@@ -497,7 +665,9 @@ where
         let budget = Arc::clone(&budget);
         let base_uri = base_uri.map(ToOwned::to_owned);
         let blank_prefix = blank_prefix.clone();
-        let format = to_oxrdf_format(input.format);
+        let format = input.format;
+        let max_term_bytes = options.max_term_bytes;
+        let path = input.path.clone();
 
         worker_handles.push(std::thread::spawn(move || -> Result<()> {
             for task in task_rx {
@@ -510,9 +680,10 @@ where
                     quads: Vec::new(),
                     stats: ParseStats::default(),
                     error_samples: Vec::new(),
+                    fatal: None,
                 };
 
-                let parser = make_lenient_parser(format, base_uri.as_deref());
+                let parser = LenientParser::new(format, base_uri.as_deref(), max_term_bytes);
                 for result in parser.for_reader(task.bytes.as_slice()) {
                     match result {
                         Ok(quad) => {
@@ -540,6 +711,11 @@ where
                             });
                         }
                         Err(e) => {
+                            if e.is_fatal() {
+                                parsed.fatal =
+                                    Some(e.into_fatal(&path, max_term_bytes).to_string());
+                                break;
+                            }
                             parsed.stats.errors += 1;
                             if parsed.error_samples.len() < 12 {
                                 parsed.error_samples.push(e.to_string());
@@ -867,6 +1043,123 @@ mod tests {
         (f, input)
     }
 
+    fn make_temp_with(
+        content: &[u8],
+        suffix: &str,
+        format: RdfFormat,
+    ) -> (tempfile::NamedTempFile, RdfInput) {
+        let mut f = tempfile::Builder::new().suffix(suffix).tempfile().unwrap();
+        f.write_all(content).unwrap();
+        f.flush().unwrap();
+        let input = RdfInput {
+            path: f.path().to_path_buf(),
+            format,
+            compression: Compression::None,
+        };
+        (f, input)
+    }
+
+    /// Two statements, the first carrying a literal past the 16 MiB bound the
+    /// released oxttl hard-codes — the GADM boundary case in miniature.
+    fn oversized_literal_document(graph_wrapped: bool) -> String {
+        let big = "x".repeat(17 * 1024 * 1024);
+        let body = format!(
+            "<http://example.org/s> <http://example.org/big> \"{big}\" .\n\
+             <http://example.org/s> <http://example.org/p> <http://example.org/o> .\n"
+        );
+        if graph_wrapped {
+            format!("<http://example.org/g> {{\n{body}}}\n")
+        } else {
+            body
+        }
+    }
+
+    #[test]
+    fn test_oversized_literal_parses_under_default_bound() {
+        let (_f, input) = make_temp_with(
+            oversized_literal_document(true).as_bytes(),
+            ".trig",
+            RdfFormat::TriG,
+        );
+        let mut quads = Vec::new();
+        let stats = stream_quads(&input, 0, false, None, |q| {
+            quads.push(q);
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(stats.errors, 0);
+        assert_eq!(stats.quads, 2);
+        assert!(quads[0].object.len() > 17 * 1024 * 1024);
+        assert_eq!(quads[0].graph.as_deref(), Some("http://example.org/g"));
+    }
+
+    #[test]
+    fn test_oversized_literal_fails_under_small_bound() {
+        // The lexer cannot skip a term it cannot buffer, and the released
+        // oxttl loops forever on one; hdtc must end the input with the remedy.
+        let (_f, input) = make_temp_with(
+            oversized_literal_document(true).as_bytes(),
+            ".trig",
+            RdfFormat::TriG,
+        );
+        let options = ParseOptions {
+            max_term_bytes: 1024 * 1024,
+            ..ParseOptions::default()
+        };
+        let error = stream_quads_with_options(&input, 0, false, None, &options, |_| Ok(()))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--max-term-bytes"), "{error}");
+        assert!(error.contains("1048576"), "{error}");
+    }
+
+    #[test]
+    fn test_oversized_literal_fails_under_small_bound_parallel() {
+        let (_f, input) = make_temp_with(
+            oversized_literal_document(false).as_bytes(),
+            ".nt",
+            RdfFormat::NTriples,
+        );
+        let options = ParseOptions {
+            enable_ntnq_parallel: true,
+            chunk_size_bytes: 4096,
+            chunk_workers: 2,
+            max_inflight_bytes: 64 * 1024 * 1024,
+            max_term_bytes: 1024 * 1024,
+        };
+        let error = stream_quads_with_options(&input, 0, false, None, &options, |_| Ok(()))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--max-term-bytes"), "{error}");
+    }
+
+    #[test]
+    fn test_oversized_literal_parallel_ntriples() {
+        let (_f, input) = make_temp_with(
+            oversized_literal_document(false).as_bytes(),
+            ".nt",
+            RdfFormat::NTriples,
+        );
+        let options = ParseOptions {
+            enable_ntnq_parallel: true,
+            chunk_size_bytes: 4096,
+            chunk_workers: 2,
+            max_inflight_bytes: 64 * 1024 * 1024,
+            max_term_bytes: DEFAULT_MAX_TERM_BYTES,
+        };
+        let mut quads = Vec::new();
+        let stats = stream_quads_with_options(&input, 0, false, None, &options, |q| {
+            quads.push(q);
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(stats.errors, 0);
+        assert_eq!(stats.quads, 2);
+        assert!(quads[0].object.len() > 17 * 1024 * 1024);
+    }
+
     #[test]
     fn test_parse_ntriples() {
         let content = r#"<http://example.org/s> <http://example.org/p> <http://example.org/o> .
@@ -998,6 +1291,7 @@ _:b1 <http://example.org/type> <http://example.org/Thing> .
                 chunk_size_bytes: 128,
                 chunk_workers: 1,
                 max_inflight_bytes: 1024,
+                max_term_bytes: DEFAULT_MAX_TERM_BYTES,
             },
             |q| {
                 seq_quads.push(q);
@@ -1017,6 +1311,7 @@ _:b1 <http://example.org/type> <http://example.org/Thing> .
                 chunk_size_bytes: 128,
                 chunk_workers: 4,
                 max_inflight_bytes: 8 * 1024,
+                max_term_bytes: DEFAULT_MAX_TERM_BYTES,
             },
             |q| {
                 par_quads.push(q);
@@ -1057,6 +1352,7 @@ _:b1 <http://example.org/type> <http://example.org/Thing> .
                 chunk_size_bytes: 96,
                 chunk_workers: 3,
                 max_inflight_bytes: 4 * 1024,
+                max_term_bytes: DEFAULT_MAX_TERM_BYTES,
             },
             |q| {
                 quads.push(q);

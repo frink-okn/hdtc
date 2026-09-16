@@ -302,6 +302,11 @@ pub struct CreateArgs {
     /// Maximum in-flight parser chunk bytes per file (default: 268435456)
     #[arg(long, value_name = "BYTES")]
     pub parse_max_inflight_bytes: Option<usize>,
+
+    /// Largest single IRI or literal the parser accepts (e.g. 256M, 1G); an
+    /// input containing a larger term fails with an error naming this flag
+    #[arg(long, value_name = "SIZE", default_value = "256M")]
+    pub max_term_bytes: MemorySize,
 }
 
 #[derive(Debug, Parser)]

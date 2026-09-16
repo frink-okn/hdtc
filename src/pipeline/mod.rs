@@ -25,7 +25,9 @@ use crate::quads::{
     GraphAssignments, GraphMembership, GraphSidecarReader, IdQuad, QuadUnionIterator,
     SourceGraphAssignment, canonical_sidecar_path,
 };
-use crate::rdf::{ExtractedQuad, ParseOptions, RdfInput, stream_quads_with_options};
+use crate::rdf::{
+    DEFAULT_MAX_TERM_BYTES, ExtractedQuad, ParseOptions, RdfInput, stream_quads_with_options,
+};
 use crate::sort::{ExternalSorter, Sortable};
 use crate::triples::id_triple::IdTriple;
 use anyhow::{Context, Result};
@@ -125,6 +127,9 @@ pub struct ParserParallelismConfig {
     pub chunk_workers: Option<usize>,
     pub chunk_size_bytes: Option<usize>,
     pub max_inflight_bytes: Option<usize>,
+    /// Largest single IRI or literal accepted (`--max-term-bytes`); defaults to
+    /// [`DEFAULT_MAX_TERM_BYTES`].
+    pub max_term_bytes: Option<usize>,
 }
 
 /// Result of pipeline execution.
@@ -643,6 +648,9 @@ fn parser_stage(
         chunk_size_bytes,
         chunk_workers,
         max_inflight_bytes,
+        max_term_bytes: parser_parallelism
+            .max_term_bytes
+            .unwrap_or(DEFAULT_MAX_TERM_BYTES),
     };
 
     let assembler = Arc::new(SharedBatchAssembler::new(batch_size, batch_tx));

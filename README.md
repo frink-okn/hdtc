@@ -177,6 +177,18 @@ Direct temporary files to a fast disk with sufficient space:
 hdtc create huge.nt -o huge.hdt --temp-dir /mnt/fast-ssd/tmp
 ```
 
+**Very large terms.** The Turtle-family parser buffers one term at a time, so a
+single IRI or literal larger than `--max-term-bytes` (default `256M`) cannot be
+read, and unlike a syntax error it cannot be skipped either: the lexer has no
+way past a term it cannot hold. hdtc therefore fails the input with an error
+naming the flag. Real data exceeds the 16 MiB the parser library hard-codes —
+GADM publishes country boundaries as WKT literals up to 86 MB — and the released
+library does not fail on them but spins forever, logging
+`Reached the buffer maximal size` once per rescan of its buffer. The buffer grows
+on demand, so raising the flag costs only what the largest term needs, per
+parser. hdtc carries a vendored oxttl (`vendor/oxttl`) to expose this bound; see
+its `Cargo.toml`.
+
 ### Index: Creating indexes
 
 Create an index file for an existing HDT file:
@@ -593,6 +605,7 @@ predicate (the `void:` statistics and the `hdt:` namespace).
 | `--parse-chunk-workers N`          | auto (capped)                | Parser workers per active NT/NQ file                        |
 | `--parse-chunk-bytes BYTES`        | auto                         | Target NT/NQ chunk size in bytes                            |
 | `--parse-max-inflight-bytes BYTES` | auto                         | Max in-flight parser chunk bytes per file                   |
+| `--max-term-bytes SIZE`            | `256M`                       | Largest single IRI or literal accepted; a larger one fails  |
 | `--benchmark`                      | off                          | Emit stage timing and RSS high-water summary                |
 | `-v, --verbose`                    | —                            | Increase log verbosity (`-v` debug, `-vv` trace)            |
 | `-q, --quiet`                      | —                            | Suppress all output except errors                           |
