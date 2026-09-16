@@ -257,6 +257,21 @@ where
     )
 }
 
+/// The triples of an HDT header, which is N-Triples text held whole in memory.
+///
+/// No term bound applies: `hdtc header` accepts terms up to its own
+/// `--max-term-bytes`, and every reader of a header must accept whatever the
+/// writer wrote, so the header goes through the vendored parser over the full
+/// slice rather than through the registry parser and its fixed 16 MiB buffer.
+/// Strict, not lenient: a malformed header line is an error, never skipped.
+pub(crate) fn header_triples(
+    text: &[u8],
+) -> impl Iterator<Item = std::result::Result<Triple, oxttl::TurtleSyntaxError>> + '_ {
+    oxttl::NTriplesParser::new()
+        .with_max_buffer_size(usize::MAX)
+        .for_slice(text)
+}
+
 /// Triples parsed from an RDF input, in oxrdf form (for header serialization).
 pub(crate) struct ParsedTriples {
     pub triples: Vec<Triple>,
@@ -1151,6 +1166,33 @@ mod tests {
             self.data = &self.data[n..];
             Ok(n)
         }
+    }
+
+    #[test]
+    fn test_bound_applies_per_term_not_per_statement() {
+        // A 480 KiB IRI already consumed, then a 600 KiB literal: each is
+        // under a 1 MiB bound, their sum is not. The lexer must compact the
+        // consumed prefix before judging the literal too large.
+        let iri = format!("http://example.org/{}", "a".repeat(480 * 1024));
+        let literal = "x".repeat(600 * 1024);
+        let content = format!(
+            "<{iri}> <http://example.org/big> \"{literal}\" .\n\
+             <http://example.org/s> <http://example.org/p> <http://example.org/o> .\n"
+        );
+        let (_f, input) = make_temp_with(content.as_bytes(), ".ttl", RdfFormat::Turtle);
+        let options = ParseOptions {
+            max_term_bytes: 1024 * 1024,
+            ..ParseOptions::default()
+        };
+        let mut quads = Vec::new();
+        let stats = stream_quads_with_options(&input, 0, false, None, &options, |q| {
+            quads.push(q);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(stats.errors, 0);
+        assert_eq!(quads.len(), 2);
+        assert_eq!(quads[0].subject, iri);
     }
 
     #[test]

@@ -188,7 +188,8 @@ library hard-codes — GADM publishes country boundaries as WKT literals up to
 logging `Reached the buffer maximal size` once per rescan of its buffer. The
 buffer grows on demand and compacts at the same point as before, so raising the
 flag costs only what the largest term needs, per parser. `hdtc header` takes the
-same flag for its `--replace`/`--add` input. hdtc builds the Turtle-family
+same flag for its `--replace`/`--add` input, and every reader of an HDT header
+parses it without a term bound, so what `header` accepts stays readable. hdtc builds the Turtle-family
 parsers from a vendored oxttl (`vendor/oxttl`, package `oxttl-hdtc`) that
 exposes this bound; see its `Cargo.toml` for what was changed. RDF/XML and
 JSON-LD have no such bound and are unaffected.

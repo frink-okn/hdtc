@@ -11,9 +11,8 @@ use crate::quads::writer::canonical_sidecar_path;
 use crate::sort::{ExternalSorter, Sortable};
 use anyhow::{Context, Result, bail, ensure};
 use oxrdf::NamedNode;
-use oxrdfio::{RdfFormat, RdfParser};
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 const HEADER_SIZE: u64 = 256;
@@ -2580,14 +2579,13 @@ fn hdt_metadata(path: &Path) -> Result<(u64, u64, u64)> {
 fn parse_hdt_triple_count(header: &[u8]) -> Result<u64> {
     const VOID_TRIPLES: &str = "http://rdfs.org/ns/void#triples";
     const HDT_TRIPLES: &str = "http://purl.org/HDT/hdt#triplesnumTriples";
-    let parser = RdfParser::from_format(RdfFormat::NTriples).for_reader(Cursor::new(header));
     let mut value = None;
-    for result in parser {
-        let quad = result.context("Invalid HDT header N-Triples")?;
-        if quad.predicate.as_str() != VOID_TRIPLES && quad.predicate.as_str() != HDT_TRIPLES {
+    for result in crate::rdf::header_triples(header) {
+        let triple = result.context("Invalid HDT header N-Triples")?;
+        if triple.predicate.as_str() != VOID_TRIPLES && triple.predicate.as_str() != HDT_TRIPLES {
             continue;
         }
-        let oxrdf::Term::Literal(literal) = quad.object else {
+        let oxrdf::Term::Literal(literal) = triple.object else {
             continue;
         };
         let parsed = literal

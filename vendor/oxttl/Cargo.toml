@@ -23,9 +23,12 @@
 #    raise resident memory for inputs without line breaks. hdtc's own fix.
 # 5. The over-bound error carries a typed cause, `BufferLimitExceeded`, so hdtc
 #    can tell it from any other `OutOfMemory` I/O error. hdtc's own addition.
+# 6. A full buffer is compacted of its consumed prefix before the current token
+#    is judged too large, so the bound applies to one term, not to the terms of
+#    a statement together. hdtc's own fix.
 #
 # Replacing this directory with an upstream release requires that release to
-# cover items 2–5 as well as item 1; check before dropping it.
+# cover items 2–6 as well as item 1; check before dropping it.
 #
 # The manifest below is the crates.io-normalized one from the 0.2.3 package,
 # with the package and library renamed.

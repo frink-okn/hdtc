@@ -139,6 +139,12 @@ impl<R: TokenRecognizer> Lexer<Vec<u8>, R> {
 
     pub fn extend_from_reader(&mut self, reader: &mut impl Read) -> io::Result<()> {
         self.shrink_data();
+        if self.data.len() >= self.max_buffer_size && self.position.buffer_offset > 0 {
+            // Everything before the current token is consumed. Make room for the
+            // token alone before deciding it does not fit, or a bound applies to
+            // a statement's terms together rather than to each (hdtc addition).
+            self.shrink_data_by(self.position.buffer_offset);
+        }
         if self.data.len() >= self.max_buffer_size {
             return Err(io::Error::new(
                 io::ErrorKind::OutOfMemory,
@@ -179,6 +185,12 @@ impl<R: TokenRecognizer> Lexer<Vec<u8>, R> {
         reader: &mut (impl AsyncRead + Unpin),
     ) -> io::Result<()> {
         self.shrink_data();
+        if self.data.len() >= self.max_buffer_size && self.position.buffer_offset > 0 {
+            // Everything before the current token is consumed. Make room for the
+            // token alone before deciding it does not fit, or a bound applies to
+            // a statement's terms together rather than to each (hdtc addition).
+            self.shrink_data_by(self.position.buffer_offset);
+        }
         if self.data.len() >= self.max_buffer_size {
             return Err(io::Error::new(
                 io::ErrorKind::OutOfMemory,

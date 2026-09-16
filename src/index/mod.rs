@@ -18,7 +18,6 @@ use anyhow::{Context, Result, bail};
 use oxrdf::Term;
 use predicate_index::{PredicateEntry, build_predicate_index_streaming};
 use std::fs::File;
-use std::io::Cursor;
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -33,18 +32,15 @@ fn parse_num_triples_from_header(header: &str) -> Result<u64> {
     let mut value_from_void: Option<u64> = None;
     let mut value_from_hdt: Option<u64> = None;
 
-    let parser = oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::NTriples)
-        .for_reader(Cursor::new(header.as_bytes()));
-
-    for quad_result in parser {
-        let quad = quad_result.context("Invalid N-Triples in HDT header metadata")?;
-        let predicate = quad.predicate.as_str();
+    for result in crate::rdf::header_triples(header.as_bytes()) {
+        let triple = result.context("Invalid N-Triples in HDT header metadata")?;
+        let predicate = triple.predicate.as_str();
 
         if predicate != VOID_TRIPLES && predicate != HDT_TRIPLES_NUM {
             continue;
         }
 
-        let Term::Literal(literal) = quad.object else {
+        let Term::Literal(literal) = triple.object else {
             continue;
         };
         let parsed = literal.value().parse::<u64>().with_context(|| {

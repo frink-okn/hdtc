@@ -99,3 +99,114 @@ fn max_term_bytes_reaches_the_parser_on_create_and_header() {
         "{stderr}"
     );
 }
+
+#[test]
+fn a_header_term_past_the_old_bound_stays_readable_everywhere() {
+    // `header --add` accepts a term up to its own --max-term-bytes; every
+    // reader of the header must then accept it too. Dump, search (the HDT
+    // reader), index, and re-import each parse the header on their own path.
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data.nt");
+    std::fs::write(
+        &data,
+        "<http://example.org/s> <http://example.org/p> <http://example.org/o> .\n",
+    )
+    .unwrap();
+    let base = dir.path().join("base.hdt");
+    let output = Command::new(env!("CARGO_BIN_EXE_hdtc"))
+        .args(["create", "-o"])
+        .arg(&base)
+        .arg(&data)
+        .output()
+        .expect("run hdtc create");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let big = "x".repeat(17 * 1024 * 1024);
+    let extra = dir.path().join("extra.ttl");
+    std::fs::write(
+        &extra,
+        format!("<http://example.org/meta> <http://example.org/note> \"{big}\" .\n"),
+    )
+    .unwrap();
+    let with = dir.path().join("with.hdt");
+    let output = Command::new(env!("CARGO_BIN_EXE_hdtc"))
+        .args(["header", "--max-term-bytes", "32M", "--add"])
+        .arg(&extra)
+        .arg("-o")
+        .arg(&with)
+        .arg(&base)
+        .output()
+        .expect("run hdtc header --add");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let dumped = Command::new(env!("CARGO_BIN_EXE_hdtc"))
+        .arg("header")
+        .arg(&with)
+        .output()
+        .expect("run hdtc header");
+    assert!(
+        dumped.status.success(),
+        "{}",
+        String::from_utf8_lossy(&dumped.stderr)
+    );
+    assert!(
+        dumped.stdout.len() > 17 * 1024 * 1024,
+        "dumped header lacks the big term"
+    );
+
+    let searched = Command::new(env!("CARGO_BIN_EXE_hdtc"))
+        .arg("search")
+        .arg(&with)
+        .args(["--query", "? ? ?", "--count"])
+        .output()
+        .expect("run hdtc search");
+    assert!(
+        searched.status.success(),
+        "{}",
+        String::from_utf8_lossy(&searched.stderr)
+    );
+
+    let indexed = Command::new(env!("CARGO_BIN_EXE_hdtc"))
+        .arg("index")
+        .arg(&with)
+        .output()
+        .expect("run hdtc index");
+    assert!(
+        indexed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+
+    let reimported = Command::new(env!("CARGO_BIN_EXE_hdtc"))
+        .args(["create", "-o"])
+        .arg(dir.path().join("again.hdt"))
+        .arg(&with)
+        .output()
+        .expect("run hdtc create from an HDT");
+    assert!(
+        reimported.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reimported.stderr)
+    );
+
+    let edited = Command::new(env!("CARGO_BIN_EXE_hdtc"))
+        .arg("header")
+        .arg(&with)
+        .args(["--dataset-uri", "http://example.org/renamed", "-o"])
+        .arg(dir.path().join("renamed.hdt"))
+        .output()
+        .expect("run hdtc header --dataset-uri");
+    assert!(
+        edited.status.success(),
+        "{}",
+        String::from_utf8_lossy(&edited.stderr)
+    );
+}

@@ -12,11 +12,10 @@ use crate::pipeline::batch_vocab::Roles;
 use crate::pipeline::vocab_merger::StreamEntry;
 use crate::quads::{GraphSidecarReader, GraphTerm};
 use anyhow::{Context, Result, bail};
-use oxrdfio::{RdfFormat, RdfParser};
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::fs::File;
-use std::io::{BufReader, Cursor, Seek, SeekFrom};
+use std::io::{BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use crate::hdt::sections::scan_hdt_sections;
@@ -823,14 +822,11 @@ fn parse_header_metadata(header_text: &str) -> Result<(u64, u64)> {
     let mut triples_from_hdt: Option<u64> = None;
     let mut original_size: u64 = 0;
 
-    let parser =
-        RdfParser::from_format(RdfFormat::NTriples).for_reader(Cursor::new(header_text.as_bytes()));
+    for result in crate::rdf::header_triples(header_text.as_bytes()) {
+        let triple = result.context("Invalid N-Triples in HDT header metadata")?;
+        let predicate = triple.predicate.as_str();
 
-    for quad_result in parser {
-        let quad = quad_result.context("Invalid N-Triples in HDT header metadata")?;
-        let predicate = quad.predicate.as_str();
-
-        let oxrdf::Term::Literal(literal) = quad.object else {
+        let oxrdf::Term::Literal(literal) = triple.object else {
             continue;
         };
 

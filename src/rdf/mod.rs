@@ -1,5 +1,6 @@
 mod input;
 pub(crate) mod parser;
+pub(crate) use parser::header_triples;
 pub(crate) mod serializer;
 
 pub use input::{RdfInput, discover_inputs};

@@ -14,12 +14,11 @@ use crate::io::{
     encode_vbyte, read_vbyte,
 };
 use anyhow::{Context, Result, bail};
-use oxrdfio::{RdfFormat, RdfParser};
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 const PFC_SECTION_TYPE: u8 = 0x02;
@@ -638,18 +637,15 @@ fn parse_num_triples_from_header(header: &str) -> Result<u64> {
     let mut value_from_void: Option<u64> = None;
     let mut value_from_hdt: Option<u64> = None;
 
-    let parser =
-        RdfParser::from_format(RdfFormat::NTriples).for_reader(Cursor::new(header.as_bytes()));
-
-    for quad_result in parser {
-        let quad = quad_result.context("Invalid N-Triples in HDT header metadata")?;
-        let predicate = quad.predicate.as_str();
+    for result in crate::rdf::header_triples(header.as_bytes()) {
+        let triple = result.context("Invalid N-Triples in HDT header metadata")?;
+        let predicate = triple.predicate.as_str();
 
         if predicate != VOID_TRIPLES && predicate != HDT_TRIPLES_NUM {
             continue;
         }
 
-        let oxrdf::Term::Literal(literal) = quad.object else {
+        let oxrdf::Term::Literal(literal) = triple.object else {
             continue;
         };
 

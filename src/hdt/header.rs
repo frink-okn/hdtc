@@ -257,13 +257,9 @@ fn write_modified_hdt<R: Read>(
 /// surfaced as an error rather than silently dropped, so a rewrite can never
 /// quietly discard header content it failed to understand.
 fn parse_ntriples_text(text: &str) -> Result<Vec<Triple>> {
-    let parser =
-        oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::NTriples).for_reader(text.as_bytes());
-
     let mut triples = Vec::new();
-    for quad in parser {
-        let quad = quad.context("Invalid N-Triples in HDT header")?;
-        triples.push(Triple::new(quad.subject, quad.predicate, quad.object));
+    for triple in crate::rdf::header_triples(text.as_bytes()) {
+        triples.push(triple.context("Invalid N-Triples in HDT header")?);
     }
     Ok(triples)
 }
