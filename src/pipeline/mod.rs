@@ -35,6 +35,7 @@ use crossbeam_channel::{Receiver, Sender, bounded};
 use std::fs::File;
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -121,15 +122,26 @@ pub(super) fn tune_usize(name: &str, default: usize) -> usize {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ParserParallelismConfig {
     pub file_workers: Option<usize>,
     pub chunk_workers: Option<usize>,
     pub chunk_size_bytes: Option<usize>,
     pub max_inflight_bytes: Option<usize>,
-    /// Largest single IRI or literal accepted (`--max-term-bytes`); defaults to
-    /// [`DEFAULT_MAX_TERM_BYTES`].
-    pub max_term_bytes: Option<usize>,
+    /// Largest single IRI or literal accepted (`--max-term-bytes`).
+    pub max_term_bytes: usize,
+}
+
+impl Default for ParserParallelismConfig {
+    fn default() -> Self {
+        Self {
+            file_workers: None,
+            chunk_workers: None,
+            chunk_size_bytes: None,
+            max_inflight_bytes: None,
+            max_term_bytes: DEFAULT_MAX_TERM_BYTES,
+        }
+    }
 }
 
 /// Result of pipeline execution.
@@ -648,9 +660,7 @@ fn parser_stage(
         chunk_size_bytes,
         chunk_workers,
         max_inflight_bytes,
-        max_term_bytes: parser_parallelism
-            .max_term_bytes
-            .unwrap_or(DEFAULT_MAX_TERM_BYTES),
+        max_term_bytes: parser_parallelism.max_term_bytes,
     };
 
     let assembler = Arc::new(SharedBatchAssembler::new(batch_size, batch_tx));
@@ -667,6 +677,11 @@ fn parser_stage(
 
     let (stats_tx, stats_rx) = crossbeam_channel::unbounded::<(usize, Result<u64>)>();
     let mut worker_handles = Vec::with_capacity(file_workers);
+    // Set by the first worker whose input fails. A parse error is fatal now (a
+    // term past `--max-term-bytes`, an unreadable file), so the other workers
+    // stop at their next quad and take no further inputs rather than parsing
+    // the rest of a build that is already lost.
+    let aborted = Arc::new(AtomicBool::new(false));
 
     for _ in 0..file_workers {
         let file_rx = file_rx.clone();
@@ -674,9 +689,13 @@ fn parser_stage(
         let assembler = Arc::clone(&assembler);
         let base_uri = base_uri.clone();
         let parse_options = parse_options.clone();
+        let aborted = Arc::clone(&aborted);
 
         worker_handles.push(std::thread::spawn(move || {
             for (file_index, input, source_assignment) in file_rx {
+                if aborted.load(Ordering::Relaxed) {
+                    break;
+                }
                 tracing::info!("Parsing: {}", input.path.display());
 
                 let mut staged_quads = Vec::with_capacity(4096);
@@ -687,6 +706,9 @@ fn parser_stage(
                     Some(&base_uri),
                     &parse_options,
                     |mut quad| {
+                        if aborted.load(Ordering::Relaxed) {
+                            anyhow::bail!("parse abandoned: another input failed");
+                        }
                         if include_graphs {
                             // Preserving the parsed graph with no graph-map rules is by far
                             // the common case. Move the quad straight into the batch instead
@@ -733,6 +755,11 @@ fn parser_stage(
                     Ok(stats.original_ntriples_size)
                 });
 
+                // The first failure is the build's error; a later one is either
+                // this abandonment or noise behind it, and is dropped.
+                if parse_result.is_err() && aborted.swap(true, Ordering::Relaxed) {
+                    continue;
+                }
                 if stats_tx.send((file_index, parse_result)).is_err() {
                     return;
                 }
@@ -756,14 +783,17 @@ fn parser_stage(
             Ok(size) => ntriples_size += size,
             Err(e) => {
                 if first_error.is_none() {
-                    first_error = Some(anyhow::anyhow!(
-                        "Parser failed for file index {}: {}",
-                        file_index,
-                        e
-                    ));
+                    first_error =
+                        Some(e.context(format!("Parser failed for file index {file_index}")));
                 }
             }
         }
+    }
+
+    // Before the count check: after a failure the other workers stop early and
+    // report nothing, by design.
+    if let Some(e) = first_error {
+        return Err(e);
     }
 
     if outcomes != expected_files {
@@ -772,10 +802,6 @@ fn parser_stage(
             expected_files,
             outcomes
         ));
-    }
-
-    if let Some(e) = first_error {
-        return Err(e);
     }
 
     assembler.flush_final()?;

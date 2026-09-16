@@ -1,3 +1,4 @@
+use crate::DEFAULT_MAX_BUFFER_SIZE;
 use crate::toolkit::error::{TextPosition, TurtleSyntaxError};
 use memchr::{memchr2, memchr2_iter};
 use std::borrow::Cow;
@@ -53,6 +54,26 @@ impl<S: Into<String>> From<(usize, S)> for TokenRecognizerError {
         (location..=location, message).into()
     }
 }
+
+/// The error a lexer attaches to the `OutOfMemory` I/O error it returns when a
+/// single token would exceed its buffer bound, so a caller can tell that case
+/// from an allocation failure elsewhere in the read path (hdtc addition).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BufferLimitExceeded {
+    pub max_buffer_size: usize,
+}
+
+impl std::fmt::Display for BufferLimitExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Reached the buffer maximal size of {}",
+            self.max_buffer_size
+        )
+    }
+}
+
+impl std::error::Error for BufferLimitExceeded {}
 
 pub struct Lexer<B, R: TokenRecognizer> {
     parser: R,
@@ -121,10 +142,9 @@ impl<R: TokenRecognizer> Lexer<Vec<u8>, R> {
         if self.data.len() >= self.max_buffer_size {
             return Err(io::Error::new(
                 io::ErrorKind::OutOfMemory,
-                format!(
-                    "Reached the buffer maximal size of {}",
-                    self.max_buffer_size
-                ),
+                BufferLimitExceeded {
+                    max_buffer_size: self.max_buffer_size,
+                },
             ));
         }
         let min_end = min(self.data.len() + self.min_buffer_size, self.max_buffer_size);
@@ -139,7 +159,15 @@ impl<R: TokenRecognizer> Lexer<Vec<u8>, R> {
             self.data
                 .resize(min(self.data.capacity(), self.max_buffer_size), 0);
         }
-        let read = reader.read(&mut self.data[new_start..])?;
+        let read = match reader.read(&mut self.data[new_start..]) {
+            Ok(read) => read,
+            Err(e) => {
+                // Drop the zero padding, or a retried read — the right response
+                // to an interrupted one — would parse it as data (hdtc addition).
+                self.data.truncate(new_start);
+                return Err(e);
+            }
+        };
         self.data.truncate(new_start + read);
         self.is_ending = read == 0;
         Ok(())
@@ -154,10 +182,9 @@ impl<R: TokenRecognizer> Lexer<Vec<u8>, R> {
         if self.data.len() >= self.max_buffer_size {
             return Err(io::Error::new(
                 io::ErrorKind::OutOfMemory,
-                format!(
-                    "Reached the buffer maximal size of {}",
-                    self.max_buffer_size
-                ),
+                BufferLimitExceeded {
+                    max_buffer_size: self.max_buffer_size,
+                },
             ));
         }
         let min_end = min(self.data.len() + self.min_buffer_size, self.max_buffer_size);
@@ -168,7 +195,13 @@ impl<R: TokenRecognizer> Lexer<Vec<u8>, R> {
             self.data
                 .resize(min(self.data.capacity(), self.max_buffer_size), 0);
         }
-        let read = reader.read(&mut self.data[new_start..]).await?;
+        let read = match reader.read(&mut self.data[new_start..]).await {
+            Ok(read) => read,
+            Err(e) => {
+                self.data.truncate(new_start);
+                return Err(e);
+            }
+        };
         self.data.truncate(new_start + read);
         self.is_ending = read == 0;
         Ok(())
@@ -178,7 +211,12 @@ impl<R: TokenRecognizer> Lexer<Vec<u8>, R> {
         if self.position.line_start_buffer_offset > 0 {
             self.shrink_data_by(self.position.line_start_buffer_offset);
         }
-        if self.position.buffer_offset > self.max_buffer_size / 2 {
+        // Compact at the point the default bound implies, whatever the bound is.
+        // Raising the bound exists for the rare oversized term; it must not raise
+        // the resident buffer for every input that lacks line breaks, which only
+        // reaches this branch (hdtc addition).
+        let compaction_point = min(self.max_buffer_size, DEFAULT_MAX_BUFFER_SIZE) / 2;
+        if self.position.buffer_offset > compaction_point {
             // We really need to shrink, let's forget about error quality
             self.shrink_data_by(self.position.buffer_offset);
         }

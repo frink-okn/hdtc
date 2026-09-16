@@ -180,15 +180,18 @@ hdtc create huge.nt -o huge.hdt --temp-dir /mnt/fast-ssd/tmp
 **Very large terms.** The Turtle-family parser buffers one term at a time, so a
 single IRI or literal larger than `--max-term-bytes` (default `256M`) cannot be
 read, and unlike a syntax error it cannot be skipped either: the lexer has no
-way past a term it cannot hold. hdtc therefore fails the input with an error
-naming the flag. Real data exceeds the 16 MiB the parser library hard-codes —
-GADM publishes country boundaries as WKT literals up to 86 MB — and the released
-library does not fail on them but spins forever, logging
-`Reached the buffer maximal size` once per rescan of its buffer. The buffer grows
-on demand, so raising the flag costs only what the largest term needs, per
-parser. hdtc builds the Turtle-family parsers from a vendored oxttl
-(`vendor/oxttl`, package `oxttl-hdtc`) that exposes this bound; see its
-`Cargo.toml`. RDF/XML and JSON-LD have no such bound and are unaffected.
+way past a term it cannot hold. hdtc therefore fails the input at once with an
+error naming the flag, and stops the other file workers rather than parse the
+rest of a build that is already lost. Real data exceeds the 16 MiB the parser
+library hard-codes — GADM publishes country boundaries as WKT literals up to
+86 MB — and the released library does not fail on them but spins forever,
+logging `Reached the buffer maximal size` once per rescan of its buffer. The
+buffer grows on demand and compacts at the same point as before, so raising the
+flag costs only what the largest term needs, per parser. `hdtc header` takes the
+same flag for its `--replace`/`--add` input. hdtc builds the Turtle-family
+parsers from a vendored oxttl (`vendor/oxttl`, package `oxttl-hdtc`) that
+exposes this bound; see its `Cargo.toml` for what was changed. RDF/XML and
+JSON-LD have no such bound and are unaffected.
 
 ### Index: Creating indexes
 
@@ -780,6 +783,7 @@ Named-graph options (`-m quads`, `--graph-map`, `--default-graph`,
 | `--add FILE`        | —            | Append the triples in `FILE` to the header                            |
 | `--dataset-uri IRI` | —            | Rewrite the current dataset IRI throughout the header                 |
 | `-o, --output PATH` | —            | Output path; required for any modification, rejected for a plain dump |
+| `--max-term-bytes SIZE` | `256M`   | Largest single IRI or literal accepted in the `--replace`/`--add` input |
 | `--benchmark`       | off          | Emit total header timing                                              |
 | `-v, --verbose`     | —            | Increase log verbosity (`-v` debug, `-vv` trace)                      |
 | `-q, --quiet`       | —            | Suppress all output except errors                                    |

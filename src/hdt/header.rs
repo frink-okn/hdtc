@@ -44,6 +44,7 @@ pub fn run_header_command(
     add: Option<&Path>,
     dataset_uri: Option<&str>,
     output: Option<&Path>,
+    max_term_bytes: usize,
 ) -> Result<()> {
     if !hdt_path.exists() {
         bail!("HDT file not found: {}", hdt_path.display());
@@ -83,7 +84,7 @@ pub fn run_header_command(
     // rejection) happens here, before any output file is created.
     let existing = parse_ntriples_text(&header_text)
         .context("Failed to parse existing header as N-Triples")?;
-    let new_triples = build_new_header(existing, replace, add, dataset_uri)?;
+    let new_triples = build_new_header(existing, replace, add, dataset_uri, max_term_bytes)?;
     let new_header = serialize_triples(&new_triples)?;
 
     // `reader` is positioned at the start of the dictionary section; copy the
@@ -130,6 +131,7 @@ fn build_new_header(
     replace: Option<&Path>,
     add: Option<&Path>,
     dataset_uri: Option<&str>,
+    max_term_bytes: usize,
 ) -> Result<Vec<Triple>> {
     // Validate the new dataset IRI up front so a malformed value can't corrupt
     // the header (and make the file unreadable) only to fail on reopen.
@@ -154,7 +156,7 @@ fn build_new_header(
         // already present so a later --add can't merge its blank nodes with ones
         // a prior --add wrote into the header.
         let blank_offset = next_blank_index(&existing);
-        triples.extend(read_input_triples(path, blank_offset)?);
+        triples.extend(read_input_triples(path, blank_offset, max_term_bytes)?);
     }
 
     if let Some(new_node) = new_dataset {
@@ -180,7 +182,11 @@ fn build_new_header(
 ///
 /// `blank_offset` shifts the blank-node disambiguation index so parsed blank
 /// nodes can't collide with `fN_` blank nodes already in the header.
-fn read_input_triples(path: &Path, blank_offset: usize) -> Result<Vec<Triple>> {
+fn read_input_triples(
+    path: &Path,
+    blank_offset: usize,
+    max_term_bytes: usize,
+) -> Result<Vec<Triple>> {
     let discovered = discover_inputs(std::slice::from_ref(&path.to_path_buf()))?;
     if discovered.rdf_inputs.is_empty() {
         bail!("Input is not a recognized RDF file: {}", path.display());
@@ -194,7 +200,7 @@ fn read_input_triples(path: &Path, blank_offset: usize) -> Result<Vec<Triple>> {
             .ok()
             .map(|p| format!("file://{}", p.display()));
         let prefix = format!("f{}_", blank_offset + idx);
-        let parsed = parse_rdf_to_triples(input, base.as_deref(), &prefix)
+        let parsed = parse_rdf_to_triples(input, base.as_deref(), &prefix, max_term_bytes)
             .with_context(|| format!("Failed to parse {}", input.path.display()))?;
         if parsed.named_graph_seen {
             tracing::warn!(

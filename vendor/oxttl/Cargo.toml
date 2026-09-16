@@ -1,13 +1,34 @@
-# Vendored copy of oxttl 0.2.3 (MIT OR Apache-2.0), patched by hdtc.
+# Vendored copy of oxttl 0.2.3 (MIT OR Apache-2.0), modified by hdtc.
 #
-# The only change is a backport of oxigraph commit de4dc5f04 ("OxTTL: Customize
-# the max buffer size for parsing"): every parser gains `with_max_buffer_size`,
-# so a caller can raise the 16 MiB bound on a single IRI or literal that the
-# released crate hard-codes. hdtc applies it through `[patch.crates-io]`; see
-# `src/rdf/parser.rs` for why. Drop this directory once hdtc moves to an oxttl
-# release that carries the setter (0.3 and later).
+# It is a direct dependency of hdtc, renamed `oxttl-hdtc` (library `oxttl_hdtc`)
+# so it coexists with the registry oxttl that oxrdfio still uses for the formats
+# hdtc does not build itself. A `[patch]` would apply only to hdtc's own build
+# and break every crate that depends on hdtc. There is no patch section anywhere.
 #
-# The manifest below is the crates.io-normalized one from the 0.2.3 package.
+# Changes from the released 0.2.3, all in `src/toolkit/lexer.rs` unless noted:
+#
+# 1. Backport of oxigraph commit de4dc5f04: every parser gains
+#    `with_max_buffer_size`, so a caller can raise the 16 MiB bound on a single
+#    IRI or literal (`src/{trig,turtle,ntriples,nquads,n3}.rs`, `lib.rs`,
+#    `terse.rs`, `line_formats.rs`).
+# 2. Buffer growth is clamped to the bound. Vec growth could carry the buffer
+#    past a bound that is not a power of two; the overshoot was then shrunk away
+#    on the next read, which discarded bytes and read an empty slice as end of
+#    input. hdtc's own fix.
+# 3. A failed read truncates the zero padding it had reserved, so a retried
+#    read (the right response to an interrupted one) does not parse the padding
+#    as data. hdtc's own fix.
+# 4. The buffer compacts at the point the default bound implies (8 MiB) rather
+#    than at half of whatever bound is configured, so raising the bound does not
+#    raise resident memory for inputs without line breaks. hdtc's own fix.
+# 5. The over-bound error carries a typed cause, `BufferLimitExceeded`, so hdtc
+#    can tell it from any other `OutOfMemory` I/O error. hdtc's own addition.
+#
+# Replacing this directory with an upstream release requires that release to
+# cover items 2–5 as well as item 1; check before dropping it.
+#
+# The manifest below is the crates.io-normalized one from the 0.2.3 package,
+# with the package and library renamed.
 [package]
 edition = "2024"
 rust-version = "1.87"
