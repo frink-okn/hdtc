@@ -27,6 +27,7 @@
 pub(crate) mod analyzer;
 pub(crate) mod builder;
 pub(crate) mod manifest;
+pub(crate) mod readonly;
 pub(crate) mod schema;
 pub(crate) mod searcher;
 
