@@ -186,18 +186,22 @@ rest of a build that is already lost. Real data exceeds the 16 MiB the parser
 library hard-codes — GADM publishes country boundaries as WKT literals up to
 86 MB — and the released library does not fail on them but spins forever,
 logging `Reached the buffer maximal size` once per rescan of its buffer. The
-buffer grows on demand and compacts at the same point as before, so raising the
-flag costs only what the largest term needs, per parser — and the memory plan
-reserves that much per file worker: at the default `--memory-limit` of 4G the
-parser stage admits two file workers alongside a 256M bound, and a higher limit
-or a lower bound admits more (the log says when this is what limited them). A
-term of exactly the bound is accepted. In the parallel N-Triples/N-Quads path a
-line longer than four terms of the bound is refused before it is buffered. `hdtc header` takes the
-same flag for its `--replace`/`--add` input, and every reader of an HDT header
-parses it without a term bound, so what `header` accepts stays readable. hdtc builds the Turtle-family
-parsers from a vendored oxttl (`vendor/oxttl`, package `oxttl-hdtc`) that
-exposes this bound; see its `Cargo.toml` for what was changed. RDF/XML and
-JSON-LD have no such bound and are unaffected.
+buffer grows on demand and compacts at the same point as before, so the bound
+is a ceiling, not a reservation: ordinary data pays nothing for it, and the
+memory plan does not set aside the ceiling per parser, which at the defaults
+would leave two file workers for data that has no such term. Data that does
+have terms near the bound holds them outside `--memory-limit`: per file worker,
+one term in each lexer (one, or `--parse-chunk-workers` of them on the
+N-Triples/N-Quads path) plus a line of up to four terms in the chunker, and a
+few copies more as each term moves through the pipeline. Give such a build
+headroom, or fewer `--parse-file-workers`. A term of exactly the bound is
+accepted. In the parallel N-Triples/N-Quads path a line longer than four terms
+of the bound is refused before it is buffered. `hdtc header` takes the same
+flag for its `--replace`/`--add` input, and every reader of an HDT header
+parses it without a term bound, so what `header` accepts stays readable. hdtc
+builds the Turtle-family parsers from a vendored oxttl (`vendor/oxttl`, package
+`oxttl-hdtc`) that exposes this bound; see its `Cargo.toml` for what was
+changed. RDF/XML and JSON-LD have no such bound and are unaffected.
 
 ### Index: Creating indexes
 
@@ -652,7 +656,7 @@ predicate (the `void:` statistics and the `hdt:` namespace).
 | `--parse-chunk-workers N`          | auto (capped)                | Parser workers per active NT/NQ file                        |
 | `--parse-chunk-bytes BYTES`        | auto                         | Target NT/NQ chunk size in bytes                            |
 | `--parse-max-inflight-bytes BYTES` | auto                         | Max in-flight parser chunk bytes per file                   |
-| `--max-term-bytes SIZE`            | `256M`                       | Largest single IRI or literal accepted; a larger one fails; also reserved per file worker in the memory plan |
+| `--max-term-bytes SIZE`            | `256M`                       | Largest single IRI or literal accepted; a larger one fails the build |
 | `--benchmark`                      | off                          | Emit stage timing and RSS high-water summary                |
 | `-v, --verbose`                    | —                            | Increase log verbosity (`-v` debug, `-vv` trace)            |
 | `-q, --quiet`                      | —                            | Suppress all output except errors                           |

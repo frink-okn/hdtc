@@ -615,14 +615,16 @@ fn parser_stage(
         .map(|n| n.get())
         .unwrap_or(4)
         .max(1);
-    // Each file worker may hold one term of up to `max_term_bytes` in its lexer
-    // buffer on top of its working set, so the plan reserves that much per
-    // worker; a bigger --memory-limit, or a smaller --max-term-bytes, buys more
-    // parsers. The parallel N-Triples/N-Quads path can hold up to `chunk_workers`
-    // more per file when every chunk carries a maximal term at once, which the
-    // plan does not reserve for.
-    let per_worker_reserve = MIB.saturating_add(parser_parallelism.max_term_bytes);
-    let max_file_workers_by_budget = (parser_budget_total / per_worker_reserve).max(1);
+    // `max_term_bytes` is a ceiling, not a reservation. The lexer buffers grow
+    // only as large as the terms they meet, so ordinary data pays nothing for
+    // it, and reserving the ceiling per worker would cut this stage to two
+    // workers at the default limit and bound for data that has no such term.
+    // Data that does may hold, per file worker and on demand, one term of the
+    // bound in each lexer (one, or `chunk_workers` on the N-Triples/N-Quads
+    // path) plus a line of up to four in the chunker, none of it in this
+    // budget; --parse-file-workers, --parse-chunk-workers and --memory-limit
+    // are the knobs for such data, and the README says so.
+    let max_file_workers_by_budget = (parser_budget_total / MIB).max(1);
     let default_file_workers = inputs
         .len()
         .min(available_cpus)
@@ -661,14 +663,10 @@ fn parser_stage(
         max_inflight_bytes,
         parser_budget_total
     );
-    if file_workers < inputs.len().min(available_cpus) && file_workers == max_file_workers_by_budget
-    {
-        tracing::info!(
-            "File workers limited to {} by --memory-limit: each may hold a term of --max-term-bytes ({} bytes)",
-            file_workers,
-            parser_parallelism.max_term_bytes
-        );
-    }
+    tracing::debug!(
+        "Terms up to --max-term-bytes ({} bytes) are buffered on demand, outside the parser budget",
+        parser_parallelism.max_term_bytes
+    );
 
     let parse_options = ParseOptions {
         enable_ntnq_parallel: true,

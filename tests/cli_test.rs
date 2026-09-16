@@ -257,4 +257,56 @@ fn header_add_refuses_input_the_readers_would_reject() {
     assert!(!with.exists(), "a refused header edit left an output file");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("bad.nt"), "{stderr}");
+    // It is a syntax error, and is called one: not a failed read.
+    assert!(stderr.contains("invalid RDF"), "{stderr}");
+    assert!(!stderr.contains("read error"), "{stderr}");
+}
+
+#[test]
+fn a_failing_input_stops_its_siblings_and_names_the_cause() {
+    // Three inputs parsed by three workers; the first fails at once on a term
+    // past the bound while the others are still under way. The others stop
+    // and report nothing, and the build's error is the cause, not a count of
+    // outcomes that came up short because they stopped.
+    let dir = tempfile::tempdir().unwrap();
+    let bad = dir.path().join("bad.ttl");
+    let big = "x".repeat(2 * 1024 * 1024);
+    std::fs::write(
+        &bad,
+        format!("<http://example.org/s> <http://example.org/big> \"{big}\" .\n"),
+    )
+    .unwrap();
+    let line = "<http://example.org/s> <http://example.org/p> <http://example.org/o> .\n";
+    let sibling_a = dir.path().join("a.nt");
+    let sibling_b = dir.path().join("b.nt");
+    std::fs::write(&sibling_a, line.repeat(200_000)).unwrap();
+    std::fs::write(&sibling_b, line.repeat(200_000)).unwrap();
+    let out = dir.path().join("out.hdt");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_hdtc"))
+        .args([
+            "create",
+            "--max-term-bytes",
+            "1M",
+            "--parse-file-workers",
+            "3",
+            "-o",
+        ])
+        .arg(&out)
+        .arg(&bad)
+        .arg(&sibling_a)
+        .arg(&sibling_b)
+        .output()
+        .expect("run hdtc create");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "create succeeded past the bound");
+    assert!(!out.exists(), "a failed build left an output file");
+    assert!(stderr.contains("Parser failed for file index"), "{stderr}");
+    assert!(stderr.contains("bad.ttl"), "{stderr}");
+    assert!(
+        stderr.contains("--max-term-bytes (1048576 bytes)"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("outcomes mismatch"), "{stderr}");
+    assert!(!stderr.contains("parse abandoned"), "{stderr}");
 }
