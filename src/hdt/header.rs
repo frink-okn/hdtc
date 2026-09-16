@@ -44,6 +44,7 @@ pub fn run_header_command(
     add: Option<&Path>,
     dataset_uri: Option<&str>,
     output: Option<&Path>,
+    max_term_bytes: usize,
 ) -> Result<()> {
     if !hdt_path.exists() {
         bail!("HDT file not found: {}", hdt_path.display());
@@ -83,8 +84,12 @@ pub fn run_header_command(
     // rejection) happens here, before any output file is created.
     let existing = parse_ntriples_text(&header_text)
         .context("Failed to parse existing header as N-Triples")?;
-    let new_triples = build_new_header(existing, replace, add, dataset_uri)?;
+    let new_triples = build_new_header(existing, replace, add, dataset_uri, max_term_bytes)?;
     let new_header = serialize_triples(&new_triples)?;
+    // The input was parsed strictly, so this should never fail; it is the
+    // guarantee that nothing written here can make the file unreadable.
+    parse_ntriples_text(&new_header)
+        .context("The assembled header would not parse as N-Triples; nothing was written")?;
 
     // `reader` is positioned at the start of the dictionary section; copy the
     // remaining bytes verbatim after the rewritten header.
@@ -130,6 +135,7 @@ fn build_new_header(
     replace: Option<&Path>,
     add: Option<&Path>,
     dataset_uri: Option<&str>,
+    max_term_bytes: usize,
 ) -> Result<Vec<Triple>> {
     // Validate the new dataset IRI up front so a malformed value can't corrupt
     // the header (and make the file unreadable) only to fail on reopen.
@@ -154,7 +160,7 @@ fn build_new_header(
         // already present so a later --add can't merge its blank nodes with ones
         // a prior --add wrote into the header.
         let blank_offset = next_blank_index(&existing);
-        triples.extend(read_input_triples(path, blank_offset)?);
+        triples.extend(read_input_triples(path, blank_offset, max_term_bytes)?);
     }
 
     if let Some(new_node) = new_dataset {
@@ -180,7 +186,11 @@ fn build_new_header(
 ///
 /// `blank_offset` shifts the blank-node disambiguation index so parsed blank
 /// nodes can't collide with `fN_` blank nodes already in the header.
-fn read_input_triples(path: &Path, blank_offset: usize) -> Result<Vec<Triple>> {
+fn read_input_triples(
+    path: &Path,
+    blank_offset: usize,
+    max_term_bytes: usize,
+) -> Result<Vec<Triple>> {
     let discovered = discover_inputs(std::slice::from_ref(&path.to_path_buf()))?;
     if discovered.rdf_inputs.is_empty() {
         bail!("Input is not a recognized RDF file: {}", path.display());
@@ -194,7 +204,7 @@ fn read_input_triples(path: &Path, blank_offset: usize) -> Result<Vec<Triple>> {
             .ok()
             .map(|p| format!("file://{}", p.display()));
         let prefix = format!("f{}_", blank_offset + idx);
-        let parsed = parse_rdf_to_triples(input, base.as_deref(), &prefix)
+        let parsed = parse_rdf_to_triples(input, base.as_deref(), &prefix, max_term_bytes)
             .with_context(|| format!("Failed to parse {}", input.path.display()))?;
         if parsed.named_graph_seen {
             tracing::warn!(
@@ -251,13 +261,9 @@ fn write_modified_hdt<R: Read>(
 /// surfaced as an error rather than silently dropped, so a rewrite can never
 /// quietly discard header content it failed to understand.
 fn parse_ntriples_text(text: &str) -> Result<Vec<Triple>> {
-    let parser =
-        oxrdfio::RdfParser::from_format(oxrdfio::RdfFormat::NTriples).for_reader(text.as_bytes());
-
     let mut triples = Vec::new();
-    for quad in parser {
-        let quad = quad.context("Invalid N-Triples in HDT header")?;
-        triples.push(Triple::new(quad.subject, quad.predicate, quad.object));
+    for triple in crate::rdf::header_triples(text.as_bytes()) {
+        triples.push(triple.context("Invalid N-Triples in HDT header")?);
     }
     Ok(triples)
 }

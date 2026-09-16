@@ -24,6 +24,12 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 walkdir = "2"
 oxrdfio = "0.2"
+# The Turtle-family parsers are built from this vendored oxttl 0.2.3 so that
+# `with_max_buffer_size` can be set (src/rdf/parser.rs). It is a separate,
+# renamed package rather than a `[patch]` because a patch applies only to the
+# root manifest, and anything depending on hdtc would fail to build; oxrdfio
+# keeps using the registry oxttl for the formats hdtc does not build itself.
+oxttl = { package = "oxttl-hdtc", path = "vendor/oxttl" }
 oxrdf = "0.3"
 indicatif = "0.17"
 zstd = "0.13"

@@ -177,6 +177,32 @@ Direct temporary files to a fast disk with sufficient space:
 hdtc create huge.nt -o huge.hdt --temp-dir /mnt/fast-ssd/tmp
 ```
 
+**Very large terms.** The Turtle-family parser buffers one term at a time, so a
+single IRI or literal larger than `--max-term-bytes` (default `256M`) cannot be
+read, and unlike a syntax error it cannot be skipped either: the lexer has no
+way past a term it cannot hold. hdtc therefore fails the input at once with an
+error naming the flag, and stops the other file workers rather than parse the
+rest of a build that is already lost. Real data exceeds the 16 MiB the parser
+library hard-codes — GADM publishes country boundaries as WKT literals up to
+86 MB — and the released library does not fail on them but spins forever,
+logging `Reached the buffer maximal size` once per rescan of its buffer. The
+buffer grows on demand and compacts at the same point as before, so the bound
+is a ceiling, not a reservation: ordinary data pays nothing for it, and the
+memory plan does not set aside the ceiling per parser, which at the defaults
+would leave two file workers for data that has no such term. Data that does
+have terms near the bound holds them outside `--memory-limit`: per file worker,
+one term in each lexer (one, or `--parse-chunk-workers` of them on the
+N-Triples/N-Quads path) plus a line of up to four terms in the chunker, and a
+few copies more as each term moves through the pipeline. Give such a build
+headroom, or fewer `--parse-file-workers`. A term of exactly the bound is
+accepted. In the parallel N-Triples/N-Quads path a line longer than four terms
+of the bound is refused before it is buffered. `hdtc header` takes the same
+flag for its `--replace`/`--add` input, and every reader of an HDT header
+parses it without a term bound, so what `header` accepts stays readable. hdtc
+builds the Turtle-family parsers from a vendored oxttl (`vendor/oxttl`, package
+`oxttl-hdtc`) that exposes this bound; see its `Cargo.toml` for what was
+changed. RDF/XML and JSON-LD have no such bound and are unaffected.
+
 ### Index: Creating indexes
 
 Create an index file for an existing HDT file:
@@ -630,6 +656,7 @@ predicate (the `void:` statistics and the `hdt:` namespace).
 | `--parse-chunk-workers N`          | auto (capped)                | Parser workers per active NT/NQ file                        |
 | `--parse-chunk-bytes BYTES`        | auto                         | Target NT/NQ chunk size in bytes                            |
 | `--parse-max-inflight-bytes BYTES` | auto                         | Max in-flight parser chunk bytes per file                   |
+| `--max-term-bytes SIZE`            | `256M`                       | Largest single IRI or literal accepted; a larger one fails the build |
 | `--benchmark`                      | off                          | Emit stage timing and RSS high-water summary                |
 | `-v, --verbose`                    | —                            | Increase log verbosity (`-v` debug, `-vv` trace)            |
 | `-q, --quiet`                      | —                            | Suppress all output except errors                           |
@@ -766,6 +793,7 @@ Named-graph options (`-m quads`, `--graph-map`, `--default-graph`,
 | `--add FILE`        | —            | Append the triples in `FILE` to the header                            |
 | `--dataset-uri IRI` | —            | Rewrite the current dataset IRI throughout the header                 |
 | `-o, --output PATH` | —            | Output path; required for any modification, rejected for a plain dump |
+| `--max-term-bytes SIZE` | `256M`   | Largest single IRI or literal accepted in the `--replace`/`--add` input |
 | `--benchmark`       | off          | Emit total header timing                                              |
 | `-v, --verbose`     | —            | Increase log verbosity (`-v` debug, `-vv` trace)                      |
 | `-q, --quiet`       | —            | Suppress all output except errors                                    |
@@ -1310,6 +1338,15 @@ cargo build --release
 ## License
 
 MIT — see [LICENSE](LICENSE) for details.
+
+## Third-party code
+
+`vendor/oxttl` is a modified copy of the `oxttl` crate from
+[Oxigraph](https://github.com/oxigraph/oxigraph), copyright its authors and
+licensed under MIT or Apache-2.0 at your option; the license texts are in
+`vendor/LICENSE-MIT` and `vendor/LICENSE-APACHE`, and `vendor/oxttl/Cargo.toml`
+lists every change from the release. hdtc's own license (`LICENSE`) does not
+cover that directory.
 
 ## Funding
 
