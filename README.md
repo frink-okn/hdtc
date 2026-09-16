@@ -186,8 +186,9 @@ GADM publishes country boundaries as WKT literals up to 86 MB — and the releas
 library does not fail on them but spins forever, logging
 `Reached the buffer maximal size` once per rescan of its buffer. The buffer grows
 on demand, so raising the flag costs only what the largest term needs, per
-parser. hdtc carries a vendored oxttl (`vendor/oxttl`) to expose this bound; see
-its `Cargo.toml`.
+parser. hdtc builds the Turtle-family parsers from a vendored oxttl
+(`vendor/oxttl`, package `oxttl-hdtc`) that exposes this bound; see its
+`Cargo.toml`. RDF/XML and JSON-LD have no such bound and are unaffected.
 
 ### Index: Creating indexes
 

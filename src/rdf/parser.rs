@@ -5,6 +5,7 @@ use crate::rdf::input::{Compression, RdfFormat, RdfInput};
 use anyhow::{Context, Result};
 use crossbeam_channel::TrySendError;
 use oxrdf::{BlankNode, GraphName, Literal, NamedOrBlankNode, Quad, Term, Triple};
+use oxttl::n3::{N3Quad, N3Term};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
@@ -440,6 +441,9 @@ where
 enum ParseError {
     Turtle(oxttl::TurtleParseError),
     Rdf(oxrdfio::RdfParseError),
+    /// A well-formed N3 statement that is not an RDF quad (a variable, or a
+    /// literal in subject position). Skippable, like a syntax error.
+    N3(&'static str),
 }
 
 impl std::fmt::Display for ParseError {
@@ -447,6 +451,7 @@ impl std::fmt::Display for ParseError {
         match self {
             Self::Turtle(e) => e.fmt(f),
             Self::Rdf(e) => e.fmt(f),
+            Self::N3(message) => f.write_str(message),
         }
     }
 }
@@ -467,12 +472,13 @@ impl ParseError {
         )
     }
 
-    /// The lexer refused a single term larger than its buffer.
+    /// The lexer refused a single term larger than its buffer. Only the
+    /// oxttl-backed formats honour `--max-term-bytes`, so only their errors
+    /// earn the hint to raise it.
     fn exceeds_term_bound(&self) -> bool {
         matches!(
             self,
-            Self::Turtle(oxttl::TurtleParseError::Io(e)) | Self::Rdf(oxrdfio::RdfParseError::Io(e))
-                if e.kind() == io::ErrorKind::OutOfMemory
+            Self::Turtle(oxttl::TurtleParseError::Io(e)) if e.kind() == io::ErrorKind::OutOfMemory
         )
     }
 
@@ -493,15 +499,65 @@ type ParsedQuad = std::result::Result<Quad, ParseError>;
 
 /// A lenient parser for one input format, honouring the term-size bound.
 ///
-/// Turtle, TriG, N-Triples and N-Quads are built from oxttl directly, because
-/// oxrdfio's generic `RdfParser` offers no way to set the bound
-/// ([`DEFAULT_MAX_TERM_BYTES`]); the other formats go through oxrdfio as before.
+/// The Turtle family — Turtle, TriG, N-Triples, N-Quads and N3 — is built from
+/// the vendored oxttl directly, because oxrdfio's generic `RdfParser` offers no
+/// way to set the bound ([`DEFAULT_MAX_TERM_BYTES`]); RDF/XML and JSON-LD go
+/// through oxrdfio as before.
 enum LenientParser {
     Turtle(oxttl::TurtleParser),
     TriG(oxttl::TriGParser),
     NTriples(oxttl::NTriplesParser),
     NQuads(oxttl::NQuadsParser),
+    N3(oxttl::N3Parser),
     Generic(oxrdfio::RdfParser),
+}
+
+/// The RDF quad an N3 statement denotes, with oxrdfio's rules: variables are
+/// never RDF terms, and a literal may not be a subject or a predicate.
+fn n3_to_quad(quad: N3Quad) -> std::result::Result<Quad, ParseError> {
+    let subject = match quad.subject {
+        N3Term::NamedNode(node) => NamedOrBlankNode::from(node),
+        N3Term::BlankNode(node) => NamedOrBlankNode::from(node),
+        N3Term::Literal(_) => {
+            return Err(ParseError::N3(
+                "literals are not allowed in regular RDF subjects",
+            ));
+        }
+        N3Term::Variable(_) => {
+            return Err(ParseError::N3(
+                "variables are not allowed in regular RDF subjects",
+            ));
+        }
+    };
+    let predicate = match quad.predicate {
+        N3Term::NamedNode(node) => node,
+        N3Term::BlankNode(_) => {
+            return Err(ParseError::N3(
+                "blank nodes are not allowed in regular RDF predicates",
+            ));
+        }
+        N3Term::Literal(_) => {
+            return Err(ParseError::N3(
+                "literals are not allowed in regular RDF predicates",
+            ));
+        }
+        N3Term::Variable(_) => {
+            return Err(ParseError::N3(
+                "variables are not allowed in regular RDF predicates",
+            ));
+        }
+    };
+    let object = match quad.object {
+        N3Term::NamedNode(node) => Term::from(node),
+        N3Term::BlankNode(node) => Term::from(node),
+        N3Term::Literal(literal) => Term::from(literal),
+        N3Term::Variable(_) => {
+            return Err(ParseError::N3(
+                "variables are not allowed in regular RDF objects",
+            ));
+        }
+    };
+    Ok(Quad::new(subject, predicate, object, quad.graph_name))
 }
 
 impl LenientParser {
@@ -539,6 +595,17 @@ impl LenientParser {
                     .lenient()
                     .with_max_buffer_size(max_term_bytes),
             ),
+            RdfFormat::N3 => {
+                let mut parser = oxttl::N3Parser::new()
+                    .lenient()
+                    .with_max_buffer_size(max_term_bytes);
+                if let Some(base) = base_uri
+                    && let Ok(with_base) = parser.clone().with_base_iri(base)
+                {
+                    parser = with_base;
+                }
+                Self::N3(parser)
+            }
             other => {
                 let mut parser = oxrdfio::RdfParser::from_format(to_oxrdf_format(other)).lenient();
                 if let Some(base) = base_uri
@@ -572,6 +639,11 @@ impl LenientParser {
                 parser
                     .for_reader(reader)
                     .map(|result| result.map_err(ParseError::Turtle)),
+            ),
+            Self::N3(parser) => Box::new(
+                parser
+                    .for_reader(reader)
+                    .map(|result| result.map_err(ParseError::Turtle).and_then(n3_to_quad)),
             ),
             Self::Generic(parser) => Box::new(
                 parser
@@ -798,6 +870,12 @@ where
     drop(task_tx);
 
     if let Err(e) = produce_result {
+        // Workers still hold queued tasks and send each result into a bounded
+        // channel nobody reads any more. Dropping the receiver makes those
+        // sends fail, and a failed send is how a worker learns to stop; joining
+        // before that would wait forever on the first worker to fill the
+        // channel.
+        drop(result_rx);
         for handle in worker_handles {
             let _ = handle.join();
         }
@@ -1158,6 +1236,120 @@ mod tests {
         assert_eq!(stats.errors, 0);
         assert_eq!(stats.quads, 2);
         assert!(quads[0].object.len() > 17 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_non_power_of_two_bound_rejects_and_accepts_correctly() {
+        // Vec growth can carry the lexer buffer past a bound that is not a
+        // power of two; unclamped, the overshoot is shrunk away on the next
+        // read, which discards bytes and reads an empty slice as end of file.
+        // The symptom was a 4.5 MiB literal under a 3M bound producing a
+        // successful build that had silently dropped the following triple.
+        let big = "x".repeat(9 * 512 * 1024); // 4.5 MiB
+        let content = format!(
+            "<http://example.org/s> <http://example.org/big> \"{big}\" .\n\
+             <http://example.org/s> <http://example.org/p> <http://example.org/o> .\n"
+        );
+        let (_f, input) = make_temp_with(content.as_bytes(), ".ttl", RdfFormat::Turtle);
+
+        let too_small = ParseOptions {
+            max_term_bytes: 3 * 1024 * 1024,
+            ..ParseOptions::default()
+        };
+        let error = stream_quads_with_options(&input, 0, false, None, &too_small, |_| Ok(()))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--max-term-bytes"), "{error}");
+
+        let big_enough = ParseOptions {
+            max_term_bytes: 5 * 1024 * 1024,
+            ..ParseOptions::default()
+        };
+        let mut quads = Vec::new();
+        let stats = stream_quads_with_options(&input, 0, false, None, &big_enough, |q| {
+            quads.push(q);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(stats.errors, 0);
+        assert_eq!(quads.len(), 2);
+        assert_eq!(quads[1].predicate, "http://example.org/p");
+    }
+
+    #[test]
+    fn test_fatal_chunk_error_does_not_deadlock_parallel_parser() {
+        // An oversized first literal followed by enough ordinary triples to
+        // fill the bounded result channel. The fatal chunk must end the parse
+        // promptly; before the receiver was dropped ahead of the join, the
+        // workers blocked forever on their sends.
+        let mut content = oversized_literal_document(false);
+        for i in 0..20_000 {
+            content.push_str(&format!(
+                "<http://example.org/s{i}> <http://example.org/p> <http://example.org/o> .\n"
+            ));
+        }
+        let (_f, input) = make_temp_with(content.as_bytes(), ".nt", RdfFormat::NTriples);
+        let options = ParseOptions {
+            enable_ntnq_parallel: true,
+            chunk_size_bytes: 4096,
+            chunk_workers: 2,
+            max_inflight_bytes: 64 * 1024 * 1024,
+            max_term_bytes: 1024 * 1024,
+        };
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = stream_quads_with_options(&input, 0, false, None, &options, |_| Ok(()));
+            let _ = done_tx.send(result.map(|_| ()).map_err(|e| e.to_string()));
+        });
+        let outcome = done_rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("parallel parse did not finish: workers deadlocked");
+        let error = outcome.unwrap_err();
+        assert!(error.contains("--max-term-bytes"), "{error}");
+    }
+
+    #[test]
+    fn test_n3_honours_term_bound() {
+        let (_f, input) = make_temp_with(
+            oversized_literal_document(false).as_bytes(),
+            ".n3",
+            RdfFormat::N3,
+        );
+
+        let mut quads = Vec::new();
+        let stats = stream_quads(&input, 0, false, None, |q| {
+            quads.push(q);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(stats.errors, 0);
+        assert_eq!(stats.quads, 2);
+        assert!(quads[0].object.len() > 17 * 1024 * 1024);
+
+        let options = ParseOptions {
+            max_term_bytes: 1024 * 1024,
+            ..ParseOptions::default()
+        };
+        let error = stream_quads_with_options(&input, 0, false, None, &options, |_| Ok(()))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--max-term-bytes"), "{error}");
+    }
+
+    #[test]
+    fn test_n3_statement_that_is_not_rdf_is_skipped() {
+        let content = "@prefix ex: <http://example.org/> .\n?x ex:p ex:o .\nex:s ex:p ex:o .\n";
+        let (_f, input) = make_temp_with(content.as_bytes(), ".n3", RdfFormat::N3);
+        let mut quads = Vec::new();
+        let stats = stream_quads(&input, 0, false, None, |q| {
+            quads.push(q);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(stats.errors, 1);
+        assert_eq!(quads.len(), 1);
+        assert_eq!(quads[0].subject, "http://example.org/s");
     }
 
     #[test]

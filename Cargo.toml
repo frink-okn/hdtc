@@ -24,10 +24,12 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 walkdir = "2"
 oxrdfio = "0.2"
-# Named directly, not only through oxrdfio: the Turtle-family parsers are built
-# from it so that `with_max_buffer_size` can be set (src/rdf/parser.rs). Exact
-# pin because the patch below vendors exactly this version.
-oxttl = "=0.2.3"
+# The Turtle-family parsers are built from this vendored oxttl 0.2.3 so that
+# `with_max_buffer_size` can be set (src/rdf/parser.rs). It is a separate,
+# renamed package rather than a `[patch]` because a patch applies only to the
+# root manifest, and anything depending on hdtc would fail to build; oxrdfio
+# keeps using the registry oxttl for the formats hdtc does not build itself.
+oxttl = { package = "oxttl-hdtc", path = "vendor/oxttl" }
 oxrdf = "0.3"
 indicatif = "0.17"
 zstd = "0.13"
@@ -72,12 +74,3 @@ codegen-units = 1
 # docs/sketch-format.md §5.3) rather than left to a panic.
 [profile.dev.package.xorf]
 debug-assertions = false
-
-# oxttl 0.2.3 with one backport (oxigraph de4dc5f04): every parser gains
-# `with_max_buffer_size`, lifting the 16 MiB bound on a single IRI or literal
-# that the released crate hard-codes and that real data (GADM's WKT country
-# boundaries, up to 86 MB) exceeds. See vendor/oxttl/Cargo.toml. A `[patch]`
-# only takes effect from the root manifest, so a workspace that builds hdtc
-# from source (kgf-rs) repeats this entry.
-[patch.crates-io]
-oxttl = { path = "vendor/oxttl" }

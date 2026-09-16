@@ -11,7 +11,7 @@
 [package]
 edition = "2024"
 rust-version = "1.87"
-name = "oxttl"
+name = "oxttl-hdtc"
 version = "0.2.3"
 authors = ["Tpt <thomas@pellissier-tanon.fr>"]
 build = false
@@ -47,7 +47,7 @@ default = []
 rdf-12 = ["oxrdf/rdf-12"]
 
 [lib]
-name = "oxttl"
+name = "oxttl_hdtc"
 path = "src/lib.rs"
 
 [dependencies.memchr]

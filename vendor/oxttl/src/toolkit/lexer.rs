@@ -118,7 +118,7 @@ impl<R: TokenRecognizer> Lexer<Vec<u8>, R> {
 
     pub fn extend_from_reader(&mut self, reader: &mut impl Read) -> io::Result<()> {
         self.shrink_data();
-        if self.data.len() == self.max_buffer_size {
+        if self.data.len() >= self.max_buffer_size {
             return Err(io::Error::new(
                 io::ErrorKind::OutOfMemory,
                 format!(
@@ -131,8 +131,13 @@ impl<R: TokenRecognizer> Lexer<Vec<u8>, R> {
         let new_start = self.data.len();
         self.data.resize(min_end, 0);
         if self.data.len() < self.data.capacity() {
-            // We keep extending to have as much space as available without reallocation
-            self.data.resize(self.data.capacity(), 0);
+            // We keep extending to have as much space as available without
+            // reallocation — but never past the bound: Vec growth can leave
+            // capacity above it, and a buffer that overshoots is then shrunk on
+            // the next call, which discards bytes and mistakes an empty read for
+            // the end of the input (hdtc backport note).
+            self.data
+                .resize(min(self.data.capacity(), self.max_buffer_size), 0);
         }
         let read = reader.read(&mut self.data[new_start..])?;
         self.data.truncate(new_start + read);
@@ -146,7 +151,7 @@ impl<R: TokenRecognizer> Lexer<Vec<u8>, R> {
         reader: &mut (impl AsyncRead + Unpin),
     ) -> io::Result<()> {
         self.shrink_data();
-        if self.data.len() == self.max_buffer_size {
+        if self.data.len() >= self.max_buffer_size {
             return Err(io::Error::new(
                 io::ErrorKind::OutOfMemory,
                 format!(
@@ -159,8 +164,9 @@ impl<R: TokenRecognizer> Lexer<Vec<u8>, R> {
         let new_start = self.data.len();
         self.data.resize(min_end, 0);
         if self.data.len() < self.data.capacity() {
-            // We keep extending to have as much space as available without reallocation
-            self.data.resize(self.data.capacity(), 0);
+            // Same clamp as `extend_from_reader`.
+            self.data
+                .resize(min(self.data.capacity(), self.max_buffer_size), 0);
         }
         let read = reader.read(&mut self.data[new_start..]).await?;
         self.data.truncate(new_start + read);
