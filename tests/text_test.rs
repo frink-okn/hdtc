@@ -8,7 +8,7 @@
 mod common;
 
 use common::{run_hdtc_to_path, run_hdtc_to_path_with_args, write_file};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -80,8 +80,10 @@ fn text_index_dir(hdt: &Path) -> PathBuf {
     PathBuf::from(format!("{}.text", hdt.display()))
 }
 
-/// Copy the frozen version-1 index into a writable temporary directory.
-/// Tantivy may create lock files beside an index even when it is only queried.
+/// Copy the frozen version-1 index into a temporary directory, so the checked-in
+/// fixture cannot be disturbed by a run. Querying it in place would be safe —
+/// reading an index writes nothing — but a test that writes nowhere near the
+/// source tree is easier to trust.
 fn legacy_text_fixture(temp: &Path) -> PathBuf {
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/text-index-v1");
     let hdt = temp.join("legacy.hdt");
@@ -135,6 +137,12 @@ fn rows(hdt: &Path, args: &[&str]) -> Vec<(String, String, String)> {
         "search failed: {}",
         stderr(&output)
     );
+    parse_rows(&output)
+}
+
+/// The same parse, for a caller that must inspect the run before asserting it
+/// succeeded.
+fn parse_rows(output: &Output) -> Vec<(String, String, String)> {
     String::from_utf8_lossy(&output.stdout)
         .lines()
         .filter(|line| !line.is_empty())
@@ -167,6 +175,66 @@ fn objects(hdt: &Path, args: &[&str]) -> Vec<String> {
 
 fn iri(suffix: &str) -> String {
     format!("<http://example.org/{suffix}>")
+}
+
+/// Drop write permission from `dir` and everything in it, and report whether
+/// the mode bits actually bite. Root ignores them, and a test that assumed
+/// otherwise would pass without testing anything.
+fn make_read_only(dir: &Path) -> bool {
+    set_mode(dir, 0o444, 0o555);
+    let probe = dir.join(".write-probe");
+    match std::fs::File::create(&probe) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            false
+        }
+        Err(_) => true,
+    }
+}
+
+/// Restore write permission, without which the temporary directory cannot be
+/// removed. Every caller must reach this before it asserts anything.
+fn restore_write(dir: &Path) {
+    set_mode(dir, 0o644, 0o755);
+}
+
+#[cfg(unix)]
+fn set_mode(dir: &Path, file_mode: u32, dir_mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    for entry in std::fs::read_dir(dir).expect("read index directory") {
+        let entry = entry.expect("read index entry");
+        std::fs::set_permissions(entry.path(), PermissionsExt::from_mode(file_mode))
+            .expect("set file permissions");
+    }
+    std::fs::set_permissions(dir, PermissionsExt::from_mode(dir_mode))
+        .expect("set directory permissions");
+}
+
+#[cfg(not(unix))]
+fn set_mode(dir: &Path, file_mode: u32, _dir_mode: u32) {
+    let read_only = file_mode & 0o200 == 0;
+    for entry in std::fs::read_dir(dir).expect("read index directory") {
+        let entry = entry.expect("read index entry");
+        let mut permissions = entry.metadata().expect("read metadata").permissions();
+        permissions.set_readonly(read_only);
+        std::fs::set_permissions(entry.path(), permissions).expect("set file permissions");
+    }
+}
+
+/// Every entry of `dir` with its length and modification time, which is what a
+/// caller compares to claim a run left the directory alone.
+fn directory_snapshot(dir: &Path) -> BTreeMap<std::ffi::OsString, (u64, std::time::SystemTime)> {
+    std::fs::read_dir(dir)
+        .expect("read index directory")
+        .map(|entry| {
+            let entry = entry.expect("read index entry");
+            let metadata = entry.metadata().expect("read index entry metadata");
+            (
+                entry.file_name(),
+                (metadata.len(), metadata.modified().expect("entry mtime")),
+            )
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -903,6 +971,57 @@ fn predicate_telemetry_reports_prefilter_occurrences() {
         stderr(&output).contains("2 occurrence(s) examined"),
         "telemetry did not report the pre-filter pair count: {}",
         stderr(&output)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Read-only indexes
+// ---------------------------------------------------------------------------
+
+/// A published index is immutable by contract, and a read-only filesystem is
+/// the only mechanism a deployment has to *enforce* that rather than promise
+/// it — a `readOnly` volume, a bucket mirror, a snapshot. So querying must
+/// write nothing at all, including Tantivy's meta lock file: taking that lock
+/// is the one write a reader would otherwise perform, and it failed the open
+/// before a single query ran.
+#[test]
+fn a_query_answers_from_a_read_only_index_without_writing_to_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let hdt = fixture(temp.path());
+    let index = text_index_dir(&hdt);
+
+    if !make_read_only(&index) {
+        restore_write(&index);
+        eprintln!("skipped: mode bits do not restrict this user");
+        return;
+    }
+
+    let before = directory_snapshot(&index);
+    let output = search(&hdt, &["--text", "atrazine"]);
+    let after = directory_snapshot(&index);
+    // Before any assertion, or a failure leaves a directory that cannot be
+    // removed.
+    restore_write(&index);
+
+    assert!(
+        output.status.success(),
+        "search over a read-only index failed: {}",
+        stderr(&output)
+    );
+    let found: Vec<String> = parse_rows(&output)
+        .into_iter()
+        .map(|(_, _, object)| object)
+        .collect();
+    assert_eq!(found[0], r#""atrazine"@en"#);
+    assert!(
+        found
+            .iter()
+            .any(|object| object.contains("chlorohydrolase")),
+        "the read-only index answered short: {found:?}"
+    );
+    assert_eq!(
+        before, after,
+        "querying changed the index directory; it must write nothing"
     );
 }
 

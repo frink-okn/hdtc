@@ -9,6 +9,7 @@ use super::analyzer::{
     TOKENIZER_NAME, UNDETERMINED_LANGUAGE, language_matches, stemmer_language, stemming_tokenizer,
 };
 use super::manifest::TextManifest;
+use super::readonly::ReadOnlyDirectory;
 use super::schema::{FIELD_LANG, FIELD_OBJECT, FIELD_TEXT, FIELD_TEXT_STEMMED, register_tokenizer};
 use anyhow::{Context, Result, ensure};
 use std::cmp::{Ordering, Reverse};
@@ -225,7 +226,11 @@ impl TextSearcher {
         let format = manifest
             .tantivy_index_format
             .map_or_else(|| "unknown".to_string(), |version| version.to_string());
-        let index = Index::open_in_dir(dir).with_context(|| {
+        // Through a directory that never writes, so a published index serves
+        // from a read-only filesystem; see [`ReadOnlyDirectory`].
+        let directory = ReadOnlyDirectory::open(dir)
+            .with_context(|| format!("Failed to open text index directory {}", dir.display()))?;
+        let index = Index::open(directory).with_context(|| {
             format!(
                 "Failed to open text index {} (written by Tantivy {}, index format {})",
                 dir.display(),

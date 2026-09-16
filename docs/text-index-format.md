@@ -416,6 +416,27 @@ tokens at 40 bytes and would fail to match any longer term.
 A published index is merged to a single segment where it has any documents. This
 is a property of what hdtc publishes, not a requirement on readers.
 
+### 5.4 Reading writes nothing
+
+A published index is immutable, so opening and querying one **must not** write
+to its directory — not a file, not an mtime. It follows that an index serves
+unchanged from a read-only mount, a bucket mirror or a snapshot, which is the
+only way a deployment can enforce immutability rather than promise it.
+
+This is a constraint on readers, because it is not what Tantivy does by default.
+`IndexReader` takes the index meta lock while it opens segment readers, to stop a
+concurrent writer's garbage collection from deleting them mid-open, and
+`MmapDirectory` implements that lock by opening `.tantivy-meta.lock` for writing.
+A published index has no writer, so the lock guards nothing; a reader **should**
+supply a `Directory` that answers the lock without touching the filesystem. hdtc
+does this in `src/text/readonly.rs`, and refuses every write through that
+directory rather than delegating it, so a stray write fails loudly instead of
+mutating a published artifact.
+
+An index may carry a zero-byte `.tantivy-meta.lock` or `.tantivy-writer.lock`
+left by its build. Neither is part of the published index, and a reader must not
+require or create either.
+
 ## 6. Ranking
 
 Scoring is Tantivy's BM25 over the `text` field, with that release's default
