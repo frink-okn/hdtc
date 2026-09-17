@@ -20,9 +20,14 @@
 //! - **Identity** — [`sha256_to_end`], so a sidecar's binding to its HDT is
 //!   verified by one implementation rather than two.
 //! - **Sidecar directories** — [`PermutationHeader`] and [`PermutationSection`]
-//!   describe `.hdt.perm`'s regions precisely enough to map them directly.
-//!   [`SketchHeader`] and [`KeysetHeader`] validate and expose the metadata of
-//!   the dictionary-derived artifacts under `filters/` and `keysets/`.
+//!   describe `.hdt.perm`'s regions precisely enough to map them directly;
+//!   [`GraphSidecarDirectory`] and [`GraphIndexDirectory`] do the same for
+//!   `.hdt.graphs` and `.hdt.graphs.idx`, whose layer records
+//!   ([`GraphLayerEntry`], [`GraphChunkEntry`], [`EliasFanoHeader`]) are
+//!   decoded here so a mapped reader addresses them without restating their
+//!   layout. [`SketchHeader`] and [`KeysetHeader`] validate and expose the
+//!   metadata of the dictionary-derived artifacts under `filters/` and
+//!   `keysets/`.
 //! - **Bounded work**, so a service can spend a published budget rather than
 //!   discover a query's cost after paying it: [`TextSearcher::search_up_to`]
 //!   and [`TextSearcher::scan_matching_objects`].
@@ -110,20 +115,22 @@ pub use crate::permutation::{
 // Graphs sidecar (.hdt.graphs)
 // ---------------------------------------------------------------------------
 //
-// The sidecar's header locates its three parts, and its fixed-size records —
-// a layer-directory entry, a chunk-directory entry, an Elias–Fano header —
-// are decoded by these parsers wherever a reader addresses them. A mapped
-// reader addresses them lazily: a bundle may carry thousands of graphs, so
-// reading every entry at open would make opening proportional to `G`. The
-// graph dictionary is one standard PFC section at `dictionary_offset`, so
-// [`scan_pfc_section`] locates it. `GraphSidecarReader`'s membership
-// operations are seek-based and for this crate's own tools.
+// [`GraphSidecarDirectory::read`] is the mapped reader's open path: the
+// header, bound to the HDT, locates the sidecar's three parts. The fixed-size
+// records — a layer-directory entry, a chunk-directory entry, an Elias–Fano
+// header — are decoded by these parsers wherever a reader addresses them,
+// and a mapped reader addresses them lazily: a bundle may carry thousands of
+// graphs, so reading every entry at open would make opening proportional to
+// `G`. The graph dictionary is one standard PFC section at
+// `dictionary_offset`, so [`scan_pfc_section`] locates it. The seek-based
+// `GraphSidecarReader` is this crate's own and stays off the façade.
 
 pub use crate::quads::{
-    ELIAS_FANO_HEADER_SIZE, EliasFanoHeader, GRAPH_ARRAY_CONTAINER_MAX,
-    GRAPH_BITMAP_CONTAINER_BYTES, GRAPH_CHUNK_ENTRY_SIZE, GRAPH_LAYER_ENTRY_SIZE,
+    ELIAS_FANO_HEADER_SIZE, ELIAS_FANO_SUBBLOCK_BITS, ELIAS_FANO_SUPERBLOCK_BITS, EliasFanoHeader,
+    GRAPH_ARRAY_CONTAINER_MAX, GRAPH_BITMAP_CONTAINER_BYTES, GRAPH_BITMAP_CONTAINER_SUBBLOCK_BITS,
+    GRAPH_BITMAP_CONTAINER_SUBRANK_BYTES, GRAPH_CHUNK_ENTRY_SIZE, GRAPH_LAYER_ENTRY_SIZE,
     GRAPH_POSITION_CHUNK_SHIFT, GraphChunkContainer, GraphChunkEntry, GraphLayerEncoding,
-    GraphLayerEntry, GraphSidecarHeader, GraphSidecarReader, GraphTerm,
+    GraphLayerEntry, GraphSidecarDirectory, GraphSidecarHeader,
     canonical_sidecar_path as graph_sidecar_path,
 };
 

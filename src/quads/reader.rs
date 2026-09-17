@@ -23,6 +23,9 @@ const CHUNK_SHIFT: u32 = GRAPH_POSITION_CHUNK_SHIFT;
 const ENCODING_DENSE: u32 = GraphLayerEncoding::DenseChunks as u32;
 const ENCODING_SPARSE: u32 = GraphLayerEncoding::SparseChunks as u32;
 const ENCODING_ELIAS_FANO: u32 = GraphLayerEncoding::EliasFano as u32;
+const FLAG_EXHAUSTIVE: u64 = 1 << 0;
+const FLAG_DISJOINT: u64 = 1 << 1;
+const FLAG_HAS_BLANK_GRAPH_NAMES: u64 = 1 << 2;
 
 /// Bytes in one layer-directory entry (`docs/graphs-sidecar-format.md` §6).
 pub const GRAPH_LAYER_ENTRY_SIZE: usize = 96;
@@ -38,6 +41,15 @@ pub const GRAPH_ARRAY_CONTAINER_MAX: u32 = 4096;
 /// Bytes of a bitmap container payload: 128 `u16` subranks then 8192 bitmap
 /// bytes (`docs/graphs-sidecar-format.md` §7.3).
 pub const GRAPH_BITMAP_CONTAINER_BYTES: u32 = 8_448;
+/// Bytes of a bitmap container's subrank prefix; the bitmap follows it.
+pub const GRAPH_BITMAP_CONTAINER_SUBRANK_BYTES: usize = 256;
+/// Bits per bitmap-container subrank sample.
+pub const GRAPH_BITMAP_CONTAINER_SUBBLOCK_BITS: u32 = 512;
+/// Superblock width of an Elias–Fano layer's upper-bitmap rank directory
+/// (`docs/graphs-sidecar-format.md` §8.2).
+pub const ELIAS_FANO_SUPERBLOCK_BITS: u32 = 4096;
+/// Subblock width of the same directory.
+pub const ELIAS_FANO_SUBBLOCK_BITS: u32 = 512;
 
 /// How one membership layer stores its positions
 /// (`docs/graphs-sidecar-format.md` §6, "Encoding").
@@ -46,7 +58,10 @@ pub const GRAPH_BITMAP_CONTAINER_BYTES: u32 = 8_448;
 pub enum GraphLayerEncoding {
     /// One chunk entry per universe chunk, empty chunks included (§7.1).
     DenseChunks = 1,
-    /// Only non-empty chunks, with the access hash of §7.4 (§7.1).
+    /// Only non-empty chunks, with the access hash of §7.4 (§7.1). Also the
+    /// encoding every *empty* layer records, with no structures at all: a
+    /// reader checks `member_count` before it interprets the encoding, since
+    /// an empty layer has a zero hash capacity and no directory to probe.
     SparseChunks = 2,
     /// One monotone Elias–Fano sequence (§8).
     EliasFano = 3,
@@ -101,19 +116,18 @@ pub enum GraphTerm {
 /// counts and source binding it checks the file against its HDT with.
 #[derive(Debug, Clone, Copy)]
 pub struct GraphSidecarHeader {
-    /// Assertion flags; bit 0 `EXHAUSTIVE`, bit 1 `DISJOINT`, bit 2
-    /// `HAS_BLANK_GRAPH_NAMES`.
+    /// Assertion flags; see the `is_*` and `has_*` methods.
     pub flags: u64,
     /// `N`, the HDT's triple count.
-    pub triple_count: u64,
+    pub triples: u64,
     /// `G`, the named graphs; layers are indexed `0..=G`.
-    pub named_graph_count: u64,
+    pub named_graphs: u64,
     /// `M`, the memberships summed over every layer.
-    pub membership_count: u64,
+    pub memberships: u64,
     /// Length of the HDT's dictionary-and-triples suffix this sidecar binds to.
     pub source_data_length: u64,
     /// Exact file size, footer included.
-    pub sidecar_size: u64,
+    pub file_size: u64,
     /// Absolute offset of the graph dictionary's PFC section.
     pub dictionary_offset: u64,
     /// Length of that section, padding excluded.
@@ -133,6 +147,74 @@ pub struct GraphSidecarHeader {
     pub source_digest: [u8; 32],
     /// CRC32C of the header's first 252 bytes.
     pub header_crc: u32,
+}
+
+impl GraphSidecarHeader {
+    /// Whether every SPO position belongs to at least one graph. Every
+    /// version-1 sidecar asserts this.
+    pub fn is_exhaustive(&self) -> bool {
+        self.flags & FLAG_EXHAUSTIVE != 0
+    }
+
+    /// Whether every SPO position belongs to at most one graph — so with
+    /// [`is_exhaustive`](Self::is_exhaustive), exactly one, and the
+    /// membership count equals the triple count.
+    pub fn is_disjoint(&self) -> bool {
+        self.flags & FLAG_DISJOINT != 0
+    }
+
+    /// Whether at least one graph is named by a blank node, stored as
+    /// `_:label`.
+    pub fn has_blank_graph_names(&self) -> bool {
+        self.flags & FLAG_HAS_BLANK_GRAPH_NAMES != 0
+    }
+}
+
+/// What a reader that maps the sidecar needs from it, bound to its HDT.
+///
+/// The counterpart of `GraphIndex::directory`: the parsed header, which
+/// locates the graph dictionary — one standard PFC section at
+/// `dictionary_offset`, scannable with [`scan_pfc_section`](crate::format::scan_pfc_section)
+/// — and the layer directory, whose entries are decoded lazily with
+/// [`GraphLayerEntry::parse`]. The seek-based membership operations of
+/// [`GraphSidecarReader`] are for this crate's own tools and are not part of
+/// this type.
+#[derive(Debug, Clone)]
+pub struct GraphSidecarDirectory {
+    path: PathBuf,
+    header: GraphSidecarHeader,
+    hdt_data_offset: u64,
+}
+
+impl GraphSidecarDirectory {
+    /// Read the header of the sidecar at `path` and check its cheap binding to
+    /// the HDT at `hdt_path`: the suffix length and the triple count. The
+    /// dictionary's preamble is scanned and its count checked; no payload is
+    /// read.
+    pub fn read(path: &Path, hdt_path: &Path) -> Result<Self> {
+        let reader = GraphSidecarReader::open(path, hdt_path)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            header: reader.header,
+            hdt_data_offset: reader.hdt_data_offset,
+        })
+    }
+
+    /// The file this directory was read from.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The parsed header.
+    pub fn header(&self) -> &GraphSidecarHeader {
+        &self.header
+    }
+
+    /// Where the bound HDT's identity input begins: its dictionary control
+    /// information (`docs/graphs-sidecar-format.md` §10).
+    pub fn hdt_data_offset(&self) -> u64 {
+        self.hdt_data_offset
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -273,9 +355,9 @@ impl GraphChunkEntry {
 /// (`docs/graphs-sidecar-format.md` §8.1).
 ///
 /// Region offsets are absolute within the file holding the layer. The
-/// superrank and subrank directories have the two-level geometry of
-/// `docs/permutation-index-format.md` §7.2: `u64` samples every 4096 bits
-/// with a sentinel, `u16` samples every 512 bits.
+/// superrank and subrank regions are the two-level rank directory of
+/// `docs/graphs-sidecar-format.md` §8.2 over the upper bitmap, at
+/// [`ELIAS_FANO_SUPERBLOCK_BITS`] and [`ELIAS_FANO_SUBBLOCK_BITS`].
 #[derive(Debug, Clone, Copy)]
 pub struct EliasFanoHeader {
     /// `l`, the low-bit width.
@@ -403,11 +485,11 @@ impl EmbeddedLayerSetReader {
         let layers_offset = if region_length == 0 { 0 } else { region_offset };
         let header = GraphSidecarHeader {
             flags: 1,
-            triple_count,
-            named_graph_count,
-            membership_count,
+            triples: triple_count,
+            named_graphs: named_graph_count,
+            memberships: membership_count,
             source_data_length: 0,
-            sidecar_size: file_size,
+            file_size,
             dictionary_offset: 0,
             dictionary_length: 0,
             directory_offset,
@@ -497,7 +579,7 @@ impl EmbeddedLayerSetReader {
         let mut first_start = None;
         let mut previous_end = self.inner.header.layers_offset;
         let mut covered_end = self.inner.header.layers_offset;
-        for graph_id in 0..=self.inner.header.named_graph_count {
+        for graph_id in 0..=self.inner.header.named_graphs {
             let layer = self.inner.layer_entry(graph_id)?;
             if let Some((start, end)) = self.inner.validate_layer_metadata(layer)? {
                 ensure!(
@@ -561,7 +643,7 @@ impl EmbeddedLayerSetReader {
                 }
             }
             let mut count = 0u64;
-            let mut minimum = self.inner.header.triple_count;
+            let mut minimum = self.inner.header.triples;
             let mut maximum_exclusive = 0u64;
             let mut previous = None;
             for position in self.inner.layer_iter(graph_id)? {
@@ -593,7 +675,7 @@ impl EmbeddedLayerSetReader {
                 .context("embedded membership overflow")?;
         }
         ensure!(
-            total == self.inner.header.membership_count,
+            total == self.inner.header.memberships,
             "embedded layer-set membership-count mismatch"
         );
         ensure!(
@@ -663,7 +745,7 @@ impl GraphSidecarReader {
             "sidecar/HDT data length mismatch"
         );
         ensure!(
-            hdt_triples == header.triple_count,
+            hdt_triples == header.triples,
             "sidecar/HDT triple count mismatch"
         );
         let dictionary = read_graph_dictionary(&mut file, header)?;
@@ -679,15 +761,15 @@ impl GraphSidecarReader {
     }
 
     pub fn triple_count(&self) -> u64 {
-        self.header.triple_count
+        self.header.triples
     }
 
     pub fn named_graph_count(&self) -> u64 {
-        self.header.named_graph_count
+        self.header.named_graphs
     }
 
     pub fn membership_count(&self) -> u64 {
-        self.header.membership_count
+        self.header.memberships
     }
 
     /// The parsed file header, checked against the HDT's suffix length and
@@ -728,7 +810,7 @@ impl GraphSidecarReader {
             return Ok(GraphTerm::DefaultGraph);
         }
         ensure!(
-            graph_id <= self.header.named_graph_count,
+            graph_id <= self.header.named_graphs,
             "graph ID out of range"
         );
         Ok(GraphTerm::Named(self.dictionary_term(graph_id)?))
@@ -776,7 +858,7 @@ impl GraphSidecarReader {
     }
 
     pub fn access(&mut self, graph_id: u64, position: u64) -> Result<bool> {
-        ensure!(position < self.header.triple_count, "position out of range");
+        ensure!(position < self.header.triples, "position out of range");
         let layer = self.layer_entry(graph_id)?;
         if layer.member_count == 0
             || position < layer.minimum_position
@@ -802,14 +884,14 @@ impl GraphSidecarReader {
 
     pub fn rank(&mut self, graph_id: u64, position: u64) -> Result<u64> {
         ensure!(
-            position <= self.header.triple_count,
+            position <= self.header.triples,
             "rank position out of range"
         );
         let layer = self.layer_entry(graph_id)?;
         if position == 0 || layer.member_count == 0 {
             return Ok(0);
         }
-        if position == self.header.triple_count || position >= layer.maximum_position_exclusive {
+        if position == self.header.triples || position >= layer.maximum_position_exclusive {
             return Ok(layer.member_count);
         }
         if position <= layer.minimum_position {
@@ -833,7 +915,7 @@ impl GraphSidecarReader {
     }
 
     pub fn next_member(&mut self, graph_id: u64, position: u64) -> Result<Option<u64>> {
-        ensure!(position < self.header.triple_count, "position out of range");
+        ensure!(position < self.header.triples, "position out of range");
         let rank = self.rank(graph_id, position)?;
         let count = self.count(graph_id)?;
         if rank == count {
@@ -844,9 +926,9 @@ impl GraphSidecarReader {
     }
 
     pub fn graphs_of(&mut self, position: u64) -> Result<Vec<u64>> {
-        ensure!(position < self.header.triple_count, "position out of range");
+        ensure!(position < self.header.triples, "position out of range");
         let mut graphs = Vec::new();
-        for graph_id in 0..=self.header.named_graph_count {
+        for graph_id in 0..=self.header.named_graphs {
             if self.access(graph_id, position)? {
                 graphs.push(graph_id);
             }
@@ -856,7 +938,7 @@ impl GraphSidecarReader {
 
     pub fn layer_iter(&mut self, graph_id: u64) -> Result<LayerMemberIter> {
         let layer = self.layer_entry(graph_id)?;
-        LayerMemberIter::new(&self.file, layer, self.header.triple_count)
+        LayerMemberIter::new(&self.file, layer, self.header.triples)
     }
 
     /// Perform full identity, checksum, encoding, dictionary, and exhaustive
@@ -911,7 +993,7 @@ impl GraphSidecarReader {
 
         let mut previous_term: Option<String> = None;
         let mut blank_graph_seen = false;
-        for graph_id in 1..=self.header.named_graph_count {
+        for graph_id in 1..=self.header.named_graphs {
             let GraphTerm::Named(term) = self.graph(graph_id)? else {
                 unreachable!()
             };
@@ -955,7 +1037,7 @@ impl GraphSidecarReader {
         let mut first_layer_start = None;
         let mut previous_layer_end = self.header.layers_offset;
 
-        for graph_id in 0..=self.header.named_graph_count {
+        for graph_id in 0..=self.header.named_graphs {
             let layer = self.layer_entry(graph_id)?;
             if let Some((start, end)) = self.validate_layer_metadata(layer)? {
                 ensure!(
@@ -966,7 +1048,7 @@ impl GraphSidecarReader {
                 previous_layer_end = end;
             }
             let mut count = 0u64;
-            let mut minimum = self.header.triple_count;
+            let mut minimum = self.header.triples;
             let mut maximum_exclusive = 0u64;
             let mut previous = None;
             let iterator = self.layer_iter(graph_id)?;
@@ -1002,7 +1084,7 @@ impl GraphSidecarReader {
             );
         }
         ensure!(
-            total_members == self.header.membership_count,
+            total_members == self.header.memberships,
             "global membership count mismatch"
         );
         let expected_layers_end = self
@@ -1071,7 +1153,7 @@ impl GraphSidecarReader {
             expected_position += 1;
         }
         ensure!(
-            expected_position == self.header.triple_count,
+            expected_position == self.header.triples,
             "non-exhaustive graph memberships"
         );
         if let Some(encoder) = transposed {
@@ -1111,7 +1193,7 @@ impl GraphSidecarReader {
                 "invalid empty layer fields"
             );
             ensure!(
-                layer.minimum_position == self.header.triple_count,
+                layer.minimum_position == self.header.triples,
                 "invalid empty layer minimum"
             );
             ensure!(
@@ -1125,7 +1207,7 @@ impl GraphSidecarReader {
             "invalid layer range"
         );
         ensure!(
-            layer.maximum_position_exclusive <= self.header.triple_count,
+            layer.maximum_position_exclusive <= self.header.triples,
             "layer range outside universe"
         );
         ensure!(
@@ -1150,10 +1232,10 @@ impl GraphSidecarReader {
                     "chunk directory length mismatch"
                 );
                 if layer.encoding == ENCODING_DENSE {
-                    let expected = if self.header.triple_count == 0 {
+                    let expected = if self.header.triples == 0 {
                         0
                     } else {
-                        1 + ((self.header.triple_count - 1) >> CHUNK_SHIFT)
+                        1 + ((self.header.triples - 1) >> CHUNK_SHIFT)
                     };
                     ensure!(
                         layer.item_count_a == expected,
@@ -1254,7 +1336,7 @@ impl GraphSidecarReader {
                 );
             }
             ensure!(
-                chunk.key < self.header.triple_count.div_ceil(1 << CHUNK_SHIFT),
+                chunk.key < self.header.triples.div_ceil(1 << CHUNK_SHIFT),
                 "chunk key outside universe"
             );
             if chunk.cardinality == 0 {
@@ -1362,7 +1444,7 @@ impl GraphSidecarReader {
         );
         let header = self.ef_header(layer)?;
         ensure!(
-            header.universe == self.header.triple_count,
+            header.universe == self.header.triples,
             "Elias-Fano universe mismatch"
         );
         ensure!(
@@ -1561,7 +1643,7 @@ impl GraphSidecarReader {
 
     fn layer_entry(&mut self, graph_id: u64) -> Result<GraphLayerEntry> {
         ensure!(
-            graph_id <= self.header.named_graph_count,
+            graph_id <= self.header.named_graphs,
             "graph ID out of range"
         );
         let offset = self
@@ -2456,9 +2538,9 @@ fn read_header(file: &mut File, file_size: u64) -> Result<GraphSidecarHeader> {
         "unsupported graph position chunk shift"
     );
 
-    let named_graph_count = get_u64(&bytes, 32);
+    let named_graphs = get_u64(&bytes, 32);
     let directory_length = get_u64(&bytes, 88);
-    let expected_directory_length = named_graph_count
+    let expected_directory_length = named_graphs
         .checked_add(1)
         .and_then(|count| count.checked_mul(DIRECTORY_ENTRY_SIZE))
         .and_then(|length| length.checked_add(4))
@@ -2470,11 +2552,11 @@ fn read_header(file: &mut File, file_size: u64) -> Result<GraphSidecarHeader> {
 
     let header = GraphSidecarHeader {
         flags,
-        triple_count: get_u64(&bytes, 24),
-        named_graph_count,
-        membership_count: get_u64(&bytes, 40),
+        triples: get_u64(&bytes, 24),
+        named_graphs,
+        memberships: get_u64(&bytes, 40),
         source_data_length: get_u64(&bytes, 48),
-        sidecar_size: get_u64(&bytes, 56),
+        file_size: get_u64(&bytes, 56),
         dictionary_offset: get_u64(&bytes, 64),
         dictionary_length: get_u64(&bytes, 72),
         directory_offset: get_u64(&bytes, 80),
@@ -2486,7 +2568,7 @@ fn read_header(file: &mut File, file_size: u64) -> Result<GraphSidecarHeader> {
         header_crc: get_u32(&bytes, 252),
     };
     ensure!(
-        header.sidecar_size == file_size,
+        header.file_size == file_size,
         "graph sidecar file size mismatch"
     );
     ensure!(
@@ -2506,7 +2588,7 @@ fn read_header(file: &mut File, file_size: u64) -> Result<GraphSidecarHeader> {
         "unaligned graph sidecar footer"
     );
     ensure!(
-        header.membership_count >= header.triple_count,
+        header.memberships >= header.triples,
         "graph sidecar membership count is below triple count"
     );
     checked_range(
@@ -2645,7 +2727,7 @@ fn read_graph_dictionary(file: &mut File, header: GraphSidecarHeader) -> Result<
         "graph PFC preamble CRC mismatch"
     );
     ensure!(
-        string_count == header.named_graph_count,
+        string_count == header.named_graphs,
         "graph dictionary count mismatch"
     );
 
