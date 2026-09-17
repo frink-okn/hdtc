@@ -21,14 +21,60 @@ const SUPERBLOCK_BITS: u32 = 4096;
 const SUBBLOCK_BITS: u32 = 512;
 const REQUIRED: u32 = 1;
 
-const POS_DIRECTORY: u32 = 0x0101;
-const POS_REGION: u32 = 0x0102;
-const OPS_DIRECTORY: u32 = 0x0201;
-const OPS_REGION: u32 = 0x0202;
-const TRANSPOSE_ARRAY: u32 = 0x0301;
-const TRANSPOSE_BITMAP: u32 = 0x0302;
-const TRANSPOSE_SUPER: u32 = 0x0303;
-const TRANSPOSE_SUB: u32 = 0x0304;
+/// A version-1 section of the graph index, by wire type
+/// (`docs/graphs-index-format.md` §5). The type is `(structure << 8) | kind`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+#[non_exhaustive]
+pub enum GraphIndexSectionKind {
+    /// `G + 1` layer entries keyed to POS positions, plus their CRC32C.
+    PosLayerDirectory = 0x0101,
+    /// The span holding the POS layers' payloads.
+    PosLayerRegion = 0x0102,
+    /// `G + 1` layer entries keyed to OPS positions, plus their CRC32C.
+    OpsLayerDirectory = 0x0201,
+    /// The span holding the OPS layers' payloads.
+    OpsLayerRegion = 0x0202,
+    /// `ArrayG`: each SPO position's graph ids, concatenated.
+    TransposeArray = 0x0301,
+    /// `BitmapG`: one bit per `ArrayG` entry, set on a position's last graph.
+    TransposeBitmap = 0x0302,
+    /// `BitmapG`'s superblock ranks.
+    TransposeSuperrank = 0x0303,
+    /// `BitmapG`'s subblock ranks.
+    TransposeSubrank = 0x0304,
+}
+
+impl GraphIndexSectionKind {
+    /// The wire-level section type.
+    pub const fn section_type(self) -> u32 {
+        self as u32
+    }
+
+    /// The kind a wire-level section type names, if version 1 defines it.
+    pub fn from_section_type(value: u32) -> Option<Self> {
+        match value {
+            0x0101 => Some(Self::PosLayerDirectory),
+            0x0102 => Some(Self::PosLayerRegion),
+            0x0201 => Some(Self::OpsLayerDirectory),
+            0x0202 => Some(Self::OpsLayerRegion),
+            0x0301 => Some(Self::TransposeArray),
+            0x0302 => Some(Self::TransposeBitmap),
+            0x0303 => Some(Self::TransposeSuperrank),
+            0x0304 => Some(Self::TransposeSubrank),
+            _ => None,
+        }
+    }
+}
+
+const POS_DIRECTORY: u32 = GraphIndexSectionKind::PosLayerDirectory.section_type();
+const POS_REGION: u32 = GraphIndexSectionKind::PosLayerRegion.section_type();
+const OPS_DIRECTORY: u32 = GraphIndexSectionKind::OpsLayerDirectory.section_type();
+const OPS_REGION: u32 = GraphIndexSectionKind::OpsLayerRegion.section_type();
+const TRANSPOSE_ARRAY: u32 = GraphIndexSectionKind::TransposeArray.section_type();
+const TRANSPOSE_BITMAP: u32 = GraphIndexSectionKind::TransposeBitmap.section_type();
+const TRANSPOSE_SUPER: u32 = GraphIndexSectionKind::TransposeSuperrank.section_type();
+const TRANSPOSE_SUB: u32 = GraphIndexSectionKind::TransposeSubrank.section_type();
 
 const HAS_POS_LAYERS: u64 = 1 << 0;
 const HAS_OPS_LAYERS: u64 = 1 << 1;
@@ -37,42 +83,146 @@ const HAS_MEMBERSHIP_IDS: u64 = 1 << 3;
 const KNOWN_FLAGS: u64 =
     HAS_POS_LAYERS | HAS_OPS_LAYERS | HAS_MEMBERSHIP_RANKS | HAS_MEMBERSHIP_IDS;
 
+/// The parsed 256-byte graph-index header (`docs/graphs-index-format.md` §4).
 #[derive(Debug, Clone)]
-struct Header {
-    flags: u64,
-    triples: u64,
-    named_graphs: u64,
-    memberships: u64,
-    source_data_length: u64,
-    file_size: u64,
-    directory_offset: u64,
-    directory_length: u64,
-    section_count: u32,
-    footer_offset: u64,
-    source_digest: [u8; 32],
-    sidecar_digest: [u8; 32],
-    header_crc: u32,
+pub struct GraphIndexHeader {
+    /// Assertion flags; see the `has_*` methods.
+    pub flags: u64,
+    /// `N`, the HDT's triple count.
+    pub triples: u64,
+    /// `G`, the sidecar's named graphs.
+    pub named_graphs: u64,
+    /// `M`, the sidecar's memberships.
+    pub memberships: u64,
+    /// Length of the HDT's dictionary-and-triples suffix.
+    pub source_data_length: u64,
+    /// Exact file size, footer included.
+    pub file_size: u64,
+    /// Absolute offset of the section directory.
+    pub directory_offset: u64,
+    /// `section_count * 64 + 4`.
+    pub directory_length: u64,
+    /// Directory entries.
+    pub section_count: u32,
+    /// Absolute offset of the 64-byte footer.
+    pub footer_offset: u64,
+    /// SHA-256 of the HDT suffix (`docs/graphs-index-format.md` §6).
+    pub source_digest: [u8; 32],
+    /// SHA-256 of the entire graphs sidecar (`docs/graphs-index-format.md` §6).
+    pub sidecar_digest: [u8; 32],
+    /// CRC32C of the header's first 252 bytes.
+    pub header_crc: u32,
 }
 
+impl GraphIndexHeader {
+    /// Whether a complete POS-keyed layer set is present.
+    pub fn has_pos_layers(&self) -> bool {
+        self.flags & HAS_POS_LAYERS != 0
+    }
+
+    /// Whether a complete OPS-keyed layer set is present.
+    pub fn has_ops_layers(&self) -> bool {
+        self.flags & HAS_OPS_LAYERS != 0
+    }
+
+    /// Whether `BitmapG` and its rank directory are present.
+    pub fn has_membership_ranks(&self) -> bool {
+        self.flags & HAS_MEMBERSHIP_RANKS != 0
+    }
+
+    /// Whether `ArrayG` is present.
+    pub fn has_membership_ids(&self) -> bool {
+        self.flags & HAS_MEMBERSHIP_IDS != 0
+    }
+
+    /// Superblock width of `BitmapG`'s rank directory, in bits.
+    pub const fn superblock_bits(&self) -> u32 {
+        SUPERBLOCK_BITS
+    }
+
+    /// Subblock width of `BitmapG`'s rank directory, in bits.
+    pub const fn subblock_bits(&self) -> u32 {
+        SUBBLOCK_BITS
+    }
+}
+
+/// One 64-byte section-directory entry (`docs/graphs-index-format.md` §5),
+/// in the layout of `docs/permutation-index-format.md` §6.
 #[derive(Debug, Clone, Copy)]
-struct Section {
-    section_type: u32,
-    flags: u32,
-    offset: u64,
-    length: u64,
-    entry_count: u64,
-    bits_per_entry: u8,
-    crc: u32,
-    parameter: u64,
-    indexed_bits: u64,
+pub struct GraphIndexSection {
+    /// The wire-level type; see [`GraphIndexSectionKind`].
+    pub section_type: u32,
+    /// Section flags; bit 0 `REQUIRED`.
+    pub flags: u32,
+    /// Absolute, 64-byte-aligned payload offset; zero when empty.
+    pub offset: u64,
+    /// Payload length. For a layer region this is a span that includes the
+    /// alignment gaps between layer payloads.
+    pub length: u64,
+    /// Entries: layers for a directory, non-empty layers for a region,
+    /// memberships for the transpose arrays, samples for the rank directories.
+    pub entry_count: u64,
+    /// Bits per entry for packed payloads; zero for directories and regions.
+    pub bits_per_entry: u8,
+    /// CRC32C of the payload; zero for a region.
+    pub crc: u32,
+    /// Block width for the rank directories; zero otherwise.
+    pub parameter: u64,
+    /// For the rank directories, the bit length of `BitmapG`.
+    pub indexed_bits: u64,
+}
+
+impl GraphIndexSection {
+    /// The kind this entry's type names, if version 1 defines it.
+    pub fn kind(&self) -> Option<GraphIndexSectionKind> {
+        GraphIndexSectionKind::from_section_type(self.section_type)
+    }
+}
+
+/// The header and section directory of a graph index, bound to its parents.
+///
+/// What a reader that maps the file needs and nothing else: every region's
+/// absolute offset, length, and shape, with the cross-artifact bindings of
+/// `docs/graphs-index-format.md` §6 already checked. The per-query layer
+/// readers of [`GraphIndex`] are not built.
+#[derive(Debug, Clone)]
+pub struct GraphIndexDirectory {
+    path: PathBuf,
+    header: GraphIndexHeader,
+    sections: Vec<GraphIndexSection>,
+}
+
+impl GraphIndexDirectory {
+    /// The file this directory was read from.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The parsed header.
+    pub fn header(&self) -> &GraphIndexHeader {
+        &self.header
+    }
+
+    /// The section directory, ascending by section type.
+    pub fn sections(&self) -> &[GraphIndexSection] {
+        &self.sections
+    }
+
+    /// The entry for one section kind, if the file carries it.
+    pub fn section(&self, kind: GraphIndexSectionKind) -> Option<&GraphIndexSection> {
+        self.sections
+            .binary_search_by_key(&kind.section_type(), |section| section.section_type)
+            .ok()
+            .map(|index| &self.sections[index])
+    }
 }
 
 pub struct GraphIndex {
     path: PathBuf,
     hdt_path: PathBuf,
     sidecar_path: PathBuf,
-    header: Header,
-    sections: Vec<Section>,
+    header: GraphIndexHeader,
+    sections: Vec<GraphIndexSection>,
     file: File,
     pos_layers: Option<EmbeddedLayerSetReader>,
     ops_layers: Option<EmbeddedLayerSetReader>,
@@ -146,12 +296,33 @@ impl GraphIndex {
         Self::read_bound(path, hdt_path).map(|_| ())
     }
 
+    /// Read the header and section directory, bound to `hdt_path` and its
+    /// graphs sidecar, without opening the per-query layer readers.
+    ///
+    /// The same checks as [`verify_binding`](Self::verify_binding), keeping
+    /// what they parsed. This is the integration point for a reader that maps
+    /// the index rather than seeking it (KGF's `kgf-store`): the directory
+    /// says where every region is, and the format's mapped-load guarantee
+    /// (`docs/graphs-index-format.md` §2) holds for each byte range in it.
+    pub fn directory(
+        path: &Path,
+        hdt_path: &Path,
+    ) -> std::result::Result<GraphIndexDirectory, GraphIndexOpenError> {
+        let (_, header, sections) = Self::read_bound(path, hdt_path)?;
+        Ok(GraphIndexDirectory {
+            path: path.to_path_buf(),
+            header,
+            sections,
+        })
+    }
+
     /// The header and section directory of a graph index that has been checked
     /// against its parent artifacts.
     fn read_bound(
         path: &Path,
         hdt_path: &Path,
-    ) -> std::result::Result<(File, Header, Vec<Section>), GraphIndexOpenError> {
+    ) -> std::result::Result<(File, GraphIndexHeader, Vec<GraphIndexSection>), GraphIndexOpenError>
+    {
         let sidecar_path = canonical_sidecar_path(hdt_path);
 
         let (file, header, sections) = (|| -> Result<_> {
@@ -360,7 +531,7 @@ impl GraphIndex {
             .context("adjacency offset overflow")
     }
 
-    fn section(&self, section_type: u32) -> Result<Section> {
+    fn section(&self, section_type: u32) -> Result<GraphIndexSection> {
         self.sections
             .binary_search_by_key(&section_type, |section| section.section_type)
             .map(|index| self.sections[index])
@@ -368,7 +539,7 @@ impl GraphIndex {
     }
 }
 
-fn section_from(sections: &[Section], section_type: u32) -> Result<Section> {
+fn section_from(sections: &[GraphIndexSection], section_type: u32) -> Result<GraphIndexSection> {
     sections
         .binary_search_by_key(&section_type, |section| section.section_type)
         .map(|index| sections[index])
@@ -393,7 +564,7 @@ fn read_exact_at(file: &mut File, offset: u64, bytes: &mut [u8]) -> Result<()> {
     Ok(())
 }
 
-fn read_header(file: &mut File, actual_size: u64, strict_crc: bool) -> Result<Header> {
+fn read_header(file: &mut File, actual_size: u64, strict_crc: bool) -> Result<GraphIndexHeader> {
     ensure!(
         actual_size >= HEADER_SIZE + FOOTER_SIZE,
         "graph index is truncated"
@@ -472,7 +643,7 @@ fn read_header(file: &mut File, actual_size: u64, strict_crc: bool) -> Result<He
     source_digest.copy_from_slice(&bytes[112..144]);
     let mut sidecar_digest = [0u8; 32];
     sidecar_digest.copy_from_slice(&bytes[144..176]);
-    Ok(Header {
+    Ok(GraphIndexHeader {
         flags: get_u64(&bytes, 16),
         triples: get_u64(&bytes, 24),
         named_graphs: get_u64(&bytes, 32),
@@ -489,7 +660,11 @@ fn read_header(file: &mut File, actual_size: u64, strict_crc: bool) -> Result<He
     })
 }
 
-fn read_sections(file: &mut File, header: &Header, strict_crc: bool) -> Result<Vec<Section>> {
+fn read_sections(
+    file: &mut File,
+    header: &GraphIndexHeader,
+    strict_crc: bool,
+) -> Result<Vec<GraphIndexSection>> {
     let entries_length = u64::from(header.section_count) * DIRECTORY_ENTRY_SIZE;
     let mut bytes = vec![0u8; usize::try_from(entries_length).context("directory too large")?];
     read_exact_at(file, header.directory_offset, &mut bytes)?;
@@ -511,7 +686,7 @@ fn read_sections(file: &mut File, header: &Header, strict_crc: bool) -> Result<V
     let mut sections = Vec::with_capacity(header.section_count as usize);
     let mut previous = None;
     for entry in bytes.chunks_exact(DIRECTORY_ENTRY_SIZE as usize) {
-        let section = Section {
+        let section = GraphIndexSection {
             section_type: get_u32(entry, 0),
             flags: get_u32(entry, 4),
             offset: get_u64(entry, 8),
@@ -573,7 +748,7 @@ fn id_width(maximum: u64) -> u8 {
     }
 }
 
-fn validate_section_set(header: &Header, sections: &[Section]) -> Result<()> {
+fn validate_section_set(header: &GraphIndexHeader, sections: &[GraphIndexSection]) -> Result<()> {
     let find = |section_type| {
         sections
             .binary_search_by_key(&section_type, |section| section.section_type)
@@ -726,7 +901,7 @@ fn validate_section_set(header: &Header, sections: &[Section]) -> Result<()> {
     Ok(())
 }
 
-fn validate_regions(header: &Header, sections: &[Section]) -> Result<()> {
+fn validate_regions(header: &GraphIndexHeader, sections: &[GraphIndexSection]) -> Result<()> {
     let directory_end = header
         .directory_offset
         .checked_add(header.directory_length)
@@ -765,7 +940,7 @@ fn validate_regions(header: &Header, sections: &[Section]) -> Result<()> {
     Ok(())
 }
 
-fn read_footer(file: &mut File, header: &Header, strict_crc: bool) -> Result<()> {
+fn read_footer(file: &mut File, header: &GraphIndexHeader, strict_crc: bool) -> Result<()> {
     let mut bytes = [0u8; FOOTER_SIZE as usize];
     read_exact_at(file, header.footer_offset, &mut bytes)?;
     ensure!(
@@ -863,7 +1038,7 @@ fn validate_outer_checksums(index: &GraphIndex) -> Result<()> {
     Ok(())
 }
 
-fn packed_value(file: &mut File, section: Section, index: u64) -> Result<u64> {
+fn packed_value(file: &mut File, section: GraphIndexSection, index: u64) -> Result<u64> {
     ensure!(
         index < section.entry_count,
         "packed-array index out of range"
@@ -889,9 +1064,9 @@ fn packed_value(file: &mut File, section: Section, index: u64) -> Result<u64> {
 
 fn select1(
     file: &mut File,
-    bitmap: Section,
-    superranks: Section,
-    subranks: Section,
+    bitmap: GraphIndexSection,
+    superranks: GraphIndexSection,
+    subranks: GraphIndexSection,
     ordinal: u64,
 ) -> Result<u64> {
     let total = packed_value(file, superranks, superranks.entry_count - 1)?;
@@ -979,7 +1154,7 @@ fn select1(
     bail!("bitmap rank directory does not locate select ordinal")
 }
 
-fn bitmap_bit(file: &mut File, section: Section, index: u64) -> Result<bool> {
+fn bitmap_bit(file: &mut File, section: GraphIndexSection, index: u64) -> Result<bool> {
     ensure!(index < section.entry_count, "bitmap index out of range");
     let mut byte = [0u8; 1];
     read_exact_at(file, section.offset + index / 8, &mut byte)?;
@@ -1052,7 +1227,11 @@ fn validate_transpose(index: &GraphIndex, memberships_path: &Path) -> Result<()>
     Ok(())
 }
 
-fn validate_bitmap_ranks(index: &GraphIndex, file: &mut File, bitmap: Section) -> Result<()> {
+fn validate_bitmap_ranks(
+    index: &GraphIndex,
+    file: &mut File,
+    bitmap: GraphIndexSection,
+) -> Result<()> {
     let superranks = index.section(TRANSPOSE_SUPER)?;
     let subranks = index.section(TRANSPOSE_SUB)?;
     let blocks = index.header.memberships.div_ceil(u64::from(SUBBLOCK_BITS));
@@ -1302,7 +1481,7 @@ mod tests {
         file.write_all(&0u64.to_le_bytes())?;
         file.write_all(&3u64.to_le_bytes())?;
         file.write_all(&0u16.to_le_bytes())?;
-        let bitmap = Section {
+        let bitmap = GraphIndexSection {
             section_type: TRANSPOSE_BITMAP,
             flags: REQUIRED,
             offset: 0,
@@ -1313,7 +1492,7 @@ mod tests {
             parameter: 0,
             indexed_bits: 0,
         };
-        let superranks = Section {
+        let superranks = GraphIndexSection {
             section_type: TRANSPOSE_SUPER,
             flags: REQUIRED,
             offset: 8,
@@ -1324,7 +1503,7 @@ mod tests {
             parameter: 4096,
             indexed_bits: 6,
         };
-        let subranks = Section {
+        let subranks = GraphIndexSection {
             section_type: TRANSPOSE_SUB,
             flags: REQUIRED,
             offset: 24,
@@ -1349,7 +1528,7 @@ mod tests {
         file.write_all(&1u64.to_le_bytes())?;
         file.write_all(&1u64.to_le_bytes())?;
         file.write_all(&0u16.to_le_bytes())?;
-        let bitmap = Section {
+        let bitmap = GraphIndexSection {
             section_type: TRANSPOSE_BITMAP,
             flags: REQUIRED,
             offset: 0,
@@ -1360,7 +1539,7 @@ mod tests {
             parameter: 0,
             indexed_bits: 0,
         };
-        let superranks = Section {
+        let superranks = GraphIndexSection {
             section_type: TRANSPOSE_SUPER,
             flags: REQUIRED,
             offset: 8,
@@ -1371,7 +1550,7 @@ mod tests {
             parameter: 4096,
             indexed_bits: 1,
         };
-        let subranks = Section {
+        let subranks = GraphIndexSection {
             section_type: TRANSPOSE_SUB,
             flags: REQUIRED,
             offset: 24,

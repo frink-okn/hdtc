@@ -107,11 +107,38 @@ pub use crate::permutation::{
 };
 
 // ---------------------------------------------------------------------------
+// Graphs sidecar (.hdt.graphs)
+// ---------------------------------------------------------------------------
+//
+// The sidecar's header locates its three parts, and its fixed-size records —
+// a layer-directory entry, a chunk-directory entry, an Elias–Fano header —
+// are decoded by these parsers wherever a reader addresses them. A mapped
+// reader addresses them lazily: a bundle may carry thousands of graphs, so
+// reading every entry at open would make opening proportional to `G`. The
+// graph dictionary is one standard PFC section at `dictionary_offset`, so
+// [`scan_pfc_section`] locates it. `GraphSidecarReader`'s membership
+// operations are seek-based and for this crate's own tools.
+
+pub use crate::quads::{
+    ELIAS_FANO_HEADER_SIZE, EliasFanoHeader, GRAPH_ARRAY_CONTAINER_MAX,
+    GRAPH_BITMAP_CONTAINER_BYTES, GRAPH_CHUNK_ENTRY_SIZE, GRAPH_LAYER_ENTRY_SIZE,
+    GRAPH_POSITION_CHUNK_SHIFT, GraphChunkContainer, GraphChunkEntry, GraphLayerEncoding,
+    GraphLayerEntry, GraphSidecarHeader, GraphSidecarReader, GraphTerm,
+    canonical_sidecar_path as graph_sidecar_path,
+};
+
+// ---------------------------------------------------------------------------
 // Graphs sidecar index (.hdt.graphs.idx)
 // ---------------------------------------------------------------------------
+//
+// [`GraphIndex::directory`] is the mapped reader's open path: the typed
+// section directory, bound to both parents. A layer set inside the index has
+// exactly the sidecar's layout (`docs/graphs-index-format.md` §5.1), so the
+// record parsers above serve it unchanged.
 
 pub use crate::graph_index::{
-    GraphIndex, GraphIndexOpenError, GraphIndexSpace, canonical_path as graph_index_path,
+    GraphIndex, GraphIndexDirectory, GraphIndexHeader, GraphIndexOpenError, GraphIndexSection,
+    GraphIndexSectionKind, GraphIndexSpace, canonical_path as graph_index_path,
     validate_graph_index,
 };
 

@@ -11,12 +11,16 @@ mod common;
 
 use common::{REPRESENTATIVE_NT, write_file};
 use hdtc::format::{
-    GraphIndex, GraphIndexOpenError, KeyRole, KeysetEncoding, KeysetHeader, KeysetOpenError,
-    ParsedLiteral, PermutationComponent, PermutationIndex, PermutationIndexOpenError,
-    PermutationSectionKind, PfcSectionHeader, PfcSectionIterator, SketchBody, SketchHeader,
-    SketchKind, SketchOpenError, encode_literal, graph_index_path, keyset_path, packed_len,
-    parse_literal, permutation_index_path, read_keyset_header, read_sketch_header,
-    scan_hdt_sections, sha256_to_end, sketch_path,
+    ELIAS_FANO_HEADER_SIZE, EliasFanoHeader, GRAPH_ARRAY_CONTAINER_MAX,
+    GRAPH_BITMAP_CONTAINER_BYTES, GRAPH_CHUNK_ENTRY_SIZE, GRAPH_LAYER_ENTRY_SIZE,
+    GRAPH_POSITION_CHUNK_SHIFT, GraphChunkContainer, GraphChunkEntry, GraphIndex,
+    GraphIndexOpenError, GraphIndexSectionKind, GraphLayerEncoding, GraphLayerEntry,
+    GraphSidecarReader, KeyRole, KeysetEncoding, KeysetHeader, KeysetOpenError, ParsedLiteral,
+    PermutationComponent, PermutationIndex, PermutationIndexOpenError, PermutationSectionKind,
+    PfcSectionHeader, PfcSectionIterator, SketchBody, SketchHeader, SketchKind, SketchOpenError,
+    encode_literal, graph_index_path, graph_sidecar_path, keyset_path, packed_len, parse_literal,
+    permutation_index_path, read_keyset_header, read_sketch_header, scan_hdt_sections,
+    scan_pfc_section, sha256_to_end, sketch_path,
 };
 use std::fs::File;
 use std::io::{BufReader, Seek, SeekFrom};
@@ -248,6 +252,285 @@ fn graph_open_distinguishes_foreign_parents_from_a_malformed_index() {
         Ok(_) => panic!("a truncated graph index must be classified separately"),
     };
     assert!(matches!(error, GraphIndexOpenError::Index { .. }));
+}
+
+/// The graphs half of the same contract. A mapped reader locates the sidecar's
+/// dictionary and layer directory from the header, the index's layer sets and
+/// transpose from the section directory, and decodes each layer's records
+/// lazily from the bytes those offsets name — so every offset must be
+/// resolvable against the file, and every record decodable, for every
+/// encoding a layer can have.
+#[test]
+fn the_graph_artifacts_describe_every_region_well_enough_to_map_them() {
+    let temp = tempfile::tempdir().unwrap();
+    let hdt = build_graph_fixture_from(temp.path(), &synthetic_quads());
+    let sidecar_path = graph_sidecar_path(&hdt);
+    let index_path = graph_index_path(&hdt);
+
+    let sidecar = GraphSidecarReader::open(&sidecar_path, &hdt).expect("open sidecar");
+    let header = *sidecar.header();
+    let sidecar_bytes = std::fs::read(&sidecar_path).unwrap();
+    assert_eq!(header.sidecar_size, sidecar_bytes.len() as u64);
+    assert_eq!(header.triple_count, sidecar.triple_count());
+    assert_eq!(header.named_graph_count, 3);
+    assert!(header.membership_count > header.triple_count);
+    assert!(sidecar.hdt_data_offset() > 0);
+
+    // The graph dictionary is one standard PFC section, so the ordinary
+    // scanner locates it and its count is the named-graph count.
+    let mut cursor = std::io::Cursor::new(&sidecar_bytes[..]);
+    cursor
+        .seek(SeekFrom::Start(header.dictionary_offset))
+        .unwrap();
+    let dictionary = scan_pfc_section(&mut cursor, "graph dictionary").expect("scan dictionary");
+    assert_eq!(dictionary.string_count, header.named_graph_count);
+    assert_eq!(dictionary.section_start, header.dictionary_offset);
+    assert!(dictionary.section_end <= header.directory_offset);
+
+    let mut encodings = Vec::new();
+    let sidecar_layers = check_layer_set(
+        &sidecar_bytes,
+        header.directory_offset,
+        header.named_graph_count,
+        header.triple_count,
+        &mut encodings,
+    );
+    assert_eq!(
+        sidecar_layers
+            .iter()
+            .map(|entry| entry.member_count)
+            .sum::<u64>(),
+        header.membership_count,
+        "layer counts sum to M"
+    );
+    assert!(
+        sidecar_layers
+            .iter()
+            .filter(|entry| entry.member_count > 0)
+            .all(|entry| {
+                entry.primary_offset >= header.layers_offset
+                    && entry.primary_offset < header.layers_offset + header.layers_length
+            }),
+        "every non-empty layer lives inside the layers span"
+    );
+
+    // Both re-keyed layer sets, framed exactly like the sidecar's, and no
+    // transpose unless the header says so.
+    let index = GraphIndex::directory(&index_path, &hdt).expect("open index directory");
+    let index_bytes = std::fs::read(&index_path).unwrap();
+    assert_eq!(index.path(), index_path.as_path());
+    assert_eq!(index.header().file_size, index_bytes.len() as u64);
+    assert_eq!(index.header().triples, header.triple_count);
+    assert_eq!(index.header().named_graphs, header.named_graph_count);
+    assert_eq!(index.header().memberships, header.membership_count);
+    assert_eq!(index.header().source_digest, header.source_digest);
+    assert!(index.header().has_pos_layers() && index.header().has_ops_layers());
+    assert_eq!(
+        index.header().section_count as usize,
+        index.sections().len()
+    );
+    assert!(
+        index
+            .sections()
+            .windows(2)
+            .all(|w| w[0].section_type < w[1].section_type)
+    );
+    for section in index.sections() {
+        assert!(section.kind().is_some(), "{:#06x}", section.section_type);
+        if section.length > 0 {
+            assert_eq!(section.offset % 64, 0);
+            assert!(section.offset + section.length <= index_bytes.len() as u64);
+        }
+    }
+    for (directory, region) in [
+        (
+            GraphIndexSectionKind::PosLayerDirectory,
+            GraphIndexSectionKind::PosLayerRegion,
+        ),
+        (
+            GraphIndexSectionKind::OpsLayerDirectory,
+            GraphIndexSectionKind::OpsLayerRegion,
+        ),
+    ] {
+        let directory = index.section(directory).expect("layer directory");
+        assert_eq!(directory.entry_count, header.named_graph_count + 1);
+        let region = index.section(region).expect("layer region");
+        let layers = check_layer_set(
+            &index_bytes,
+            directory.offset,
+            header.named_graph_count,
+            header.triple_count,
+            &mut encodings,
+        );
+        for (graph, layer) in layers.iter().enumerate() {
+            assert_eq!(
+                layer.member_count, sidecar_layers[graph].member_count,
+                "a layer set holds the sidecar's memberships in another space"
+            );
+            if layer.member_count > 0 {
+                assert!(
+                    layer.primary_offset >= region.offset
+                        && layer.primary_offset < region.offset + region.length
+                );
+            }
+        }
+    }
+    let transposed = index.header().has_membership_ranks();
+    assert_eq!(
+        index
+            .section(GraphIndexSectionKind::TransposeBitmap)
+            .is_some(),
+        transposed
+    );
+    assert_eq!(
+        index
+            .section(GraphIndexSectionKind::TransposeArray)
+            .is_some(),
+        index.header().has_membership_ids()
+    );
+
+    encodings.sort();
+    encodings.dedup();
+    assert_eq!(
+        encodings,
+        vec![
+            GraphLayerEncoding::DenseChunks,
+            GraphLayerEncoding::SparseChunks,
+            GraphLayerEncoding::EliasFano,
+        ],
+        "the synthetic fixture must reach every encoding a reader has to decode"
+    );
+}
+
+/// Decode a layer directory from the bytes at `directory_offset` and walk
+/// every record each layer names, so a wrong offset or an undecodable record
+/// fails here rather than in a downstream reader.
+fn check_layer_set(
+    bytes: &[u8],
+    directory_offset: u64,
+    named_graphs: u64,
+    triples: u64,
+    encodings: &mut Vec<GraphLayerEncoding>,
+) -> Vec<GraphLayerEntry> {
+    let mut layers = Vec::new();
+    for graph in 0..=named_graphs {
+        let start = (directory_offset + graph * GRAPH_LAYER_ENTRY_SIZE as u64) as usize;
+        let entry: &[u8; GRAPH_LAYER_ENTRY_SIZE] = bytes[start..start + GRAPH_LAYER_ENTRY_SIZE]
+            .try_into()
+            .unwrap();
+        let layer = GraphLayerEntry::parse(entry);
+        let encoding = layer.layer_encoding().expect("a version-1 encoding");
+        if layer.member_count == 0 {
+            assert_eq!(layer.minimum_position, triples);
+            assert_eq!(layer.maximum_position_exclusive, 0);
+            layers.push(layer);
+            continue;
+        }
+        encodings.push(encoding);
+        assert!(layer.minimum_position < layer.maximum_position_exclusive);
+        assert!(layer.maximum_position_exclusive <= triples);
+        assert_eq!(layer.primary_offset % 64, 0);
+        let primary_end = layer.primary_offset + layer.primary_length;
+        assert!(primary_end <= bytes.len() as u64);
+        match encoding {
+            GraphLayerEncoding::DenseChunks | GraphLayerEncoding::SparseChunks => {
+                assert_eq!(
+                    layer.primary_length,
+                    layer.item_count_a * GRAPH_CHUNK_ENTRY_SIZE as u64
+                );
+                let mut rank = 0;
+                for index in 0..layer.item_count_a {
+                    let start =
+                        (layer.primary_offset + index * GRAPH_CHUNK_ENTRY_SIZE as u64) as usize;
+                    let chunk: &[u8; GRAPH_CHUNK_ENTRY_SIZE] = bytes
+                        [start..start + GRAPH_CHUNK_ENTRY_SIZE]
+                        .try_into()
+                        .unwrap();
+                    let chunk = GraphChunkEntry::parse(chunk);
+                    assert_eq!(chunk.rank_before, rank);
+                    assert!(chunk.key < triples.div_ceil(1 << GRAPH_POSITION_CHUNK_SHIFT));
+                    match chunk.container().expect("a version-1 container") {
+                        GraphChunkContainer::Empty => assert_eq!(chunk.cardinality, 0),
+                        GraphChunkContainer::Array => {
+                            assert!(chunk.cardinality <= GRAPH_ARRAY_CONTAINER_MAX);
+                            assert_eq!(chunk.payload_length, chunk.cardinality * 2);
+                        }
+                        GraphChunkContainer::Bitmap => {
+                            assert!(chunk.cardinality > GRAPH_ARRAY_CONTAINER_MAX);
+                            assert_eq!(chunk.payload_length, GRAPH_BITMAP_CONTAINER_BYTES);
+                        }
+                    }
+                    if chunk.cardinality > 0 {
+                        assert_eq!(chunk.payload_offset % 8, 0);
+                        assert!(
+                            chunk.payload_offset + u64::from(chunk.payload_length)
+                                <= bytes.len() as u64
+                        );
+                    }
+                    rank += u64::from(chunk.cardinality);
+                }
+                assert_eq!(rank, layer.member_count);
+                if encoding == GraphLayerEncoding::SparseChunks {
+                    assert_eq!(layer.secondary_length, layer.parameter * 8);
+                    assert!(layer.secondary_offset + layer.secondary_length <= bytes.len() as u64);
+                }
+            }
+            GraphLayerEncoding::EliasFano => {
+                assert_eq!(layer.primary_length, ELIAS_FANO_HEADER_SIZE as u64);
+                let start = layer.primary_offset as usize;
+                let raw: &[u8; ELIAS_FANO_HEADER_SIZE] = bytes
+                    [start..start + ELIAS_FANO_HEADER_SIZE]
+                    .try_into()
+                    .unwrap();
+                let ef = EliasFanoHeader::parse(raw).expect("a valid Elias-Fano header");
+                assert_eq!(ef.universe, triples);
+                assert_eq!(ef.members, layer.member_count);
+                assert_eq!(ef.upper_bits, ef.high_buckets + ef.members);
+                assert_eq!(ef.superrank_count, ef.upper_bits.div_ceil(4096) + 1);
+                assert_eq!(ef.subrank_count, ef.upper_bits.div_ceil(512));
+                for (offset, length) in [
+                    (ef.lower_offset, ef.lower_length),
+                    (ef.superrank_offset, ef.superrank_length),
+                    (ef.subrank_offset, ef.subrank_length),
+                    (ef.upper_offset, ef.upper_length),
+                ] {
+                    if length > 0 {
+                        assert_eq!(offset % 8, 0);
+                        assert!(offset + length <= bytes.len() as u64);
+                    }
+                }
+                let mut corrupt = *raw;
+                corrupt[0] ^= 1;
+                assert!(EliasFanoHeader::parse(&corrupt).is_err());
+            }
+        }
+        layers.push(layer);
+    }
+    layers
+}
+
+/// Three graphs over one universe, at densities that make the writer pick a
+/// different encoding for each: everything (dense chunks with bitmap
+/// containers), every three-hundredth triple (Elias–Fano), and a short run in
+/// the middle (sparse chunks with an array container). The universe spans
+/// three position chunks; with one chunk a dense directory is always the
+/// cheapest structure and nothing else is ever chosen.
+fn synthetic_quads() -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    for i in 0..140_000u32 {
+        let subject = format!("<urn:s{}>", i / 4);
+        let predicate = format!("<urn:p{}>", i % 4);
+        let object = format!("<urn:o{i}>");
+        writeln!(out, "{subject} {predicate} {object} <urn:g:all> .").unwrap();
+        if i % 300 == 0 {
+            writeln!(out, "{subject} {predicate} {object} <urn:g:sparse> .").unwrap();
+        }
+        if (70_000..70_040).contains(&i) {
+            writeln!(out, "{subject} {predicate} {object} <urn:g:run> .").unwrap();
+        }
+    }
+    out
 }
 
 #[test]

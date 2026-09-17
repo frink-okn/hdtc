@@ -10,4 +10,7 @@ pub use builder::{
     finish_prepared_graph_index,
 };
 #[allow(unused_imports)]
-pub use reader::{GraphIndex, GraphIndexOpenError, GraphIndexSpace, validate_graph_index};
+pub use reader::{
+    GraphIndex, GraphIndexDirectory, GraphIndexHeader, GraphIndexOpenError, GraphIndexSection,
+    GraphIndexSectionKind, GraphIndexSpace, validate_graph_index,
+};
