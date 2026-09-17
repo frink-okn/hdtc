@@ -16,9 +16,15 @@ pub enum RdfFormat {
 
 impl RdfFormat {
     /// Returns true if this format can contain quad (named graph) information.
-    #[allow(dead_code)]
+    ///
+    /// JSON-LD belongs here with N-Quads and TriG: `@graph` names a graph, and
+    /// the parser preserves it, so a `--mode quads` build of a `.jsonld` input
+    /// writes named graphs into the sidecar like any other quad syntax.
     pub fn is_quad_format(self) -> bool {
-        matches!(self, RdfFormat::NQuads | RdfFormat::TriG)
+        matches!(
+            self,
+            RdfFormat::NQuads | RdfFormat::TriG | RdfFormat::JsonLd
+        )
     }
 }
 
@@ -76,6 +82,15 @@ fn detect_format(path: &Path) -> Option<RdfFormat> {
         "n3" => Some(RdfFormat::N3),
         _ => None,
     }
+}
+
+/// The RDF format a path names, with any compression suffix stripped first.
+///
+/// `data.nq.gz` is N-Quads. A name this does not recognize as RDF is `None`,
+/// which is also what a directory or an HDT answers.
+pub(crate) fn format_of(path: &Path) -> Option<RdfFormat> {
+    let (_, uncompressed) = detect_compression(path);
+    detect_format(&uncompressed)
 }
 
 /// Result of input discovery, partitioned by type.

@@ -20,8 +20,8 @@ use hdtc::format::{
     PermutationComponent, PermutationIndex, PermutationIndexOpenError, PermutationSectionKind,
     PfcSectionHeader, PfcSectionIterator, SketchBody, SketchHeader, SketchKind, SketchOpenError,
     encode_literal, graph_index_path, graph_sidecar_path, keyset_path, packed_len, parse_literal,
-    permutation_index_path, read_keyset_header, read_sketch_header, scan_hdt_sections,
-    scan_pfc_section, sha256_to_end, sketch_path,
+    permutation_index_path, rdf_input_carries_graphs, read_keyset_header, read_sketch_header,
+    scan_hdt_sections, scan_pfc_section, sha256_to_end, sketch_path,
 };
 use std::fs::File;
 use std::io::{BufReader, Seek, SeekFrom};
@@ -1112,4 +1112,92 @@ fn the_text_surface_queries_describes_and_binds() {
         error.to_string().contains("binding mismatch"),
         "unexpected error: {error}"
     );
+}
+
+/// A name says whether its RDF carries graphs, and a build agrees with it.
+///
+/// The predicate exists so a caller deciding whether to build a quads bundle
+/// does not keep its own extension table. That is only worth anything if it
+/// matches what a quads build really preserves, so each case here is built and
+/// the sidecar asked how many named graphs it found.
+#[test]
+fn the_input_classification_agrees_with_what_a_quads_build_preserves() {
+    let one_graph = [
+        (
+            "input.nq",
+            "<http://e.org/a> <http://e.org/b> <http://e.org/c> <http://e.org/g1> .\n",
+        ),
+        (
+            "input.trig",
+            "<http://e.org/g1> { <http://e.org/a> <http://e.org/b> <http://e.org/c> . }\n",
+        ),
+        (
+            "input.jsonld",
+            "{\"@graph\": [{\"@id\": \"http://e.org/g1\", \"@graph\": \
+             [{\"@id\": \"http://e.org/a\", \"http://e.org/b\": {\"@id\": \"http://e.org/c\"}}]}]}",
+        ),
+    ];
+    let no_graph = [
+        (
+            "input.nt",
+            "<http://e.org/a> <http://e.org/b> <http://e.org/c> .\n",
+        ),
+        (
+            "input.ttl",
+            "<http://e.org/a> <http://e.org/b> <http://e.org/c> .\n",
+        ),
+    ];
+
+    for (name, source) in one_graph.iter().chain(no_graph.iter()) {
+        let expected = one_graph.iter().any(|(candidate, _)| candidate == name);
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join(name);
+        write_file(&input, source.as_bytes());
+        assert_eq!(
+            rdf_input_carries_graphs(&input),
+            expected,
+            "{name} is classified by its name"
+        );
+        // And compressed, which is the same syntax under a second suffix.
+        assert_eq!(
+            rdf_input_carries_graphs(&temp.path().join(format!("{name}.gz"))),
+            expected,
+            "{name}.gz is the same syntax"
+        );
+
+        let hdt = temp.path().join("data.hdt");
+        let output = Command::new(env!("CARGO_BIN_EXE_hdtc"))
+            .args([
+                "create",
+                input.to_str().unwrap(),
+                "-o",
+                hdt.to_str().unwrap(),
+                "--mode",
+                "quads",
+                "--temp-dir",
+                temp.path().join("work").to_str().unwrap(),
+                "--memory-limit",
+                "64M",
+            ])
+            .output()
+            .expect("run hdtc");
+        assert!(
+            output.status.success(),
+            "hdtc create failed for {name}:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let sidecar = GraphSidecarDirectory::read(&graph_sidecar_path(&hdt), &hdt)
+            .unwrap_or_else(|error| panic!("open the sidecar built from {name}: {error}"));
+        assert_eq!(
+            sidecar.header().named_graphs > 0,
+            expected,
+            "{name} builds what its name promised"
+        );
+    }
+
+    // Neither a directory nor an artifact is RDF input.
+    let temp = tempfile::tempdir().unwrap();
+    assert!(!rdf_input_carries_graphs(temp.path()));
+    assert!(!rdf_input_carries_graphs(&temp.path().join("data.hdt")));
+    assert!(!rdf_input_carries_graphs(&temp.path().join("notes.txt")));
 }

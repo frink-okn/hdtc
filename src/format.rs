@@ -49,7 +49,11 @@
 //! # What is deliberately absent
 //!
 //! Builder entry points, the pipeline, the sorter, and the RDF parsers. Those
-//! are the CLI's business. Also absent are readers whose logic a mapped
+//! are the CLI's business — with one exception, which is knowledge rather than
+//! parsing: [`rdf_input_carries_graphs`] says whether a file name denotes a
+//! syntax with a fourth position, because a caller deciding whether to build a
+//! quads bundle would otherwise keep its own copy of that table and drift from
+//! this one. Also absent are readers whose logic a mapped
 //! implementation replaces outright rather than reuses; `PermutationIndex`
 //! appears here for its directory accessors, not for `triples()`.
 
@@ -175,3 +179,22 @@ pub use crate::text::{
     TextScanPosition, TextSearch, TextSearcher, default_text_index_path, normalize_language,
     verify_text_index_binding,
 };
+
+// ---------------------------------------------------------------------------
+// RDF input classification
+// ---------------------------------------------------------------------------
+
+/// Whether a file name denotes RDF that can carry named graphs.
+///
+/// The parsers stay out of this module, but *which syntax has a fourth
+/// position* is format knowledge, and a caller deciding whether to build a
+/// quads bundle would otherwise keep its own copy of the extension table and
+/// drift from this one. Compression suffixes are stripped first, so
+/// `data.nq.gz` is N-Quads. A name hdtc does not recognize as RDF at all —
+/// a directory, an `.hdt`, anything else — answers `false`.
+///
+/// It answers about the *name*, which is all a name can say: a `.nt` file
+/// holding quads is a file, not a question this can decide.
+pub fn rdf_input_carries_graphs(path: &std::path::Path) -> bool {
+    crate::rdf::input::format_of(path).is_some_and(crate::rdf::input::RdfFormat::is_quad_format)
+}
