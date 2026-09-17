@@ -130,7 +130,7 @@ pub use crate::quads::{
     GRAPH_ARRAY_CONTAINER_MAX, GRAPH_BITMAP_CONTAINER_BYTES, GRAPH_BITMAP_CONTAINER_SUBBLOCK_BITS,
     GRAPH_BITMAP_CONTAINER_SUBRANK_BYTES, GRAPH_CHUNK_ENTRY_SIZE, GRAPH_LAYER_ENTRY_SIZE,
     GRAPH_POSITION_CHUNK_SHIFT, GraphChunkContainer, GraphChunkEntry, GraphLayerEncoding,
-    GraphLayerEntry, GraphSidecarDirectory, GraphSidecarHeader,
+    GraphLayerEntry, GraphSidecarDirectory, GraphSidecarHeader, GraphSidecarOpenError,
     canonical_sidecar_path as graph_sidecar_path,
 };
 

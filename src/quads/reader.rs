@@ -170,6 +170,39 @@ impl GraphSidecarHeader {
     }
 }
 
+/// Which phase prevented a graph sidecar from opening.
+///
+/// Callers that expose artifact-specific diagnostics can distinguish a
+/// corrupt sidecar from one bound to a different HDT without inspecting
+/// error text — the same split as `PermutationIndexOpenError`.
+#[derive(Debug, thiserror::Error)]
+pub enum GraphSidecarOpenError {
+    /// The sidecar's header, footer, or dictionary preamble is malformed.
+    #[error("invalid graph sidecar: {source:#}")]
+    Sidecar {
+        /// The format-layer failure.
+        #[source]
+        source: anyhow::Error,
+    },
+
+    /// The associated HDT could not be read for its structural metadata.
+    #[error("invalid source HDT: {source:#}")]
+    Source {
+        /// The HDT read failure.
+        #[source]
+        source: anyhow::Error,
+    },
+
+    /// Both files are well-formed enough to inspect, but the sidecar's
+    /// recorded suffix length or triple count is not this HDT's.
+    #[error("graph sidecar does not bind to its source HDT: {source:#}")]
+    Binding {
+        /// The failed cross-artifact check.
+        #[source]
+        source: anyhow::Error,
+    },
+}
+
 /// What a reader that maps the sidecar needs from it, bound to its HDT.
 ///
 /// The counterpart of `GraphIndex::directory`: the parsed header, which
@@ -191,12 +224,38 @@ impl GraphSidecarDirectory {
     /// the HDT at `hdt_path`: the suffix length and the triple count. The
     /// dictionary's preamble is scanned and its count checked; no payload is
     /// read.
-    pub fn read(path: &Path, hdt_path: &Path) -> Result<Self> {
-        let reader = GraphSidecarReader::open(path, hdt_path)?;
+    pub fn read(path: &Path, hdt_path: &Path) -> std::result::Result<Self, GraphSidecarOpenError> {
+        let (header, hdt_data_offset) = (|| -> Result<_> {
+            let mut file = File::open(path)
+                .with_context(|| format!("Failed to open graph sidecar {}", path.display()))?;
+            let file_size = file.metadata()?.len();
+            let header = read_header(&mut file, file_size)?;
+            Ok((header, file))
+        })()
+        .map_err(|source| GraphSidecarOpenError::Sidecar { source })
+        .and_then(|(header, mut file)| {
+            let (hdt_data_offset, hdt_data_length, hdt_triples) = hdt_metadata(hdt_path)
+                .map_err(|source| GraphSidecarOpenError::Source { source })?;
+            (|| -> Result<()> {
+                ensure!(
+                    hdt_data_length == header.source_data_length,
+                    "sidecar/HDT data length mismatch"
+                );
+                ensure!(
+                    hdt_triples == header.triples,
+                    "sidecar/HDT triple count mismatch"
+                );
+                Ok(())
+            })()
+            .map_err(|source| GraphSidecarOpenError::Binding { source })?;
+            read_graph_dictionary(&mut file, header)
+                .map_err(|source| GraphSidecarOpenError::Sidecar { source })?;
+            Ok((header, hdt_data_offset))
+        })?;
         Ok(Self {
             path: path.to_path_buf(),
-            header: reader.header,
-            hdt_data_offset: reader.hdt_data_offset,
+            header,
+            hdt_data_offset,
         })
     }
 
