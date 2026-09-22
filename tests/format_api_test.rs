@@ -1136,6 +1136,12 @@ fn the_input_classification_agrees_with_what_a_quads_build_preserves() {
             "{\"@graph\": [{\"@id\": \"http://e.org/g1\", \"@graph\": \
              [{\"@id\": \"http://e.org/a\", \"http://e.org/b\": {\"@id\": \"http://e.org/c\"}}]}]}",
         ),
+        // A formula's statements land in a graph named by a blank node.
+        (
+            "input.n3",
+            "<http://e.org/s> <http://e.org/says> \
+             { <http://e.org/a> <http://e.org/b> <http://e.org/c> . } .\n",
+        ),
     ];
     let no_graph = [
         (
