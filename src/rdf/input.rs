@@ -16,9 +16,16 @@ pub enum RdfFormat {
 
 impl RdfFormat {
     /// Returns true if this format can contain quad (named graph) information.
-    #[allow(dead_code)]
+    ///
+    /// JSON-LD and N3 belong here with N-Quads and TriG. JSON-LD's `@graph`
+    /// names a graph; an N3 formula `{ ... }` puts its statements in a graph
+    /// named by a blank node. The parsers preserve both, so a `--mode quads`
+    /// build writes them into the sidecar like any other quad syntax.
     pub fn is_quad_format(self) -> bool {
-        matches!(self, RdfFormat::NQuads | RdfFormat::TriG)
+        matches!(
+            self,
+            RdfFormat::NQuads | RdfFormat::TriG | RdfFormat::JsonLd | RdfFormat::N3
+        )
     }
 }
 
@@ -76,6 +83,15 @@ fn detect_format(path: &Path) -> Option<RdfFormat> {
         "n3" => Some(RdfFormat::N3),
         _ => None,
     }
+}
+
+/// The RDF format a path names, with any compression suffix stripped first.
+///
+/// `data.nq.gz` is N-Quads. A name this does not recognize as RDF is `None`,
+/// which is also what a directory or an HDT answers.
+pub(crate) fn format_of(path: &Path) -> Option<RdfFormat> {
+    let (_, uncompressed) = detect_compression(path);
+    detect_format(&uncompressed)
 }
 
 /// Result of input discovery, partitioned by type.
@@ -258,6 +274,8 @@ mod tests {
     fn test_quad_format_detection() {
         assert!(RdfFormat::NQuads.is_quad_format());
         assert!(RdfFormat::TriG.is_quad_format());
+        assert!(RdfFormat::JsonLd.is_quad_format());
+        assert!(RdfFormat::N3.is_quad_format());
         assert!(!RdfFormat::NTriples.is_quad_format());
         assert!(!RdfFormat::Turtle.is_quad_format());
         assert!(!RdfFormat::RdfXml.is_quad_format());

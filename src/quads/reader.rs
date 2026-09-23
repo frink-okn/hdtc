@@ -17,12 +17,91 @@ use std::path::{Path, PathBuf};
 
 const HEADER_SIZE: u64 = 256;
 const FOOTER_SIZE: u64 = 64;
-const DIRECTORY_ENTRY_SIZE: u64 = 96;
-const CHUNK_ENTRY_SIZE: u64 = 48;
-const CHUNK_SHIFT: u32 = 16;
-const ENCODING_DENSE: u32 = 1;
-const ENCODING_SPARSE: u32 = 2;
-const ENCODING_ELIAS_FANO: u32 = 3;
+const DIRECTORY_ENTRY_SIZE: u64 = GRAPH_LAYER_ENTRY_SIZE as u64;
+const CHUNK_ENTRY_SIZE: u64 = GRAPH_CHUNK_ENTRY_SIZE as u64;
+const CHUNK_SHIFT: u32 = GRAPH_POSITION_CHUNK_SHIFT;
+const ENCODING_DENSE: u32 = GraphLayerEncoding::DenseChunks as u32;
+const ENCODING_SPARSE: u32 = GraphLayerEncoding::SparseChunks as u32;
+const ENCODING_ELIAS_FANO: u32 = GraphLayerEncoding::EliasFano as u32;
+const FLAG_EXHAUSTIVE: u64 = 1 << 0;
+const FLAG_DISJOINT: u64 = 1 << 1;
+const FLAG_HAS_BLANK_GRAPH_NAMES: u64 = 1 << 2;
+
+/// Bytes in one layer-directory entry (`docs/graphs-sidecar-format.md` §6).
+pub const GRAPH_LAYER_ENTRY_SIZE: usize = 96;
+/// Bytes in one chunk-directory entry (`docs/graphs-sidecar-format.md` §7.2).
+pub const GRAPH_CHUNK_ENTRY_SIZE: usize = 48;
+/// Bytes in an Elias–Fano layer header (`docs/graphs-sidecar-format.md` §8.1).
+pub const ELIAS_FANO_HEADER_SIZE: usize = 160;
+/// Positions per chunk, as a shift (`docs/graphs-sidecar-format.md` §7).
+pub const GRAPH_POSITION_CHUNK_SHIFT: u32 = 16;
+/// Members at or below which a chunk is an array container rather than a
+/// bitmap container (`docs/graphs-sidecar-format.md` §7.3).
+pub const GRAPH_ARRAY_CONTAINER_MAX: u32 = 4096;
+/// Bytes of a bitmap container payload: 128 `u16` subranks then 8192 bitmap
+/// bytes (`docs/graphs-sidecar-format.md` §7.3).
+pub const GRAPH_BITMAP_CONTAINER_BYTES: u32 = 8_448;
+/// Bytes of a bitmap container's subrank prefix; the bitmap follows it.
+pub const GRAPH_BITMAP_CONTAINER_SUBRANK_BYTES: usize = 256;
+/// Bits per bitmap-container subrank sample.
+pub const GRAPH_BITMAP_CONTAINER_SUBBLOCK_BITS: u32 = 512;
+/// Superblock width of an Elias–Fano layer's upper-bitmap rank directory
+/// (`docs/graphs-sidecar-format.md` §8.2).
+pub const ELIAS_FANO_SUPERBLOCK_BITS: u32 = 4096;
+/// Subblock width of the same directory.
+pub const ELIAS_FANO_SUBBLOCK_BITS: u32 = 512;
+
+/// How one membership layer stores its positions
+/// (`docs/graphs-sidecar-format.md` §6, "Encoding").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(u32)]
+pub enum GraphLayerEncoding {
+    /// One chunk entry per universe chunk, empty chunks included (§7.1).
+    DenseChunks = 1,
+    /// Only non-empty chunks, with the access hash of §7.4 (§7.1). Also the
+    /// encoding every *empty* layer records, with no structures at all: a
+    /// reader checks `member_count` before it interprets the encoding, since
+    /// an empty layer has a zero hash capacity and no directory to probe.
+    SparseChunks = 2,
+    /// One monotone Elias–Fano sequence (§8).
+    EliasFano = 3,
+}
+
+impl GraphLayerEncoding {
+    /// Decode the directory entry's `Encoding` field.
+    pub fn from_u32(value: u32) -> Option<Self> {
+        match value {
+            1 => Some(Self::DenseChunks),
+            2 => Some(Self::SparseChunks),
+            3 => Some(Self::EliasFano),
+            _ => None,
+        }
+    }
+}
+
+/// How one chunk's members are stored (`docs/graphs-sidecar-format.md` §7.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(u8)]
+pub enum GraphChunkContainer {
+    /// No members and no payload; only dense directories hold these.
+    Empty = 0,
+    /// `cardinality` strictly increasing little-endian `u16` offsets.
+    Array = 1,
+    /// 128 `u16` subranks followed by a 65,536-bit bitmap.
+    Bitmap = 2,
+}
+
+impl GraphChunkContainer {
+    /// Decode the chunk entry's `Container encoding` byte.
+    pub fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Empty),
+            1 => Some(Self::Array),
+            2 => Some(Self::Bitmap),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GraphTerm {
@@ -30,23 +109,171 @@ pub enum GraphTerm {
     Named(String),
 }
 
+/// The parsed 256-byte sidecar header (`docs/graphs-sidecar-format.md` §4).
+///
+/// Every field a mapped reader needs to locate the dictionary, the layer
+/// directory, and the layers span without re-deriving the layout, plus the
+/// counts and source binding it checks the file against its HDT with.
 #[derive(Debug, Clone, Copy)]
-struct Header {
-    flags: u64,
-    triple_count: u64,
-    named_graph_count: u64,
-    membership_count: u64,
-    source_data_length: u64,
-    sidecar_size: u64,
-    dictionary_offset: u64,
-    dictionary_length: u64,
-    directory_offset: u64,
-    directory_length: u64,
-    layers_offset: u64,
-    layers_length: u64,
-    footer_offset: u64,
-    source_digest: [u8; 32],
-    header_crc: u32,
+pub struct GraphSidecarHeader {
+    /// Assertion flags; see the `is_*` and `has_*` methods.
+    pub flags: u64,
+    /// `N`, the HDT's triple count.
+    pub triples: u64,
+    /// `G`, the named graphs; layers are indexed `0..=G`.
+    pub named_graphs: u64,
+    /// `M`, the memberships summed over every layer.
+    pub memberships: u64,
+    /// Length of the HDT's dictionary-and-triples suffix this sidecar binds to.
+    pub source_data_length: u64,
+    /// Exact file size, footer included.
+    pub file_size: u64,
+    /// Absolute offset of the graph dictionary's PFC section.
+    pub dictionary_offset: u64,
+    /// Length of that section, padding excluded.
+    pub dictionary_length: u64,
+    /// Absolute offset of the `G + 1` layer-directory entries.
+    pub directory_offset: u64,
+    /// `(G + 1) * 96 + 4`: the entries and their trailing CRC32C.
+    pub directory_length: u64,
+    /// Absolute offset of the first layer region, or the footer offset when
+    /// no layer has members.
+    pub layers_offset: u64,
+    /// Span through the last layer payload, internal padding included.
+    pub layers_length: u64,
+    /// Absolute offset of the 64-byte footer.
+    pub footer_offset: u64,
+    /// SHA-256 of the HDT suffix (`docs/graphs-sidecar-format.md` §10).
+    pub source_digest: [u8; 32],
+    /// CRC32C of the header's first 252 bytes.
+    pub header_crc: u32,
+}
+
+impl GraphSidecarHeader {
+    /// Whether every SPO position belongs to at least one graph. Every
+    /// version-1 sidecar asserts this.
+    pub fn is_exhaustive(&self) -> bool {
+        self.flags & FLAG_EXHAUSTIVE != 0
+    }
+
+    /// Whether every SPO position belongs to at most one graph — so with
+    /// [`is_exhaustive`](Self::is_exhaustive), exactly one, and the
+    /// membership count equals the triple count.
+    pub fn is_disjoint(&self) -> bool {
+        self.flags & FLAG_DISJOINT != 0
+    }
+
+    /// Whether at least one graph is named by a blank node, stored as
+    /// `_:label`.
+    pub fn has_blank_graph_names(&self) -> bool {
+        self.flags & FLAG_HAS_BLANK_GRAPH_NAMES != 0
+    }
+}
+
+/// Which phase prevented a graph sidecar from opening.
+///
+/// Callers that expose artifact-specific diagnostics can distinguish a
+/// corrupt sidecar from one bound to a different HDT without inspecting
+/// error text — the same split as `PermutationIndexOpenError`.
+#[derive(Debug, thiserror::Error)]
+pub enum GraphSidecarOpenError {
+    /// The sidecar's header, footer, or dictionary preamble is malformed.
+    #[error("invalid graph sidecar: {source:#}")]
+    Sidecar {
+        /// The format-layer failure.
+        #[source]
+        source: anyhow::Error,
+    },
+
+    /// The associated HDT could not be read for its structural metadata.
+    #[error("invalid source HDT: {source:#}")]
+    Source {
+        /// The HDT read failure.
+        #[source]
+        source: anyhow::Error,
+    },
+
+    /// Both files are well-formed enough to inspect, but the sidecar's
+    /// recorded suffix length or triple count is not this HDT's.
+    #[error("graph sidecar does not bind to its source HDT: {source:#}")]
+    Binding {
+        /// The failed cross-artifact check.
+        #[source]
+        source: anyhow::Error,
+    },
+}
+
+/// What a reader that maps the sidecar needs from it, bound to its HDT.
+///
+/// The counterpart of `GraphIndex::directory`: the parsed header, which
+/// locates the graph dictionary — one standard PFC section at
+/// `dictionary_offset`, scannable with [`scan_pfc_section`](crate::format::scan_pfc_section)
+/// — and the layer directory, whose entries are decoded lazily with
+/// [`GraphLayerEntry::parse`]. The seek-based membership operations of
+/// [`GraphSidecarReader`] are for this crate's own tools and are not part of
+/// this type.
+#[derive(Debug, Clone)]
+pub struct GraphSidecarDirectory {
+    path: PathBuf,
+    header: GraphSidecarHeader,
+    hdt_data_offset: u64,
+}
+
+impl GraphSidecarDirectory {
+    /// Read the header of the sidecar at `path` and check its cheap binding to
+    /// the HDT at `hdt_path`: the suffix length and the triple count. The
+    /// dictionary's preamble is scanned and its count checked; no payload is
+    /// read.
+    pub fn read(path: &Path, hdt_path: &Path) -> std::result::Result<Self, GraphSidecarOpenError> {
+        let (header, hdt_data_offset) = (|| -> Result<_> {
+            let mut file = File::open(path)
+                .with_context(|| format!("Failed to open graph sidecar {}", path.display()))?;
+            let file_size = file.metadata()?.len();
+            let header = read_header(&mut file, file_size)?;
+            Ok((header, file))
+        })()
+        .map_err(|source| GraphSidecarOpenError::Sidecar { source })
+        .and_then(|(header, mut file)| {
+            let (hdt_data_offset, hdt_data_length, hdt_triples) = hdt_metadata(hdt_path)
+                .map_err(|source| GraphSidecarOpenError::Source { source })?;
+            (|| -> Result<()> {
+                ensure!(
+                    hdt_data_length == header.source_data_length,
+                    "sidecar/HDT data length mismatch"
+                );
+                ensure!(
+                    hdt_triples == header.triples,
+                    "sidecar/HDT triple count mismatch"
+                );
+                Ok(())
+            })()
+            .map_err(|source| GraphSidecarOpenError::Binding { source })?;
+            read_graph_dictionary(&mut file, header)
+                .map_err(|source| GraphSidecarOpenError::Sidecar { source })?;
+            Ok((header, hdt_data_offset))
+        })?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            header,
+            hdt_data_offset,
+        })
+    }
+
+    /// The file this directory was read from.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The parsed header.
+    pub fn header(&self) -> &GraphSidecarHeader {
+        &self.header
+    }
+
+    /// Where the bound HDT's identity input begins: its dictionary control
+    /// information (`docs/graphs-sidecar-format.md` §10).
+    pub fn hdt_data_offset(&self) -> u64 {
+        self.hdt_data_offset
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -68,26 +295,49 @@ struct GraphDictionary {
     offsets: DiskLogArray,
 }
 
+/// One 96-byte layer-directory entry (`docs/graphs-sidecar-format.md` §6).
+///
+/// Offsets are absolute within the file that holds the entry — the sidecar
+/// for its own directory, the graph index for a re-keyed layer set
+/// (`docs/graphs-index-format.md` §5.1).
 #[derive(Debug, Clone, Copy)]
-struct LayerEntry {
-    primary_offset: u64,
-    primary_length: u64,
-    secondary_offset: u64,
-    secondary_length: u64,
-    item_count_a: u64,
-    item_count_b: u64,
-    member_count: u64,
-    minimum_position: u64,
-    maximum_position_exclusive: u64,
-    encoding: u32,
-    flags: u32,
-    primary_crc: u32,
-    secondary_crc: u32,
-    parameter: u64,
+pub struct GraphLayerEntry {
+    /// Chunk directory (chunked encodings) or Elias–Fano header.
+    pub primary_offset: u64,
+    /// Encoding-specific length of the primary structure.
+    pub primary_length: u64,
+    /// Sparse access hash; zero for dense and Elias–Fano layers.
+    pub secondary_offset: u64,
+    /// Length of the secondary structure.
+    pub secondary_length: u64,
+    /// Stored chunk entries for chunked layers; zero for Elias–Fano.
+    pub item_count_a: u64,
+    /// Non-empty chunks for chunked layers; zero for Elias–Fano.
+    pub item_count_b: u64,
+    /// `count(g)`.
+    pub member_count: u64,
+    /// First member, or `N` when the layer is empty.
+    pub minimum_position: u64,
+    /// Last member plus one, or zero when the layer is empty.
+    pub maximum_position_exclusive: u64,
+    /// See [`GraphLayerEncoding`].
+    pub encoding: u32,
+    /// Reserved; zero.
+    pub flags: u32,
+    /// CRC32C of the primary structure.
+    pub primary_crc: u32,
+    /// CRC32C of the secondary structure.
+    pub secondary_crc: u32,
+    /// Sparse hash capacity, else zero.
+    pub parameter: u64,
 }
 
-impl LayerEntry {
-    fn parse(bytes: &[u8; DIRECTORY_ENTRY_SIZE as usize]) -> Self {
+impl GraphLayerEntry {
+    /// Decode one directory entry from its 96 bytes.
+    ///
+    /// Purely a field decode: the ranges it names are validated by whoever
+    /// resolves them against a file.
+    pub fn parse(bytes: &[u8; GRAPH_LAYER_ENTRY_SIZE]) -> Self {
         Self {
             primary_offset: get_u64(bytes, 0),
             primary_length: get_u64(bytes, 8),
@@ -105,24 +355,41 @@ impl LayerEntry {
             parameter: get_u64(bytes, 88),
         }
     }
+
+    /// The layer's encoding, or `None` for a value this version does not define.
+    pub fn layer_encoding(&self) -> Option<GraphLayerEncoding> {
+        GraphLayerEncoding::from_u32(self.encoding)
+    }
 }
 
+/// One 48-byte chunk-directory entry (`docs/graphs-sidecar-format.md` §7.2).
 #[derive(Debug, Clone, Copy)]
-struct ChunkEntry {
-    key: u64,
-    rank_before: u64,
-    payload_offset: u64,
-    payload_length: u32,
-    cardinality: u32,
-    encoding: u8,
-    flags: u8,
-    reserved16: u16,
-    payload_crc: u32,
-    reserved64: u64,
+pub struct GraphChunkEntry {
+    /// Position chunk number, `position >> 16`.
+    pub key: u64,
+    /// Layer members in all smaller-key chunks.
+    pub rank_before: u64,
+    /// Absolute, 8-byte-aligned payload offset; zero when empty.
+    pub payload_offset: u64,
+    /// Payload bytes, padding excluded; zero when empty.
+    pub payload_length: u32,
+    /// Members in this chunk, `0..=65,536`.
+    pub cardinality: u32,
+    /// See [`GraphChunkContainer`].
+    pub encoding: u8,
+    /// Reserved; zero.
+    pub flags: u8,
+    /// Reserved; zero.
+    pub reserved16: u16,
+    /// CRC32C of the payload; zero when empty.
+    pub payload_crc: u32,
+    /// Reserved; zero.
+    pub reserved64: u64,
 }
 
-impl ChunkEntry {
-    fn parse(bytes: &[u8; CHUNK_ENTRY_SIZE as usize]) -> Self {
+impl GraphChunkEntry {
+    /// Decode one chunk entry from its 48 bytes.
+    pub fn parse(bytes: &[u8; GRAPH_CHUNK_ENTRY_SIZE]) -> Self {
         Self {
             key: get_u64(bytes, 0),
             rank_before: get_u64(bytes, 8),
@@ -136,29 +403,98 @@ impl ChunkEntry {
             reserved64: get_u64(bytes, 40),
         }
     }
+
+    /// The chunk's container, or `None` for a value this version does not define.
+    pub fn container(&self) -> Option<GraphChunkContainer> {
+        GraphChunkContainer::from_u8(self.encoding)
+    }
 }
 
+/// The 160-byte header of an Elias–Fano layer
+/// (`docs/graphs-sidecar-format.md` §8.1).
+///
+/// Region offsets are absolute within the file holding the layer. The
+/// superrank and subrank regions are the two-level rank directory of
+/// `docs/graphs-sidecar-format.md` §8.2 over the upper bitmap, at
+/// [`ELIAS_FANO_SUPERBLOCK_BITS`] and [`ELIAS_FANO_SUBBLOCK_BITS`].
 #[derive(Debug, Clone, Copy)]
-struct EfHeader {
-    low_bits: u32,
-    universe: u64,
-    members: u64,
-    upper_bits: u64,
-    high_buckets: u64,
-    lower_offset: u64,
-    lower_length: u64,
-    superrank_offset: u64,
-    superrank_length: u64,
-    subrank_offset: u64,
-    subrank_length: u64,
-    upper_offset: u64,
-    upper_length: u64,
-    superrank_count: u64,
-    subrank_count: u64,
-    lower_crc: u32,
-    superrank_crc: u32,
-    subrank_crc: u32,
-    upper_crc: u32,
+pub struct EliasFanoHeader {
+    /// `l`, the low-bit width.
+    pub low_bits: u32,
+    /// `N`, the position universe.
+    pub universe: u64,
+    /// `m`, the members.
+    pub members: u64,
+    /// `L = H + m`, the upper bitmap's length in bits.
+    pub upper_bits: u64,
+    /// `H`, the high-bucket count.
+    pub high_buckets: u64,
+    /// Packed low bits; zero when `l = 0`.
+    pub lower_offset: u64,
+    /// `ceil(m * l / 8)`.
+    pub lower_length: u64,
+    /// Superrank samples over the upper bitmap.
+    pub superrank_offset: u64,
+    /// `superrank_count * 8`.
+    pub superrank_length: u64,
+    /// Subrank samples over the upper bitmap.
+    pub subrank_offset: u64,
+    /// `subrank_count * 2`.
+    pub subrank_length: u64,
+    /// The upper bitmap.
+    pub upper_offset: u64,
+    /// `ceil(L / 8)`.
+    pub upper_length: u64,
+    /// `ceil(L / 4096) + 1`.
+    pub superrank_count: u64,
+    /// `ceil(L / 512)`.
+    pub subrank_count: u64,
+    /// CRC32C of the lower region, or zero when absent.
+    pub lower_crc: u32,
+    /// CRC32C of the superrank region.
+    pub superrank_crc: u32,
+    /// CRC32C of the subrank region.
+    pub subrank_crc: u32,
+    /// CRC32C of the upper region.
+    pub upper_crc: u32,
+}
+
+impl EliasFanoHeader {
+    /// Decode and check a layer's Elias–Fano header: magic, size, reserved
+    /// bytes, and the header's own CRC32C. Region CRCs are not verified.
+    pub fn parse(bytes: &[u8; ELIAS_FANO_HEADER_SIZE]) -> Result<Self> {
+        ensure!(&bytes[0..8] == b"$HDTEF01", "invalid Elias-Fano magic");
+        ensure!(get_u32(bytes, 8) == 160, "invalid Elias-Fano header size");
+        ensure!(
+            crc32c(&bytes[..156]) == get_u32(bytes, 156),
+            "Elias-Fano header CRC mismatch"
+        );
+        ensure!(
+            bytes[144..156].iter().all(|byte| *byte == 0),
+            "nonzero Elias-Fano header reserved bytes"
+        );
+        Ok(Self {
+            low_bits: get_u32(bytes, 12),
+            universe: get_u64(bytes, 16),
+            members: get_u64(bytes, 24),
+            upper_bits: get_u64(bytes, 32),
+            high_buckets: get_u64(bytes, 40),
+            lower_offset: get_u64(bytes, 48),
+            lower_length: get_u64(bytes, 56),
+            superrank_offset: get_u64(bytes, 64),
+            superrank_length: get_u64(bytes, 72),
+            subrank_offset: get_u64(bytes, 80),
+            subrank_length: get_u64(bytes, 88),
+            upper_offset: get_u64(bytes, 96),
+            upper_length: get_u64(bytes, 104),
+            superrank_count: get_u64(bytes, 112),
+            subrank_count: get_u64(bytes, 120),
+            lower_crc: get_u32(bytes, 128),
+            superrank_crc: get_u32(bytes, 132),
+            subrank_crc: get_u32(bytes, 136),
+            upper_crc: get_u32(bytes, 140),
+        })
+    }
 }
 
 /// A file-backed sidecar reader. Opening reads fixed metadata only; the graph
@@ -166,11 +502,11 @@ struct EfHeader {
 pub struct GraphSidecarReader {
     hdt_path: PathBuf,
     file: File,
-    header: Header,
+    header: GraphSidecarHeader,
     dictionary: GraphDictionary,
     hdt_data_offset: u64,
     /// Last Elias-Fano header parsed, keyed by its layer primary offset.
-    ef_header_cache: Option<(u64, EfHeader)>,
+    ef_header_cache: Option<(u64, EliasFanoHeader)>,
 }
 
 /// Reader over a sidecar-compatible layer set embedded in another artifact.
@@ -206,13 +542,13 @@ impl EmbeddedLayerSetReader {
             "embedded layer-directory length mismatch"
         );
         let layers_offset = if region_length == 0 { 0 } else { region_offset };
-        let header = Header {
+        let header = GraphSidecarHeader {
             flags: 1,
-            triple_count,
-            named_graph_count,
-            membership_count,
+            triples: triple_count,
+            named_graphs: named_graph_count,
+            memberships: membership_count,
             source_data_length: 0,
-            sidecar_size: file_size,
+            file_size,
             dictionary_offset: 0,
             dictionary_length: 0,
             directory_offset,
@@ -302,7 +638,7 @@ impl EmbeddedLayerSetReader {
         let mut first_start = None;
         let mut previous_end = self.inner.header.layers_offset;
         let mut covered_end = self.inner.header.layers_offset;
-        for graph_id in 0..=self.inner.header.named_graph_count {
+        for graph_id in 0..=self.inner.header.named_graphs {
             let layer = self.inner.layer_entry(graph_id)?;
             if let Some((start, end)) = self.inner.validate_layer_metadata(layer)? {
                 ensure!(
@@ -366,7 +702,7 @@ impl EmbeddedLayerSetReader {
                 }
             }
             let mut count = 0u64;
-            let mut minimum = self.inner.header.triple_count;
+            let mut minimum = self.inner.header.triples;
             let mut maximum_exclusive = 0u64;
             let mut previous = None;
             for position in self.inner.layer_iter(graph_id)? {
@@ -398,7 +734,7 @@ impl EmbeddedLayerSetReader {
                 .context("embedded membership overflow")?;
         }
         ensure!(
-            total == self.inner.header.membership_count,
+            total == self.inner.header.memberships,
             "embedded layer-set membership-count mismatch"
         );
         ensure!(
@@ -468,7 +804,7 @@ impl GraphSidecarReader {
             "sidecar/HDT data length mismatch"
         );
         ensure!(
-            hdt_triples == header.triple_count,
+            hdt_triples == header.triples,
             "sidecar/HDT triple count mismatch"
         );
         let dictionary = read_graph_dictionary(&mut file, header)?;
@@ -484,15 +820,34 @@ impl GraphSidecarReader {
     }
 
     pub fn triple_count(&self) -> u64 {
-        self.header.triple_count
+        self.header.triples
     }
 
     pub fn named_graph_count(&self) -> u64 {
-        self.header.named_graph_count
+        self.header.named_graphs
     }
 
     pub fn membership_count(&self) -> u64 {
-        self.header.membership_count
+        self.header.memberships
+    }
+
+    /// The parsed file header, checked against the HDT's suffix length and
+    /// triple count when this reader opened.
+    ///
+    /// This is the integration point for a reader that maps the sidecar rather
+    /// than seeking it: the header locates the dictionary — one standard PFC
+    /// section, scannable with [`scan_pfc_section`](crate::format::scan_pfc_section)
+    /// at `dictionary_offset` — and the layer directory, whose entries are
+    /// addressed lazily with [`GraphLayerEntry::parse`]. The seek-based
+    /// membership operations on this type are for this crate's own tools.
+    pub fn header(&self) -> &GraphSidecarHeader {
+        &self.header
+    }
+
+    /// Where the bound HDT's identity input begins: its dictionary control
+    /// information (`docs/graphs-sidecar-format.md` §10).
+    pub fn hdt_data_offset(&self) -> u64 {
+        self.hdt_data_offset
     }
 
     pub(crate) fn source_data_length(&self) -> u64 {
@@ -514,7 +869,7 @@ impl GraphSidecarReader {
             return Ok(GraphTerm::DefaultGraph);
         }
         ensure!(
-            graph_id <= self.header.named_graph_count,
+            graph_id <= self.header.named_graphs,
             "graph ID out of range"
         );
         Ok(GraphTerm::Named(self.dictionary_term(graph_id)?))
@@ -562,7 +917,7 @@ impl GraphSidecarReader {
     }
 
     pub fn access(&mut self, graph_id: u64, position: u64) -> Result<bool> {
-        ensure!(position < self.header.triple_count, "position out of range");
+        ensure!(position < self.header.triples, "position out of range");
         let layer = self.layer_entry(graph_id)?;
         if layer.member_count == 0
             || position < layer.minimum_position
@@ -588,14 +943,14 @@ impl GraphSidecarReader {
 
     pub fn rank(&mut self, graph_id: u64, position: u64) -> Result<u64> {
         ensure!(
-            position <= self.header.triple_count,
+            position <= self.header.triples,
             "rank position out of range"
         );
         let layer = self.layer_entry(graph_id)?;
         if position == 0 || layer.member_count == 0 {
             return Ok(0);
         }
-        if position == self.header.triple_count || position >= layer.maximum_position_exclusive {
+        if position == self.header.triples || position >= layer.maximum_position_exclusive {
             return Ok(layer.member_count);
         }
         if position <= layer.minimum_position {
@@ -619,7 +974,7 @@ impl GraphSidecarReader {
     }
 
     pub fn next_member(&mut self, graph_id: u64, position: u64) -> Result<Option<u64>> {
-        ensure!(position < self.header.triple_count, "position out of range");
+        ensure!(position < self.header.triples, "position out of range");
         let rank = self.rank(graph_id, position)?;
         let count = self.count(graph_id)?;
         if rank == count {
@@ -630,9 +985,9 @@ impl GraphSidecarReader {
     }
 
     pub fn graphs_of(&mut self, position: u64) -> Result<Vec<u64>> {
-        ensure!(position < self.header.triple_count, "position out of range");
+        ensure!(position < self.header.triples, "position out of range");
         let mut graphs = Vec::new();
-        for graph_id in 0..=self.header.named_graph_count {
+        for graph_id in 0..=self.header.named_graphs {
             if self.access(graph_id, position)? {
                 graphs.push(graph_id);
             }
@@ -642,7 +997,7 @@ impl GraphSidecarReader {
 
     pub fn layer_iter(&mut self, graph_id: u64) -> Result<LayerMemberIter> {
         let layer = self.layer_entry(graph_id)?;
-        LayerMemberIter::new(&self.file, layer, self.header.triple_count)
+        LayerMemberIter::new(&self.file, layer, self.header.triples)
     }
 
     /// Perform full identity, checksum, encoding, dictionary, and exhaustive
@@ -697,7 +1052,7 @@ impl GraphSidecarReader {
 
         let mut previous_term: Option<String> = None;
         let mut blank_graph_seen = false;
-        for graph_id in 1..=self.header.named_graph_count {
+        for graph_id in 1..=self.header.named_graphs {
             let GraphTerm::Named(term) = self.graph(graph_id)? else {
                 unreachable!()
             };
@@ -741,7 +1096,7 @@ impl GraphSidecarReader {
         let mut first_layer_start = None;
         let mut previous_layer_end = self.header.layers_offset;
 
-        for graph_id in 0..=self.header.named_graph_count {
+        for graph_id in 0..=self.header.named_graphs {
             let layer = self.layer_entry(graph_id)?;
             if let Some((start, end)) = self.validate_layer_metadata(layer)? {
                 ensure!(
@@ -752,7 +1107,7 @@ impl GraphSidecarReader {
                 previous_layer_end = end;
             }
             let mut count = 0u64;
-            let mut minimum = self.header.triple_count;
+            let mut minimum = self.header.triples;
             let mut maximum_exclusive = 0u64;
             let mut previous = None;
             let iterator = self.layer_iter(graph_id)?;
@@ -788,7 +1143,7 @@ impl GraphSidecarReader {
             );
         }
         ensure!(
-            total_members == self.header.membership_count,
+            total_members == self.header.memberships,
             "global membership count mismatch"
         );
         let expected_layers_end = self
@@ -857,7 +1212,7 @@ impl GraphSidecarReader {
             expected_position += 1;
         }
         ensure!(
-            expected_position == self.header.triple_count,
+            expected_position == self.header.triples,
             "non-exhaustive graph memberships"
         );
         if let Some(encoder) = transposed {
@@ -877,7 +1232,7 @@ impl GraphSidecarReader {
         Ok(())
     }
 
-    fn validate_layer_metadata(&mut self, layer: LayerEntry) -> Result<Option<(u64, u64)>> {
+    fn validate_layer_metadata(&mut self, layer: GraphLayerEntry) -> Result<Option<(u64, u64)>> {
         ensure!(layer.flags == 0, "nonzero layer flags");
         if layer.member_count == 0 {
             ensure!(
@@ -897,7 +1252,7 @@ impl GraphSidecarReader {
                 "invalid empty layer fields"
             );
             ensure!(
-                layer.minimum_position == self.header.triple_count,
+                layer.minimum_position == self.header.triples,
                 "invalid empty layer minimum"
             );
             ensure!(
@@ -911,7 +1266,7 @@ impl GraphSidecarReader {
             "invalid layer range"
         );
         ensure!(
-            layer.maximum_position_exclusive <= self.header.triple_count,
+            layer.maximum_position_exclusive <= self.header.triples,
             "layer range outside universe"
         );
         ensure!(
@@ -936,10 +1291,10 @@ impl GraphSidecarReader {
                     "chunk directory length mismatch"
                 );
                 if layer.encoding == ENCODING_DENSE {
-                    let expected = if self.header.triple_count == 0 {
+                    let expected = if self.header.triples == 0 {
                         0
                     } else {
-                        1 + ((self.header.triple_count - 1) >> CHUNK_SHIFT)
+                        1 + ((self.header.triples - 1) >> CHUNK_SHIFT)
                     };
                     ensure!(
                         layer.item_count_a == expected,
@@ -1003,7 +1358,7 @@ impl GraphSidecarReader {
         }
     }
 
-    fn validate_chunk_directory(&mut self, layer: LayerEntry) -> Result<u64> {
+    fn validate_chunk_directory(&mut self, layer: GraphLayerEntry) -> Result<u64> {
         let mut rank = 0u64;
         let mut previous_key = None;
         let mut non_empty = 0u64;
@@ -1040,7 +1395,7 @@ impl GraphSidecarReader {
                 );
             }
             ensure!(
-                chunk.key < self.header.triple_count.div_ceil(1 << CHUNK_SHIFT),
+                chunk.key < self.header.triples.div_ceil(1 << CHUNK_SHIFT),
                 "chunk key outside universe"
             );
             if chunk.cardinality == 0 {
@@ -1113,7 +1468,7 @@ impl GraphSidecarReader {
         Ok(payload_end)
     }
 
-    fn validate_bitmap_subranks(&mut self, chunk: ChunkEntry) -> Result<()> {
+    fn validate_bitmap_subranks(&mut self, chunk: GraphChunkEntry) -> Result<()> {
         let mut bitmap = [0u8; 8192];
         read_exact_at(&mut self.file, chunk.payload_offset + 256, &mut bitmap)?;
         let mut rank = 0u32;
@@ -1136,7 +1491,7 @@ impl GraphSidecarReader {
         Ok(())
     }
 
-    fn validate_ef_metadata(&mut self, layer: LayerEntry) -> Result<u64> {
+    fn validate_ef_metadata(&mut self, layer: GraphLayerEntry) -> Result<u64> {
         ensure!(
             layer.secondary_offset == 0
                 && layer.secondary_length == 0
@@ -1148,7 +1503,7 @@ impl GraphSidecarReader {
         );
         let header = self.ef_header(layer)?;
         ensure!(
-            header.universe == self.header.triple_count,
+            header.universe == self.header.triples,
             "Elias-Fano universe mismatch"
         );
         ensure!(
@@ -1287,7 +1642,7 @@ impl GraphSidecarReader {
         Ok(previous_end)
     }
 
-    fn validate_ef_ranks(&mut self, header: EfHeader) -> Result<()> {
+    fn validate_ef_ranks(&mut self, header: EliasFanoHeader) -> Result<()> {
         let word_count = header.upper_bits.div_ceil(64);
         let mut rank = 0u64;
         let mut super_base = 0u64;
@@ -1345,9 +1700,9 @@ impl GraphSidecarReader {
         Ok(())
     }
 
-    fn layer_entry(&mut self, graph_id: u64) -> Result<LayerEntry> {
+    fn layer_entry(&mut self, graph_id: u64) -> Result<GraphLayerEntry> {
         ensure!(
-            graph_id <= self.header.named_graph_count,
+            graph_id <= self.header.named_graphs,
             "graph ID out of range"
         );
         let offset = self
@@ -1361,10 +1716,10 @@ impl GraphSidecarReader {
             .context("directory offset overflow")?;
         let mut bytes = [0u8; DIRECTORY_ENTRY_SIZE as usize];
         read_exact_at(&mut self.file, offset, &mut bytes)?;
-        Ok(LayerEntry::parse(&bytes))
+        Ok(GraphLayerEntry::parse(&bytes))
     }
 
-    fn read_chunk(&mut self, layer: LayerEntry, index: u64) -> Result<ChunkEntry> {
+    fn read_chunk(&mut self, layer: GraphLayerEntry, index: u64) -> Result<GraphChunkEntry> {
         ensure!(index < layer.item_count_a, "chunk index out of range");
         let offset = layer
             .primary_offset
@@ -1376,10 +1731,14 @@ impl GraphSidecarReader {
             .context("chunk offset overflow")?;
         let mut bytes = [0u8; CHUNK_ENTRY_SIZE as usize];
         read_exact_at(&mut self.file, offset, &mut bytes)?;
-        Ok(ChunkEntry::parse(&bytes))
+        Ok(GraphChunkEntry::parse(&bytes))
     }
 
-    fn find_chunk_for_access(&mut self, layer: LayerEntry, key: u64) -> Result<Option<ChunkEntry>> {
+    fn find_chunk_for_access(
+        &mut self,
+        layer: GraphLayerEntry,
+        key: u64,
+    ) -> Result<Option<GraphChunkEntry>> {
         if layer.encoding == ENCODING_DENSE {
             if key >= layer.item_count_a {
                 return Ok(None);
@@ -1410,9 +1769,9 @@ impl GraphSidecarReader {
 
     fn find_chunk_sorted(
         &mut self,
-        layer: LayerEntry,
+        layer: GraphLayerEntry,
         key: u64,
-    ) -> Result<(u64, Option<ChunkEntry>)> {
+    ) -> Result<(u64, Option<GraphChunkEntry>)> {
         let mut low = 0u64;
         let mut high = layer.item_count_a;
         while low < high {
@@ -1433,7 +1792,7 @@ impl GraphSidecarReader {
         Ok((low, None))
     }
 
-    fn container_access(&mut self, chunk: ChunkEntry, offset: u16) -> Result<bool> {
+    fn container_access(&mut self, chunk: GraphChunkEntry, offset: u16) -> Result<bool> {
         match chunk.encoding {
             1 => {
                 let mut low = 0u32;
@@ -1464,7 +1823,7 @@ impl GraphSidecarReader {
         }
     }
 
-    fn container_rank(&mut self, chunk: ChunkEntry, offset: u16) -> Result<u64> {
+    fn container_rank(&mut self, chunk: GraphChunkEntry, offset: u16) -> Result<u64> {
         match chunk.encoding {
             1 => {
                 let mut low = 0u32;
@@ -1511,7 +1870,7 @@ impl GraphSidecarReader {
         }
     }
 
-    fn container_select(&mut self, chunk: ChunkEntry, ordinal: u64) -> Result<u16> {
+    fn container_select(&mut self, chunk: GraphChunkEntry, ordinal: u64) -> Result<u16> {
         ensure!(
             ordinal < u64::from(chunk.cardinality),
             "container select out of range"
@@ -1562,7 +1921,7 @@ impl GraphSidecarReader {
         }
     }
 
-    fn chunked_rank(&mut self, layer: LayerEntry, position: u64) -> Result<u64> {
+    fn chunked_rank(&mut self, layer: GraphLayerEntry, position: u64) -> Result<u64> {
         let key = position >> CHUNK_SHIFT;
         let offset = (position & 0xffff) as u16;
         let (insertion, entry) = if layer.encoding == ENCODING_DENSE {
@@ -1584,7 +1943,7 @@ impl GraphSidecarReader {
         }
     }
 
-    fn chunked_select(&mut self, layer: LayerEntry, ordinal: u64) -> Result<u64> {
+    fn chunked_select(&mut self, layer: GraphLayerEntry, ordinal: u64) -> Result<u64> {
         let mut low = 0u64;
         let mut high = layer.item_count_a;
         while low < high {
@@ -1605,7 +1964,7 @@ impl GraphSidecarReader {
     /// Read a layer's Elias-Fano header, reusing the last one parsed. The
     /// header is immutable file data, so a single-slot cache removes the
     /// repeated 160-byte read and CRC32C from every rank/select/access.
-    fn ef_header(&mut self, layer: LayerEntry) -> Result<EfHeader> {
+    fn ef_header(&mut self, layer: GraphLayerEntry) -> Result<EliasFanoHeader> {
         if let Some((offset, header)) = self.ef_header_cache
             && offset == layer.primary_offset
         {
@@ -1616,7 +1975,7 @@ impl GraphSidecarReader {
         Ok(header)
     }
 
-    fn ef_lower(&mut self, header: EfHeader, index: u64) -> Result<u64> {
+    fn ef_lower(&mut self, header: EliasFanoHeader, index: u64) -> Result<u64> {
         if header.low_bits == 0 {
             return Ok(0);
         }
@@ -1641,7 +2000,7 @@ impl GraphSidecarReader {
         Ok(((packed >> shift) & mask) as u64)
     }
 
-    fn ef_rank1(&mut self, header: EfHeader, position: u64) -> Result<u64> {
+    fn ef_rank1(&mut self, header: EliasFanoHeader, position: u64) -> Result<u64> {
         ensure!(
             position <= header.upper_bits,
             "upper rank position out of range"
@@ -1682,7 +2041,7 @@ impl GraphSidecarReader {
     /// superblock end ranks, then the containing superblock's eight
     /// subblocks, then at most eight 64-bit words. Reads stay bounded
     /// instead of scaling with the bitmap length.
-    fn ef_select_bit(&mut self, header: EfHeader, ordinal: u64, one: bool) -> Result<u64> {
+    fn ef_select_bit(&mut self, header: EliasFanoHeader, ordinal: u64, one: bool) -> Result<u64> {
         let total = if one {
             header.members
         } else {
@@ -1779,7 +2138,7 @@ impl GraphSidecarReader {
         bail!("Elias-Fano rank directory disagrees with the upper bitmap")
     }
 
-    fn ef_select(&mut self, layer: LayerEntry, ordinal: u64) -> Result<u64> {
+    fn ef_select(&mut self, layer: GraphLayerEntry, ordinal: u64) -> Result<u64> {
         let header = self.ef_header(layer)?;
         let upper = self.ef_select_bit(header, ordinal, true)?;
         let high = upper - ordinal;
@@ -1791,7 +2150,7 @@ impl GraphSidecarReader {
         Ok(value)
     }
 
-    fn ef_rank(&mut self, layer: LayerEntry, position: u64) -> Result<u64> {
+    fn ef_rank(&mut self, layer: GraphLayerEntry, position: u64) -> Result<u64> {
         let header = self.ef_header(layer)?;
         if position == 0 {
             return Ok(0);
@@ -1966,7 +2325,7 @@ impl Seek for PositionedFile {
 }
 
 impl LayerMemberIter {
-    fn new(file: &File, layer: LayerEntry, universe: u64) -> Result<Self> {
+    fn new(file: &File, layer: GraphLayerEntry, universe: u64) -> Result<Self> {
         if layer.member_count == 0 {
             return Ok(Self::Empty);
         }
@@ -2005,7 +2364,7 @@ impl Iterator for LayerMemberIter {
 
 pub struct ChunkLayerIter {
     file: PositionedFile,
-    layer: LayerEntry,
+    layer: GraphLayerEntry,
     universe: u64,
     entry_index: u64,
     current_positions: Vec<u64>,
@@ -2022,7 +2381,7 @@ impl ChunkLayerIter {
             self.entry_index += 1;
             let mut bytes = [0u8; CHUNK_ENTRY_SIZE as usize];
             read_exact_at(&mut self.file, offset, &mut bytes)?;
-            let chunk = ChunkEntry::parse(&bytes);
+            let chunk = GraphChunkEntry::parse(&bytes);
             if chunk.cardinality == 0 {
                 continue;
             }
@@ -2107,7 +2466,7 @@ impl Iterator for ChunkLayerIter {
 pub struct EliasFanoLayerIter {
     lower_file: PositionedFile,
     upper_reader: BufReader<PositionedFile>,
-    header: EfHeader,
+    header: EliasFanoHeader,
     universe: u64,
     ordinal: u64,
     bit_position: u64,
@@ -2119,7 +2478,7 @@ impl EliasFanoLayerIter {
     fn new(
         mut upper_file: PositionedFile,
         lower_file: PositionedFile,
-        layer: LayerEntry,
+        layer: GraphLayerEntry,
         universe: u64,
     ) -> Result<Self> {
         let header = read_ef_header_from(&mut upper_file, layer)?;
@@ -2198,7 +2557,7 @@ impl Iterator for EliasFanoLayerIter {
     }
 }
 
-fn read_header(file: &mut File, file_size: u64) -> Result<Header> {
+fn read_header(file: &mut File, file_size: u64) -> Result<GraphSidecarHeader> {
     ensure!(
         file_size >= HEADER_SIZE + FOOTER_SIZE,
         "graph sidecar is truncated"
@@ -2238,9 +2597,9 @@ fn read_header(file: &mut File, file_size: u64) -> Result<Header> {
         "unsupported graph position chunk shift"
     );
 
-    let named_graph_count = get_u64(&bytes, 32);
+    let named_graphs = get_u64(&bytes, 32);
     let directory_length = get_u64(&bytes, 88);
-    let expected_directory_length = named_graph_count
+    let expected_directory_length = named_graphs
         .checked_add(1)
         .and_then(|count| count.checked_mul(DIRECTORY_ENTRY_SIZE))
         .and_then(|length| length.checked_add(4))
@@ -2250,13 +2609,13 @@ fn read_header(file: &mut File, file_size: u64) -> Result<Header> {
         "invalid layer-directory length"
     );
 
-    let header = Header {
+    let header = GraphSidecarHeader {
         flags,
-        triple_count: get_u64(&bytes, 24),
-        named_graph_count,
-        membership_count: get_u64(&bytes, 40),
+        triples: get_u64(&bytes, 24),
+        named_graphs,
+        memberships: get_u64(&bytes, 40),
         source_data_length: get_u64(&bytes, 48),
-        sidecar_size: get_u64(&bytes, 56),
+        file_size: get_u64(&bytes, 56),
         dictionary_offset: get_u64(&bytes, 64),
         dictionary_length: get_u64(&bytes, 72),
         directory_offset: get_u64(&bytes, 80),
@@ -2268,7 +2627,7 @@ fn read_header(file: &mut File, file_size: u64) -> Result<Header> {
         header_crc: get_u32(&bytes, 252),
     };
     ensure!(
-        header.sidecar_size == file_size,
+        header.file_size == file_size,
         "graph sidecar file size mismatch"
     );
     ensure!(
@@ -2288,7 +2647,7 @@ fn read_header(file: &mut File, file_size: u64) -> Result<Header> {
         "unaligned graph sidecar footer"
     );
     ensure!(
-        header.membership_count >= header.triple_count,
+        header.memberships >= header.triples,
         "graph sidecar membership count is below triple count"
     );
     checked_range(
@@ -2403,7 +2762,7 @@ fn validate_tail_bits(file: &mut File, offset: u64, length: u64, used_bits: u64)
     Ok(())
 }
 
-fn read_graph_dictionary(file: &mut File, header: Header) -> Result<GraphDictionary> {
+fn read_graph_dictionary(file: &mut File, header: GraphSidecarHeader) -> Result<GraphDictionary> {
     file.seek(SeekFrom::Start(header.dictionary_offset))?;
     let mut preamble = Vec::new();
     let mut section_type = [0u8; 1];
@@ -2427,7 +2786,7 @@ fn read_graph_dictionary(file: &mut File, header: Header) -> Result<GraphDiction
         "graph PFC preamble CRC mismatch"
     );
     ensure!(
-        string_count == header.named_graph_count,
+        string_count == header.named_graphs,
         "graph dictionary count mismatch"
     );
 
@@ -2580,44 +2939,17 @@ fn parse_hdt_triple_count(header: &[u8]) -> Result<u64> {
     Ok(crate::rdf::header_counts(header)?.triples)
 }
 
-fn read_ef_header_from<R: Read + Seek>(file: &mut R, layer: LayerEntry) -> Result<EfHeader> {
+fn read_ef_header_from<R: Read + Seek>(
+    file: &mut R,
+    layer: GraphLayerEntry,
+) -> Result<EliasFanoHeader> {
     ensure!(
-        layer.primary_length == 160,
+        layer.primary_length == ELIAS_FANO_HEADER_SIZE as u64,
         "invalid Elias-Fano primary length"
     );
-    let mut bytes = [0u8; 160];
+    let mut bytes = [0u8; ELIAS_FANO_HEADER_SIZE];
     read_exact_at(file, layer.primary_offset, &mut bytes)?;
-    ensure!(&bytes[0..8] == b"$HDTEF01", "invalid Elias-Fano magic");
-    ensure!(get_u32(&bytes, 8) == 160, "invalid Elias-Fano header size");
-    ensure!(
-        crc32c(&bytes[..156]) == get_u32(&bytes, 156),
-        "Elias-Fano header CRC mismatch"
-    );
-    ensure!(
-        bytes[144..156].iter().all(|byte| *byte == 0),
-        "nonzero Elias-Fano header reserved bytes"
-    );
-    Ok(EfHeader {
-        low_bits: get_u32(&bytes, 12),
-        universe: get_u64(&bytes, 16),
-        members: get_u64(&bytes, 24),
-        upper_bits: get_u64(&bytes, 32),
-        high_buckets: get_u64(&bytes, 40),
-        lower_offset: get_u64(&bytes, 48),
-        lower_length: get_u64(&bytes, 56),
-        superrank_offset: get_u64(&bytes, 64),
-        superrank_length: get_u64(&bytes, 72),
-        subrank_offset: get_u64(&bytes, 80),
-        subrank_length: get_u64(&bytes, 88),
-        upper_offset: get_u64(&bytes, 96),
-        upper_length: get_u64(&bytes, 104),
-        superrank_count: get_u64(&bytes, 112),
-        subrank_count: get_u64(&bytes, 120),
-        lower_crc: get_u32(&bytes, 128),
-        superrank_crc: get_u32(&bytes, 132),
-        subrank_crc: get_u32(&bytes, 136),
-        upper_crc: get_u32(&bytes, 140),
-    })
+    EliasFanoHeader::parse(&bytes)
 }
 
 fn read_exact_at<R: Read + Seek>(file: &mut R, offset: u64, bytes: &mut [u8]) -> Result<()> {
@@ -2959,7 +3291,7 @@ mod tests {
         file.write_all(&upper)?;
         file.flush()?;
 
-        let layer = LayerEntry {
+        let layer = GraphLayerEntry {
             primary_offset: 0,
             primary_length: 160,
             secondary_offset: 0,

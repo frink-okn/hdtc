@@ -20,9 +20,14 @@
 //! - **Identity** — [`sha256_to_end`], so a sidecar's binding to its HDT is
 //!   verified by one implementation rather than two.
 //! - **Sidecar directories** — [`PermutationHeader`] and [`PermutationSection`]
-//!   describe `.hdt.perm`'s regions precisely enough to map them directly.
-//!   [`SketchHeader`] and [`KeysetHeader`] validate and expose the metadata of
-//!   the dictionary-derived artifacts under `filters/` and `keysets/`.
+//!   describe `.hdt.perm`'s regions precisely enough to map them directly;
+//!   [`GraphSidecarDirectory`] and [`GraphIndexDirectory`] do the same for
+//!   `.hdt.graphs` and `.hdt.graphs.idx`, whose layer records
+//!   ([`GraphLayerEntry`], [`GraphChunkEntry`], [`EliasFanoHeader`]) are
+//!   decoded here so a mapped reader addresses them without restating their
+//!   layout. [`SketchHeader`] and [`KeysetHeader`] validate and expose the
+//!   metadata of the dictionary-derived artifacts under `filters/` and
+//!   `keysets/`.
 //! - **Bounded work**, so a service can spend a published budget rather than
 //!   discover a query's cost after paying it: [`TextSearcher::search_up_to`]
 //!   and [`TextSearcher::scan_matching_objects`].
@@ -44,7 +49,11 @@
 //! # What is deliberately absent
 //!
 //! Builder entry points, the pipeline, the sorter, and the RDF parsers. Those
-//! are the CLI's business. Also absent are readers whose logic a mapped
+//! are the CLI's business — with one exception, which is knowledge rather than
+//! parsing: [`rdf_input_carries_graphs`] says whether a file name denotes a
+//! syntax with a fourth position, because a caller deciding whether to build a
+//! quads bundle would otherwise keep its own copy of that table and drift from
+//! this one. Also absent are readers whose logic a mapped
 //! implementation replaces outright rather than reuses; `PermutationIndex`
 //! appears here for its directory accessors, not for `triples()`.
 
@@ -107,11 +116,40 @@ pub use crate::permutation::{
 };
 
 // ---------------------------------------------------------------------------
+// Graphs sidecar (.hdt.graphs)
+// ---------------------------------------------------------------------------
+//
+// [`GraphSidecarDirectory::read`] is the mapped reader's open path: the
+// header, bound to the HDT, locates the sidecar's three parts. The fixed-size
+// records — a layer-directory entry, a chunk-directory entry, an Elias–Fano
+// header — are decoded by these parsers wherever a reader addresses them,
+// and a mapped reader addresses them lazily: a bundle may carry thousands of
+// graphs, so reading every entry at open would make opening proportional to
+// `G`. The graph dictionary is one standard PFC section at
+// `dictionary_offset`, so [`scan_pfc_section`] locates it. The seek-based
+// `GraphSidecarReader` is this crate's own and stays off the façade.
+
+pub use crate::quads::{
+    ELIAS_FANO_HEADER_SIZE, ELIAS_FANO_SUBBLOCK_BITS, ELIAS_FANO_SUPERBLOCK_BITS, EliasFanoHeader,
+    GRAPH_ARRAY_CONTAINER_MAX, GRAPH_BITMAP_CONTAINER_BYTES, GRAPH_BITMAP_CONTAINER_SUBBLOCK_BITS,
+    GRAPH_BITMAP_CONTAINER_SUBRANK_BYTES, GRAPH_CHUNK_ENTRY_SIZE, GRAPH_LAYER_ENTRY_SIZE,
+    GRAPH_POSITION_CHUNK_SHIFT, GraphChunkContainer, GraphChunkEntry, GraphLayerEncoding,
+    GraphLayerEntry, GraphSidecarDirectory, GraphSidecarHeader, GraphSidecarOpenError,
+    canonical_sidecar_path as graph_sidecar_path,
+};
+
+// ---------------------------------------------------------------------------
 // Graphs sidecar index (.hdt.graphs.idx)
 // ---------------------------------------------------------------------------
+//
+// [`GraphIndex::directory`] is the mapped reader's open path: the typed
+// section directory, bound to both parents. A layer set inside the index has
+// exactly the sidecar's layout (`docs/graphs-index-format.md` §5.1), so the
+// record parsers above serve it unchanged.
 
 pub use crate::graph_index::{
-    GraphIndex, GraphIndexOpenError, GraphIndexSpace, canonical_path as graph_index_path,
+    GraphIndex, GraphIndexDirectory, GraphIndexHeader, GraphIndexOpenError, GraphIndexSection,
+    GraphIndexSectionKind, GraphIndexSpace, canonical_path as graph_index_path,
     validate_graph_index,
 };
 
@@ -141,3 +179,22 @@ pub use crate::text::{
     TextScanPosition, TextSearch, TextSearcher, default_text_index_path, normalize_language,
     verify_text_index_binding,
 };
+
+// ---------------------------------------------------------------------------
+// RDF input classification
+// ---------------------------------------------------------------------------
+
+/// Whether a file name denotes RDF that can carry named graphs.
+///
+/// The parsers stay out of this module, but *which syntax has a fourth
+/// position* is format knowledge, and a caller deciding whether to build a
+/// quads bundle would otherwise keep its own copy of the extension table and
+/// drift from this one. Compression suffixes are stripped first, so
+/// `data.nq.gz` is N-Quads. A name hdtc does not recognize as RDF at all —
+/// a directory, an `.hdt`, anything else — answers `false`.
+///
+/// It answers about the *name*, which is all a name can say: a `.nt` file
+/// holding quads is a file, not a question this can decide.
+pub fn rdf_input_carries_graphs(path: &std::path::Path) -> bool {
+    crate::rdf::input::format_of(path).is_some_and(crate::rdf::input::RdfFormat::is_quad_format)
+}

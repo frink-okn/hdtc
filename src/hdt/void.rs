@@ -963,8 +963,10 @@ fn class_entity_counts(
 /// - Language-tagged literal `"..."@tag` → entry for that language tag (implicitly rdf:langString)
 /// - Plain literal `"..."` → entry for xsd:string (RDF 1.1)
 ///
-/// Sequential access through `PfcSectionIndex::get_bytes()` achieves near-optimal
-/// block-cache hit rates since IDs are accessed in order.
+/// The section is streamed with `PfcSectionIndex::for_each_term`, not read
+/// through the block cache: every block is visited once, and caching them
+/// would leave the cache full of this section's longest terms — the literals —
+/// for the rest of the run.
 fn build_datatype_index(
     resolver: &mut DictionaryResolver,
     nb_shared: u64,
@@ -994,25 +996,18 @@ fn build_datatype_index(
     // remapped to final IDs (lang_boundary + idx) after all datatypes are known.
     const LANG_FLAG: u16 = 0x8000;
 
-    let mut term_buf = Vec::new();
     let mut literals_found: u64 = 0;
 
-    for local_id in 1..=nb_object_only {
-        term_buf.clear();
-        resolver
-            .objects
-            .get_bytes(local_id, &mut term_buf)
-            .with_context(|| format!("Failed to read object-only ID {local_id}"))?;
-
-        if !term_buf.starts_with(b"\"") {
+    resolver.objects.for_each_term(|local_id, term| {
+        if !term.starts_with(b"\"") {
             // Not a literal — leave as 0.
-            continue;
+            return Ok(());
         }
 
         literals_found += 1;
 
-        let (_, suffix_start) = find_literal_boundary(&term_buf);
-        let suffix = &term_buf[suffix_start..];
+        let (_, suffix_start) = find_literal_boundary(term);
+        let suffix = &term[suffix_start..];
 
         let entry = if suffix.starts_with(b"^^<") && suffix.ends_with(b">") {
             // Typed literal: extract datatype IRI.
@@ -1059,7 +1054,8 @@ fn build_datatype_index(
         if literals_found.is_multiple_of(10_000_000) {
             tracing::info!("  Datatype index: {literals_found} literals classified...");
         }
-    }
+        Ok(())
+    })?;
 
     // Remap language-tag entries from (LANG_FLAG | idx) to (lang_boundary + idx).
     let lang_boundary = datatype_iris.len() as u16 + 1;

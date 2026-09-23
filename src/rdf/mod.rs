@@ -1,4 +1,4 @@
-mod input;
+pub(crate) mod input;
 pub(crate) mod parser;
 pub(crate) use parser::{HeaderCounts, header_counts, header_triples};
 pub(crate) mod serializer;

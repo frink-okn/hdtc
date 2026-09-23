@@ -11,12 +11,17 @@ mod common;
 
 use common::{REPRESENTATIVE_NT, write_file};
 use hdtc::format::{
-    GraphIndex, GraphIndexOpenError, KeyRole, KeysetEncoding, KeysetHeader, KeysetOpenError,
-    ParsedLiteral, PermutationComponent, PermutationIndex, PermutationIndexOpenError,
-    PermutationSectionKind, PfcSectionHeader, PfcSectionIterator, SketchBody, SketchHeader,
-    SketchKind, SketchOpenError, encode_literal, graph_index_path, keyset_path, packed_len,
-    parse_literal, permutation_index_path, read_keyset_header, read_sketch_header,
-    scan_hdt_sections, sha256_to_end, sketch_path,
+    ELIAS_FANO_HEADER_SIZE, ELIAS_FANO_SUBBLOCK_BITS, ELIAS_FANO_SUPERBLOCK_BITS, EliasFanoHeader,
+    GRAPH_ARRAY_CONTAINER_MAX, GRAPH_BITMAP_CONTAINER_BYTES, GRAPH_BITMAP_CONTAINER_SUBBLOCK_BITS,
+    GRAPH_BITMAP_CONTAINER_SUBRANK_BYTES, GRAPH_CHUNK_ENTRY_SIZE, GRAPH_LAYER_ENTRY_SIZE,
+    GRAPH_POSITION_CHUNK_SHIFT, GraphChunkContainer, GraphChunkEntry, GraphIndex,
+    GraphIndexOpenError, GraphIndexSectionKind, GraphLayerEncoding, GraphLayerEntry,
+    GraphSidecarDirectory, KeyRole, KeysetEncoding, KeysetHeader, KeysetOpenError, ParsedLiteral,
+    PermutationComponent, PermutationIndex, PermutationIndexOpenError, PermutationSectionKind,
+    PfcSectionHeader, PfcSectionIterator, SketchBody, SketchHeader, SketchKind, SketchOpenError,
+    encode_literal, graph_index_path, graph_sidecar_path, keyset_path, packed_len, parse_literal,
+    permutation_index_path, rdf_input_carries_graphs, read_keyset_header, read_sketch_header,
+    scan_hdt_sections, scan_pfc_section, sha256_to_end, sketch_path,
 };
 use std::fs::File;
 use std::io::{BufReader, Seek, SeekFrom};
@@ -220,6 +225,29 @@ fn open_distinguishes_a_foreign_hdt_from_a_malformed_sidecar() {
     assert!(matches!(error, PermutationIndexOpenError::Sidecar { .. }));
 }
 
+/// CRC32C as the formats define it, computed independently of hdtc's own
+/// implementation so the test is an oracle rather than an echo.
+fn crc32c(bytes: &[u8]) -> u32 {
+    crc::Crc::<u32>::new(&crc::CRC_32_ISCSI).checksum(bytes)
+}
+
+#[test]
+fn the_graph_index_directory_classifies_foreign_parents() {
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    let first_hdt = build_graph_fixture_from(first.path(), "<urn:s> <urn:p> <urn:o> <urn:g> .\n");
+    let second_hdt = build_graph_fixture_from(
+        second.path(),
+        "<urn:s> <urn:p> <urn:o> <urn:g> .\n<urn:t> <urn:p> <urn:o> <urn:h> .\n",
+    );
+    let error = match GraphIndex::directory(&graph_index_path(&first_hdt), &second_hdt) {
+        Err(error) => error,
+        Ok(_) => panic!("a directory from another HDT must not bind"),
+    };
+    assert!(matches!(error, GraphIndexOpenError::Binding { .. }));
+    assert!(GraphSidecarDirectory::read(&graph_sidecar_path(&first_hdt), &second_hdt).is_err());
+}
+
 #[test]
 fn graph_open_distinguishes_foreign_parents_from_a_malformed_index() {
     let first = tempfile::tempdir().unwrap();
@@ -248,6 +276,440 @@ fn graph_open_distinguishes_foreign_parents_from_a_malformed_index() {
         Ok(_) => panic!("a truncated graph index must be classified separately"),
     };
     assert!(matches!(error, GraphIndexOpenError::Index { .. }));
+}
+
+/// The graphs half of the same contract. A mapped reader locates the sidecar's
+/// dictionary and layer directory from the header, the index's layer sets and
+/// transpose from the section directory, and decodes each layer's records
+/// lazily from the bytes those offsets name — so every offset must be
+/// resolvable against the file, and every record decodable, for every
+/// encoding a layer can have.
+#[test]
+fn the_graph_artifacts_describe_every_region_well_enough_to_map_them() {
+    let temp = tempfile::tempdir().unwrap();
+    let hdt = build_graph_fixture_from(temp.path(), &synthetic_quads());
+    let sidecar_path = graph_sidecar_path(&hdt);
+    let index_path = graph_index_path(&hdt);
+
+    let sidecar = GraphSidecarDirectory::read(&sidecar_path, &hdt).expect("open sidecar");
+    let header = *sidecar.header();
+    let sidecar_bytes = std::fs::read(&sidecar_path).unwrap();
+    assert_eq!(sidecar.path(), sidecar_path.as_path());
+    assert_eq!(header.file_size, sidecar_bytes.len() as u64);
+    assert!(header.triples > 0);
+    assert_eq!(header.named_graphs, 3);
+    assert!(header.memberships > header.triples);
+    assert!(header.is_exhaustive() && !header.is_disjoint() && !header.has_blank_graph_names());
+    assert!(sidecar.hdt_data_offset() > 0);
+    // The header's own CRC and the directory's trailing CRC cover the bytes
+    // the offsets name, so a header that pointed elsewhere would fail here.
+    assert_eq!(crc32c(&sidecar_bytes[..252]), header.header_crc);
+    let directory_end = (header.directory_offset + header.directory_length) as usize;
+    assert_eq!(
+        crc32c(&sidecar_bytes[header.directory_offset as usize..directory_end - 4]),
+        u32::from_le_bytes(
+            sidecar_bytes[directory_end - 4..directory_end]
+                .try_into()
+                .unwrap()
+        )
+    );
+
+    // The graph dictionary is one standard PFC section, so the ordinary
+    // scanner locates it and its count is the named-graph count.
+    let mut cursor = std::io::Cursor::new(&sidecar_bytes[..]);
+    cursor
+        .seek(SeekFrom::Start(header.dictionary_offset))
+        .unwrap();
+    let dictionary = scan_pfc_section(&mut cursor, "graph dictionary").expect("scan dictionary");
+    assert_eq!(dictionary.string_count, header.named_graphs);
+    assert_eq!(dictionary.section_start, header.dictionary_offset);
+    assert!(dictionary.section_end <= header.directory_offset);
+
+    let mut encodings = Vec::new();
+    let sidecar_layers = check_layer_set(
+        &sidecar_bytes,
+        header.directory_offset,
+        header.named_graphs,
+        header.triples,
+        &mut encodings,
+    );
+    assert_eq!(
+        sidecar_layers
+            .iter()
+            .map(|entry| entry.member_count)
+            .sum::<u64>(),
+        header.memberships,
+        "layer counts sum to M"
+    );
+    // Layer 0 is empty here — every triple is in a named graph — and an empty
+    // layer records the sparse encoding with no structure behind it.
+    let empty = &sidecar_layers[0];
+    assert_eq!(empty.member_count, 0);
+    assert_eq!(
+        empty.layer_encoding(),
+        Some(GraphLayerEncoding::SparseChunks)
+    );
+    assert!(
+        empty.primary_offset == 0
+            && empty.primary_length == 0
+            && empty.secondary_offset == 0
+            && empty.secondary_length == 0
+            && empty.item_count_a == 0
+            && empty.item_count_b == 0
+            && empty.parameter == 0
+            && empty.primary_crc == 0
+            && empty.secondary_crc == 0
+    );
+    assert!(
+        sidecar_layers
+            .iter()
+            .filter(|entry| entry.member_count > 0)
+            .all(|entry| {
+                entry.primary_offset >= header.layers_offset
+                    && entry.primary_offset < header.layers_offset + header.layers_length
+            }),
+        "every non-empty layer lives inside the layers span"
+    );
+
+    // Both re-keyed layer sets, framed exactly like the sidecar's, and no
+    // transpose unless the header says so.
+    let index = GraphIndex::directory(&index_path, &hdt).expect("open index directory");
+    let index_bytes = std::fs::read(&index_path).unwrap();
+    assert_eq!(index.path(), index_path.as_path());
+    assert_eq!(index.header().file_size, index_bytes.len() as u64);
+    assert_eq!(index.header().triples, header.triples);
+    assert_eq!(index.header().named_graphs, header.named_graphs);
+    assert_eq!(index.header().memberships, header.memberships);
+    assert_eq!(index.header().source_digest, header.source_digest);
+    assert!(index.header().has_pos_layers() && index.header().has_ops_layers());
+    assert_eq!(
+        index.header().section_count as usize,
+        index.sections().len()
+    );
+    assert!(
+        index
+            .sections()
+            .windows(2)
+            .all(|w| w[0].section_type < w[1].section_type)
+    );
+    for section in index.sections() {
+        assert!(section.kind().is_some(), "{:#06x}", section.section_type);
+        if section.length > 0 {
+            assert_eq!(section.offset % 64, 0);
+            assert!(section.offset + section.length <= index_bytes.len() as u64);
+        }
+    }
+    for (directory, region) in [
+        (
+            GraphIndexSectionKind::PosLayerDirectory,
+            GraphIndexSectionKind::PosLayerRegion,
+        ),
+        (
+            GraphIndexSectionKind::OpsLayerDirectory,
+            GraphIndexSectionKind::OpsLayerRegion,
+        ),
+    ] {
+        let directory = index.section(directory).expect("layer directory");
+        assert_eq!(directory.entry_count, header.named_graphs + 1);
+        let entries_end = (directory.offset + directory.length) as usize;
+        assert_eq!(
+            crc32c(&index_bytes[directory.offset as usize..entries_end]),
+            directory.crc,
+            "the section CRC covers the directory payload"
+        );
+        let region = index.section(region).expect("layer region");
+        let layers = check_layer_set(
+            &index_bytes,
+            directory.offset,
+            header.named_graphs,
+            header.triples,
+            &mut encodings,
+        );
+        for (graph, layer) in layers.iter().enumerate() {
+            assert_eq!(
+                layer.member_count, sidecar_layers[graph].member_count,
+                "a layer set holds the sidecar's memberships in another space"
+            );
+            if layer.member_count > 0 {
+                assert!(
+                    layer.primary_offset >= region.offset
+                        && layer.primary_offset < region.offset + region.length
+                );
+            }
+        }
+    }
+    let transposed = index.header().has_membership_ranks();
+    assert_eq!(
+        index
+            .section(GraphIndexSectionKind::TransposeBitmap)
+            .is_some(),
+        transposed
+    );
+    assert_eq!(
+        index
+            .section(GraphIndexSectionKind::TransposeArray)
+            .is_some(),
+        index.header().has_membership_ids()
+    );
+
+    encodings.sort();
+    encodings.dedup();
+    assert_eq!(
+        encodings,
+        vec![
+            GraphLayerEncoding::DenseChunks,
+            GraphLayerEncoding::SparseChunks,
+            GraphLayerEncoding::EliasFano,
+        ],
+        "the synthetic fixture must reach every encoding a reader has to decode"
+    );
+}
+
+/// Decode a layer directory from the bytes at `directory_offset` and walk
+/// every record each layer names, so a wrong offset or an undecodable record
+/// fails here rather than in a downstream reader.
+fn check_layer_set(
+    bytes: &[u8],
+    directory_offset: u64,
+    named_graphs: u64,
+    triples: u64,
+    encodings: &mut Vec<GraphLayerEncoding>,
+) -> Vec<GraphLayerEntry> {
+    let mut layers = Vec::new();
+    for graph in 0..=named_graphs {
+        let start = (directory_offset + graph * GRAPH_LAYER_ENTRY_SIZE as u64) as usize;
+        let entry: &[u8; GRAPH_LAYER_ENTRY_SIZE] = bytes[start..start + GRAPH_LAYER_ENTRY_SIZE]
+            .try_into()
+            .unwrap();
+        let layer = GraphLayerEntry::parse(entry);
+        let encoding = layer.layer_encoding().expect("a version-1 encoding");
+        if layer.member_count == 0 {
+            assert_eq!(layer.minimum_position, triples);
+            assert_eq!(layer.maximum_position_exclusive, 0);
+            layers.push(layer);
+            continue;
+        }
+        encodings.push(encoding);
+        assert!(layer.minimum_position < layer.maximum_position_exclusive);
+        assert!(layer.maximum_position_exclusive <= triples);
+        assert_eq!(layer.primary_offset % 64, 0);
+        let primary_end = layer.primary_offset + layer.primary_length;
+        assert!(primary_end <= bytes.len() as u64);
+        // Identity, not merely bounds: the primary CRC covers the bytes the
+        // offset names, so an offset onto the wrong bytes fails here.
+        assert_eq!(
+            crc32c(&bytes[layer.primary_offset as usize..primary_end as usize]),
+            layer.primary_crc,
+            "layer {graph} primary CRC"
+        );
+        match encoding {
+            GraphLayerEncoding::DenseChunks | GraphLayerEncoding::SparseChunks => {
+                assert_eq!(
+                    layer.primary_length,
+                    layer.item_count_a * GRAPH_CHUNK_ENTRY_SIZE as u64
+                );
+                if encoding == GraphLayerEncoding::DenseChunks {
+                    assert_eq!(
+                        layer.item_count_a,
+                        triples.div_ceil(1 << GRAPH_POSITION_CHUNK_SHIFT),
+                        "a dense directory covers the universe"
+                    );
+                    assert_eq!(layer.secondary_offset, 0);
+                    assert_eq!(layer.parameter, 0);
+                } else {
+                    assert_eq!(layer.item_count_a, layer.item_count_b);
+                    assert!(layer.parameter.is_power_of_two() && layer.parameter >= 2);
+                    assert!(layer.parameter >= 2 * layer.item_count_a);
+                    assert_eq!(layer.secondary_offset % 8, 0);
+                }
+                let mut rank = 0;
+                let mut non_empty = 0;
+                let mut previous_key = None;
+                for index in 0..layer.item_count_a {
+                    let start =
+                        (layer.primary_offset + index * GRAPH_CHUNK_ENTRY_SIZE as u64) as usize;
+                    let chunk: &[u8; GRAPH_CHUNK_ENTRY_SIZE] = bytes
+                        [start..start + GRAPH_CHUNK_ENTRY_SIZE]
+                        .try_into()
+                        .unwrap();
+                    let chunk = GraphChunkEntry::parse(chunk);
+                    assert_eq!(chunk.rank_before, rank);
+                    assert!(chunk.key < triples.div_ceil(1 << GRAPH_POSITION_CHUNK_SHIFT));
+                    if encoding == GraphLayerEncoding::DenseChunks {
+                        assert_eq!(chunk.key, index, "dense chunks are keyed by index");
+                    } else {
+                        assert!(
+                            chunk.cardinality > 0,
+                            "sparse directories hold no empty chunk"
+                        );
+                        assert!(previous_key.is_none_or(|key| chunk.key > key));
+                    }
+                    previous_key = Some(chunk.key);
+                    match chunk.container().expect("a version-1 container") {
+                        GraphChunkContainer::Empty => assert_eq!(chunk.cardinality, 0),
+                        GraphChunkContainer::Array => {
+                            assert!(chunk.cardinality <= GRAPH_ARRAY_CONTAINER_MAX);
+                            assert_eq!(chunk.payload_length, chunk.cardinality * 2);
+                        }
+                        GraphChunkContainer::Bitmap => {
+                            assert!(chunk.cardinality > GRAPH_ARRAY_CONTAINER_MAX);
+                            assert_eq!(chunk.payload_length, GRAPH_BITMAP_CONTAINER_BYTES);
+                        }
+                    }
+                    if chunk.cardinality > 0 {
+                        non_empty += 1;
+                        assert_eq!(chunk.payload_offset % 8, 0);
+                        let payload_end = chunk.payload_offset + u64::from(chunk.payload_length);
+                        assert!(payload_end <= bytes.len() as u64);
+                        assert_eq!(
+                            crc32c(&bytes[chunk.payload_offset as usize..payload_end as usize]),
+                            chunk.payload_crc,
+                            "layer {graph} chunk {index} payload CRC"
+                        );
+                        if chunk.container() == Some(GraphChunkContainer::Bitmap) {
+                            // The subrank prefix counts the bitmap's set bits per
+                            // subblock, so the two halves of the payload agree.
+                            let payload =
+                                &bytes[chunk.payload_offset as usize..payload_end as usize];
+                            let bitmap = &payload[GRAPH_BITMAP_CONTAINER_SUBRANK_BYTES..];
+                            let mut seen = 0u32;
+                            for (block, subrank) in payload[..GRAPH_BITMAP_CONTAINER_SUBRANK_BYTES]
+                                .chunks_exact(2)
+                                .enumerate()
+                            {
+                                assert_eq!(
+                                    u16::from_le_bytes([subrank[0], subrank[1]]),
+                                    seen as u16
+                                );
+                                let bytes_per_block =
+                                    GRAPH_BITMAP_CONTAINER_SUBBLOCK_BITS as usize / 8;
+                                seen += bitmap
+                                    [block * bytes_per_block..(block + 1) * bytes_per_block]
+                                    .iter()
+                                    .map(|byte| byte.count_ones())
+                                    .sum::<u32>();
+                            }
+                            assert_eq!(seen, chunk.cardinality);
+                        }
+                    }
+                    rank += u64::from(chunk.cardinality);
+                }
+                assert_eq!(rank, layer.member_count);
+                assert_eq!(non_empty, layer.item_count_b);
+                if encoding == GraphLayerEncoding::SparseChunks {
+                    assert_eq!(layer.secondary_length, layer.parameter * 8);
+                    let secondary_end = layer.secondary_offset + layer.secondary_length;
+                    assert!(secondary_end <= bytes.len() as u64);
+                    assert_eq!(
+                        crc32c(&bytes[layer.secondary_offset as usize..secondary_end as usize]),
+                        layer.secondary_crc,
+                        "layer {graph} access hash CRC"
+                    );
+                }
+            }
+            GraphLayerEncoding::EliasFano => {
+                assert_eq!(layer.primary_length, ELIAS_FANO_HEADER_SIZE as u64);
+                let start = layer.primary_offset as usize;
+                let raw: &[u8; ELIAS_FANO_HEADER_SIZE] = bytes
+                    [start..start + ELIAS_FANO_HEADER_SIZE]
+                    .try_into()
+                    .unwrap();
+                let ef = EliasFanoHeader::parse(raw).expect("a valid Elias-Fano header");
+                assert_eq!(ef.universe, triples);
+                assert_eq!(ef.members, layer.member_count);
+                let ratio = ef.universe / ef.members;
+                let expected_low_bits = if ratio <= 1 {
+                    0
+                } else {
+                    63 - ratio.leading_zeros()
+                };
+                assert_eq!(ef.low_bits, expected_low_bits, "canonical low-bit width");
+                assert_eq!(ef.high_buckets, 1 + ((ef.universe - 1) >> ef.low_bits));
+                assert_eq!(ef.upper_bits, ef.high_buckets + ef.members);
+                assert_eq!(
+                    ef.lower_length,
+                    (ef.members * u64::from(ef.low_bits)).div_ceil(8)
+                );
+                assert_eq!(ef.upper_length, ef.upper_bits.div_ceil(8));
+                assert_eq!(
+                    ef.superrank_count,
+                    ef.upper_bits
+                        .div_ceil(u64::from(ELIAS_FANO_SUPERBLOCK_BITS))
+                        + 1
+                );
+                assert_eq!(
+                    ef.subrank_count,
+                    ef.upper_bits.div_ceil(u64::from(ELIAS_FANO_SUBBLOCK_BITS))
+                );
+                assert_eq!(ef.superrank_length, ef.superrank_count * 8);
+                assert_eq!(ef.subrank_length, ef.subrank_count * 2);
+                let mut previous_end = primary_end;
+                for (offset, length, crc, what) in [
+                    (ef.lower_offset, ef.lower_length, ef.lower_crc, "lower"),
+                    (
+                        ef.superrank_offset,
+                        ef.superrank_length,
+                        ef.superrank_crc,
+                        "superrank",
+                    ),
+                    (
+                        ef.subrank_offset,
+                        ef.subrank_length,
+                        ef.subrank_crc,
+                        "subrank",
+                    ),
+                    (ef.upper_offset, ef.upper_length, ef.upper_crc, "upper"),
+                ] {
+                    if length == 0 {
+                        assert_eq!((offset, crc), (0, 0), "an absent {what} region is all zero");
+                        continue;
+                    }
+                    assert_eq!(offset % 8, 0);
+                    assert!(
+                        offset >= previous_end,
+                        "{what} region overlaps or is out of order"
+                    );
+                    let end = offset + length;
+                    assert!(end <= bytes.len() as u64);
+                    assert_eq!(
+                        crc32c(&bytes[offset as usize..end as usize]),
+                        crc,
+                        "layer {graph} Elias-Fano {what} CRC"
+                    );
+                    previous_end = end;
+                }
+                let mut corrupt = *raw;
+                corrupt[0] ^= 1;
+                assert!(EliasFanoHeader::parse(&corrupt).is_err());
+            }
+        }
+        layers.push(layer);
+    }
+    layers
+}
+
+/// Three graphs over one universe, at densities that make the writer pick a
+/// different encoding for each: everything (dense chunks with bitmap
+/// containers), every three-hundredth triple (Elias–Fano), and a short run in
+/// the middle (sparse chunks with an array container). The universe spans
+/// three position chunks; with one chunk a dense directory is always the
+/// cheapest structure and nothing else is ever chosen.
+fn synthetic_quads() -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    for i in 0..140_000u32 {
+        let subject = format!("<urn:s{}>", i / 4);
+        let predicate = format!("<urn:p{}>", i % 4);
+        let object = format!("<urn:o{i}>");
+        writeln!(out, "{subject} {predicate} {object} <urn:g:all> .").unwrap();
+        if i % 300 == 0 {
+            writeln!(out, "{subject} {predicate} {object} <urn:g:sparse> .").unwrap();
+        }
+        if (70_000..70_040).contains(&i) {
+            writeln!(out, "{subject} {predicate} {object} <urn:g:run> .").unwrap();
+        }
+    }
+    out
 }
 
 #[test]
@@ -650,4 +1112,98 @@ fn the_text_surface_queries_describes_and_binds() {
         error.to_string().contains("binding mismatch"),
         "unexpected error: {error}"
     );
+}
+
+/// A name says whether its RDF carries graphs, and a build agrees with it.
+///
+/// The predicate exists so a caller deciding whether to build a quads bundle
+/// does not keep its own extension table. That is only worth anything if it
+/// matches what a quads build really preserves, so each case here is built and
+/// the sidecar asked how many named graphs it found.
+#[test]
+fn the_input_classification_agrees_with_what_a_quads_build_preserves() {
+    let one_graph = [
+        (
+            "input.nq",
+            "<http://e.org/a> <http://e.org/b> <http://e.org/c> <http://e.org/g1> .\n",
+        ),
+        (
+            "input.trig",
+            "<http://e.org/g1> { <http://e.org/a> <http://e.org/b> <http://e.org/c> . }\n",
+        ),
+        (
+            "input.jsonld",
+            "{\"@graph\": [{\"@id\": \"http://e.org/g1\", \"@graph\": \
+             [{\"@id\": \"http://e.org/a\", \"http://e.org/b\": {\"@id\": \"http://e.org/c\"}}]}]}",
+        ),
+        // A formula's statements land in a graph named by a blank node.
+        (
+            "input.n3",
+            "<http://e.org/s> <http://e.org/says> \
+             { <http://e.org/a> <http://e.org/b> <http://e.org/c> . } .\n",
+        ),
+    ];
+    let no_graph = [
+        (
+            "input.nt",
+            "<http://e.org/a> <http://e.org/b> <http://e.org/c> .\n",
+        ),
+        (
+            "input.ttl",
+            "<http://e.org/a> <http://e.org/b> <http://e.org/c> .\n",
+        ),
+    ];
+
+    for (name, source) in one_graph.iter().chain(no_graph.iter()) {
+        let expected = one_graph.iter().any(|(candidate, _)| candidate == name);
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join(name);
+        write_file(&input, source.as_bytes());
+        assert_eq!(
+            rdf_input_carries_graphs(&input),
+            expected,
+            "{name} is classified by its name"
+        );
+        // And compressed, which is the same syntax under a second suffix.
+        assert_eq!(
+            rdf_input_carries_graphs(&temp.path().join(format!("{name}.gz"))),
+            expected,
+            "{name}.gz is the same syntax"
+        );
+
+        let hdt = temp.path().join("data.hdt");
+        let output = Command::new(env!("CARGO_BIN_EXE_hdtc"))
+            .args([
+                "create",
+                input.to_str().unwrap(),
+                "-o",
+                hdt.to_str().unwrap(),
+                "--mode",
+                "quads",
+                "--temp-dir",
+                temp.path().join("work").to_str().unwrap(),
+                "--memory-limit",
+                "64M",
+            ])
+            .output()
+            .expect("run hdtc");
+        assert!(
+            output.status.success(),
+            "hdtc create failed for {name}:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let sidecar = GraphSidecarDirectory::read(&graph_sidecar_path(&hdt), &hdt)
+            .unwrap_or_else(|error| panic!("open the sidecar built from {name}: {error}"));
+        assert_eq!(
+            sidecar.header().named_graphs > 0,
+            expected,
+            "{name} builds what its name promised"
+        );
+    }
+
+    // Neither a directory nor an artifact is RDF input.
+    let temp = tempfile::tempdir().unwrap();
+    assert!(!rdf_input_carries_graphs(temp.path()));
+    assert!(!rdf_input_carries_graphs(&temp.path().join("data.hdt")));
+    assert!(!rdf_input_carries_graphs(&temp.path().join("notes.txt")));
 }

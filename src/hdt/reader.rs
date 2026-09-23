@@ -92,7 +92,7 @@ pub struct HdtSectionOffsets {
 ///
 /// Supports ID→term lookup (`get_bytes`), term→ID lookup (`locate`), and
 /// lower-bound/prefix-range searches.
-/// Block-level LRU cache bounds memory usage.
+/// Decoded blocks are cached first-in, first-out under a byte budget.
 pub struct PfcSectionIndex {
     pub section_name: &'static str,
     pub string_count: u64,
@@ -104,8 +104,29 @@ pub struct PfcSectionIndex {
     /// Seekable reader for block data.
     reader: BufReader<File>,
     block_cache: HashMap<u64, Vec<Vec<u8>>>,
+    /// Cached block indexes in insertion order; the front is evicted first.
     cache_order: VecDeque<u64>,
-    cache_capacity: usize,
+    /// [`decoded_block_bytes`] summed over the cached blocks.
+    cache_bytes: usize,
+    cache_budget: usize,
+}
+
+/// An allocator chunk header, and rounding to its 16-byte granularity.
+const ALLOCATION_OVERHEAD: usize = 16;
+
+/// Resident bytes of one cached block: its terms, their `Vec` headers, and the
+/// allocator's overhead on each.
+///
+/// Counted per block rather than assumed, because a term's size is unbounded: a
+/// block of geometry literals can be a thousand times a block of IRIs. The map
+/// and queue slots holding the block are not included; they outlive the block
+/// and are counted by [`PfcSectionIndex::table_bytes`].
+fn decoded_block_bytes(block: &[Vec<u8>]) -> usize {
+    let terms: usize = block
+        .iter()
+        .map(|term| term.capacity() + std::mem::size_of::<Vec<u8>>() + ALLOCATION_OVERHEAD)
+        .sum();
+    ALLOCATION_OVERHEAD + terms
 }
 
 impl PfcSectionIndex {
@@ -183,10 +204,6 @@ impl PfcSectionIndex {
             .seek(SeekFrom::Current(buffer_length as i64 + 4))
             .with_context(|| format!("Failed to skip string buffer for {section_name}"))?;
 
-        // ~2KB per decoded block; at least 64 blocks so small budgets still work.
-        const ESTIMATED_BLOCK_BYTES: usize = 2048;
-        let cache_capacity = (cache_budget / ESTIMATED_BLOCK_BYTES).max(64);
-
         let file = File::open(hdt_path)?;
         Ok(Self {
             section_name,
@@ -197,7 +214,9 @@ impl PfcSectionIndex {
             reader: BufReader::with_capacity(64 * 1024, file),
             block_cache: HashMap::new(),
             cache_order: VecDeque::new(),
-            cache_capacity,
+            cache_bytes: 0,
+            // A floor so a tiny budget still caches a few dozen blocks of IRIs.
+            cache_budget: cache_budget.max(128 * 1024),
         })
     }
 
@@ -351,22 +370,173 @@ impl PfcSectionIndex {
         Ok(result)
     }
 
-    /// Return a decoded block, using the LRU cache.
+    /// Visit every term in ID order, reading the section front to back.
+    ///
+    /// A full scan never revisits a block, so it bypasses the block cache. Sent
+    /// through [`get_bytes`](Self::get_bytes) instead, it would fill the cache to
+    /// capacity with terms that are never read again — and capacity is counted in
+    /// blocks sized for short terms, so a section of long literals would hold many
+    /// times its budget.
+    pub fn for_each_term(&mut self, mut visit: impl FnMut(u64, &[u8]) -> Result<()>) -> Result<()> {
+        let blocks = self.offsets.len().saturating_sub(1) as u64;
+        if blocks == 0 {
+            return Ok(());
+        }
+        // Blocks are contiguous, so one seek positions the whole scan.
+        let (first, _) = self.block_range(0)?;
+        self.reader
+            .seek(SeekFrom::Start(self.string_buf_start + first))?;
+
+        let mut data = Vec::new();
+        let mut term = Vec::new();
+        let mut id = 0u64;
+        for block_index in 0..blocks {
+            let (start, end) = self.block_range(block_index)?;
+            data.resize((end - start) as usize, 0);
+            self.reader.read_exact(&mut data)?;
+            self.decode_terms(block_index, &data, &mut term, |value| {
+                id += 1;
+                visit(id, value)
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Return a decoded block, using the block cache.
+    ///
+    /// The block just decoded is never evicted, since it is the one returned; a
+    /// single block larger than the whole budget is the only way to exceed it.
     fn get_or_decode_block(&mut self, block_index: u64) -> Result<&Vec<Vec<u8>>> {
         if !self.block_cache.contains_key(&block_index) {
             let block = self.decode_block(block_index)?;
+            self.cache_bytes += decoded_block_bytes(&block);
             self.block_cache.insert(block_index, block);
             self.cache_order.push_back(block_index);
-            while self.cache_order.len() > self.cache_capacity {
-                if let Some(evicted) = self.cache_order.pop_front() {
-                    self.block_cache.remove(&evicted);
+            while self.resident_bytes() > self.cache_budget && self.cache_order.len() > 1 {
+                if let Some(evicted) = self.cache_order.pop_front()
+                    && let Some(block) = self.block_cache.remove(&evicted)
+                {
+                    self.cache_bytes -= decoded_block_bytes(&block);
                 }
+                self.shrink_sparse_tables();
             }
         }
         Ok(self.block_cache.get(&block_index).unwrap())
     }
 
+    /// Bytes the cache holds: its blocks and the tables that index them.
+    fn resident_bytes(&self) -> usize {
+        self.cache_bytes + self.table_bytes()
+    }
+
+    /// Bytes of the map and queue storage, by capacity rather than occupancy.
+    ///
+    /// Neither shrinks when an entry is removed, so after many small blocks give
+    /// way to a few large ones their storage is still sized for the many. Counting
+    /// occupancy instead would let the blocks refill a budget the tables already
+    /// spend.
+    fn table_bytes(&self) -> usize {
+        // A map slot is the entry plus one control byte, and the map keeps an
+        // eighth of its slots empty.
+        let map_slot = std::mem::size_of::<(u64, Vec<Vec<u8>>)>() + 1;
+        let map = (self.block_cache.capacity() * map_slot).div_ceil(7) * 8;
+        let queue = self.cache_order.capacity() * std::mem::size_of::<u64>();
+        map + queue + 2 * ALLOCATION_OVERHEAD
+    }
+
+    /// Release table storage once three quarters of it is empty.
+    ///
+    /// Shrinking to twice the occupancy means the next shrink waits for half the
+    /// remaining entries to go, so rehashing costs amortized O(1) per eviction.
+    fn shrink_sparse_tables(&mut self) {
+        // Below this a table is too small to be worth rehashing.
+        const MIN_SHRINK_CAPACITY: usize = 64;
+        let entries = self.block_cache.len();
+        if self.block_cache.capacity() > MIN_SHRINK_CAPACITY
+            && entries * 4 <= self.block_cache.capacity()
+        {
+            self.block_cache.shrink_to(entries * 2);
+        }
+        if self.cache_order.capacity() > MIN_SHRINK_CAPACITY
+            && self.cache_order.len() * 4 <= self.cache_order.capacity()
+        {
+            self.cache_order.shrink_to(self.cache_order.len() * 2);
+        }
+    }
+
     fn decode_block(&mut self, block_index: u64) -> Result<Vec<Vec<u8>>> {
+        let (start, end) = self.block_range(block_index)?;
+        let mut data = vec![0u8; (end - start) as usize];
+        self.reader
+            .seek(SeekFrom::Start(self.string_buf_start + start))?;
+        self.reader.read_exact(&mut data)?;
+
+        let mut entries = Vec::with_capacity(self.block_entries(block_index) as usize);
+        let mut term = Vec::new();
+        self.decode_terms(block_index, &data, &mut term, |value| {
+            entries.push(value.to_vec());
+            Ok(())
+        })?;
+        Ok(entries)
+    }
+
+    /// Terms in block `block_index`: `block_size`, except in a short final block.
+    fn block_entries(&self, block_index: u64) -> u64 {
+        (self.string_count - block_index * self.block_size).min(self.block_size)
+    }
+
+    /// Decode one front-coded block, handing each term to `visit` in order.
+    ///
+    /// Each term is decoded in place over its predecessor in `term`, so decoding
+    /// allocates nothing per term.
+    fn decode_terms(
+        &self,
+        block_index: u64,
+        data: &[u8],
+        term: &mut Vec<u8>,
+        mut visit: impl FnMut(&[u8]) -> Result<()>,
+    ) -> Result<()> {
+        let mut pos = 0usize;
+        for i in 0..self.block_entries(block_index) {
+            if pos >= data.len() {
+                bail!(
+                    "Unexpected end of block in {} at entry {i}",
+                    self.section_name
+                );
+            }
+
+            if i == 0 {
+                term.clear();
+            } else {
+                let (shared, consumed) = decode_vbyte(&data[pos..])?;
+                pos += consumed;
+                let shared = shared as usize;
+                if shared > term.len() {
+                    bail!(
+                        "Invalid shared prefix length {} in {} block {block_index} (prev len {})",
+                        shared,
+                        self.section_name,
+                        term.len()
+                    );
+                }
+                term.truncate(shared);
+            }
+
+            let rel_end = data[pos..].iter().position(|&b| b == 0).with_context(|| {
+                format!(
+                    "Missing null terminator in {} block {block_index}",
+                    self.section_name
+                )
+            })?;
+            term.extend_from_slice(&data[pos..pos + rel_end]);
+            pos += rel_end + 1;
+            visit(term)?;
+        }
+        Ok(())
+    }
+
+    /// The byte range of block `block_index` within the string buffer.
+    fn block_range(&self, block_index: u64) -> Result<(u64, u64)> {
         let start = self
             .offsets
             .get(block_index as usize)
@@ -397,72 +567,7 @@ impl PfcSectionIndex {
                 start
             );
         }
-
-        let block_len = (end - start) as usize;
-        let mut data = vec![0u8; block_len];
-        self.reader
-            .seek(SeekFrom::Start(self.string_buf_start + start))?;
-        self.reader.read_exact(&mut data)?;
-
-        let base = block_index * self.block_size;
-        let max_entries = (self.string_count - base).min(self.block_size) as usize;
-        let mut entries = Vec::with_capacity(max_entries);
-
-        let mut pos = 0usize;
-        let mut prev_bytes = Vec::<u8>::new();
-        for i in 0..max_entries {
-            if pos >= data.len() {
-                bail!(
-                    "Unexpected end of block in {} at entry {i}",
-                    self.section_name
-                );
-            }
-
-            if i == 0 {
-                let rel_end = data[pos..].iter().position(|&b| b == 0).with_context(|| {
-                    format!(
-                        "Missing null terminator in {} block {block_index}",
-                        self.section_name
-                    )
-                })?;
-                let end_pos = pos + rel_end;
-                let term_bytes = data[pos..end_pos].to_vec();
-                pos = end_pos + 1;
-                prev_bytes = term_bytes.clone();
-                entries.push(term_bytes);
-                continue;
-            }
-
-            let (shared, consumed) = decode_vbyte(&data[pos..])?;
-            pos += consumed;
-            let rel_end = data[pos..].iter().position(|&b| b == 0).with_context(|| {
-                format!(
-                    "Missing null terminator in {} block {block_index}",
-                    self.section_name
-                )
-            })?;
-            let end_pos = pos + rel_end;
-            let suffix = &data[pos..end_pos];
-            pos = end_pos + 1;
-
-            let shared = shared as usize;
-            if shared > prev_bytes.len() {
-                bail!(
-                    "Invalid shared prefix length {} in {} block {block_index} (prev len {})",
-                    shared,
-                    self.section_name,
-                    prev_bytes.len()
-                );
-            }
-
-            let mut value_bytes = Vec::with_capacity(shared + suffix.len());
-            value_bytes.extend_from_slice(&prev_bytes[..shared]);
-            value_bytes.extend_from_slice(suffix);
-            prev_bytes = value_bytes.clone();
-            entries.push(value_bytes);
-        }
-
-        Ok(entries)
+        Ok((start, end))
     }
 }
 
@@ -1024,6 +1129,141 @@ mod tests {
                 strings.partition_point(|value| value.as_bytes() < query.as_bytes()) as u64 + 1;
             assert_eq!(index.lower_bound(query.as_bytes()).unwrap(), expected);
         }
+    }
+
+    #[test]
+    fn for_each_term_visits_every_term_in_order_without_caching() {
+        // Eleven terms in blocks of three: the last block is short, and the
+        // shared prefixes exercise front-coding across each block.
+        let strings = [
+            "aa0", "aa1", "aa2", "ab0", "ab1", "ba0", "ba1", "ba2", "bb0", "ca0", "za0",
+        ];
+        let (_temp, mut index) = pfc_index(&strings, 3);
+
+        let mut visited = Vec::new();
+        index
+            .for_each_term(|id, term| {
+                visited.push((id, String::from_utf8(term.to_vec()).unwrap()));
+                Ok(())
+            })
+            .unwrap();
+        let expected: Vec<_> = strings
+            .iter()
+            .enumerate()
+            .map(|(i, value)| (i as u64 + 1, value.to_string()))
+            .collect();
+        assert_eq!(visited, expected);
+        assert!(index.block_cache.is_empty());
+
+        // The scan leaves random access working.
+        let mut buf = Vec::new();
+        index.get_bytes(7, &mut buf).unwrap();
+        assert_eq!(buf, b"ba1");
+
+        let (_temp, mut empty) = pfc_index(&[], 4);
+        empty
+            .for_each_term(|_, _| panic!("an empty section has no terms"))
+            .unwrap();
+    }
+
+    /// The cached blocks' accounted bytes, recomputed from the blocks themselves.
+    fn recount_cache(index: &PfcSectionIndex) -> usize {
+        index
+            .block_cache
+            .values()
+            .map(|block| decoded_block_bytes(block))
+            .sum()
+    }
+
+    #[test]
+    fn block_cache_is_bounded_by_bytes_not_blocks() {
+        // Ten blocks of four 20 KB terms: each block alone is over half the
+        // 128 KiB floor, so no two fit together. A count-bounded cache held all
+        // ten, 800 KB, under the same budget.
+        let long: Vec<String> = (0..40)
+            .map(|i| format!("{i:03}{}", "x".repeat(20_000)))
+            .collect();
+        let long: Vec<&str> = long.iter().map(String::as_str).collect();
+        let (_temp, mut index) = pfc_index(&long, 4);
+        let mut buf = Vec::new();
+        for id in (1..=40).chain([3, 39, 17]) {
+            index.get_bytes(id, &mut buf).unwrap();
+            assert_eq!(buf, long[id as usize - 1].as_bytes());
+            assert_eq!(index.cache_bytes, recount_cache(&index));
+            assert!(index.cache_bytes <= index.cache_budget);
+        }
+        assert_eq!(index.block_cache.len(), 1);
+        assert_eq!(index.cache_order.len(), 1);
+
+        // Short terms still share the budget: every block stays resident.
+        let short = [
+            "aa0", "aa1", "aa2", "ab0", "ab1", "ba0", "ba1", "ba2", "bb0", "ca0", "za0",
+        ];
+        let (_temp, mut index) = pfc_index(&short, 3);
+        for id in 1..=11 {
+            index.get_bytes(id, &mut buf).unwrap();
+            assert_eq!(buf, short[id as usize - 1].as_bytes());
+        }
+        assert_eq!(index.block_cache.len(), 4);
+        assert_eq!(index.cache_bytes, recount_cache(&index));
+    }
+
+    #[test]
+    fn table_storage_is_counted_and_released_when_blocks_grow() {
+        // One term per block, so the tables cost as much as the blocks: about
+        // a thousand 16-byte terms fill the budget, then thirty 4 KiB ones do.
+        let short: Vec<String> = (0..2000).map(|i| format!("a{i:015}")).collect();
+        let long: Vec<String> = (0..60)
+            .map(|i| format!("b{i:03}{}", "x".repeat(4096)))
+            .collect();
+        let terms: Vec<&str> = short.iter().chain(&long).map(String::as_str).collect();
+        let (_temp, mut index) = pfc_index(&terms, 1);
+
+        let mut buf = Vec::new();
+        for id in 1..=terms.len() as u64 {
+            index.get_bytes(id, &mut buf).unwrap();
+            assert_eq!(buf, terms[id as usize - 1].as_bytes());
+            assert_eq!(index.cache_bytes, recount_cache(&index));
+            assert!(index.resident_bytes() <= index.cache_budget);
+            if id == short.len() as u64 {
+                assert!(index.block_cache.len() > 500);
+            }
+        }
+        // Storage sized for the thousand short blocks was given back rather
+        // than left beside the thirty long ones.
+        assert!(index.block_cache.len() < 40);
+        assert!(index.block_cache.capacity() <= 128);
+        assert!(index.cache_order.capacity() <= 128);
+    }
+
+    #[test]
+    fn a_block_larger_than_the_budget_is_still_returned() {
+        let huge = "y".repeat(300_000);
+        let (_temp, mut index) = pfc_index(&["a", &huge, "z"], 2);
+        let mut buf = Vec::new();
+        index.get_bytes(2, &mut buf).unwrap();
+        assert_eq!(buf, huge.as_bytes());
+        assert!(index.cache_bytes > index.cache_budget);
+        // The next block evicts it rather than joining it.
+        index.get_bytes(3, &mut buf).unwrap();
+        assert_eq!(buf, b"z");
+        assert_eq!(index.block_cache.len(), 1);
+        assert_eq!(index.cache_bytes, recount_cache(&index));
+    }
+
+    #[test]
+    fn for_each_term_stops_at_the_first_visitor_error() {
+        let (_temp, mut index) = pfc_index(&["a", "b", "c", "d"], 2);
+        let mut seen = 0;
+        let error = index
+            .for_each_term(|id, _| {
+                seen += 1;
+                anyhow::ensure!(id < 3, "stop at {id}");
+                Ok(())
+            })
+            .unwrap_err();
+        assert_eq!(error.to_string(), "stop at 3");
+        assert_eq!(seen, 3);
     }
 
     #[test]
