@@ -65,36 +65,42 @@ impl ExternalSorter {
     ) -> Result<MergeIterator<T>> {
         let mut buffer: Vec<T> = Vec::new();
         let mut mem_used: usize = 0;
-
         for item in items {
-            mem_used += item.mem_size();
-            buffer.push(item);
-
-            if mem_used >= self.memory_budget {
-                self.flush_chunk(&mut buffer)?;
-                mem_used = 0;
-            }
+            self.push(item, &mut buffer, &mut mem_used)?;
         }
-
-        // Flush remaining items
-        if !buffer.is_empty() {
-            self.flush_chunk(&mut buffer)?;
-        }
-
-        self.merge()
+        self.finish(&mut buffer)
     }
 
     /// Sort items pushed incrementally. Call `push` repeatedly, then `finish`.
+    ///
+    /// A chunk spills when the items' accounted size reaches the budget, or when
+    /// the buffer holds as many items as the budget has bytes for, whichever
+    /// comes first. The buffer grows toward that item limit and never past it. A
+    /// `Vec` left to double on its own reserves up to twice the budget in address
+    /// space, which counts wherever the kernel limits commit or virtual size.
     pub fn push<T: Sortable>(
         &mut self,
         item: T,
         buffer: &mut Vec<T>,
         mem_used: &mut usize,
     ) -> Result<()> {
+        // Small enough that a tiny sort stays tiny.
+        const MIN_GROWTH_ITEMS: usize = 1024;
+        let item_limit = (self.memory_budget / std::mem::size_of::<T>().max(1)).max(1);
+        if buffer.len() == buffer.capacity() {
+            // A spill at the limit empties the buffer, so it is below the
+            // limit here and the target always has room for this item.
+            let target = buffer
+                .capacity()
+                .saturating_mul(2)
+                .clamp(MIN_GROWTH_ITEMS.min(item_limit), item_limit);
+            buffer.reserve_exact(target - buffer.len());
+        }
+
         *mem_used += item.mem_size();
         buffer.push(item);
 
-        if *mem_used >= self.memory_budget {
+        if *mem_used >= self.memory_budget || buffer.len() >= item_limit {
             self.flush_chunk(buffer)?;
             *mem_used = 0;
         }
@@ -102,6 +108,10 @@ impl ExternalSorter {
     }
 
     /// Flush remaining buffer and create the merge iterator.
+    ///
+    /// The buffer is released, not just emptied. Callers often own it as a
+    /// field beside other sorts that are still filling, and a drained `Vec`
+    /// keeps its whole high-water allocation resident until dropped.
     pub fn finish<T: Sortable + PartialEq + 'static>(
         &mut self,
         buffer: &mut Vec<T>,
@@ -109,6 +119,7 @@ impl ExternalSorter {
         if !buffer.is_empty() {
             self.flush_chunk(buffer)?;
         }
+        *buffer = Vec::new();
         self.merge()
     }
 
@@ -406,6 +417,62 @@ mod tests {
 
         let expected: Vec<TestItem> = (0..10).map(TestItem).collect();
         assert_eq!(merged, expected);
+    }
+
+    #[test]
+    fn buffer_never_reserves_past_the_budget() {
+        // 100_000 bytes is 12_500 eight-byte items. Left to double, the buffer
+        // would reach 16_384 items, 131_072 bytes, before its first spill.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let budget = 100_000;
+        let mut sorter = ExternalSorter::new(temp_dir.path(), budget);
+        let mut buffer = Vec::new();
+        let mut memory = 0;
+        for value in (0..40_000u64).rev() {
+            sorter
+                .push(TestItem(value), &mut buffer, &mut memory)
+                .unwrap();
+            assert!(buffer.capacity() * std::mem::size_of::<TestItem>() <= budget);
+        }
+        assert_eq!(sorter.chunk_file_count(), 3);
+
+        let merged: Vec<TestItem> = sorter
+            .finish(&mut buffer)
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(merged, (0..40_000).map(TestItem).collect::<Vec<_>>());
+        assert_eq!(buffer.capacity(), 0, "finish releases the buffer");
+    }
+
+    #[test]
+    fn items_that_underreport_their_size_still_spill_at_the_budget() {
+        /// Accounts for one byte but occupies eight in the buffer.
+        #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+        struct Light(u64);
+        impl Sortable for Light {
+            fn write_to<W: Write>(&self, writer: &mut W) -> Result<()> {
+                TestItem(self.0).write_to(writer)
+            }
+            fn read_from<R: Read>(reader: &mut R) -> Result<Option<Self>> {
+                Ok(TestItem::read_from(reader)?.map(|item| Light(item.0)))
+            }
+            fn mem_size(&self) -> usize {
+                1
+            }
+        }
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        // 800 bytes holds 100 items, whatever they claim to cost.
+        let mut sorter = ExternalSorter::new(temp_dir.path(), 800);
+        let mut buffer = Vec::new();
+        let mut memory = 0;
+        for value in 0..250u64 {
+            sorter.push(Light(value), &mut buffer, &mut memory).unwrap();
+            assert!(buffer.capacity() <= 100);
+        }
+        assert_eq!(sorter.chunk_file_count(), 2);
+        assert_eq!(sorter.finish(&mut buffer).unwrap().count(), 250);
     }
 
     #[test]
