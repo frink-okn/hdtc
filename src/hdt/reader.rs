@@ -92,7 +92,7 @@ pub struct HdtSectionOffsets {
 ///
 /// Supports ID→term lookup (`get_bytes`), term→ID lookup (`locate`), and
 /// lower-bound/prefix-range searches.
-/// Block-level LRU cache bounds memory usage.
+/// Decoded blocks are cached first-in, first-out under a byte budget.
 pub struct PfcSectionIndex {
     pub section_name: &'static str,
     pub string_count: u64,
@@ -104,8 +104,28 @@ pub struct PfcSectionIndex {
     /// Seekable reader for block data.
     reader: BufReader<File>,
     block_cache: HashMap<u64, Vec<Vec<u8>>>,
+    /// Cached block indexes in insertion order; the front is evicted first.
     cache_order: VecDeque<u64>,
-    cache_capacity: usize,
+    /// [`decoded_block_bytes`] summed over the cached blocks.
+    cache_bytes: usize,
+    cache_budget: usize,
+}
+
+/// Resident bytes of one cached block: its terms, their `Vec` headers, and an
+/// allowance for the allocator and the cache's own map and queue entries.
+///
+/// Counted per block rather than assumed, because a term's size is unbounded: a
+/// block of geometry literals can be a thousand times a block of IRIs.
+fn decoded_block_bytes(block: &[Vec<u8>]) -> usize {
+    // An allocator chunk header, and rounding to its 16-byte granularity.
+    const ALLOCATION_OVERHEAD: usize = 16;
+    // The map slot, the queue slot, and the outer `Vec`'s own allocation.
+    const BLOCK_OVERHEAD: usize = 64;
+    let terms: usize = block
+        .iter()
+        .map(|term| term.capacity() + std::mem::size_of::<Vec<u8>>() + ALLOCATION_OVERHEAD)
+        .sum();
+    BLOCK_OVERHEAD + terms
 }
 
 impl PfcSectionIndex {
@@ -183,10 +203,6 @@ impl PfcSectionIndex {
             .seek(SeekFrom::Current(buffer_length as i64 + 4))
             .with_context(|| format!("Failed to skip string buffer for {section_name}"))?;
 
-        // ~2KB per decoded block; at least 64 blocks so small budgets still work.
-        const ESTIMATED_BLOCK_BYTES: usize = 2048;
-        let cache_capacity = (cache_budget / ESTIMATED_BLOCK_BYTES).max(64);
-
         let file = File::open(hdt_path)?;
         Ok(Self {
             section_name,
@@ -197,7 +213,9 @@ impl PfcSectionIndex {
             reader: BufReader::with_capacity(64 * 1024, file),
             block_cache: HashMap::new(),
             cache_order: VecDeque::new(),
-            cache_capacity,
+            cache_bytes: 0,
+            // A floor so a tiny budget still caches a few dozen blocks of IRIs.
+            cache_budget: cache_budget.max(128 * 1024),
         })
     }
 
@@ -383,15 +401,21 @@ impl PfcSectionIndex {
         Ok(())
     }
 
-    /// Return a decoded block, using the LRU cache.
+    /// Return a decoded block, using the block cache.
+    ///
+    /// The block just decoded is never evicted, since it is the one returned; a
+    /// single block larger than the whole budget is the only way to exceed it.
     fn get_or_decode_block(&mut self, block_index: u64) -> Result<&Vec<Vec<u8>>> {
         if !self.block_cache.contains_key(&block_index) {
             let block = self.decode_block(block_index)?;
+            self.cache_bytes += decoded_block_bytes(&block);
             self.block_cache.insert(block_index, block);
             self.cache_order.push_back(block_index);
-            while self.cache_order.len() > self.cache_capacity {
-                if let Some(evicted) = self.cache_order.pop_front() {
-                    self.block_cache.remove(&evicted);
+            while self.cache_bytes > self.cache_budget && self.cache_order.len() > 1 {
+                if let Some(evicted) = self.cache_order.pop_front()
+                    && let Some(block) = self.block_cache.remove(&evicted)
+                {
+                    self.cache_bytes -= decoded_block_bytes(&block);
                 }
             }
         }
@@ -1098,6 +1122,63 @@ mod tests {
         empty
             .for_each_term(|_, _| panic!("an empty section has no terms"))
             .unwrap();
+    }
+
+    /// The cached blocks' accounted bytes, recomputed from the blocks themselves.
+    fn recount_cache(index: &PfcSectionIndex) -> usize {
+        index
+            .block_cache
+            .values()
+            .map(|block| decoded_block_bytes(block))
+            .sum()
+    }
+
+    #[test]
+    fn block_cache_is_bounded_by_bytes_not_blocks() {
+        // Ten blocks of four 20 KB terms: each block alone is over half the
+        // 128 KiB floor, so no two fit together. A count-bounded cache held all
+        // ten, 800 KB, under the same budget.
+        let long: Vec<String> = (0..40)
+            .map(|i| format!("{i:03}{}", "x".repeat(20_000)))
+            .collect();
+        let long: Vec<&str> = long.iter().map(String::as_str).collect();
+        let (_temp, mut index) = pfc_index(&long, 4);
+        let mut buf = Vec::new();
+        for id in (1..=40).chain([3, 39, 17]) {
+            index.get_bytes(id, &mut buf).unwrap();
+            assert_eq!(buf, long[id as usize - 1].as_bytes());
+            assert_eq!(index.cache_bytes, recount_cache(&index));
+            assert!(index.cache_bytes <= index.cache_budget);
+        }
+        assert_eq!(index.block_cache.len(), 1);
+        assert_eq!(index.cache_order.len(), 1);
+
+        // Short terms still share the budget: every block stays resident.
+        let short = [
+            "aa0", "aa1", "aa2", "ab0", "ab1", "ba0", "ba1", "ba2", "bb0", "ca0", "za0",
+        ];
+        let (_temp, mut index) = pfc_index(&short, 3);
+        for id in 1..=11 {
+            index.get_bytes(id, &mut buf).unwrap();
+            assert_eq!(buf, short[id as usize - 1].as_bytes());
+        }
+        assert_eq!(index.block_cache.len(), 4);
+        assert_eq!(index.cache_bytes, recount_cache(&index));
+    }
+
+    #[test]
+    fn a_block_larger_than_the_budget_is_still_returned() {
+        let huge = "y".repeat(300_000);
+        let (_temp, mut index) = pfc_index(&["a", &huge, "z"], 2);
+        let mut buf = Vec::new();
+        index.get_bytes(2, &mut buf).unwrap();
+        assert_eq!(buf, huge.as_bytes());
+        assert!(index.cache_bytes > index.cache_budget);
+        // The next block evicts it rather than joining it.
+        index.get_bytes(3, &mut buf).unwrap();
+        assert_eq!(buf, b"z");
+        assert_eq!(index.block_cache.len(), 1);
+        assert_eq!(index.cache_bytes, recount_cache(&index));
     }
 
     #[test]
