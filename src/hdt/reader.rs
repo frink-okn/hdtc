@@ -351,6 +351,38 @@ impl PfcSectionIndex {
         Ok(result)
     }
 
+    /// Visit every term in ID order, reading the section front to back.
+    ///
+    /// A full scan never revisits a block, so it bypasses the block cache. Sent
+    /// through [`get_bytes`](Self::get_bytes) instead, it would fill the cache to
+    /// capacity with terms that are never read again — and capacity is counted in
+    /// blocks sized for short terms, so a section of long literals would hold many
+    /// times its budget.
+    pub fn for_each_term(&mut self, mut visit: impl FnMut(u64, &[u8]) -> Result<()>) -> Result<()> {
+        let blocks = self.offsets.len().saturating_sub(1) as u64;
+        if blocks == 0 {
+            return Ok(());
+        }
+        // Blocks are contiguous, so one seek positions the whole scan.
+        let (first, _) = self.block_range(0)?;
+        self.reader
+            .seek(SeekFrom::Start(self.string_buf_start + first))?;
+
+        let mut data = Vec::new();
+        let mut term = Vec::new();
+        let mut id = 0u64;
+        for block_index in 0..blocks {
+            let (start, end) = self.block_range(block_index)?;
+            data.resize((end - start) as usize, 0);
+            self.reader.read_exact(&mut data)?;
+            self.decode_terms(block_index, &data, &mut term, |value| {
+                id += 1;
+                visit(id, value)
+            })?;
+        }
+        Ok(())
+    }
+
     /// Return a decoded block, using the LRU cache.
     fn get_or_decode_block(&mut self, block_index: u64) -> Result<&Vec<Vec<u8>>> {
         if !self.block_cache.contains_key(&block_index) {
@@ -367,6 +399,78 @@ impl PfcSectionIndex {
     }
 
     fn decode_block(&mut self, block_index: u64) -> Result<Vec<Vec<u8>>> {
+        let (start, end) = self.block_range(block_index)?;
+        let mut data = vec![0u8; (end - start) as usize];
+        self.reader
+            .seek(SeekFrom::Start(self.string_buf_start + start))?;
+        self.reader.read_exact(&mut data)?;
+
+        let mut entries = Vec::with_capacity(self.block_entries(block_index) as usize);
+        let mut term = Vec::new();
+        self.decode_terms(block_index, &data, &mut term, |value| {
+            entries.push(value.to_vec());
+            Ok(())
+        })?;
+        Ok(entries)
+    }
+
+    /// Terms in block `block_index`: `block_size`, except in a short final block.
+    fn block_entries(&self, block_index: u64) -> u64 {
+        (self.string_count - block_index * self.block_size).min(self.block_size)
+    }
+
+    /// Decode one front-coded block, handing each term to `visit` in order.
+    ///
+    /// Each term is decoded in place over its predecessor in `term`, so decoding
+    /// allocates nothing per term.
+    fn decode_terms(
+        &self,
+        block_index: u64,
+        data: &[u8],
+        term: &mut Vec<u8>,
+        mut visit: impl FnMut(&[u8]) -> Result<()>,
+    ) -> Result<()> {
+        let mut pos = 0usize;
+        for i in 0..self.block_entries(block_index) {
+            if pos >= data.len() {
+                bail!(
+                    "Unexpected end of block in {} at entry {i}",
+                    self.section_name
+                );
+            }
+
+            if i == 0 {
+                term.clear();
+            } else {
+                let (shared, consumed) = decode_vbyte(&data[pos..])?;
+                pos += consumed;
+                let shared = shared as usize;
+                if shared > term.len() {
+                    bail!(
+                        "Invalid shared prefix length {} in {} block {block_index} (prev len {})",
+                        shared,
+                        self.section_name,
+                        term.len()
+                    );
+                }
+                term.truncate(shared);
+            }
+
+            let rel_end = data[pos..].iter().position(|&b| b == 0).with_context(|| {
+                format!(
+                    "Missing null terminator in {} block {block_index}",
+                    self.section_name
+                )
+            })?;
+            term.extend_from_slice(&data[pos..pos + rel_end]);
+            pos += rel_end + 1;
+            visit(term)?;
+        }
+        Ok(())
+    }
+
+    /// The byte range of block `block_index` within the string buffer.
+    fn block_range(&self, block_index: u64) -> Result<(u64, u64)> {
         let start = self
             .offsets
             .get(block_index as usize)
@@ -397,72 +501,7 @@ impl PfcSectionIndex {
                 start
             );
         }
-
-        let block_len = (end - start) as usize;
-        let mut data = vec![0u8; block_len];
-        self.reader
-            .seek(SeekFrom::Start(self.string_buf_start + start))?;
-        self.reader.read_exact(&mut data)?;
-
-        let base = block_index * self.block_size;
-        let max_entries = (self.string_count - base).min(self.block_size) as usize;
-        let mut entries = Vec::with_capacity(max_entries);
-
-        let mut pos = 0usize;
-        let mut prev_bytes = Vec::<u8>::new();
-        for i in 0..max_entries {
-            if pos >= data.len() {
-                bail!(
-                    "Unexpected end of block in {} at entry {i}",
-                    self.section_name
-                );
-            }
-
-            if i == 0 {
-                let rel_end = data[pos..].iter().position(|&b| b == 0).with_context(|| {
-                    format!(
-                        "Missing null terminator in {} block {block_index}",
-                        self.section_name
-                    )
-                })?;
-                let end_pos = pos + rel_end;
-                let term_bytes = data[pos..end_pos].to_vec();
-                pos = end_pos + 1;
-                prev_bytes = term_bytes.clone();
-                entries.push(term_bytes);
-                continue;
-            }
-
-            let (shared, consumed) = decode_vbyte(&data[pos..])?;
-            pos += consumed;
-            let rel_end = data[pos..].iter().position(|&b| b == 0).with_context(|| {
-                format!(
-                    "Missing null terminator in {} block {block_index}",
-                    self.section_name
-                )
-            })?;
-            let end_pos = pos + rel_end;
-            let suffix = &data[pos..end_pos];
-            pos = end_pos + 1;
-
-            let shared = shared as usize;
-            if shared > prev_bytes.len() {
-                bail!(
-                    "Invalid shared prefix length {} in {} block {block_index} (prev len {})",
-                    shared,
-                    self.section_name,
-                    prev_bytes.len()
-                );
-            }
-
-            let mut value_bytes = Vec::with_capacity(shared + suffix.len());
-            value_bytes.extend_from_slice(&prev_bytes[..shared]);
-            value_bytes.extend_from_slice(suffix);
-            prev_bytes = value_bytes.clone();
-            entries.push(value_bytes);
-        }
-
-        Ok(entries)
+        Ok((start, end))
     }
 }
 
@@ -1024,6 +1063,56 @@ mod tests {
                 strings.partition_point(|value| value.as_bytes() < query.as_bytes()) as u64 + 1;
             assert_eq!(index.lower_bound(query.as_bytes()).unwrap(), expected);
         }
+    }
+
+    #[test]
+    fn for_each_term_visits_every_term_in_order_without_caching() {
+        // Eleven terms in blocks of three: the last block is short, and the
+        // shared prefixes exercise front-coding across each block.
+        let strings = [
+            "aa0", "aa1", "aa2", "ab0", "ab1", "ba0", "ba1", "ba2", "bb0", "ca0", "za0",
+        ];
+        let (_temp, mut index) = pfc_index(&strings, 3);
+
+        let mut visited = Vec::new();
+        index
+            .for_each_term(|id, term| {
+                visited.push((id, String::from_utf8(term.to_vec()).unwrap()));
+                Ok(())
+            })
+            .unwrap();
+        let expected: Vec<_> = strings
+            .iter()
+            .enumerate()
+            .map(|(i, value)| (i as u64 + 1, value.to_string()))
+            .collect();
+        assert_eq!(visited, expected);
+        assert!(index.block_cache.is_empty());
+
+        // The scan leaves random access working.
+        let mut buf = Vec::new();
+        index.get_bytes(7, &mut buf).unwrap();
+        assert_eq!(buf, b"ba1");
+
+        let (_temp, mut empty) = pfc_index(&[], 4);
+        empty
+            .for_each_term(|_, _| panic!("an empty section has no terms"))
+            .unwrap();
+    }
+
+    #[test]
+    fn for_each_term_stops_at_the_first_visitor_error() {
+        let (_temp, mut index) = pfc_index(&["a", "b", "c", "d"], 2);
+        let mut seen = 0;
+        let error = index
+            .for_each_term(|id, _| {
+                seen += 1;
+                anyhow::ensure!(id < 3, "stop at {id}");
+                Ok(())
+            })
+            .unwrap_err();
+        assert_eq!(error.to_string(), "stop at 3");
+        assert_eq!(seen, 3);
     }
 
     #[test]
