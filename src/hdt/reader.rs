@@ -111,21 +111,22 @@ pub struct PfcSectionIndex {
     cache_budget: usize,
 }
 
-/// Resident bytes of one cached block: its terms, their `Vec` headers, and an
-/// allowance for the allocator and the cache's own map and queue entries.
+/// An allocator chunk header, and rounding to its 16-byte granularity.
+const ALLOCATION_OVERHEAD: usize = 16;
+
+/// Resident bytes of one cached block: its terms, their `Vec` headers, and the
+/// allocator's overhead on each.
 ///
 /// Counted per block rather than assumed, because a term's size is unbounded: a
-/// block of geometry literals can be a thousand times a block of IRIs.
+/// block of geometry literals can be a thousand times a block of IRIs. The map
+/// and queue slots holding the block are not included; they outlive the block
+/// and are counted by [`PfcSectionIndex::table_bytes`].
 fn decoded_block_bytes(block: &[Vec<u8>]) -> usize {
-    // An allocator chunk header, and rounding to its 16-byte granularity.
-    const ALLOCATION_OVERHEAD: usize = 16;
-    // The map slot, the queue slot, and the outer `Vec`'s own allocation.
-    const BLOCK_OVERHEAD: usize = 64;
     let terms: usize = block
         .iter()
         .map(|term| term.capacity() + std::mem::size_of::<Vec<u8>>() + ALLOCATION_OVERHEAD)
         .sum();
-    BLOCK_OVERHEAD + terms
+    ALLOCATION_OVERHEAD + terms
 }
 
 impl PfcSectionIndex {
@@ -411,15 +412,56 @@ impl PfcSectionIndex {
             self.cache_bytes += decoded_block_bytes(&block);
             self.block_cache.insert(block_index, block);
             self.cache_order.push_back(block_index);
-            while self.cache_bytes > self.cache_budget && self.cache_order.len() > 1 {
+            while self.resident_bytes() > self.cache_budget && self.cache_order.len() > 1 {
                 if let Some(evicted) = self.cache_order.pop_front()
                     && let Some(block) = self.block_cache.remove(&evicted)
                 {
                     self.cache_bytes -= decoded_block_bytes(&block);
                 }
+                self.shrink_sparse_tables();
             }
         }
         Ok(self.block_cache.get(&block_index).unwrap())
+    }
+
+    /// Bytes the cache holds: its blocks and the tables that index them.
+    fn resident_bytes(&self) -> usize {
+        self.cache_bytes + self.table_bytes()
+    }
+
+    /// Bytes of the map and queue storage, by capacity rather than occupancy.
+    ///
+    /// Neither shrinks when an entry is removed, so after many small blocks give
+    /// way to a few large ones their storage is still sized for the many. Counting
+    /// occupancy instead would let the blocks refill a budget the tables already
+    /// spend.
+    fn table_bytes(&self) -> usize {
+        // A map slot is the entry plus one control byte, and the map keeps an
+        // eighth of its slots empty.
+        let map_slot = std::mem::size_of::<(u64, Vec<Vec<u8>>)>() + 1;
+        let map = (self.block_cache.capacity() * map_slot).div_ceil(7) * 8;
+        let queue = self.cache_order.capacity() * std::mem::size_of::<u64>();
+        map + queue + 2 * ALLOCATION_OVERHEAD
+    }
+
+    /// Release table storage once three quarters of it is empty.
+    ///
+    /// Shrinking to twice the occupancy means the next shrink waits for half the
+    /// remaining entries to go, so rehashing costs amortized O(1) per eviction.
+    fn shrink_sparse_tables(&mut self) {
+        // Below this a table is too small to be worth rehashing.
+        const MIN_SHRINK_CAPACITY: usize = 64;
+        let entries = self.block_cache.len();
+        if self.block_cache.capacity() > MIN_SHRINK_CAPACITY
+            && entries * 4 <= self.block_cache.capacity()
+        {
+            self.block_cache.shrink_to(entries * 2);
+        }
+        if self.cache_order.capacity() > MIN_SHRINK_CAPACITY
+            && self.cache_order.len() * 4 <= self.cache_order.capacity()
+        {
+            self.cache_order.shrink_to(self.cache_order.len() * 2);
+        }
     }
 
     fn decode_block(&mut self, block_index: u64) -> Result<Vec<Vec<u8>>> {
@@ -1164,6 +1206,34 @@ mod tests {
         }
         assert_eq!(index.block_cache.len(), 4);
         assert_eq!(index.cache_bytes, recount_cache(&index));
+    }
+
+    #[test]
+    fn table_storage_is_counted_and_released_when_blocks_grow() {
+        // One term per block, so the tables cost as much as the blocks: about
+        // a thousand 16-byte terms fill the budget, then thirty 4 KiB ones do.
+        let short: Vec<String> = (0..2000).map(|i| format!("a{i:015}")).collect();
+        let long: Vec<String> = (0..60)
+            .map(|i| format!("b{i:03}{}", "x".repeat(4096)))
+            .collect();
+        let terms: Vec<&str> = short.iter().chain(&long).map(String::as_str).collect();
+        let (_temp, mut index) = pfc_index(&terms, 1);
+
+        let mut buf = Vec::new();
+        for id in 1..=terms.len() as u64 {
+            index.get_bytes(id, &mut buf).unwrap();
+            assert_eq!(buf, terms[id as usize - 1].as_bytes());
+            assert_eq!(index.cache_bytes, recount_cache(&index));
+            assert!(index.resident_bytes() <= index.cache_budget);
+            if id == short.len() as u64 {
+                assert!(index.block_cache.len() > 500);
+            }
+        }
+        // Storage sized for the thousand short blocks was given back rather
+        // than left beside the thirty long ones.
+        assert!(index.block_cache.len() < 40);
+        assert!(index.block_cache.capacity() <= 128);
+        assert!(index.cache_order.capacity() <= 128);
     }
 
     #[test]
