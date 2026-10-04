@@ -970,14 +970,15 @@ fn namespace_inventories_do_not_count_triple_terms_as_iris() {
 }
 
 /// What lenient ingest stores inside an unasserted triple term survives the
-/// propositions HDT's build: an IRI holding a space, a datatype IRI holding a
-/// quote, a language tag no validator passes.
+/// propositions HDT's build unchanged, though no RDF syntax spells all of it:
+/// IRIs and datatype IRIs holding `>`, `\`, a space or a quote, a blank-node
+/// label ending in `.`, a language tag with `_`.
 #[test]
 fn unasserted_triple_terms_keep_whatever_lenient_ingest_stored() {
     let dir = tempfile::tempdir().unwrap();
-    let input = dir.path().join("in.nt");
+    let ntriples = dir.path().join("in.nt");
     common::write_file(
-        &input,
+        &ntriples,
         format!(
             "<http://ex/e1> <{RDF_REIFIES}> <<( <http://ex/s> <http://ex/p> <http://ex/c d> )>> .\n\
              <http://ex/e2> <{RDF_REIFIES}> <<( <http://ex/s> <http://ex/p> \"y\"^^<http://ex/d\\u0022t> )>> .\n\
@@ -985,21 +986,54 @@ fn unasserted_triple_terms_keep_whatever_lenient_ingest_stored() {
         )
         .as_bytes(),
     );
-    let hdt = create(dir.path(), &[&input], "o.hdt");
-    assert!(tt_path(&hdt, ".props.hdt").exists());
-    validate(&hdt, dir.path());
-    let lines = dump(&hdt);
-    assert_eq!(lines.len(), 3, "{lines:?}");
-    assert!(
-        lines.iter().any(|l| l.contains("<http://ex/c d>")),
-        "{lines:?}"
+    let xml = dir.path().join("in.rdf");
+    common::write_file(
+        &xml,
+        concat!(
+            "<?xml version=\"1.0\"?>\n",
+            "<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\" ",
+            "xmlns:ex=\"http://ex/\" rdf:version=\"1.2\">\n",
+            "<rdf:Description rdf:about=\"http://ex/e4\"><rdf:reifies rdf:parseType=\"Triple\">",
+            "<rdf:Description rdf:about=\"http://ex/a&gt;b\"><ex:p rdf:resource=\"http://ex/c\\d\"/>",
+            "</rdf:Description></rdf:reifies></rdf:Description>\n",
+            "<rdf:Description rdf:about=\"http://ex/e5\"><rdf:reifies rdf:parseType=\"Triple\">",
+            "<rdf:Description rdf:nodeID=\"x.\"><ex:p xml:lang=\"en_US\">v</ex:p>",
+            "</rdf:Description></rdf:reifies></rdf:Description>\n",
+            "<rdf:Description rdf:about=\"http://ex/e6\"><rdf:reifies rdf:parseType=\"Triple\">",
+            "<rdf:Description rdf:about=\"http://ex/s\"><ex:p rdf:datatype=\"http://ex/d&gt;t\">w</ex:p>",
+            "</rdf:Description></rdf:reifies></rdf:Description>\n",
+            "</rdf:RDF>\n",
+        )
+        .as_bytes(),
     );
-    assert!(
-        lines.iter().any(|l| l.contains("^^<http://ex/d\"t>")),
-        "{lines:?}"
-    );
-    assert!(
-        lines.iter().any(|l| l.contains("@zh-classical")),
-        "{lines:?}"
-    );
+    for (input, name, expected) in [
+        (
+            &ntriples,
+            "nt.hdt",
+            vec!["<http://ex/c d>", "^^<http://ex/d\"t>", "@zh-classical"],
+        ),
+        (
+            &xml,
+            "rdf.hdt",
+            vec![
+                "<http://ex/a>b>",
+                "<http://ex/c\\d>",
+                "_:x.",
+                "@en_us",
+                "^^<http://ex/d>t>",
+            ],
+        ),
+    ] {
+        let hdt = create(dir.path(), &[input], name);
+        assert!(tt_path(&hdt, ".props.hdt").exists(), "{name}");
+        validate(&hdt, dir.path());
+        let lines = dump(&hdt);
+        assert_eq!(lines.len(), 3, "{name}: {lines:?}");
+        for needle in expected {
+            assert!(
+                lines.iter().any(|l| l.contains(needle)),
+                "{name}: {needle} in {lines:?}"
+            );
+        }
+    }
 }

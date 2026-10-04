@@ -12,6 +12,11 @@ pub enum RdfFormat {
     RdfXml,
     JsonLd,
     N3,
+    /// hdtc's own record of dictionary terms, one triple per line — never
+    /// an input format a user names: it is how the propositions HDT of RDF
+    /// 1.2 triple terms is built from terms the build already holds, which
+    /// no RDF syntax can spell in every case (`src/rdf/records.rs`).
+    TermRecords,
 }
 
 impl RdfFormat {

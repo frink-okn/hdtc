@@ -323,6 +323,7 @@ fn to_oxrdf_format(format: RdfFormat) -> oxrdfio::RdfFormat {
         RdfFormat::JsonLd => oxrdfio::RdfFormat::JsonLd {
             profile: oxrdfio::JsonLdProfileSet::empty(),
         },
+        RdfFormat::TermRecords => unreachable!("term records have their own reader"),
     }
 }
 
@@ -710,6 +711,11 @@ enum ParseError {
     Turtle(#[from] oxttl::TurtleParseError),
     #[error(transparent)]
     RdfXml(#[from] oxrdfxml::RdfXmlParseError),
+    /// A term record that does not read back. Records are written by the
+    /// build itself, so this is fatal: skipping one would silently drop a
+    /// proposition.
+    #[error("{0}")]
+    Record(String),
     #[error(transparent)]
     Rdf(#[from] oxrdfio::RdfParseError),
     /// A well-formed N3 statement that is not an RDF quad (a variable, or a
@@ -747,7 +753,7 @@ impl ParseError {
     /// buffer per iteration. An interrupted read is the one I/O error retried
     /// first; the callers give up on it after [`MAX_INTERRUPTED_RETRIES`].
     fn is_fatal(&self) -> bool {
-        self.io_error().is_some()
+        self.io_error().is_some() || matches!(self, Self::Record(_))
     }
 
     /// The lexer refused a single term larger than its buffer — recognised by
@@ -845,6 +851,7 @@ enum FormatParser {
     NQuads(oxttl::NQuadsParser),
     N3(oxttl::N3Parser),
     RdfXml(oxrdfxml::RdfXmlParser),
+    TermRecords,
     Generic(oxrdfio::RdfParser),
 }
 
@@ -938,6 +945,7 @@ impl FormatParser {
             RdfFormat::NTriples => Self::NTriples(bounded!(oxttl::NTriplesParser::new())),
             RdfFormat::NQuads => Self::NQuads(bounded!(oxttl::NQuadsParser::new())),
             RdfFormat::N3 => Self::N3(bounded!(oxttl::N3Parser::new(), base)),
+            RdfFormat::TermRecords => Self::TermRecords,
             RdfFormat::RdfXml => {
                 let parser = oxrdfxml::RdfXmlParser::new();
                 let parser = if lenient { parser.lenient() } else { parser };
@@ -965,6 +973,9 @@ impl FormatParser {
             Self::NQuads(parser) => LenientQuads::NQuads(parser.for_reader(reader)),
             Self::N3(parser) => LenientQuads::N3(parser.for_reader(reader)),
             Self::RdfXml(parser) => LenientQuads::RdfXml(parser.for_reader(reader)),
+            Self::TermRecords => {
+                LenientQuads::TermRecords(crate::rdf::records::RecordReader::new(reader))
+            }
             Self::Generic(parser) => LenientQuads::Generic(parser.for_reader(reader)),
         }
     }
@@ -979,6 +990,7 @@ enum LenientQuads<R: Read> {
     NQuads(oxttl::nquads::ReaderNQuadsParser<R>),
     N3(oxttl::n3::ReaderN3Parser<R>),
     RdfXml(oxrdfxml::ReaderRdfXmlParser<R>),
+    TermRecords(crate::rdf::records::RecordReader<R>),
     Generic(oxrdfio::ReaderQuadParser<R>),
 }
 
@@ -1005,6 +1017,10 @@ impl<R: Read> Iterator for LenientQuads<R> {
                 .next()?
                 .map(|triple| triple.in_graph(GraphName::DefaultGraph))
                 .map_err(ParseError::RdfXml),
+            Self::TermRecords(reader) => reader
+                .next()?
+                .map(|triple| triple.in_graph(GraphName::DefaultGraph))
+                .map_err(|error| ParseError::Record(format!("{error:#}"))),
             Self::Generic(parser) => parser.next()?.map_err(ParseError::Rdf),
         })
     }

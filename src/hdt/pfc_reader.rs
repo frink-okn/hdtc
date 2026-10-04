@@ -1,7 +1,9 @@
 //! Sequential PFC (Plain Front Coding) section reader.
 //!
 //! Iterates all terms in a PFC dictionary section in lexicographic order,
-//! decoding blocks sequentially. O(block_size) memory — no seeking needed.
+//! decoding blocks sequentially. O(block_size) memory. A reader that can seek
+//! may start mid-section (`PfcSectionIterator::seek_to`); reading is still
+//! sequential from there.
 
 use crate::io::crc_utils::crc8;
 use crate::io::{
@@ -104,7 +106,8 @@ impl PfcSectionHeader {
 /// Sequential iterator over all terms in a PFC section.
 ///
 /// Yields terms in lexicographic order (1-based IDs: 1, 2, 3, ...).
-/// Reads blocks linearly from the underlying reader — no seeking.
+/// Reads blocks linearly from the underlying reader; the only seek is the
+/// optional initial `seek_to`.
 pub struct PfcSectionIterator<R: Read> {
     reader: R,
     section_name: String,

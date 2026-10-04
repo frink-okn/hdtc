@@ -30,10 +30,7 @@ use super::iri::TT_NAMESPACE;
 use super::spool::{PropositionSpool, SpoolWriter};
 use crate::cli::InputSidecarPolicy;
 use crate::hdt::artifacts::SourceIdentity;
-use crate::hdt::reader::{
-    BitmapTriplesScanner, DictionaryResolver, find_literal_boundary, open_hdt,
-    write_escaped_literal_value,
-};
+use crate::hdt::reader::{BitmapTriplesScanner, DictionaryResolver, open_hdt};
 use crate::io::{BitPacker, StreamingLogArrayEncoder};
 use crate::permutation::format::{
     SUBBLOCK_BITS, SUPERBLOCK_BITS, id_width, sub_count, super_count,
@@ -708,8 +705,10 @@ pub(super) fn place(
     Ok((found, missing))
 }
 
-/// Write the given propositions as N-Triples for the propositions HDT build.
-fn write_propositions_ntriples(
+/// Write the given propositions as term records for the propositions HDT
+/// build (`src/rdf/records.rs`): the dictionary strings themselves, which no
+/// RDF syntax could spell for every string lenient ingest stores.
+fn write_proposition_records(
     distinct: &PropositionSpool,
     ranks: &RankFile,
     path: &Path,
@@ -727,73 +726,24 @@ fn write_propositions_ntriples(
             None => break,
             _ => continue,
         }
-        write_nt_term(&mut encoder, record.subject.as_bytes())?;
-        encoder.write_all(b" ")?;
-        write_nt_iri(&mut encoder, record.predicate.as_bytes())?;
-        encoder.write_all(b" ")?;
-        write_nt_term(&mut encoder, record.object.as_bytes())?;
-        encoder.write_all(b" .\n")?;
+        crate::rdf::records::write_record(
+            &mut encoder,
+            record.subject.as_bytes(),
+            record.predicate.as_bytes(),
+            record.object.as_bytes(),
+        )?;
     }
     encoder.finish()?.flush()?;
     Ok(())
 }
 
-/// Write a dictionary term as an N-Triples term that parses back to it.
-///
-/// Lenient ingest can store an IRI — or a literal's datatype IRI — holding
-/// characters an N-Triples IRIREF excludes, decoded from `UCHAR` escapes in
-/// the source. Written raw, such a term would not parse back, and the
-/// propositions HDT could not be built; escaped, the parser decodes it to the
-/// same dictionary string.
-fn write_nt_term(w: &mut impl Write, term: &[u8]) -> std::io::Result<()> {
-    if term.starts_with(b"_:") {
-        return w.write_all(term);
-    }
-    if term.starts_with(b"\"") {
-        let (value_end, suffix_start) = find_literal_boundary(term);
-        w.write_all(b"\"")?;
-        write_escaped_literal_value(w, &term[1..value_end])?;
-        w.write_all(b"\"")?;
-        let suffix = &term[suffix_start..];
-        return match suffix
-            .strip_prefix(b"^^<")
-            .and_then(|datatype| datatype.strip_suffix(b">"))
-        {
-            Some(datatype) => {
-                w.write_all(b"^^")?;
-                write_nt_iri(w, datatype)
-            }
-            None => w.write_all(suffix),
-        };
-    }
-    write_nt_iri(w, term)
-}
-
-/// Write an IRI as an N-Triples IRIREF, escaping what IRIREF excludes.
-fn write_nt_iri(w: &mut impl Write, iri: &[u8]) -> std::io::Result<()> {
-    w.write_all(b"<")?;
-    let mut start = 0;
-    for (i, &byte) in iri.iter().enumerate() {
-        if byte <= 0x20 || b"<>\"{}|^`\\".contains(&byte) {
-            w.write_all(&iri[start..i])?;
-            write!(w, "\\u{byte:04X}")?;
-            start = i + 1;
-        }
-    }
-    w.write_all(&iri[start..])?;
-    w.write_all(b">")
-}
-
 /// Build the propositions HDT and its permutation index with the ordinary
 /// pipeline, staging both in `output_dir`.
-fn build_propositions_hdt(
-    ctx: &FinishContext<'_>,
-    ntriples: &Path,
-) -> Result<(TempPath, TempPath)> {
+fn build_propositions_hdt(ctx: &FinishContext<'_>, records: &Path) -> Result<(TempPath, TempPath)> {
     use crate::pipeline::{ParserParallelismConfig, run_pipeline};
     let input = RdfInput {
-        path: ntriples.to_path_buf(),
-        format: RdfFormat::NTriples,
+        path: records.to_path_buf(),
+        format: RdfFormat::TermRecords,
         compression: Compression::Zstd,
     };
     let parallelism = ParserParallelismConfig {
@@ -1164,10 +1114,10 @@ pub(crate) fn finish(
     let mut placed_unasserted = None;
     if unasserted_count > 0 {
         let started = std::time::Instant::now();
-        let ntriples = temp_dir.join("tt-propositions.nt.zst");
-        write_propositions_ntriples(&distinct, &unasserted_ranks, &ntriples)?;
-        let (hdt, perm) = build_propositions_hdt(ctx, &ntriples)?;
-        let _ = std::fs::remove_file(&ntriples);
+        let records = temp_dir.join("tt-propositions.records.zst");
+        write_proposition_records(&distinct, &unasserted_ranks, &records)?;
+        let (hdt, perm) = build_propositions_hdt(ctx, &records)?;
+        let _ = std::fs::remove_file(&records);
         props_shape = shape_of(&hdt, &mut open_hdt(&hdt, budget / 8)?.1)?;
         let (found, _) = place(
             &hdt,
