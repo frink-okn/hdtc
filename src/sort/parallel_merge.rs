@@ -12,7 +12,13 @@ use crossbeam_channel::{Receiver, Sender, bounded};
 use std::cmp::Ordering;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::thread::JoinHandle;
+
+/// Distinguishes the intermediate files of merges sharing a directory: two
+/// sorters may finish side by side in one temp directory, and files named by
+/// round and group alone would overwrite each other.
+static NEXT_MERGE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Default maximum fan-in per merge round. With a binary tree over 512 leaves,
 /// this spawns at most ~1023 threads — well within OS limits.
@@ -229,6 +235,7 @@ fn build_multi_round<T: Mergeable>(
 ) -> Result<MergeTreeHandle<T>> {
     let mut all_temp_files: Vec<PathBuf> = Vec::new();
     let mut current_sources = sources;
+    let merge_id = NEXT_MERGE_ID.fetch_add(1, AtomicOrdering::Relaxed);
 
     // Keep merging in rounds until we're within max_fanin
     let mut round = 0u32;
@@ -253,8 +260,7 @@ fn build_multi_round<T: Mergeable>(
 
         for (group_idx, group) in groups.into_iter().enumerate() {
             let intermediate_path = config.temp_dir.join(format!(
-                "merge_intermediate_r{:02}_g{:04}.tmp.zst",
-                round, group_idx
+                "merge_{merge_id}_intermediate_r{round:02}_g{group_idx:04}.tmp.zst"
             ));
 
             // Build a merge tree for this group, drain to intermediate file
@@ -738,17 +744,47 @@ mod tests {
         // Verify intermediate files were cleaned up
         let remaining_files: Vec<_> = std::fs::read_dir(temp_dir.path())?
             .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .starts_with("merge_intermediate")
-            })
+            .filter(|e| e.file_name().to_string_lossy().contains("_intermediate_"))
             .collect();
         assert!(
             remaining_files.is_empty(),
             "Intermediate files should be cleaned up"
         );
 
+        Ok(())
+    }
+
+    /// Two multi-round merges finishing at once in one directory keep their
+    /// intermediate files apart: each reads back exactly its own sources.
+    #[test]
+    fn concurrent_multi_round_merges_share_a_directory() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let results = std::thread::scope(|scope| {
+            let merges: Vec<_> = [0u64, 1000]
+                .into_iter()
+                .map(|base| {
+                    let dir = temp_dir.path();
+                    scope.spawn(move || -> Result<Vec<TestItem>> {
+                        let config = MergeTreeConfig::new(dir)
+                            .with_max_fanin(3)
+                            .with_channel_capacity(2);
+                        let sources: Vec<MergeSource<TestItem>> = (0..20)
+                            .map(|i| factory_source(vec![base + i * 2, base + i * 2 + 1]))
+                            .collect();
+                        let handle = build_merge_tree(sources, &config)?;
+                        MergeTreeIterator::new(handle).collect()
+                    })
+                })
+                .collect();
+            merges
+                .into_iter()
+                .map(|merge| merge.join().expect("a merge thread"))
+                .collect::<Result<Vec<_>>>()
+        })?;
+        for (base, items) in [0u64, 1000].into_iter().zip(results) {
+            let expected: Vec<TestItem> = (0..40).map(|i| TestItem(base + i)).collect();
+            assert_eq!(items, expected, "the merge from {base}");
+        }
         Ok(())
     }
 
