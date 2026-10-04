@@ -316,9 +316,8 @@ fn parse_triple_term(bytes: &[u8], pos: &mut usize) -> Result<QueryTerm> {
             InnerTerm::Ground(component) => component,
             InnerTerm::Wildcard => unreachable!(),
         };
-        let predicate = match take(predicate) {
-            Component::Iri(iri) => iri,
-            _ => bail!("A triple term's predicate must be an IRI"),
+        let Component::Iri(predicate) = take(predicate) else {
+            unreachable!("a predicate is read as the string it is stored as")
         };
         let proposition = Proposition {
             subject: take(subject),
@@ -376,9 +375,8 @@ fn parse_triple_term_positions(
                 }
             }
             let object = ground.pop().unwrap();
-            let predicate = match ground.pop().unwrap() {
-                Component::Iri(iri) => iri,
-                _ => bail!("A triple term's predicate must be an IRI"),
+            let Component::Iri(predicate) = ground.pop().unwrap() else {
+                unreachable!("a predicate is read as the string it is stored as")
             };
             InnerTerm::Ground(Component::Triple(Box::new(
                 crate::triple_terms::Proposition {

@@ -394,9 +394,10 @@ counts disagree with the bound HDTs. Strict validation MUST additionally verify:
 2. each run against the dictionary's triple-term IRIs (§7 requirement 1);
 3. every run entry, by decoding its proposition and minting it again (§7
    requirement 2);
-4. each layer: that every set bit's triple, minted, is the IRI its `REVERSE`
-   entry names, and that each layer has exactly one bit per IRI of the data run
-   whose proposition it covers (§8);
+4. each layer: that every set bit's triple is the target of the IRI its
+   `REVERSE` entry names — which, with item 3, is the IRI that triple's
+   proposition mints — and that each layer has exactly one bit per IRI of the
+   data run whose proposition it covers (§8);
 5. that every target is a triple of the HDT its flag names, that the
    propositions HDT holds exactly the unasserted targets, and that none of
    them is a triple of `data.hdt` (§7 requirement 3, §3);

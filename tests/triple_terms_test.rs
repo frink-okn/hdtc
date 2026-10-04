@@ -346,6 +346,9 @@ fn search_refuses_misplaced_triple_terms() {
         let output = hdtc(&["search", "-q", hdt.to_str().unwrap(), "--query", query]);
         assert!(!output.status.success(), "{query} was accepted");
     }
+    // A predicate is read as stored, so one spelled like a literal is no
+    // error: like an ordinary pattern's, it simply matches nothing here.
+    assert!(search(&hdt, "? ? <<( ? \"lit\" ? )>>", &[]).is_empty());
 }
 
 const SECOND: &str = r#"@prefix : <http://ex/> .

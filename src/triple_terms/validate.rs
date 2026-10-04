@@ -9,8 +9,9 @@
 //!   nested terms included, and minted again ([`super::iri::iri_for`]);
 //! - every asserted proposition is a triple of `data.hdt`, and every
 //!   unasserted one a triple of the propositions HDT;
-//! - every set layer bit marks a triple whose IRI is the one its reverse entry
-//!   names, and each layer has exactly one bit per IRI it should cover.
+//! - every set layer bit marks the triple that is the target of the IRI its
+//!   reverse entry names — so, by the run check, the triple that IRI names —
+//!   and each layer has exactly one bit per IRI it should cover.
 
 use super::format::{self, Section};
 use super::iri::{Component, Proposition, TT_NAMESPACE, iri_for};
