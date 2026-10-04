@@ -13,16 +13,20 @@ use super::readonly::ReadOnlyDirectory;
 use super::schema::{FIELD_LANG, FIELD_OBJECT, FIELD_TEXT, FIELD_TEXT_STEMMED, register_tokenizer};
 use anyhow::{Context, Result, ensure};
 use std::cmp::{Ordering, Reverse};
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 use tantivy::collector::{Count, TopDocs};
+use tantivy::index::SegmentId;
 use tantivy::query::{
-    BooleanQuery, EnableScoring, FuzzyTermQuery, Occur, PhraseQuery, Query, QueryClone, RangeQuery,
-    TermQuery,
+    BooleanQuery, EmptyScorer, EnableScoring, Explanation, FuzzyTermQuery, Occur, PhraseQuery,
+    Query, QueryClone, Scorer, TermQuery, Weight,
 };
 use tantivy::schema::{Field, IndexRecordOption};
 use tantivy::tokenizer::{Language, TextAnalyzer, TokenStream};
-use tantivy::{DocSet, Index, IndexReader, ReloadPolicy, TERMINATED, Term};
+use tantivy::{
+    DocId, DocSet, Index, IndexReader, ReloadPolicy, Score, SegmentReader, TERMINATED, Term,
+};
 
 /// How the tokens of a query must combine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -213,8 +217,9 @@ pub struct TextSearcher {
     text_field: Field,
     stemmed_field: Field,
     lang_field: Field,
-    /// The object-ID column, which scopes a query to the data HDT's objects.
-    object_field: Field,
+    /// The segments holding the propositions HDT's literals, which a query
+    /// leaves out unless it asks for them (`docs/text-index-format.md` §5.3).
+    proposition_segments: Arc<HashSet<SegmentId>>,
     /// One analyzer per stemming algorithm the index actually used, so a query
     /// token is stemmed the same way the documents were. Empty when the index
     /// stems nothing, which skips the stemmed phase entirely.
@@ -256,9 +261,6 @@ impl TextSearcher {
         let stemmed_field = schema.get_field(FIELD_TEXT_STEMMED)?;
         let lang_field = schema.get_field(FIELD_LANG)?;
         let stemmers = build_stemmers(&manifest);
-        // Read through the fast-field column by name; the field itself scopes
-        // a query that leaves out the propositions HDT's literals.
-        let object_field = schema.get_field(FIELD_OBJECT)?;
         let analyzer = index
             .tokenizers()
             .get(TOKENIZER_NAME)
@@ -272,6 +274,7 @@ impl TextSearcher {
             .reload_policy(ReloadPolicy::Manual)
             .try_into()
             .with_context(|| format!("Failed to open text index reader {}", dir.display()))?;
+        let proposition_segments = Arc::new(proposition_segments(&reader, &manifest)?);
 
         Ok(Self {
             reader,
@@ -280,7 +283,7 @@ impl TextSearcher {
             text_field,
             stemmed_field,
             lang_field,
-            object_field,
+            proposition_segments,
             stemmers,
         })
     }
@@ -829,26 +832,19 @@ impl TextSearcher {
         Ok(Some(self.scoped(built, query)))
     }
 
-    /// Exclude the propositions HDT's literals unless the query asks for
-    /// them: a must-not range on the object column, which neither scores nor
-    /// counts the documents it removes.
+    /// Leave out the propositions HDT's literals unless the query asks for
+    /// them. Their documents are segments of their own, so the query matches
+    /// nothing there and runs unchanged everywhere else: nothing excluded is
+    /// matched, scored or counted, and the exclusion costs nothing per query
+    /// or per document.
     fn scoped(&self, built: Box<dyn Query>, query: &TextQuery) -> Box<dyn Query> {
-        match &self.manifest.propositions {
-            Some(coverage) if !query.propositions => {
-                let past_data = RangeQuery::new(
-                    std::ops::Bound::Excluded(Term::from_field_u64(
-                        self.object_field,
-                        coverage.object_offset,
-                    )),
-                    std::ops::Bound::Unbounded,
-                );
-                Box::new(BooleanQuery::new(vec![
-                    (Occur::Must, built),
-                    (Occur::MustNot, Box::new(past_data)),
-                ]))
-            }
-            _ => built,
+        if query.propositions || self.proposition_segments.is_empty() {
+            return built;
         }
+        Box::new(OutsideSegments {
+            inner: built,
+            skipped: Arc::clone(&self.proposition_segments),
+        })
     }
 
     /// A phrase query needs at least two tokens; one token is just a term.
@@ -1042,6 +1038,144 @@ fn stem_with(analyzer: &mut TextAnalyzer, token: &str) -> String {
     }
 }
 
+/// The segments of an index covering a propositions HDT that hold its
+/// literals: every document's ID is past `propositions_object_offset`
+/// (`docs/text-index-format.md` §2.4). hdtc publishes them as segments of
+/// their own (§5.3), and a segment mixing the two is refused, since a query
+/// leaves them out segment by segment. Decided from each segment's object
+/// column bounds once, when the index opens.
+fn proposition_segments(
+    reader: &IndexReader,
+    manifest: &TextManifest,
+) -> Result<HashSet<SegmentId>> {
+    let mut segments = HashSet::new();
+    let Some(coverage) = &manifest.propositions else {
+        return Ok(segments);
+    };
+    for segment in reader.searcher().segment_readers() {
+        if segment.num_docs() == 0 {
+            continue;
+        }
+        let column = segment
+            .fast_fields()
+            .u64(FIELD_OBJECT)
+            .context("Text index has no object ID column")?;
+        if column.min_value() > coverage.object_offset {
+            segments.insert(segment.segment_id());
+        } else {
+            ensure!(
+                column.max_value() <= coverage.object_offset,
+                "Text index segment {} holds literals of both data.hdt and the propositions \
+                 HDT; rebuild the index with `hdtc text`",
+                segment.segment_id().uuid_string()
+            );
+        }
+    }
+    Ok(segments)
+}
+
+/// A query that matches nothing in the `skipped` segments and is `inner`,
+/// unchanged, in every other: each of its weight's paths — scoring, counting,
+/// pruning — is delegated, so a segment it keeps runs exactly as it would
+/// without the wrapper.
+#[derive(Debug)]
+struct OutsideSegments {
+    inner: Box<dyn Query>,
+    skipped: Arc<HashSet<SegmentId>>,
+}
+
+impl Clone for OutsideSegments {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.box_clone(),
+            skipped: Arc::clone(&self.skipped),
+        }
+    }
+}
+
+impl Query for OutsideSegments {
+    fn weight(&self, enable_scoring: EnableScoring<'_>) -> tantivy::Result<Box<dyn Weight>> {
+        Ok(Box::new(OutsideSegmentsWeight {
+            inner: self.inner.weight(enable_scoring)?,
+            skipped: Arc::clone(&self.skipped),
+        }))
+    }
+
+    fn query_terms<'a>(&'a self, visitor: &mut dyn FnMut(&'a Term, bool)) {
+        self.inner.query_terms(visitor);
+    }
+}
+
+struct OutsideSegmentsWeight {
+    inner: Box<dyn Weight>,
+    skipped: Arc<HashSet<SegmentId>>,
+}
+
+impl OutsideSegmentsWeight {
+    fn skips(&self, reader: &SegmentReader) -> bool {
+        self.skipped.contains(&reader.segment_id())
+    }
+}
+
+impl Weight for OutsideSegmentsWeight {
+    fn scorer(&self, reader: &SegmentReader, boost: Score) -> tantivy::Result<Box<dyn Scorer>> {
+        if self.skips(reader) {
+            return Ok(Box::new(EmptyScorer));
+        }
+        self.inner.scorer(reader, boost)
+    }
+
+    fn explain(&self, reader: &SegmentReader, doc: DocId) -> tantivy::Result<Explanation> {
+        if self.skips(reader) {
+            return Err(tantivy::TantivyError::InvalidArgument(format!(
+                "document {doc} is a propositions HDT literal, which this query leaves out"
+            )));
+        }
+        self.inner.explain(reader, doc)
+    }
+
+    fn count(&self, reader: &SegmentReader) -> tantivy::Result<u32> {
+        if self.skips(reader) {
+            return Ok(0);
+        }
+        self.inner.count(reader)
+    }
+
+    fn for_each(
+        &self,
+        reader: &SegmentReader,
+        callback: &mut dyn FnMut(DocId, Score),
+    ) -> tantivy::Result<()> {
+        if self.skips(reader) {
+            return Ok(());
+        }
+        self.inner.for_each(reader, callback)
+    }
+
+    fn for_each_no_score(
+        &self,
+        reader: &SegmentReader,
+        callback: &mut dyn FnMut(&[DocId]),
+    ) -> tantivy::Result<()> {
+        if self.skips(reader) {
+            return Ok(());
+        }
+        self.inner.for_each_no_score(reader, callback)
+    }
+
+    fn for_each_pruning(
+        &self,
+        threshold: Score,
+        reader: &SegmentReader,
+        callback: &mut dyn FnMut(DocId, Score) -> Score,
+    ) -> tantivy::Result<()> {
+        if self.skips(reader) {
+            return Ok(());
+        }
+        self.inner.for_each_pruning(threshold, reader, callback)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1102,10 +1236,70 @@ mod tests {
                 text_field,
                 stemmed_field,
                 lang_field,
-                object_field,
+                proposition_segments: Arc::default(),
                 stemmers: Vec::new(),
             },
         ))
+    }
+
+    /// An index covering a propositions HDT with data.hdt's object count
+    /// `offset`: one segment per batch of IDs, then the segments sorted out
+    /// as `TextSearcher::open` does.
+    fn covering(offset: u64, batches: &[&[u64]]) -> Result<TextSearcher> {
+        let (index, mut searcher) = fixture(&[])?;
+        let schema = index.schema();
+        let mut writer: IndexWriter<TantivyDocument> =
+            index.writer_with_num_threads(1, 20 * 1024 * 1024)?;
+        for batch in batches {
+            for object_id in *batch {
+                let mut document = TantivyDocument::new();
+                document.add_text(schema.get_field(FIELD_TEXT)?, "shared");
+                document.add_u64(schema.get_field(FIELD_OBJECT)?, *object_id);
+                document.add_text(schema.get_field(FIELD_LANG)?, UNDETERMINED_LANGUAGE);
+                writer.add_document(document)?;
+            }
+            writer.commit()?;
+        }
+        searcher.reader.reload()?;
+        searcher.manifest.propositions = Some(super::super::manifest::PropositionsCoverage {
+            digest: [0; 32],
+            object_offset: offset,
+        });
+        searcher.proposition_segments =
+            Arc::new(proposition_segments(&searcher.reader, &searcher.manifest)?);
+        Ok(searcher)
+    }
+
+    /// The propositions HDT's segments are left out whole unless a query asks
+    /// for them, on every path a query takes.
+    #[test]
+    fn a_query_leaves_out_the_propositions_segments_unless_asked() -> Result<()> {
+        let searcher = covering(10, &[&[1, 4, 10], &[11, 12]])?;
+        assert_eq!(searcher.proposition_segments.len(), 1);
+        for (propositions, expected) in [(false, 3), (true, 5)] {
+            let query = TextQuery {
+                propositions,
+                ..shared()
+            };
+            assert_eq!(searcher.count(&query)?, expected, "{propositions}");
+            assert_eq!(searcher.count_up_to(&query, 100)?.0, expected as u64);
+            assert_eq!(searcher.search(&query, 100)?.len(), expected);
+            let mut ids = searcher
+                .scan_matching_objects(&query, None, 100)?
+                .object_ids;
+            ids.sort_unstable();
+            let all = [1, 4, 10, 11, 12];
+            assert_eq!(ids, all[..expected].to_vec());
+        }
+        Ok(())
+    }
+
+    /// A segment holding both data.hdt's literals and the propositions HDT's
+    /// cannot be left out whole, so such an index is refused at open.
+    #[test]
+    fn a_segment_mixing_data_and_propositions_is_refused() {
+        let error = covering(10, &[&[1, 11]]).err().expect("refused");
+        assert!(error.to_string().contains("both data.hdt"), "{error}");
     }
 
     fn shared() -> TextQuery {

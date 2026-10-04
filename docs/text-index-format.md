@@ -443,8 +443,16 @@ tokens at 40 bytes and would fail to match any longer term.
 
 ### 5.3 Segments
 
-A published index is merged to a single segment where it has any documents. This
-is a property of what hdtc publishes, not a requirement on readers.
+A published index is merged to a single segment where it has any documents —
+or, when it covers a propositions HDT (§2.4), to two: one of the data HDT's
+literals, then one of the propositions HDT's. The split lets a reader leave the
+propositions literals out whole segments at a time, at no cost per query: hdtc's
+reader decides at open, from each segment's `object` column bounds, which
+segments hold them, and refuses an index covering a propositions HDT whose
+segment mixes the two. A reader of its own may instead exclude IDs past
+`propositions_object_offset` with a range, which is correct on any
+segmentation, but in Tantivy costs time in proportion to the index on every
+query.
 
 ### 5.4 Reading writes nothing
 

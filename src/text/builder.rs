@@ -118,87 +118,91 @@ pub fn create_text_index(config: &TextConfig) -> Result<TextSummary> {
     let mut languages: HashMap<String, u64> = HashMap::new();
 
     tracing::info!("Scanning HDT object dictionary for literals");
-    let mut index_literal = |term: &[u8], object_id: u64| -> Result<()> {
-        let Some(literal) = parse_literal(term) else {
-            return Ok(());
+    let mut index_literal =
+        |writer: &IndexWriter<TantivyDocument>, term: &[u8], object_id: u64| -> Result<()> {
+            let Some(literal) = parse_literal(term) else {
+                return Ok(());
+            };
+            counts.literals_scanned += 1;
+
+            match analyzer::classify(&literal, config.max_literal_bytes, &config.exclusions) {
+                Some(Exclusion::Oversize) => {
+                    counts.excluded_oversize += 1;
+                    return Ok(());
+                }
+                Some(Exclusion::Datatype) => {
+                    counts.excluded_datatype += 1;
+                    return Ok(());
+                }
+                Some(Exclusion::NoTokens) => {
+                    counts.excluded_no_tokens += 1;
+                    return Ok(());
+                }
+                None => {}
+            }
+
+            let language = literal
+                .language
+                .map(normalize_language)
+                .unwrap_or_else(|| UNDETERMINED_LANGUAGE.to_string());
+
+            let value = String::from_utf8_lossy(literal.value).into_owned();
+            let mut document = TantivyDocument::new();
+            document.add_u64(object_field, object_id);
+            document.add_text(lang_field, &language);
+            // A literal in a language with no Snowball algorithm — or under
+            // `--untagged-language none` — is simply left out of the stemmed field.
+            // It stays exactly searchable; only the extra recall is unavailable.
+            if let Some(analyzer) = stemmers.for_language(&language) {
+                let tokens = collect_tokens(analyzer, &value);
+                document.add_pre_tokenized_text(
+                    stemmed_field,
+                    PreTokenizedString {
+                        text: value.clone(),
+                        tokens,
+                    },
+                );
+            }
+            document.add_text(text_field, value);
+            writer
+                .add_document(document)
+                .context("Failed to add a literal to the text index")?;
+
+            *languages.entry(language).or_default() += 1;
+            counts.indexed_docs += 1;
+            if counts.indexed_docs.is_multiple_of(1_000_000) {
+                tracing::info!("Indexed {} literals", counts.indexed_docs);
+            }
+            Ok(())
         };
-        counts.literals_scanned += 1;
-
-        match analyzer::classify(&literal, config.max_literal_bytes, &config.exclusions) {
-            Some(Exclusion::Oversize) => {
-                counts.excluded_oversize += 1;
-                return Ok(());
-            }
-            Some(Exclusion::Datatype) => {
-                counts.excluded_datatype += 1;
-                return Ok(());
-            }
-            Some(Exclusion::NoTokens) => {
-                counts.excluded_no_tokens += 1;
-                return Ok(());
-            }
-            None => {}
-        }
-
-        let language = literal
-            .language
-            .map(normalize_language)
-            .unwrap_or_else(|| UNDETERMINED_LANGUAGE.to_string());
-
-        let value = String::from_utf8_lossy(literal.value).into_owned();
-        let mut document = TantivyDocument::new();
-        document.add_u64(object_field, object_id);
-        document.add_text(lang_field, &language);
-        // A literal in a language with no Snowball algorithm — or under
-        // `--untagged-language none` — is simply left out of the stemmed field.
-        // It stays exactly searchable; only the extra recall is unavailable.
-        if let Some(analyzer) = stemmers.for_language(&language) {
-            let tokens = collect_tokens(analyzer, &value);
-            document.add_pre_tokenized_text(
-                stemmed_field,
-                PreTokenizedString {
-                    text: value.clone(),
-                    tokens,
-                },
-            );
-        }
-        document.add_text(text_field, value);
-        writer
-            .add_document(document)
-            .context("Failed to add a literal to the text index")?;
-
-        *languages.entry(language).or_default() += 1;
-        counts.indexed_docs += 1;
-        if counts.indexed_docs.is_multiple_of(1_000_000) {
-            tracing::info!("Indexed {} literals", counts.indexed_docs);
-        }
-        Ok(())
-    };
     // Object IDs in the object-only section continue after the shared section
     // (`docs/text-index-format.md` §2), which is the ID a search resolves.
     let shared_count = adapter.shared_count;
     for (offset, term) in adapter.object_terms()?.enumerate() {
-        index_literal(&term?, shared_count + offset as u64 + 1)?;
+        index_literal(&writer, &term?, shared_count + offset as u64 + 1)?;
     }
+    let data_segments = commit_as_one_segment(&index, &mut writer, &[])?;
     // The literals of unasserted RDF 1.2 triple terms live in the
     // propositions HDT; their documents follow the data HDT's object IDs
-    // (`docs/text-index-format.md` §2.4).
+    // (`docs/text-index-format.md` §2.4), in a segment of their own.
     if let Some((props, object_offset)) = propositions.as_ref() {
         tracing::info!("Scanning the propositions HDT's object dictionary for literals");
         let props_adapter = HdtInputAdapter::scan(&props.path)?;
         let props_shared = props_adapter.shared_count;
         for (offset, term) in props_adapter.object_terms()?.enumerate() {
-            index_literal(&term?, object_offset + props_shared + offset as u64 + 1)?;
+            index_literal(
+                &writer,
+                &term?,
+                object_offset + props_shared + offset as u64 + 1,
+            )?;
         }
+        commit_as_one_segment(&index, &mut writer, &data_segments)?;
     }
-
     tracing::info!(
-        "Committing {} documents ({} literals scanned)",
+        "Committed {} documents ({} literals scanned)",
         counts.indexed_docs,
         counts.literals_scanned
     );
-    writer.commit().context("Failed to commit the text index")?;
-    merge_to_one_segment(&index, &mut writer)?;
     writer
         .wait_merging_threads()
         .context("Text index merge threads failed")?;
@@ -332,12 +336,27 @@ struct ScanCounts {
     excluded_no_tokens: u64,
 }
 
-/// Merge every segment into one, so the published index is a compact artifact
-/// rather than a snapshot of whatever the merge policy happened to leave.
-fn merge_to_one_segment(index: &Index, writer: &mut IndexWriter<TantivyDocument>) -> Result<()> {
-    let segments = index
+/// Commit the documents added so far, and merge the segments they made — every
+/// searchable segment but `kept` — into one, so the published index is a
+/// compact artifact rather than a snapshot of whatever the writer threads
+/// happened to leave. Returns the searchable segments afterwards.
+///
+/// The data HDT's literals are one segment, and the propositions HDT's another
+/// (`docs/text-index-format.md` §5.3): leaving the propositions out of a query
+/// is then a range on the object column that each segment's column bounds
+/// decide whole, at no cost per document.
+fn commit_as_one_segment(
+    index: &Index,
+    writer: &mut IndexWriter<TantivyDocument>,
+    kept: &[tantivy::index::SegmentId],
+) -> Result<Vec<tantivy::index::SegmentId>> {
+    writer.commit().context("Failed to commit the text index")?;
+    let segments: Vec<_> = index
         .searchable_segment_ids()
-        .context("Failed to list text index segments")?;
+        .context("Failed to list text index segments")?
+        .into_iter()
+        .filter(|segment| !kept.contains(segment))
+        .collect();
     if segments.len() > 1 {
         tracing::info!("Merging {} segments", segments.len());
         writer
@@ -349,7 +368,9 @@ fn merge_to_one_segment(index: &Index, writer: &mut IndexWriter<TantivyDocument>
         .garbage_collect_files()
         .wait()
         .context("Failed to remove superseded text index segments")?;
-    Ok(())
+    index
+        .searchable_segment_ids()
+        .context("Failed to list text index segments")
 }
 
 /// Split `memory_limit` into a thread count and the total arena Tantivy divides

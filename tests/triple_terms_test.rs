@@ -911,6 +911,16 @@ fn text_search_reaches_literals_of_unasserted_triple_terms() {
     // Nested two levels down inside an unasserted claim is still reachable.
     assert_eq!(text("quoted", &[]).len(), 1);
 
+    // Their documents are a segment of their own, after data.hdt's, so a
+    // query leaves them out by each segment's column bounds rather than by
+    // testing documents (`docs/text-index-format.md` §5.3).
+    let text_dir = PathBuf::from(format!("{}.text", hdt.display()));
+    let segments = tantivy::Index::open_in_dir(&text_dir)
+        .unwrap()
+        .searchable_segment_metas()
+        .unwrap();
+    assert_eq!(segments.len(), 2, "{segments:?}");
+
     // Through the library, those literals are opt-in: a caller resolving hits
     // through data.hdt alone never matches, scores or counts them.
     use hdtc::format::{TextQuery, TextSearcher};
