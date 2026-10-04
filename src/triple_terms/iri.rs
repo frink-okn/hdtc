@@ -204,8 +204,23 @@ fn write_canonical_component<'a>(
 
 fn write_canonical_iri(out: &mut Vec<u8>, iri: &str) {
     out.push(b'<');
-    out.extend_from_slice(iri.as_bytes());
+    write_canonical_iri_body(out, iri.as_bytes());
     out.push(b'>');
+}
+
+/// An IRI's characters as the canonical form writes them: those an N-Triples
+/// IRIREF excludes — U+0000–U+0020 and `<>"{}|^`\` — as `\uXXXX` with
+/// uppercase hex, everything else as is. Lenient ingest can store an IRI
+/// holding any of them, and written raw one could end the IRI early and make
+/// two different terms spell alike: `<a> <b> <c> <d>` read either way.
+fn write_canonical_iri_body(out: &mut Vec<u8>, iri: &[u8]) {
+    for &byte in iri {
+        if byte <= 0x20 || b"<>\"{}|^`\\".contains(&byte) {
+            out.extend_from_slice(format!("\\u{byte:04X}").as_bytes());
+        } else {
+            out.push(byte);
+        }
+    }
 }
 
 /// A dictionary literal in canonical N-Triples 1.2 form. The dictionary already
@@ -249,7 +264,7 @@ fn write_canonical_literal(out: &mut Vec<u8>, literal: &str) {
         out.extend_from_slice(&language.to_ascii_lowercase());
     } else if let Some(datatype) = parsed.datatype {
         out.extend_from_slice(b"^^<");
-        out.extend_from_slice(datatype);
+        write_canonical_iri_body(out, datatype);
         out.push(b'>');
     }
 }
@@ -360,6 +375,24 @@ mod tests {
         out
     }
 
+    /// An IRI holding characters an IRIREF excludes cannot make two terms
+    /// spell alike: `(a, b, "c> <d")` and `("a> <b", c, d)` differ.
+    #[test]
+    fn iris_that_could_end_early_do_not_collide() {
+        let first = prop(iri("a"), "b", iri("c> <d"));
+        let second = prop(iri("a> <b"), "c", iri("d"));
+        assert_ne!(iri_for(&first), iri_for(&second));
+        assert_eq!(
+            canonical(&second),
+            "<<( <a\\u003E\\u0020\\u003Cb> <c> <d> )>>"
+        );
+        // Ordinary IRIs are untouched.
+        assert_eq!(
+            canonical(&prop(iri("http://ex/s"), "http://ex/p", iri("http://ex/o"))),
+            "<<( <http://ex/s> <http://ex/p> <http://ex/o> )>>"
+        );
+    }
+
     #[test]
     fn a_ground_iri_is_a_content_hash() {
         let p = prop(iri("http://ex/s"), "http://ex/p", iri("http://ex/o"));
@@ -375,7 +408,6 @@ mod tests {
             digest[..16].to_vec(),
             "{name} does not carry {hex}"
         );
-        assert_eq!(name, iri_for(&p.clone()));
         assert_eq!(name, iri_for(&p.clone()));
     }
 

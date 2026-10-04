@@ -79,7 +79,10 @@ The **canonical form** of a triple term is its RDF 1.2 canonical N-Triples
 serialization: `<<( ` subject ` ` predicate ` ` object ` )>>`, components
 separated by exactly one space, nested triple terms written inline, and
 
-- IRIs as `<iri>`;
+- IRIs as `<iri>`, a character an N-Triples IRIREF excludes (U+0000–U+0020
+  and `` < > " { } | ^ ` \ ``) written as `\uXXXX` with uppercase hex — lenient
+  ingest can store such an IRI, and written raw it could end early and make two
+  terms alike — and a literal's datatype IRI the same way;
 - literals as `"value"` with the value escaped as canonical N-Triples requires —
   `\b \t \n \f \r \" \\` as ECHAR; U+0000–U+0007, U+000B, U+000E–U+001F, U+007F,
   U+FFFE and U+FFFF as `\uXXXX` with uppercase hex; everything else unescaped —
@@ -99,9 +102,10 @@ urn:x-kgf:tt:g:{h}
 where `{h}` is the first 16 bytes of the SHA-256 of the UTF-8 canonical form, as
 22 characters of unpadded base64url (RFC 4648 §5: `A–Z a–z 0–9 - _`). The
 encoding is chosen for size: the hash is stored once per distinct triple term,
-and base64url carries its 128 bits in 22 characters where hex takes 32. Equal terms receive equal IRIs in every build; that is
-what lets separately built HDTs merge their triple terms by string equality, and
-what makes a ground triple term's IRI a federation-wide identifier.
+and base64url carries its 128 bits in 22 characters where hex takes 32. Equal
+terms receive equal IRIs in every build; that is what lets separately built
+HDTs merge their triple terms by string equality, and what makes a ground
+triple term's IRI a federation-wide identifier.
 
 A triple term **with blank nodes** is named
 
