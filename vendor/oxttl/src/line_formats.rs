@@ -162,7 +162,7 @@ impl RuleRecognizer for NQuadsRecognizer {
                                 results,
                                 errors,
                                 TokenOrLineJump::Token(token),
-                                "triple term nested more than 64 levels deep",
+                                crate::triple_term_nesting_error(),
                             );
                         }
                         self.stack.push(NQuadsState::AfterQuotedTriple);

@@ -482,6 +482,124 @@ fn a_propositions_hdt_is_never_an_input_of_its_own() {
     ]);
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("without the HDT it belongs to"));
+    // An explicit orphan is told that, not to give an owner that is missing.
+    let output = hdtc(&[
+        "create",
+        "-q",
+        orphans.join("a.hdt.props.hdt").to_str().unwrap(),
+        "-o",
+        dir.path().join("z.hdt").to_str().unwrap(),
+    ]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("without the HDT it belongs to"));
+
+    // `-o` takes any name, so an owner need not be called `*.hdt`.
+    let bare = dir.path().join("bare");
+    std::fs::create_dir(&bare).unwrap();
+    let unasserted = dir.path().join("unasserted.nt");
+    common::write_file(
+        &unasserted,
+        format!(
+            "<http://ex/e> <{RDF_REIFIES}> <<( <http://ex/s> <http://ex/p> <http://ex/o> )>> .\n"
+        )
+        .as_bytes(),
+    );
+    let output = hdtc(&[
+        "create",
+        "-q",
+        unasserted.to_str().unwrap(),
+        "-o",
+        bare.join("data").to_str().unwrap(),
+        "--temp-dir",
+        dir.path().join("work").to_str().unwrap(),
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(bare.join("data.props.hdt").exists());
+    let output = hdtc(&[
+        "create",
+        "-q",
+        bare.to_str().unwrap(),
+        "-o",
+        dir.path().join("w.hdt").to_str().unwrap(),
+    ]);
+    // `data` is not an HDT by name, so nothing is left to merge — and above
+    // all its propositions are not merged as asserted triples.
+    let merged = dir.path().join("w.hdt");
+    assert!(
+        !output.status.success()
+            || !dump(&merged)
+                .iter()
+                .any(|l| l == "<http://ex/s> <http://ex/p> <http://ex/o> ."),
+        "an unasserted claim became a triple"
+    );
+    let output = hdtc(&[
+        "create",
+        "-q",
+        bare.join("data.props.hdt").to_str().unwrap(),
+        "-o",
+        dir.path().join("v.hdt").to_str().unwrap(),
+    ]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("propositions HDT of"));
+}
+
+/// Rewrite bytes of a triple-term index's header, keeping its checksums
+/// right, so that only the field under test is wrong.
+fn corrupt_header(index: &Path, edit: impl FnOnce(&mut [u8])) {
+    let crc = |bytes: &[u8]| crc::Crc::<u32>::new(&crc::CRC_32_ISCSI).checksum(bytes);
+    let mut bytes = std::fs::read(index).unwrap();
+    edit(&mut bytes[..256]);
+    let header_crc = crc(&bytes[..252]);
+    bytes[252..256].copy_from_slice(&header_crc.to_le_bytes());
+    let footer = bytes.len() - 64;
+    bytes[footer + 56..footer + 60].copy_from_slice(&header_crc.to_le_bytes());
+    let footer_crc = crc(&bytes[footer..footer + 60]);
+    bytes[footer + 60..footer + 64].copy_from_slice(&footer_crc.to_le_bytes());
+    std::fs::write(index, bytes).unwrap();
+}
+
+#[test]
+fn an_index_header_that_breaks_the_format_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.nt");
+    // Asserted only, so the index has no propositions HDT.
+    common::write_file(
+        &input,
+        format!(
+            "<http://ex/s> <http://ex/p> <http://ex/o> .\n\
+             <http://ex/e> <{RDF_REIFIES}> <<( <http://ex/s> <http://ex/p> <http://ex/o> )>> .\n"
+        )
+        .as_bytes(),
+    );
+    let hdt = create(dir.path(), &[&input], "a.hdt");
+    assert!(!tt_path(&hdt, ".props.hdt").exists());
+    validate(&hdt, dir.path());
+    let pristine = std::fs::read(tt_path(&hdt, ".tt")).unwrap();
+    for (what, edit) in [
+        (
+            "minor version",
+            Box::new(|header: &mut [u8]| header[10] = 1) as Box<dyn FnOnce(&mut [u8])>,
+        ),
+        (
+            "propositions HDT fields",
+            Box::new(|header: &mut [u8]| header[120] = 1),
+        ),
+        (
+            "propositions HDT fields",
+            Box::new(|header: &mut [u8]| header[192] = 1),
+        ),
+    ] {
+        std::fs::write(tt_path(&hdt, ".tt"), &pristine).unwrap();
+        corrupt_header(&tt_path(&hdt, ".tt"), edit);
+        let output = hdtc(&["dump", "-q", hdt.to_str().unwrap()]);
+        assert!(!output.status.success(), "{what} accepted");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(what), "{what}: {stderr}");
+    }
 }
 
 #[test]
@@ -564,33 +682,64 @@ fn nesting_beyond_the_limit_is_skipped_not_crashed_on() {
         vec![format!("<http://ex/a> <http://ex/b> {term} .")]
     );
 
-    // The statement after a rejected one is kept: the depth count does not
-    // leak across the parser's recovery, in either syntax.
-    let mut deep = "<http://ex/o>".to_owned();
-    for _ in 0..65 {
-        deep = format!("<<( <http://ex/s> <http://ex/p> {deep} )>>");
+    // The depth count does not leak across the parser's recovery. Each of
+    // these lines leaves two triple terms open when it fails, and has no `.`
+    // to end it; a counter that outlived recovery would reach the limit long
+    // before the last line, which is exactly at it.
+    let mut lines = String::new();
+    for _ in 0..40 {
+        lines.push_str(
+            "<http://ex/a> <http://ex/b> <<( <http://ex/s> <http://ex/p> <<( <http://ex/s> \"\n",
+        );
     }
-    for (name, prefix) in [
-        ("leak.nt", ""),
-        ("leak.ttl", "@prefix ex: <http://ex/> .\n"),
+    let mut at_limit = "<http://ex/o>".to_owned();
+    for _ in 0..64 {
+        at_limit = format!("<<( <http://ex/s> <http://ex/p> {at_limit} )>>");
+    }
+    lines.push_str(&format!("<http://ex/c> <http://ex/d> {at_limit} .\n"));
+    let input = dir.path().join("leak.nt");
+    common::write_file(&input, lines.as_bytes());
+    let hdt = create(dir.path(), &[&input], "leak.hdt");
+    assert_eq!(
+        dump(&hdt),
+        vec![format!("<http://ex/c> <http://ex/d> {at_limit} .")]
+    );
+
+    // Reifying a triple whose object is at the limit makes a triple term one
+    // level past it, so the reifier is refused where it is written: no
+    // dangling reifier is left behind, and the next statement is kept.
+    for (name, statement) in [
+        (
+            "annotated.ttl",
+            format!("<http://ex/a> <http://ex/b> {at_limit} {{| <http://ex/q> <http://ex/r> |}} ."),
+        ),
+        (
+            "named.ttl",
+            format!(
+                "<http://ex/a> <http://ex/b> {at_limit} ~ <http://ex/r1> {{| <http://ex/q> <http://ex/r> |}} ."
+            ),
+        ),
+        (
+            "reified.ttl",
+            format!("<< <http://ex/a> <http://ex/b> {at_limit} >> <http://ex/q> <http://ex/z> ."),
+        ),
     ] {
         let input = dir.path().join(name);
         common::write_file(
             &input,
-            format!(
-                "{prefix}<http://ex/a> <http://ex/b> {deep} .\n\
-                 <http://ex/c> <http://ex/d> <<( <http://ex/s> <http://ex/p> <http://ex/o> )>> .\n"
-            )
-            .as_bytes(),
+            format!("{statement}\n<http://ex/ok> <http://ex/p> <http://ex/o> .\n").as_bytes(),
         );
         let hdt = create(dir.path(), &[&input], &format!("{name}.hdt"));
-        assert_eq!(
-            dump(&hdt),
-            vec![
-                "<http://ex/c> <http://ex/d> <<( <http://ex/s> <http://ex/p> <http://ex/o> )>> ."
-                    .to_owned()
-            ],
-            "{name}"
+        let lines = dump(&hdt);
+        assert!(
+            lines
+                .iter()
+                .all(|line| !line.contains(RDF_REIFIES) && !line.contains("<http://ex/q>")),
+            "{name}: {lines:?}"
+        );
+        assert!(
+            lines.contains(&"<http://ex/ok> <http://ex/p> <http://ex/o> .".to_owned()),
+            "{name}: {lines:?}"
         );
     }
 

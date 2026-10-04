@@ -116,10 +116,17 @@ pub fn discover_inputs(paths: &[PathBuf]) -> Result<DiscoveredInputs> {
 
         if path.is_file() {
             if let Some(owner) = propositions_owner(path) {
+                if owner.exists() {
+                    bail!(
+                        "{} is the propositions HDT of {}; give {} as the input instead",
+                        path.display(),
+                        owner.display(),
+                        owner.display()
+                    );
+                }
                 bail!(
-                    "{} is the propositions HDT of {}; give {} as the input instead",
+                    "{} is a propositions HDT without the HDT it belongs to ({})",
                     path.display(),
-                    owner.display(),
                     owner.display()
                 );
             }
@@ -184,16 +191,21 @@ pub fn discover_inputs(paths: &[PathBuf]) -> Result<DiscoveredInputs> {
     })
 }
 
-/// The HDT that `path` is the propositions HDT of, if its name says it is one
-/// (`X.hdt.props.hdt` belongs to `X.hdt`). Decided by name alone: the
-/// triple-term index beside the owner is droppable, and an interrupted build
-/// can publish the propositions HDT before it, so neither may be required.
+/// The HDT that `path` is the propositions HDT of, if it is one: `X.props.hdt`
+/// belongs to `X`. Decided by name, and by the owner's existence when the name
+/// alone cannot say — `-o` takes any name, so `data.props.hdt` belongs to an
+/// HDT called `data` when there is one — but never by the triple-term index,
+/// which is droppable and which an interrupted build can leave unpublished.
+/// An owner named `*.hdt` decides it even when missing, so that an orphaned
+/// propositions HDT is refused rather than merged as asserted data.
 fn propositions_owner(path: &Path) -> Option<PathBuf> {
     let name = path.file_name()?.to_str()?;
     let owner_name = name.strip_suffix(".props.hdt")?;
-    owner_name
-        .ends_with(".hdt")
-        .then(|| path.with_file_name(owner_name))
+    if owner_name.is_empty() {
+        return None;
+    }
+    let owner = path.with_file_name(owner_name);
+    (owner_name.ends_with(".hdt") || owner.is_file()).then_some(owner)
 }
 
 /// Check if a file has an `.hdt` extension.

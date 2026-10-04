@@ -36,3 +36,24 @@ pub(crate) const MIN_PARALLEL_CHUNK_SIZE: usize = 16384;
 /// parsers count open triple terms on their own state stacks, which error
 /// recovery clears, so a malformed statement cannot leak depth into the next.
 pub const MAX_TRIPLE_TERM_NESTING: usize = 64;
+
+/// The error a statement nesting deeper than [`MAX_TRIPLE_TERM_NESTING`] gets.
+pub(crate) fn triple_term_nesting_error() -> String {
+    format!("triple term nested more than {MAX_TRIPLE_TERM_NESTING} levels deep")
+}
+
+/// How many triple terms `term` nests: 0 unless it is one. Triple terms nest
+/// only in object position, so this follows a single chain.
+///
+/// Reifying a triple makes it a triple term, one level deeper than its
+/// object, so a statement reifying a triple whose object is already at the
+/// limit must be refused where the reifier is written (hdtc change 7).
+#[cfg(feature = "rdf-12")]
+pub(crate) fn triple_term_depth(mut term: &oxrdf::Term) -> usize {
+    let mut depth = 0;
+    while let oxrdf::Term::Triple(triple) = term {
+        depth += 1;
+        term = &triple.object;
+    }
+    depth
+}

@@ -198,34 +198,48 @@ fn roll_back(error: anyhow::Error, retired: &[&Option<RetiredArtifact>]) -> anyh
     }
 }
 
-/// Publish a staged artifact after the HDT has been replaced. On failure the
-/// staged file and every retired artifact are kept rather than deleted — the
-/// HDT is already new, so restoring would be wrong, and either may hold the
-/// only copy of data — and the error says where they are.
-fn publish_staged(
-    staged: tempfile::TempPath,
-    destination: &Path,
-    label: &str,
-    retired: &[&Option<RetiredArtifact>],
-) -> Result<()> {
-    staged.persist(destination).map_err(|error| {
-        let kept = match error.path.keep() {
+/// An artifact staged beside its final name, waiting to be published.
+struct Staged {
+    file: tempfile::TempPath,
+    destination: PathBuf,
+    label: &'static str,
+}
+
+/// Publish the artifacts staged beside a new HDT, in order, after the HDT
+/// itself has been replaced. Restoring the old artifacts would be wrong by
+/// then, so a failure instead keeps everything that could hold the only copy
+/// of something: the artifact that failed, every one not yet published, and
+/// every retired one. The error says where each is.
+fn publish_staged(staged: Vec<Staged>, retired: &[&Option<RetiredArtifact>]) -> Result<()> {
+    let mut pending = staged.into_iter();
+    while let Some(next) = pending.next() {
+        let Err(error) = next.file.persist(&next.destination) else {
+            tracing::info!("{} written: {}", next.label, next.destination.display());
+            continue;
+        };
+        let keep = |file: tempfile::TempPath, label: &str| match file.keep() {
             Ok(path) => format!("the new {label} is kept at {}", path.display()),
             Err(keep) => format!("the new {label} could not be kept: {}", keep.error),
         };
-        let previous: Vec<String> = retired
-            .iter()
-            .filter_map(|artifact| artifact.as_ref())
-            .map(RetiredArtifact::preserve)
-            .collect();
-        anyhow::anyhow!(
-            "Failed to publish {label} {}: {}; {kept}{}{}",
-            destination.display(),
+        let mut kept = vec![keep(error.path, next.label)];
+        kept.extend(
+            pending.map(|later| format!("{} (not published)", keep(later.file, later.label))),
+        );
+        kept.extend(
+            retired
+                .iter()
+                .filter_map(|artifact| artifact.as_ref())
+                .map(RetiredArtifact::preserve),
+        );
+        anyhow::bail!(
+            "Failed to publish {} {}: {}; {}",
+            next.label,
+            next.destination.display(),
             error.error,
-            if previous.is_empty() { "" } else { "; " },
-            previous.join("; ")
-        )
-    })
+            kept.join("; ")
+        );
+    }
+    Ok(())
 }
 
 /// Run the `hdtc` command-line interface.
@@ -686,92 +700,82 @@ fn create_hdt(args: cli::CreateArgs, benchmark: bool) -> Result<()> {
         );
     }
 
-    let all_retired = [
-        &retired_tt,
-        &retired_props_perm,
-        &retired_props,
-        &retired_graph_index,
-        &retired_sidecar,
-        &retired_perm,
-    ];
-    if let Some(sidecar_temp) = sidecar_temp {
-        publish_staged(
-            sidecar_temp,
-            &canonical_graphs_path,
-            "graph sidecar",
-            &all_retired,
-        )?;
-        tracing::info!("Graph sidecar written: {}", canonical_graphs_path.display());
+    // Data before the indexes that bind to it: the graph sidecar before its
+    // index, and the propositions HDT before its permutation index and the
+    // triple-term index, which binds to both HDTs.
+    let mut staged = Vec::new();
+    if let Some(file) = sidecar_temp {
+        staged.push(Staged {
+            file,
+            destination: canonical_graphs_path.clone(),
+            label: "Graph sidecar",
+        });
     }
-
+    let (props_perm_staged, tt_staged) = match built_triple_terms {
+        Some(built) => {
+            let props_perm = built.propositions.map(|(props_hdt, props_perm)| {
+                staged.push(Staged {
+                    file: props_hdt,
+                    destination: canonical_props_path.clone(),
+                    label: "Propositions HDT",
+                });
+                Staged {
+                    file: props_perm,
+                    destination: canonical_props_perm_path.clone(),
+                    label: "Propositions permutation index",
+                }
+            });
+            let tt = Staged {
+                file: built.index,
+                destination: canonical_tt_path.clone(),
+                label: "Triple-term index",
+            };
+            (props_perm, Some(tt))
+        }
+        None => (None, None),
+    };
+    if let Some(file) = perm_temp {
+        staged.push(Staged {
+            file,
+            destination: canonical_perm_path.clone(),
+            label: "Permutation index",
+        });
+    }
+    if let Some(file) = graph_index_temp {
+        staged.push(Staged {
+            file,
+            destination: canonical_graph_index_path.clone(),
+            label: "Graph index",
+        });
+    }
+    staged.extend(props_perm_staged);
+    staged.extend(tt_staged);
+    let publishes_triple_terms = staged
+        .iter()
+        .any(|artifact| artifact.destination == canonical_tt_path);
     if !publish_perm && retired_perm.is_some() {
         tracing::info!(
             "Removed stale permutation index: {}",
             canonical_perm_path.display()
         );
     }
-    if let Some(perm_temp) = perm_temp {
-        publish_staged(
-            perm_temp,
-            &canonical_perm_path,
-            "permutation index",
-            &all_retired,
-        )?;
+    if !publishes_triple_terms && retired_triple_terms {
         tracing::info!(
-            "Permutation index written: {}",
-            canonical_perm_path.display()
+            "Removed stale triple-term artifacts beside {}",
+            args.output.display()
         );
     }
-    if let Some(graph_index_temp) = graph_index_temp {
-        publish_staged(
-            graph_index_temp,
-            &canonical_graph_index_path,
-            "graph index",
-            &all_retired,
-        )?;
-        tracing::info!(
-            "Graph index written: {}",
-            canonical_graph_index_path.display()
-        );
-    }
-
-    match built_triple_terms {
-        Some(built) => {
-            // Data before index: the triple-term index binds to both HDTs.
-            if let Some((props_hdt, props_perm)) = built.propositions {
-                publish_staged(
-                    props_hdt,
-                    &canonical_props_path,
-                    "propositions HDT",
-                    &all_retired,
-                )?;
-                publish_staged(
-                    props_perm,
-                    &canonical_props_perm_path,
-                    "propositions permutation index",
-                    &all_retired,
-                )?;
-                tracing::info!(
-                    "Propositions HDT written: {}",
-                    canonical_props_path.display()
-                );
-            }
-            publish_staged(
-                built.index,
-                &canonical_tt_path,
-                "triple-term index",
-                &all_retired,
-            )?;
-            tracing::info!("Triple-term index written: {}", canonical_tt_path.display());
-        }
-        None if retired_triple_terms => {
-            tracing::info!(
-                "Removed stale triple-term artifacts beside {}",
-                args.output.display()
-            );
-        }
-        None => {}
-    }
+    publish_staged(
+        staged,
+        &[
+            &retired_tt,
+            &retired_props_perm,
+            &retired_props,
+            &retired_graph_index,
+            &retired_sidecar,
+            &retired_perm,
+        ],
+    )?;
 
     // Clean up dict section and triples temp files
     for path in &pipeline_result.dict_section_paths {

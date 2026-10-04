@@ -141,8 +141,9 @@ pub struct ExtractedQuad {
 pub struct TripleTermRecords(pub Vec<PropositionRecord>);
 
 /// A statement whose triple term nests deeper than hdtc accepts. Skipped like
-/// a syntax error — the vendored lexer refuses the same depth as one — rather
-/// than failing the build.
+/// a syntax error — the vendored Turtle-family parsers refuse the same depth as
+/// one, so this is reached only by syntaxes they do not cover — rather than
+/// failing the build.
 #[derive(Debug, thiserror::Error)]
 #[error(
     "triple term nested more than {} levels deep",
@@ -708,6 +709,8 @@ enum ParseError {
     #[error(transparent)]
     Turtle(#[from] oxttl::TurtleParseError),
     #[error(transparent)]
+    RdfXml(#[from] oxrdfxml::RdfXmlParseError),
+    #[error(transparent)]
     Rdf(#[from] oxrdfio::RdfParseError),
     /// A well-formed N3 statement that is not an RDF quad (a variable, or a
     /// literal in subject position). Skippable, like a syntax error.
@@ -720,6 +723,7 @@ impl ParseError {
     fn io_error(&self) -> Option<&io::Error> {
         match self {
             Self::Turtle(oxttl::TurtleParseError::Io(e))
+            | Self::RdfXml(oxrdfxml::RdfXmlParseError::Io(e))
             | Self::Rdf(oxrdfio::RdfParseError::Io(e)) => Some(e),
             _ => None,
         }
@@ -840,6 +844,7 @@ enum FormatParser {
     NTriples(oxttl::NTriplesParser),
     NQuads(oxttl::NQuadsParser),
     N3(oxttl::N3Parser),
+    RdfXml(oxrdfxml::RdfXmlParser),
     Generic(oxrdfio::RdfParser),
 }
 
@@ -933,6 +938,13 @@ impl FormatParser {
             RdfFormat::NTriples => Self::NTriples(bounded!(oxttl::NTriplesParser::new())),
             RdfFormat::NQuads => Self::NQuads(bounded!(oxttl::NQuadsParser::new())),
             RdfFormat::N3 => Self::N3(bounded!(oxttl::N3Parser::new(), base)),
+            RdfFormat::RdfXml => {
+                let parser = oxrdfxml::RdfXmlParser::new();
+                let parser = if lenient { parser.lenient() } else { parser };
+                Self::RdfXml(with_base(parser, base_uri, |parser, base| {
+                    parser.with_base_iri(base)
+                }))
+            }
             other => {
                 let mut parser = oxrdfio::RdfParser::from_format(to_oxrdf_format(other));
                 if lenient {
@@ -952,6 +964,7 @@ impl FormatParser {
             Self::NTriples(parser) => LenientQuads::NTriples(parser.for_reader(reader)),
             Self::NQuads(parser) => LenientQuads::NQuads(parser.for_reader(reader)),
             Self::N3(parser) => LenientQuads::N3(parser.for_reader(reader)),
+            Self::RdfXml(parser) => LenientQuads::RdfXml(parser.for_reader(reader)),
             Self::Generic(parser) => LenientQuads::Generic(parser.for_reader(reader)),
         }
     }
@@ -965,6 +978,7 @@ enum LenientQuads<R: Read> {
     NTriples(oxttl::ntriples::ReaderNTriplesParser<R>),
     NQuads(oxttl::nquads::ReaderNQuadsParser<R>),
     N3(oxttl::n3::ReaderN3Parser<R>),
+    RdfXml(oxrdfxml::ReaderRdfXmlParser<R>),
     Generic(oxrdfio::ReaderQuadParser<R>),
 }
 
@@ -987,6 +1001,10 @@ impl<R: Read> Iterator for LenientQuads<R> {
                 .next()?
                 .map_err(ParseError::Turtle)
                 .and_then(n3_to_quad),
+            Self::RdfXml(parser) => parser
+                .next()?
+                .map(|triple| triple.in_graph(GraphName::DefaultGraph))
+                .map_err(ParseError::RdfXml),
             Self::Generic(parser) => parser.next()?.map_err(ParseError::Rdf),
         })
     }

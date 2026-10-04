@@ -31,6 +31,9 @@ oxrdfio = { version = "0.2", features = ["rdf-12"] }
 # root manifest, and anything depending on hdtc would fail to build; oxrdfio
 # keeps using the registry oxttl for the formats hdtc does not build itself.
 oxttl = { package = "oxttl-hdtc", path = "vendor/oxttl", features = ["rdf-12"] }
+# RDF/XML likewise, from a vendored oxrdfxml 0.2.3 that bounds triple-term
+# nesting (vendor/oxrdfxml/Cargo.toml).
+oxrdfxml = { package = "oxrdfxml-hdtc", path = "vendor/oxrdfxml", features = ["rdf-12"] }
 oxrdf = { version = "0.3", features = ["rdf-12"] }
 indicatif = "0.17"
 zstd = "0.13"
