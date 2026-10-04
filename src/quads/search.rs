@@ -115,7 +115,7 @@ pub fn search_dataset_streaming(
     };
     let (offsets, mut dictionary) = open_hdt(hdt_path, dictionary_budget)
         .with_context(|| format!("Failed to open HDT file {}", hdt_path.display()))?;
-    dictionary.enable_triple_terms(hdt_path, dictionary_budget / 4)?;
+    dictionary.enable_triple_terms(hdt_path, dictionary_budget / 8)?;
     let Some(resolved) = resolve_triple_pattern(pattern, &mut dictionary)? else {
         return write_empty_result(output, count_only);
     };

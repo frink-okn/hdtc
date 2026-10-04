@@ -29,9 +29,14 @@
 # 6. A full buffer is compacted of its consumed prefix before the current token
 #    is judged too large, so the bound applies to one term, not to the terms of
 #    a statement together. hdtc's own fix.
+# 7. The lexer refuses RDF 1.2 triple terms nested more than 64 levels deep
+#    (`MAX_TRIPLE_TERM_NESTING`, `src/lexer.rs`) with a syntax error. Nested
+#    terms are boxed, and their `Clone` and `Drop` recurse, so a deeply nested
+#    term — a few hundred kilobytes suffice — overflowed the thread stack and
+#    aborted the process. hdtc's own fix; hdtc accepts the same depth.
 #
 # Replacing this directory with an upstream release requires that release to
-# cover items 2–6 as well as item 1; check before dropping it.
+# cover items 2–7 as well as item 1; check before dropping it.
 #
 # The manifest below is the crates.io-normalized one from the 0.2.3 package,
 # with the package and library renamed.

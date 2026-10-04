@@ -18,6 +18,7 @@
 pub mod build;
 pub mod format;
 pub mod iri;
+pub mod merge;
 pub mod reader;
 pub mod search;
 pub mod spool;

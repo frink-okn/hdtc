@@ -115,6 +115,14 @@ pub fn discover_inputs(paths: &[PathBuf]) -> Result<DiscoveredInputs> {
         }
 
         if path.is_file() {
+            if let Some(owner) = propositions_owner(path) {
+                bail!(
+                    "{} is the propositions HDT of {}; give {} as the input instead",
+                    path.display(),
+                    owner.display(),
+                    owner.display()
+                );
+            }
             classify_and_route(path, &mut rdf_inputs, &mut hdt_inputs, true);
         } else if path.is_dir() {
             for entry in WalkDir::new(path)
@@ -122,9 +130,21 @@ pub fn discover_inputs(paths: &[PathBuf]) -> Result<DiscoveredInputs> {
                 .into_iter()
                 .filter_map(|e| e.ok())
             {
-                if entry.file_type().is_file() {
-                    classify_and_route(entry.path(), &mut rdf_inputs, &mut hdt_inputs, false);
+                if !entry.file_type().is_file() {
+                    continue;
                 }
+                // A propositions HDT is part of the HDT beside it, never an
+                // input of its own: merged as one, its unasserted claims
+                // would become asserted triples.
+                if let Some(owner) = propositions_owner(entry.path()) {
+                    tracing::debug!(
+                        "Skipping {}: the propositions HDT of {}",
+                        entry.path().display(),
+                        owner.display()
+                    );
+                    continue;
+                }
+                classify_and_route(entry.path(), &mut rdf_inputs, &mut hdt_inputs, false);
             }
         } else {
             bail!(
@@ -153,6 +173,17 @@ pub fn discover_inputs(paths: &[PathBuf]) -> Result<DiscoveredInputs> {
         rdf_inputs,
         hdt_inputs,
     })
+}
+
+/// The HDT that `path` is the propositions HDT of (`X.hdt.props.hdt` beside
+/// `X.hdt` and its triple-term index `X.hdt.tt`), if it is one.
+fn propositions_owner(path: &Path) -> Option<PathBuf> {
+    let name = path.file_name()?.to_str()?;
+    let owner_name = name.strip_suffix(".props.hdt")?;
+    let owner = path.with_file_name(owner_name);
+    let mut index = owner.clone().into_os_string();
+    index.push(".tt");
+    (owner.exists() && Path::new(&index).exists()).then_some(owner)
 }
 
 /// Check if a file has an `.hdt` extension.

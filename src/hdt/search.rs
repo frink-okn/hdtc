@@ -1331,13 +1331,19 @@ pub fn search_hdt_streaming(
 
     let (offsets, mut dictionary) = open_hdt(hdt_path, memory_limit)
         .with_context(|| format!("Failed to open HDT file {}", hdt_path.display()))?;
-    dictionary.enable_triple_terms(hdt_path, memory_limit / 4)?;
+
+    // A zero-sized page is empty by definition. Stop before resolving terms or
+    // selecting an indexed route so `--limit 0` neither emits a row nor
+    // requires an index.
+    if !count_only && limit == Some(0) {
+        write_empty_output_if_needed(output)?;
+        return Ok(0);
+    }
+    // Render triple terms in output. Its propositions dictionary, when there
+    // is one, takes an eighth of the limit beside the main dictionary's.
+    dictionary.enable_triple_terms(hdt_path, memory_limit / 8)?;
 
     if let QueryTerm::TripleTerm(inner) = &o_term {
-        if !count_only && limit == Some(0) {
-            write_empty_output_if_needed(output)?;
-            return Ok(0);
-        }
         let bound = |term: &QueryTerm| match term {
             QueryTerm::Bound(bytes) => Some(bytes.clone()),
             _ => None,
@@ -1360,14 +1366,6 @@ pub fn search_hdt_streaming(
         }
         writer.flush()?;
         return Ok(count);
-    }
-
-    // A zero-sized page is empty by definition. Stop before resolving terms or
-    // selecting an indexed route so `--limit 0` neither emits a row nor
-    // requires an index.
-    if !count_only && limit == Some(0) {
-        write_empty_output_if_needed(output)?;
-        return Ok(0);
     }
 
     // Resolve bound terms to dictionary IDs. If any bound term is not found,

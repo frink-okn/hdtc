@@ -139,7 +139,15 @@ escape it: an admitted name could forge a triple term, or collide with one a
 later version mints. An HDT input to a merge is not source RDF; its triple-term
 IRIs are admitted together with the index that defines them.
 
-### 2.4 Directional language-tagged strings
+### 2.4 Nesting
+
+A writer MUST NOT produce a triple term nested more than 64 levels deep,
+counting the outermost as the first, and a reader MAY refuse one. hdtc skips a
+source statement that nests deeper, as it skips a statement it cannot parse:
+nested terms are built recursively, and an unbounded depth — a few hundred
+kilobytes of input — would exhaust the stack of any reader that follows it.
+
+### 2.5 Directional language-tagged strings
 
 RDF 1.2 also adds a base direction to language-tagged strings. The dictionary
 stores one as N-Triples 1.2 writes it, the direction following the tag:
@@ -228,9 +236,10 @@ Both run components are always present, with zero-length payloads when their
 run is empty. The three `DATA_*` layer components are always present. The
 three `PROPS_*` components are present iff `HAS_PROPOSITIONS` is set.
 
-Packed widths are the minimum sufficient for the values stored (§7, §8), as in
-the permutation index; the rank directories' widths are fixed at 64 and 16, with
-`Parameter` and `Indexed bit length` as there.
+Packed widths are fixed by the header's identifier spaces, not by the values
+present (§7, §8), so an empty run still declares them; the rank directories'
+widths are fixed at 64 and 16, with `Parameter` and `Indexed bit length` as in
+the permutation index.
 
 ## 7. Runs
 
@@ -243,7 +252,7 @@ latter.
 
 The subject array's width is one more than the width of the larger of the two
 HDTs' subject counts; the predicate and object arrays' widths are those of the
-larger predicate and object counts.
+larger predicate and object counts. Both runs use the same widths.
 
 Storing identifiers rather than a triple position is a choice for decoding: an
 IRI's proposition is three array reads and three dictionary lookups, with no
@@ -346,17 +355,23 @@ result; the propositions HDT is therefore not merged as a file.
 ## 12. Validation
 
 A version 1 reader MUST reject an unknown version, unknown flags or sections,
-nonzero reserved fields, checksum failures, and a header whose counts disagree
-with the bound HDTs. Strict validation MUST additionally verify:
+sections that break §6's presence rules or shapes, nonzero reserved fields, a
+footer that disagrees with the header, checksum failures, and a header whose
+counts disagree with the bound HDTs. Strict validation MUST additionally verify:
 
-1. both digests (§9) and every payload checksum;
+1. both digests (§9), every payload checksum, and every rank directory against
+   its bitmap;
 2. each run against the dictionary's triple-term IRIs (§7 requirement 1);
 3. every run entry, by decoding its proposition and minting it again (§7
    requirement 2);
 4. each layer: that every set bit's triple, minted, is the IRI its `REVERSE`
    entry names, and that each layer has exactly one bit per IRI of the data run
    whose proposition it covers (§8);
-5. the propositions HDT's permutation index, as for any permutation index.
+5. that every target is a triple of the HDT its flag names, that the
+   propositions HDT holds exactly the unasserted targets, and that none of
+   them is a triple of `data.hdt` (§7 requirement 3, §3);
+6. the propositions HDT's permutation index, as for any permutation index; and
+   that no propositions HDT exists without an index.
 
 ## 13. Size (non-normative)
 

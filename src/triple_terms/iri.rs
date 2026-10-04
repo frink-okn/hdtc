@@ -34,6 +34,10 @@ pub const GROUND_PREFIX: &str = "urn:x-kgf:tt:g:";
 pub const BLANK_PREFIX: &str = "urn:x-kgf:tt:b:";
 /// Hex digits of the hash in either form.
 pub const HASH_HEX_LEN: usize = 32;
+/// The deepest nesting accepted, counting the outermost triple term as the
+/// first level. Deeper input is refused when parsed, so every reader can
+/// follow any term it meets (`docs/triple-terms-format.md` §2.4).
+pub const MAX_NESTING: usize = 64;
 
 /// One position of a proposition, in dictionary form.
 ///

@@ -152,14 +152,14 @@ impl Sortable for PropositionRecord {
 }
 
 /// An external sort that owns its buffer, so a caller pushes and finishes.
-struct Sorted<T: Sortable> {
+pub(super) struct Sorted<T: Sortable> {
     sorter: ExternalSorter,
     buffer: Vec<T>,
     used: usize,
 }
 
 impl<T: Sortable + PartialEq + 'static> Sorted<T> {
-    fn new(temp_dir: &Path, budget: usize) -> Self {
+    pub(super) fn new(temp_dir: &Path, budget: usize) -> Self {
         Self {
             sorter: ExternalSorter::new(temp_dir, budget.max(1 << 20)),
             buffer: Vec::new(),
@@ -167,13 +167,15 @@ impl<T: Sortable + PartialEq + 'static> Sorted<T> {
         }
     }
 
-    fn push(&mut self, item: T) -> Result<()> {
+    pub(super) fn push(&mut self, item: T) -> Result<()> {
         self.sorter.push(item, &mut self.buffer, &mut self.used)
     }
 
     /// The sorted, deduplicated items. The sorter is returned with them because
     /// it owns the chunk files the iterator reads, and removes them on drop.
-    fn finish(mut self) -> Result<(ExternalSorter, crate::sort::external::MergeIterator<T>)> {
+    pub(super) fn finish(
+        mut self,
+    ) -> Result<(ExternalSorter, crate::sort::external::MergeIterator<T>)> {
         let iter = self.sorter.finish(&mut self.buffer)?;
         Ok((self.sorter, iter))
     }
@@ -183,7 +185,7 @@ impl<T: Sortable + PartialEq + 'static> Sorted<T> {
 // Rank sets: sorted u64 streams on disk
 // ---------------------------------------------------------------------------
 
-struct RankFile {
+pub(super) struct RankFile {
     path: PathBuf,
 }
 
@@ -305,9 +307,15 @@ impl LayerWriter {
     fn finish(mut self, temp_dir: &Path) -> Result<Vec<DraftSection>> {
         self.bitmap
             .push_zeros(self.total_bits - self.bits_written)?;
-        self.bitmap.finish()?;
+        let (words, mut writer) = self.bitmap.finish_into_inner()?;
+        writer.flush()?;
+        drop(writer);
         // The packer writes whole words; the format stores exactly ceil(L/8).
         let file = self.bitmap_file.reopen()?;
+        ensure!(
+            file.metadata()?.len() == words * 8 && words * 8 >= self.total_bits.div_ceil(8),
+            "layer bitmap was not written in full"
+        );
         file.set_len(self.total_bits.div_ceil(8))?;
         file.sync_data()?;
         let bitmap_path = self.bitmap_file.into_temp_path();
@@ -367,6 +375,8 @@ pub(crate) struct FinishContext<'a> {
     pub temp_dir: &'a Path,
     pub memory_budget: usize,
     pub dataset_uri: &'a str,
+    /// `--max-term-bytes`, which the propositions HDT's build honours too.
+    pub max_term_bytes: usize,
 }
 
 /// The staged triple-term artifacts.
@@ -395,12 +405,17 @@ struct HdtShape {
 
 fn shape_of(hdt: &Path, dictionary: &mut DictionaryResolver) -> Result<HdtShape> {
     let metadata = scan_hdt(hdt)?;
-    let shared = dictionary.shared.prefix_range(TT_NAMESPACE.as_bytes())?;
-    ensure!(
-        shared.is_empty(),
-        "{} has a triple-term IRI in subject position",
-        hdt.display()
-    );
+    for (section, role) in [
+        (&mut dictionary.shared, "subject"),
+        (&mut dictionary.subjects, "subject"),
+        (&mut dictionary.predicates, "predicate"),
+    ] {
+        ensure!(
+            section.prefix_range(TT_NAMESPACE.as_bytes())?.is_empty(),
+            "{} has a triple-term IRI in {role} position",
+            hdt.display()
+        );
+    }
     let objects = dictionary.objects.prefix_range(TT_NAMESPACE.as_bytes())?;
     let offset = dictionary.shared.string_count;
     Ok(HdtShape {
@@ -560,7 +575,7 @@ fn join_role(
 ///
 /// Returns the found rows `[rank, position, s, p, o]` and the ranks not found.
 /// With `require_all`, a miss is an error.
-fn place(
+pub(super) fn place(
     hdt: &Path,
     distinct: &PropositionSpool,
     ranks: Option<&RankFile>,
@@ -726,6 +741,7 @@ fn build_propositions_hdt(
     };
     let parallelism = ParserParallelismConfig {
         trust_triple_term_iris: true,
+        max_term_bytes: ctx.max_term_bytes,
         ..ParserParallelismConfig::default()
     };
     // The pipeline names its scratch files by role, not uniquely, so a second
@@ -1030,9 +1046,10 @@ pub(crate) fn finish(
 
     // 2. Classify against data.hdt.
     let started = std::time::Instant::now();
-    let (_, mut data_dictionary) = open_hdt(ctx.hdt, budget / 4)?;
-    let data_shape = shape_of(ctx.hdt, &mut data_dictionary)?;
+    let data_shape = shape_of(ctx.hdt, &mut open_hdt(ctx.hdt, budget / 8)?.1)?;
     let (asserted, missing) = place(ctx.hdt, &distinct, None, temp_dir, budget / 2, false)?;
+    // Spill now: the propositions HDT's build below takes the whole budget.
+    let (_asserted_sorter, asserted) = asserted.finish()?;
     let (_missing_sorter, missing) = missing.finish()?;
     let (unasserted_ranks, unasserted_count) = RankFile::write(
         temp_dir.join("tt-unasserted.ranks"),
@@ -1088,8 +1105,8 @@ pub(crate) fn finish(
     let mut props_run = RunWriter::new(temp_dir, component::PROPS_RUN, widths)?;
     let mut data_layers = LayerEntries::new(temp_dir, budget / 4);
     let mut props_layers = LayerEntries::new(temp_dir, budget / 4);
+    let (_, mut data_dictionary) = open_hdt(ctx.hdt, budget / 4)?;
     {
-        let (_a, asserted) = asserted.finish()?;
         let mut asserted = asserted.peekable();
         let mut placed = match placed_unasserted {
             Some(found) => {

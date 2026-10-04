@@ -348,3 +348,285 @@ fn search_refuses_misplaced_triple_terms() {
         assert!(!output.status.success(), "{query} was accepted");
     }
 }
+
+const SECOND: &str = r#"@prefix : <http://ex/> .
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+:bob :knows :carol ~ :r2 {| :source :census |} .
+:e9 rdf:reifies <<( _:b1 :p <<( _:b1 :q "x" )>> )>> .
+_:b1 :name "anon" .
+:e10 rdf:reifies <<( :zed :p :o )>> .
+"#;
+
+#[test]
+fn merging_hdts_matches_building_from_their_sources() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = dir.path().join("first.ttl");
+    let second = dir.path().join("second.ttl");
+    // Named reifiers: an annotation's own blank node is labelled afresh by
+    // every parse, which would make the two builds differ in name only.
+    common::write_file(
+        &first,
+        TURTLE
+            .replace("{| :source :survey1 |}", "~ :r1 {| :source :survey1 |}")
+            .as_bytes(),
+    );
+    common::write_file(&second, SECOND.as_bytes());
+    let direct = create(dir.path(), &[&first, &second], "direct.hdt");
+    validate(&direct, dir.path());
+
+    let a = create(dir.path(), &[&first], "a.hdt");
+    let b = create(dir.path(), &[&second], "b.hdt");
+    let merged = create(dir.path(), &[&a, &b], "merged.hdt");
+    validate(&merged, dir.path());
+    // `:bob :knows :carol` is quoted in the first input and asserted in the
+    // second, so the merge asserts it; the dumps agree exactly.
+    assert_eq!(dump(&merged), dump(&direct));
+
+    // An RDF input beside an HDT input. Inputs are numbered differently there
+    // (RDF files first, in name order), so compare with the prefixes removed.
+    let mixed = create(dir.path(), &[&a, &second], "mixed.hdt");
+    validate(&mixed, dir.path());
+    let unprefixed = |lines: Vec<String>| -> Vec<String> {
+        let mut lines: Vec<String> = lines
+            .into_iter()
+            .map(|line| line.replace("_:f0_", "_:").replace("_:f1_", "_:"))
+            .collect();
+        lines.sort();
+        lines
+    };
+    assert_eq!(unprefixed(dump(&mixed)), unprefixed(dump(&direct)));
+
+    // A merge of a merge.
+    let again = create(dir.path(), &[&merged, &b], "again.hdt");
+    validate(&again, dir.path());
+    let lines = dump(&again);
+    // Inputs are numbered in name order: b.hdt is f0, merged.hdt f1. The node
+    // renamed twice is renamed inside its triple terms too, and stays distinct
+    // from b's own `_:b1`.
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("<<( _:f1_f1_b1 <http://ex/p> <<( _:f1_f1_b1")),
+        "{lines:#?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("<<( _:f0_b1 <http://ex/p> <<( _:f0_b1"))
+    );
+}
+
+#[test]
+fn an_hdt_input_with_unindexed_triple_terms_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.ttl");
+    common::write_file(&input, TURTLE.as_bytes());
+    let a = create(dir.path(), &[&input], "a.hdt");
+    std::fs::remove_file(tt_path(&a, ".tt")).unwrap();
+    let output = hdtc(&[
+        "create",
+        "-q",
+        a.to_str().unwrap(),
+        "-o",
+        dir.path().join("m.hdt").to_str().unwrap(),
+        "--temp-dir",
+        dir.path().join("work").to_str().unwrap(),
+    ]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("triple-term index"));
+}
+
+#[test]
+fn a_propositions_hdt_is_never_an_input_of_its_own() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir(&data).unwrap();
+    let input = dir.path().join("in.ttl");
+    common::write_file(&input, TURTLE.as_bytes());
+    let built = common::run_hdtc_to_path_with_args(dir.path(), &[&input], "data/a.hdt", &["-q"]);
+    assert!(tt_path(&built, ".props.hdt").exists());
+
+    // Discovered in a directory: skipped, so unasserted claims stay unasserted.
+    let merged = create(dir.path(), &[&data], "merged.hdt");
+    validate(&merged, dir.path());
+    assert!(
+        !dump(&merged)
+            .iter()
+            .any(|l| l == "<http://ex/bob> <http://ex/knows> <http://ex/carol> ."),
+        "an unasserted claim became a triple"
+    );
+    // Named explicitly: refused.
+    let output = hdtc(&[
+        "create",
+        "-q",
+        tt_path(&built, ".props.hdt").to_str().unwrap(),
+        "-o",
+        dir.path().join("x.hdt").to_str().unwrap(),
+    ]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("propositions HDT"));
+}
+
+#[test]
+fn a_failed_rebuild_keeps_the_old_triple_term_artifacts() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.ttl");
+    common::write_file(&input, TURTLE.as_bytes());
+    let hdt = create(dir.path(), &[&input], "o.hdt");
+    let before = dump(&hdt);
+    // A directory where the graph sidecar would go makes retiring it fail,
+    // after the triple-term artifacts have already been retired.
+    std::fs::create_dir(tt_path(&hdt, ".graphs")).unwrap();
+    let plain = dir.path().join("plain.nt");
+    common::write_file(&plain, common::REPRESENTATIVE_NT.as_bytes());
+    let output = hdtc(&[
+        "create",
+        "-q",
+        plain.to_str().unwrap(),
+        "-o",
+        hdt.to_str().unwrap(),
+        "--temp-dir",
+        dir.path().join("work").to_str().unwrap(),
+    ]);
+    assert!(!output.status.success());
+    for suffix in [".tt", ".props.hdt", ".props.hdt.perm", ".perm"] {
+        assert!(tt_path(&hdt, suffix).exists(), "{suffix} was not restored");
+    }
+    assert_eq!(dump(&hdt), before);
+    std::fs::remove_dir(tt_path(&hdt, ".graphs")).unwrap();
+    validate(&hdt, dir.path());
+}
+
+#[test]
+fn nesting_beyond_the_limit_is_skipped_not_crashed_on() {
+    let dir = tempfile::tempdir().unwrap();
+    for depth in [65usize, 20_000] {
+        let mut term = "<http://ex/o>".to_owned();
+        for _ in 0..depth {
+            term = format!("<<( <http://ex/s> <http://ex/p> {term} )>>");
+        }
+        let input = dir.path().join(format!("deep{depth}.nt"));
+        common::write_file(
+            &input,
+            format!("<http://ex/a> <http://ex/b> {term} .\n").as_bytes(),
+        );
+        let output = hdtc(&[
+            "create",
+            "-q",
+            input.to_str().unwrap(),
+            "-o",
+            dir.path().join("deep.hdt").to_str().unwrap(),
+            "--temp-dir",
+            dir.path().join("work").to_str().unwrap(),
+        ]);
+        // Skipped with a warning, like any statement the parser rejects —
+        // and in particular not a crash: 20,000 levels used to overflow the
+        // stack.
+        assert!(
+            output.status.success(),
+            "depth {depth}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let hdt = dir.path().join("deep.hdt");
+        assert!(dump(&hdt).is_empty(), "depth {depth} was kept");
+    }
+    // The limit itself is accepted and readable.
+    let mut term = "<http://ex/o>".to_owned();
+    for _ in 0..64 {
+        term = format!("<<( <http://ex/s> <http://ex/p> {term} )>>");
+    }
+    let input = dir.path().join("deep64.nt");
+    common::write_file(
+        &input,
+        format!("<http://ex/a> <http://ex/b> {term} .\n").as_bytes(),
+    );
+    let hdt = create(dir.path(), &[&input], "deep64.hdt");
+    validate(&hdt, dir.path());
+    assert_eq!(
+        dump(&hdt),
+        vec![format!("<http://ex/a> <http://ex/b> {term} .")]
+    );
+}
+
+#[test]
+fn the_reserved_namespace_is_refused_as_predicate_and_graph_name() {
+    let dir = tempfile::tempdir().unwrap();
+    for (name, content, mode) in [
+        (
+            "predicate.nt",
+            "<http://ex/s> <urn:x-kgf:tt:p> <http://ex/o> .\n",
+            "triples",
+        ),
+        (
+            "graph.nq",
+            "<http://ex/s> <http://ex/p> <http://ex/o> <urn:x-kgf:tt:g> .\n",
+            "quads",
+        ),
+    ] {
+        let input = dir.path().join(name);
+        common::write_file(&input, content.as_bytes());
+        let output = hdtc(&[
+            "create",
+            "-q",
+            input.to_str().unwrap(),
+            "-o",
+            dir.path().join("out.hdt").to_str().unwrap(),
+            "-m",
+            mode,
+            "--temp-dir",
+            dir.path().join("work").to_str().unwrap(),
+        ]);
+        assert!(!output.status.success(), "{name} was accepted");
+    }
+}
+
+#[test]
+fn triple_terms_render_through_every_route() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.trig");
+    common::write_file(
+        &input,
+        format!(
+            "<http://ex/g> {{ <http://ex/e1> <{RDF_REIFIES}> <<( <http://ex/s> <http://ex/p> <http://ex/o> )>> . }}\n\
+             <http://ex/e2> <{RDF_REIFIES}> <<( <http://ex/s> <http://ex/p> \"v\" )>> .\n"
+        )
+        .as_bytes(),
+    );
+    let hdt = common::run_hdtc_to_path_with_args(
+        dir.path(),
+        &[&input],
+        "q.hdt",
+        &["-q", "-m", "quads", "--graphs-index", "--perm"],
+    );
+    validate(&hdt, dir.path());
+    let rendered = format!("<<( <http://ex/s> <http://ex/p> <http://ex/o> )>>");
+    // ? P ? (permutation index), S ? ?, and ? ? O by its IRI rendered back.
+    for query in [
+        format!("? <{RDF_REIFIES}> ?"),
+        "<http://ex/e1> ? ?".to_owned(),
+        format!("? ? {rendered}"),
+    ] {
+        let lines = search(&hdt, &query, &[]);
+        assert!(
+            lines.iter().any(|l| l.contains(&rendered)),
+            "{query}: {lines:#?}"
+        );
+    }
+    // The dataset view renders them too.
+    let output = hdtc(&[
+        "dump",
+        "-q",
+        hdt.to_str().unwrap(),
+        "--graph-view",
+        "dataset",
+    ]);
+    assert!(output.status.success());
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        text.contains(&format!("{rendered}\t<http://ex/g>")),
+        "{text}"
+    );
+    // So does a quad pattern.
+    let lines = search(&hdt, "? ? ? <http://ex/g>", &[]);
+    assert!(lines.iter().any(|l| l.contains(&rendered)), "{lines:#?}");
+}

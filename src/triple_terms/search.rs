@@ -17,12 +17,12 @@
 //! with the result.
 
 use super::format;
-use super::reader::{Order, Source, Target, TripleTermIndex};
+use super::reader::{LayerCursor, Order, Source, Target, TripleTermIndex};
 use crate::hdt::reader::{DictionaryResolver, OutputWriter, open_hdt, write_triple_tab};
 use crate::permutation::{ObjectGroups, PermutationIndex, canonical_path};
 use anyhow::{Context, Result};
 use std::fs::File;
-use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
 /// The inner positions of a triple-term pattern, as dictionary strings; `None`
@@ -123,116 +123,6 @@ impl Emitter<'_> {
             write_triple_tab(self.writer, &self.subject, &self.predicate, &self.object)?;
         }
         Ok(!self.full())
-    }
-}
-
-/// Streams the set bits of a layer within a position range, with the
-/// `data.hdt` object identifier each one's reverse entry gives.
-struct LayerCursor {
-    bitmap: BufReader<File>,
-    position: u64,
-    end: u64,
-    byte: u8,
-    reverse: PackedStream,
-}
-
-impl LayerCursor {
-    fn new(
-        index: &TripleTermIndex,
-        source: Source,
-        order: Order,
-        range: std::ops::Range<u64>,
-    ) -> Result<Self> {
-        let layer = index.layer(source, order)?;
-        let rank = layer.rank1(index.file(), range.start)?;
-        let mut bitmap = BufReader::with_capacity(64 * 1024, File::open(index.path())?);
-        bitmap.seek(SeekFrom::Start(layer.bitmap.offset + range.start / 8))?;
-        let mut cursor = Self {
-            bitmap,
-            position: range.start,
-            end: range.end,
-            byte: 0,
-            reverse: PackedStream::new(index.path(), &layer.reverse, rank)?,
-        };
-        if range.start < range.end && !range.start.is_multiple_of(8) {
-            let mut byte = [0u8; 1];
-            cursor.bitmap.read_exact(&mut byte)?;
-            cursor.byte = byte[0];
-        }
-        Ok(cursor)
-    }
-
-    fn next(&mut self) -> Result<Option<(u64, u64)>> {
-        while self.position < self.end {
-            if self.position.is_multiple_of(8) {
-                // Skip whole zero bytes quickly.
-                let mut byte = [0u8; 1];
-                self.bitmap.read_exact(&mut byte)?;
-                self.byte = byte[0];
-                if self.byte == 0 {
-                    self.position = (self.position + 8).min(self.end);
-                    continue;
-                }
-            }
-            let position = self.position;
-            self.position += 1;
-            if self.byte >> (position % 8) & 1 == 1 {
-                return Ok(Some((position, self.reverse.next()?)));
-            }
-        }
-        Ok(None)
-    }
-}
-
-/// Sequential reads of a packed array from a starting index.
-struct PackedStream {
-    reader: BufReader<File>,
-    width: u32,
-    buffer: u128,
-    buffered: u32,
-}
-
-impl PackedStream {
-    fn new(path: &Path, section: &format::Section, start: u64) -> Result<Self> {
-        let width = u32::from(section.bits_per_entry);
-        let bit = start * u64::from(width);
-        let mut reader = BufReader::with_capacity(64 * 1024, File::open(path)?);
-        reader.seek(SeekFrom::Start(section.offset + bit / 8))?;
-        let mut stream = Self {
-            reader,
-            width,
-            buffer: 0,
-            buffered: 0,
-        };
-        let skip = (bit % 8) as u32;
-        if skip > 0 {
-            let mut byte = [0u8; 1];
-            stream.reader.read_exact(&mut byte)?;
-            stream.buffer = u128::from(byte[0] >> skip);
-            stream.buffered = 8 - skip;
-        }
-        Ok(stream)
-    }
-
-    fn next(&mut self) -> Result<u64> {
-        if self.width == 0 {
-            return Ok(0);
-        }
-        while self.buffered < self.width {
-            let mut byte = [0u8; 1];
-            self.reader.read_exact(&mut byte)?;
-            self.buffer |= u128::from(byte[0]) << self.buffered;
-            self.buffered += 8;
-        }
-        let mask = if self.width == 64 {
-            u128::from(u64::MAX)
-        } else {
-            (1u128 << self.width) - 1
-        };
-        let value = (self.buffer & mask) as u64;
-        self.buffer >>= self.width;
-        self.buffered -= self.width;
-        Ok(value)
     }
 }
 

@@ -140,6 +140,16 @@ pub struct ExtractedQuad {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TripleTermRecords(pub Vec<PropositionRecord>);
 
+/// A statement whose triple term nests deeper than hdtc accepts. Skipped like
+/// a syntax error — the vendored lexer refuses the same depth as one — rather
+/// than failing the build.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "triple term nested more than {} levels deep",
+    triple_terms::iri::MAX_NESTING
+)]
+struct TooDeeplyNested;
+
 /// Refuse an IRI in the namespace hdtc mints triple-term IRIs in. Admitting it
 /// as data would let a source forge a triple term, or collide with one a later
 /// build mints (`docs/triple-terms-format.md` §2.3).
@@ -170,7 +180,7 @@ fn subject_to_hdt_string(
 
 /// A term as a triple-term component: blank labels scoped by `blank_prefix`,
 /// literals in dictionary form, nested triple terms kept structurally.
-fn component_of(term: &Term, blank_prefix: &str, trusted: bool) -> Result<Component> {
+fn component_of(term: &Term, blank_prefix: &str, trusted: bool, depth: usize) -> Result<Component> {
     Ok(match term {
         Term::NamedNode(n) => {
             check_not_reserved(n.as_str(), trusted)?;
@@ -178,11 +188,25 @@ fn component_of(term: &Term, blank_prefix: &str, trusted: bool) -> Result<Compon
         }
         Term::BlankNode(b) => Component::Blank(format!("{blank_prefix}{}", b.as_str())),
         Term::Literal(l) => Component::Literal(literal_to_hdt_string(l, trusted)?),
-        Term::Triple(t) => Component::Triple(Box::new(proposition_of(t, blank_prefix, trusted)?)),
+        Term::Triple(t) => Component::Triple(Box::new(proposition_of(
+            t,
+            blank_prefix,
+            trusted,
+            depth + 1,
+        )?)),
     })
 }
 
-fn proposition_of(triple: &Triple, blank_prefix: &str, trusted: bool) -> Result<Proposition> {
+fn proposition_of(
+    triple: &Triple,
+    blank_prefix: &str,
+    trusted: bool,
+    depth: usize,
+) -> Result<Proposition> {
+    // `depth` counts the triple terms enclosing this one.
+    if depth >= triple_terms::iri::MAX_NESTING {
+        return Err(TooDeeplyNested.into());
+    }
     let subject = match &triple.subject {
         NamedOrBlankNode::NamedNode(n) => {
             check_not_reserved(n.as_str(), trusted)?;
@@ -194,7 +218,7 @@ fn proposition_of(triple: &Triple, blank_prefix: &str, trusted: bool) -> Result<
     Ok(Proposition {
         subject,
         predicate: triple.predicate.as_str().to_string(),
-        object: component_of(&triple.object, blank_prefix, trusted)?,
+        object: component_of(&triple.object, blank_prefix, trusted, depth)?,
     })
 }
 
@@ -213,7 +237,7 @@ fn object_to_hdt_string(
         }
         Term::Literal(l) => (literal_to_hdt_string(l, trusted)?, None),
         Term::Triple(t) => {
-            let proposition = proposition_of(t, blank_prefix, trusted)?;
+            let proposition = proposition_of(t, blank_prefix, trusted, 0)?;
             let mut records = Vec::with_capacity(1);
             let iri = triple_terms::iri::mint(&proposition, &mut records);
             (iri, Some(Box::new(TripleTermRecords(records))))
@@ -621,8 +645,21 @@ where
                 );
                 stats.original_ntriples_size += original_size;
 
-                let extracted = extract_quad(&quad, &blank_prefix, &mut graph_interner, trusted)
-                    .with_context(|| format!("{}", input.path.display()))?;
+                let extracted =
+                    match extract_quad(&quad, &blank_prefix, &mut graph_interner, trusted) {
+                        Ok(extracted) => extracted,
+                        Err(e) if e.is::<TooDeeplyNested>() => {
+                            stats.errors += 1;
+                            if stats.errors <= 10 {
+                                tracing::warn!(
+                                    "Skipping statement in {}: {e}",
+                                    input.path.display()
+                                );
+                            }
+                            continue;
+                        }
+                        Err(e) => return Err(e.context(format!("{}", input.path.display()))),
+                    };
                 stats.quads += 1;
                 callback(extracted)?;
             }
@@ -1093,6 +1130,12 @@ where
                                     parsed.stats.quads += 1;
                                     parsed.quads.push(extracted);
                                 }
+                                Err(e) if e.is::<TooDeeplyNested>() => {
+                                    parsed.stats.errors += 1;
+                                    if parsed.error_samples.len() < 12 {
+                                        parsed.error_samples.push(e.to_string());
+                                    }
+                                }
                                 Err(e) => {
                                     aborted.store(true, std::sync::atomic::Ordering::Relaxed);
                                     parsed.fatal = Some(format!("{}: {e:#}", path.display()));
@@ -1386,8 +1429,16 @@ fn literal_ntriples_size(l: &Literal) -> u64 {
     }
 }
 
-/// N-Triples 1.2 size of a triple term, `<<( s p o )>>`.
+/// N-Triples 1.2 size of a triple term, `<<( s p o )>>`. Recursion stops at
+/// the nesting limit: deeper input is refused when it is converted.
 fn triple_term_ntriples_size(triple: &Triple) -> u64 {
+    triple_term_ntriples_size_within(triple, 0)
+}
+
+fn triple_term_ntriples_size_within(triple: &Triple, depth: usize) -> u64 {
+    if depth >= triple_terms::iri::MAX_NESTING {
+        return 0;
+    }
     let subject = match &triple.subject {
         NamedOrBlankNode::NamedNode(n) => 2 + n.as_str().len() as u64,
         NamedOrBlankNode::BlankNode(b) => 2 + b.as_str().len() as u64,
@@ -1396,7 +1447,7 @@ fn triple_term_ntriples_size(triple: &Triple) -> u64 {
         Term::NamedNode(n) => 2 + n.as_str().len() as u64,
         Term::BlankNode(b) => 2 + b.as_str().len() as u64,
         Term::Literal(l) => literal_ntriples_size(l),
-        Term::Triple(t) => triple_term_ntriples_size(t),
+        Term::Triple(t) => triple_term_ntriples_size_within(t, depth + 1),
     };
     // "<<( " + s + " " + <p> + " " + o + " )>>"
     4 + subject + 1 + 2 + triple.predicate.as_str().len() as u64 + 1 + object + 4

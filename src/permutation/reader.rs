@@ -134,11 +134,7 @@ impl PermutationIndex {
 
     /// The groups an index-side pattern selects, or `None` when the pattern
     /// matches nothing.
-    fn locate_groups(
-        &self,
-        predicate: Option<u64>,
-        object: Option<u64>,
-    ) -> Result<Option<Groups>> {
+    fn locate_groups(&self, predicate: Option<u64>, object: Option<u64>) -> Result<Option<Groups>> {
         ensure!(
             predicate.is_some() || object.is_some(),
             "permutation lookup needs a predicate or object"

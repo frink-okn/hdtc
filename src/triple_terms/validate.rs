@@ -32,7 +32,10 @@ fn component_of(
     object: u64,
     depth: usize,
 ) -> Result<Component> {
-    ensure!(depth < 64, "triple terms nested too deeply");
+    ensure!(
+        depth < super::iri::MAX_NESTING,
+        "triple terms nested too deeply"
+    );
     if let Some(nested) = index.target(source, object)? {
         return Ok(Component::Triple(Box::new(proposition_of(
             index,
@@ -207,6 +210,139 @@ fn check_layer(
     Ok(())
 }
 
+/// Recompute every layer's rank directory and compare it with the stored one.
+fn check_rank_directories(index: &TripleTermIndex, temp_dir: &Path) -> Result<()> {
+    use crate::permutation::{RawBitmap, build_rank_directories};
+    let file = File::open(index.path())?;
+    let mut sources = vec![Source::Data];
+    if index.has_propositions() {
+        sources.push(Source::Propositions);
+    }
+    for source in sources {
+        for order in [Order::Spo, Order::Pos, Order::Ops] {
+            let layer = index.layer(source, order)?;
+            if layer.len() == 0 {
+                continue;
+            }
+            let (superrank, subrank) = build_rank_directories(
+                &RawBitmap {
+                    path: index.path().to_path_buf(),
+                    data_offset: layer.bitmap.offset,
+                    bits: layer.len(),
+                },
+                temp_dir,
+            )?;
+            for (recomputed, stored) in [(superrank, &layer.superrank), (subrank, &layer.subrank)] {
+                let expected = std::fs::read(&recomputed)?;
+                let mut actual = vec![0u8; stored.length as usize];
+                file.read_exact_at(&mut actual, stored.offset)?;
+                ensure!(
+                    expected == actual,
+                    "{source:?} {order:?} layer's rank directory disagrees with its bitmap"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Every target is a triple of the HDT its flag names; the propositions HDT
+/// holds exactly the unasserted targets; and none of those is in `data.hdt`.
+fn check_targets(
+    index: &TripleTermIndex,
+    hdt_path: &Path,
+    props_path: &Path,
+    temp_dir: &Path,
+    memory_limit: usize,
+) -> Result<()> {
+    use super::build::{Row, Sorted, place};
+    let mut asserted = Sorted::<Row<3>>::new(temp_dir, memory_limit / 4);
+    let mut unasserted = Sorted::<Row<3>>::new(temp_dir, memory_limit / 4);
+    for source in [Source::Data, Source::Propositions] {
+        for object in index.run(source) {
+            let target = index.target(source, object)?.expect("in run");
+            let row = Row([target.subject, target.predicate, target.object]);
+            if target.asserted {
+                asserted.push(row)?;
+            } else {
+                unasserted.push(row)?;
+            }
+        }
+    }
+    // Merge-join each set (deduplicated by the sort) with its HDT's SPO stream.
+    let join = |rows: Sorted<Row<3>>, hdt: &Path| -> Result<u64> {
+        let (_sorter, rows) = rows.finish()?;
+        let mut count = 0u64;
+        let mut rows = rows.peekable();
+        if rows.peek().is_none() {
+            return Ok(0);
+        }
+        let metadata = scan_hdt(hdt)?;
+        let mut scanner = BitmapTriplesScanner::new(&metadata.offsets, hdt)?;
+        let mut current = scanner.next_triple()?;
+        for row in rows {
+            let [s, p, o] = row?.0;
+            while current.is_some_and(|triple| triple < (s, p, o)) {
+                current = scanner.next_triple()?;
+            }
+            ensure!(
+                current == Some((s, p, o)),
+                "a triple term's proposition ({s}, {p}, {o}) is not a triple of {}",
+                hdt.display()
+            );
+            count += 1;
+        }
+        Ok(count)
+    };
+    join(asserted, hdt_path)?;
+    if index.has_propositions() {
+        let stored = join(unasserted, props_path)?;
+        ensure!(
+            stored == index.header().props.triples,
+            "the propositions HDT holds {} triples but {stored} are unasserted propositions",
+            index.header().props.triples
+        );
+        // None of them is asserted: read them back as records and look for
+        // them in data.hdt the way the build does.
+        let spool_path = temp_dir.join("tt-validate-props.zst");
+        let mut out = super::spool::SpoolWriter::create(spool_path)?;
+        let (_, mut props) = open_hdt(props_path, memory_limit / 4)?;
+        let metadata = scan_hdt(props_path)?;
+        let mut scanner = BitmapTriplesScanner::new(&metadata.offsets, props_path)?;
+        let mut buf = Vec::new();
+        while let Some((s, p, o)) = scanner.next_triple()? {
+            props.subject_term_raw(s, &mut buf)?;
+            let subject = String::from_utf8(buf.clone())?;
+            props.predicate_term(p, &mut buf)?;
+            let predicate = String::from_utf8(buf.clone())?;
+            props.object_term_raw(o, &mut buf)?;
+            let object = String::from_utf8(buf.clone())?;
+            out.push(&super::PropositionRecord {
+                iri: String::new(),
+                subject,
+                predicate,
+                object,
+            })?;
+        }
+        let spool = out.finish()?;
+        let (found, _) = place(hdt_path, &spool, None, temp_dir, memory_limit / 2, false)?;
+        spool.remove();
+        let (_sorter, mut found) = found.finish()?;
+        ensure!(
+            found.next().is_none(),
+            "a triple of the propositions HDT is asserted in {}",
+            hdt_path.display()
+        );
+    } else {
+        let (_sorter, mut rows) = unasserted.finish()?;
+        ensure!(
+            rows.next().is_none(),
+            "unasserted triple terms without a propositions HDT"
+        );
+    }
+    Ok(())
+}
+
 /// Validate the triple-term index and propositions HDT beside `hdt_path`.
 pub fn validate_triple_terms(hdt_path: &Path, temp_dir: &Path, memory_limit: usize) -> Result<()> {
     let index = TripleTermIndex::open(hdt_path)?;
@@ -238,6 +374,8 @@ pub fn validate_triple_terms(hdt_path: &Path, temp_dir: &Path, memory_limit: usi
         );
     }
     check_payloads(index.path(), index.sections())?;
+    check_rank_directories(&index, temp_dir)?;
+    check_targets(&index, hdt_path, &props_path, temp_dir, memory_limit)?;
 
     let mut dictionaries = Dictionaries {
         data: open_hdt(hdt_path, memory_limit / 2)?.1,

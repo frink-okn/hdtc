@@ -204,7 +204,7 @@ pub fn parse_header(bytes: &[u8; 256]) -> Result<Header> {
         "unsupported rank-directory sampling"
     );
     ensure!(
-        bytes[224..252].iter().all(|b| *b == 0),
+        bytes[44..48].iter().all(|b| *b == 0) && bytes[224..252].iter().all(|b| *b == 0),
         "reserved header bytes are not zero"
     );
     Ok(Header {
@@ -260,6 +260,30 @@ pub fn read_header_and_sections(path: &Path) -> Result<(Header, Vec<Section>)> {
         header.directory_length == u64::from(header.section_count) * DIRECTORY_ENTRY_SIZE + 4,
         "directory length does not match the section count"
     );
+    ensure!(
+        header.directory_offset == HEADER_SIZE
+            && header.footer_offset.checked_add(FOOTER_SIZE) == Some(header.sidecar_size)
+            && header.footer_offset % 64 == 0,
+        "triple-term index regions are not where the header says"
+    );
+    let mut footer = [0u8; 64];
+    reader.seek(SeekFrom::Start(header.footer_offset))?;
+    reader.read_exact(&mut footer)?;
+    ensure!(
+        &footer[0..8] == FOOTER_MAGIC
+            && get_u16(&footer, 8) == get_u16(&bytes, 8)
+            && get_u16(&footer, 10) == get_u16(&bytes, 10)
+            && get_u32(&footer, 12) == FOOTER_SIZE as u32
+            && get_u64(&footer, 16) == header.sidecar_size
+            && get_u64(&footer, 24) == 0
+            && get_u64(&footer, 32) == header.directory_offset
+            && get_u64(&footer, 40) == header.directory_length
+            && get_u32(&footer, 48) == header.section_count
+            && get_u32(&footer, 52) == 0
+            && get_u32(&footer, 56) == get_u32(&bytes, 252)
+            && crc32c(&footer[..60]) == get_u32(&footer, 60),
+        "triple-term index footer does not match its header"
+    );
     reader.seek(SeekFrom::Start(header.directory_offset))?;
     let mut directory = vec![0u8; header.directory_length as usize];
     reader.read_exact(&mut directory)?;
@@ -278,6 +302,7 @@ pub fn read_header_and_sections(path: &Path) -> Result<(Header, Vec<Section>)> {
             .all(|w| w[0].section_type < w[1].section_type),
         "directory entries are not in ascending type order"
     );
+    check_section_set(&header, &sections)?;
     for section in &sections {
         if section.length > 0 {
             ensure!(
@@ -292,6 +317,121 @@ pub fn read_header_and_sections(path: &Path) -> Result<(Header, Vec<Section>)> {
         }
     }
     Ok((header, sections))
+}
+
+fn is_run(component: u32) -> bool {
+    matches!(component, component::DATA_RUN | component::PROPS_RUN)
+}
+
+/// Check the directory against §6: known types only, each REQUIRED, the
+/// presence rules, and the shapes the rest of the format relies on.
+fn check_section_set(header: &Header, sections: &[Section]) -> Result<()> {
+    use crate::permutation::format::{
+        REQUIRED, SUBBLOCK_BITS, SUPERBLOCK_BITS, id_width, sub_count, super_count,
+    };
+    let find = |section_type: u32| sections.iter().find(|s| s.section_type == section_type);
+    for section in sections {
+        let (component, kind_value) = (section.section_type >> 8, section.section_type & 0xFF);
+        let known = if is_run(component) {
+            (kind::TARGET_SUBJECT..=kind::TARGET_OBJECT).contains(&kind_value)
+        } else if DATA_ORDERS.contains(&component) || PROPS_ORDERS.contains(&component) {
+            (kind::LAYER..=kind::REVERSE).contains(&kind_value)
+        } else {
+            false
+        };
+        ensure!(
+            known,
+            "unknown triple-term index section {:#06x}",
+            section.section_type
+        );
+        ensure!(
+            section.flags == REQUIRED,
+            "section {:#06x} has flags {:#x}",
+            section.section_type,
+            section.flags
+        );
+        ensure!(
+            section.length == crate::io::packed_len(section.entry_count, section.bits_per_entry)?,
+            "section {:#06x} length does not match its entries",
+            section.section_type
+        );
+        ensure!(
+            (section.length == 0) == (section.offset == 0)
+                && (section.length > 0 || section.payload_crc == 0),
+            "section {:#06x} is empty but placed",
+            section.section_type
+        );
+    }
+    let mut components: Vec<u32> = vec![component::DATA_RUN, component::PROPS_RUN];
+    components.extend(DATA_ORDERS);
+    if header.has_propositions() {
+        components.extend(PROPS_ORDERS);
+    } else {
+        ensure!(
+            sections
+                .iter()
+                .all(|s| !PROPS_ORDERS.contains(&(s.section_type >> 8))),
+            "propositions layers without HAS_PROPOSITIONS"
+        );
+    }
+    for component in components {
+        if is_run(component) {
+            let run_length = if component == component::DATA_RUN {
+                header.data.run_length
+            } else {
+                header.props.run_length
+            };
+            for k in [
+                kind::TARGET_SUBJECT,
+                kind::TARGET_PREDICATE,
+                kind::TARGET_OBJECT,
+            ] {
+                let section = find(section_type(component, k)).with_context(|| {
+                    format!("missing section {:#06x}", section_type(component, k))
+                })?;
+                ensure!(
+                    section.entry_count == run_length,
+                    "run arrays do not match the run"
+                );
+            }
+            continue;
+        }
+        let triples = if DATA_ORDERS.contains(&component) {
+            header.data.triples
+        } else {
+            header.props.triples
+        };
+        let get = |k: u32| {
+            find(section_type(component, k))
+                .with_context(|| format!("missing section {:#06x}", section_type(component, k)))
+        };
+        let (layer, superrank, subrank, reverse) = (
+            get(kind::LAYER)?,
+            get(kind::LAYER_SUPERRANK)?,
+            get(kind::LAYER_SUBRANK)?,
+            get(kind::REVERSE)?,
+        );
+        ensure!(
+            layer.entry_count == triples && layer.bits_per_entry == 1,
+            "layer {component:#04x} does not cover its HDT's triples"
+        );
+        ensure!(
+            superrank.bits_per_entry == 64
+                && superrank.parameter == u64::from(SUPERBLOCK_BITS)
+                && superrank.entry_count == super_count(triples)
+                && superrank.indexed_bits == if triples == 0 { 0 } else { triples }
+                && subrank.bits_per_entry == 16
+                && subrank.parameter == u64::from(SUBBLOCK_BITS)
+                && subrank.entry_count == sub_count(triples)
+                && subrank.indexed_bits == if triples == 0 { 0 } else { triples },
+            "layer {component:#04x} rank directory has the wrong shape"
+        );
+        ensure!(
+            reverse.bits_per_entry == id_width(header.data.objects),
+            "layer {component:#04x} reverse array has the wrong width"
+        );
+    }
+    Ok(())
 }
 
 /// One section waiting to be placed: its payload in a scratch file.
