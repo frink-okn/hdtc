@@ -254,7 +254,7 @@ fn write_canonical_iri_body(out: &mut Vec<u8>, iri: &[u8]) {
 /// that no two strings share.
 fn write_canonical_literal(out: &mut Vec<u8>, literal: &str) {
     let parsed = crate::text::analyzer::parse_literal(literal.as_bytes())
-        .filter(|parsed| is_encoded_literal(literal, parsed));
+        .filter(|parsed| encodes_to(literal, parsed));
     let Some(parsed) = parsed else {
         write_canonical_iri(out, literal);
         return;
@@ -295,9 +295,19 @@ fn write_canonical_literal(out: &mut Vec<u8>, literal: &str) {
     }
 }
 
+/// Whether a dictionary string is a literal in the form hdtc's literal
+/// encoding writes — the strings a triple term's canonical form writes as
+/// literals (`docs/triple-terms-format.md` §2.1). Any other string that opens
+/// with a quote is written there as an IRI, so a reader publishing a triple
+/// term's component should publish it as one, to name the term hdtc named.
+pub fn is_encoded_literal(term: &str) -> bool {
+    crate::text::analyzer::parse_literal(term.as_bytes())
+        .is_some_and(|parsed| encodes_to(term, &parsed))
+}
+
 /// Whether `literal` is exactly what hdtc's literal encoding writes for its
 /// parts — the form every literal the parser stores takes.
-fn is_encoded_literal(literal: &str, parsed: &crate::text::analyzer::ParsedLiteral<'_>) -> bool {
+fn encodes_to(literal: &str, parsed: &crate::text::analyzer::ParsedLiteral<'_>) -> bool {
     let encoded = || -> Option<String> {
         fn part(bytes: &[u8]) -> Option<&str> {
             std::str::from_utf8(bytes).ok()
@@ -461,6 +471,19 @@ mod tests {
             "<<( <s> <p> <\\u0022a\\u0022\\u005E\\u005E\\u003Chttp://www.w3.org/2001/XMLSchema#string\\u003E> )>>"
         );
         assert_eq!(with(lit("\"x")), "<<( <s> <p> <\\u0022x> )>>");
+        for (term, encoded) in [
+            ("\"a\"@en", true),
+            ("\"a\"", true),
+            ("\"a\"^^<http://ex/d>", true),
+            ("\"\"@en", true),
+            ("\"a\"@EN", false),
+            ("\"a\"^^<http://www.w3.org/2001/XMLSchema#string>", false),
+            ("\"x", false),
+            ("\"@en", false),
+            ("http://ex/a", false),
+        ] {
+            assert_eq!(is_encoded_literal(term), encoded, "{term}");
+        }
     }
 
     #[test]

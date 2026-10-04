@@ -180,7 +180,7 @@ pub use crate::triple_terms::format::{
 pub use crate::triple_terms::iri::{
     Component as TripleTermComponent, MAX_NESTING as MAX_TRIPLE_TERM_NESTING,
     Proposition as TripleTermProposition, TT_NAMESPACE as TRIPLE_TERM_NAMESPACE,
-    iri_for as triple_term_iri, is_triple_term_iri,
+    iri_for as triple_term_iri, is_encoded_literal, is_triple_term_iri,
 };
 pub use crate::triple_terms::validate::validate_triple_terms;
 
