@@ -264,27 +264,58 @@ impl PackedWriter {
     }
 }
 
-/// A layer: a bitmap over one HDT's triples in one order, the rank directory
-/// over it, and the reverse array giving each set bit's triple-term IRI.
+/// A layer: which of one HDT's triples in one order are marked, in the
+/// encoding their counts choose (§8.1) — a bitmap over the positions, or the
+/// Elias–Fano high and low bits of the marked ones — with the rank directory
+/// over that bitmap and the reverse array giving each mark's triple-term IRI.
 struct LayerWriter {
     component: u32,
+    total_bits: u64,
+    marked: u64,
+    /// Marks set so far.
+    count: u64,
+    /// One past the last position set.
+    next: u64,
+    encoding: format::LayerEncoding,
+    /// The layer's bitmap, or its high bits.
     bitmap_file: NamedTempFile,
     bitmap: BitPacker<BufWriter<File>>,
     bits_written: u64,
-    total_bits: u64,
+    /// The low bits, for a sparse layer.
+    low: Option<PackedWriter>,
     reverse: PackedWriter,
 }
 
 impl LayerWriter {
-    fn new(temp_dir: &Path, component: u32, total_bits: u64, reverse_width: u8) -> Result<Self> {
+    /// A layer over `total_bits` positions, of which exactly `marked` will be
+    /// set.
+    fn new(
+        temp_dir: &Path,
+        component: u32,
+        total_bits: u64,
+        marked: u64,
+        reverse_width: u8,
+    ) -> Result<Self> {
         let bitmap_file = scratch(temp_dir, ".hdtc-tt-layer-")?;
         let bitmap = BitPacker::new(BufWriter::with_capacity(256 * 1024, bitmap_file.reopen()?));
+        let encoding = format::layer_encoding(total_bits, marked);
+        let low = match encoding {
+            format::LayerEncoding::Sparse { low_bits } => {
+                Some(PackedWriter::new(temp_dir, low_bits)?)
+            }
+            format::LayerEncoding::Dense => None,
+        };
         Ok(Self {
             component,
+            total_bits,
+            marked,
+            count: 0,
+            next: 0,
+            encoding,
             bitmap_file,
             bitmap,
             bits_written: 0,
-            total_bits,
+            low,
             reverse: PackedWriter::new(temp_dir, reverse_width)?,
         })
     }
@@ -293,44 +324,67 @@ impl LayerWriter {
     /// `data.hdt` object identifier of its triple-term IRI.
     fn set(&mut self, at: u64, data_term: u64) -> Result<()> {
         ensure!(
-            at >= self.bits_written && at < self.total_bits,
+            at >= self.next && at < self.total_bits && self.count < self.marked,
             "layer position {at} out of order or range"
         );
-        self.bitmap.push_zeros(at - self.bits_written)?;
+        // A set bit's place in the bitmap: the position itself, or, in the
+        // high bits, the position's bucket plus the marks before it.
+        let place = match self.encoding {
+            format::LayerEncoding::Dense => at,
+            format::LayerEncoding::Sparse { low_bits } => {
+                let low = self.low.as_mut().expect("a sparse layer has low bits");
+                low.push(at & ((1u64 << low_bits) - 1))?;
+                (at >> low_bits) + self.count
+            }
+        };
+        self.bitmap.push_zeros(place - self.bits_written)?;
         self.bitmap.push_bits(1, 1)?;
-        self.bits_written = at + 1;
+        self.bits_written = place + 1;
+        self.next = at + 1;
+        self.count += 1;
         self.reverse.push(data_term)
     }
 
     fn finish(mut self, temp_dir: &Path) -> Result<Vec<DraftSection>> {
-        self.bitmap
-            .push_zeros(self.total_bits - self.bits_written)?;
+        ensure!(
+            self.count == self.marked,
+            "layer marked {} positions, expected {}",
+            self.count,
+            self.marked
+        );
+        let (bits, bitmap_kind) = match self.encoding {
+            format::LayerEncoding::Dense => (self.total_bits, kind::LAYER),
+            format::LayerEncoding::Sparse { low_bits } => (
+                format::sparse_high_bits(self.total_bits, self.marked, low_bits),
+                kind::LAYER_HIGH,
+            ),
+        };
+        self.bitmap.push_zeros(bits - self.bits_written)?;
         let (words, mut writer) = self.bitmap.finish_into_inner()?;
         writer.flush()?;
         drop(writer);
         // The packer writes whole words; the format stores exactly ceil(L/8).
         let file = self.bitmap_file.reopen()?;
         ensure!(
-            file.metadata()?.len() == words * 8 && words * 8 >= self.total_bits.div_ceil(8),
+            file.metadata()?.len() == words * 8 && words * 8 >= bits.div_ceil(8),
             "layer bitmap was not written in full"
         );
-        file.set_len(self.total_bits.div_ceil(8))?;
+        file.set_len(bits.div_ceil(8))?;
         file.sync_data()?;
         let bitmap_path = self.bitmap_file.into_temp_path();
         let (superrank, subrank) = build_rank_directories(
             &RawBitmap {
                 path: bitmap_path.to_path_buf(),
                 data_offset: 0,
-                bits: self.total_bits,
+                bits,
             },
             temp_dir,
         )?;
-        let n = self.total_bits;
-        Ok(vec![
+        let mut sections = vec![
             DraftSection {
-                section_type: section_type(self.component, kind::LAYER),
+                section_type: section_type(self.component, bitmap_kind),
                 payload: bitmap_path,
-                entry_count: n,
+                entry_count: bits,
                 bits_per_entry: 1,
                 parameter: 0,
                 indexed_bits: 0,
@@ -338,22 +392,26 @@ impl LayerWriter {
             DraftSection {
                 section_type: section_type(self.component, kind::LAYER_SUPERRANK),
                 payload: superrank,
-                entry_count: super_count(n),
+                entry_count: super_count(bits),
                 bits_per_entry: 64,
                 parameter: u64::from(SUPERBLOCK_BITS),
-                indexed_bits: n,
+                indexed_bits: bits,
             },
             DraftSection {
                 section_type: section_type(self.component, kind::LAYER_SUBRANK),
                 payload: subrank,
-                entry_count: sub_count(n),
+                entry_count: sub_count(bits),
                 bits_per_entry: 16,
                 parameter: u64::from(SUBBLOCK_BITS),
-                indexed_bits: n,
+                indexed_bits: bits,
             },
             self.reverse
                 .finish(section_type(self.component, kind::REVERSE))?,
-        ])
+        ];
+        if let Some(low) = self.low {
+            sections.push(low.finish(section_type(self.component, kind::LAYER_LOW))?);
+        }
+        Ok(sections)
     }
 }
 
@@ -876,6 +934,8 @@ struct LayerEntries {
     spo: Sorted<Row<2>>,
     pos: Sorted<Row<4>>,
     ops: Sorted<Row<4>>,
+    /// Entries pushed: the marks each of the three layers will hold.
+    count: u64,
 }
 
 impl LayerEntries {
@@ -884,10 +944,12 @@ impl LayerEntries {
             spo: Sorted::new(temp_dir, budget / 3),
             pos: Sorted::new(temp_dir, budget / 3),
             ops: Sorted::new(temp_dir, budget / 3),
+            count: 0,
         }
     }
 
     fn push(&mut self, position: u64, s: u64, p: u64, o: u64, data_term: u64) -> Result<()> {
+        self.count += 1;
         self.spo.push(Row([position, data_term]))?;
         self.pos.push(Row([p, o, s, data_term]))?;
         self.ops.push(Row([o, p, s, data_term]))
@@ -906,19 +968,26 @@ impl LayerEntries {
     ) -> Result<()> {
         // The three orders read different streams into different files, so
         // they are built side by side; their sections are kept in order.
-        let Self { spo, pos, ops } = self;
+        let Self {
+            spo,
+            pos,
+            ops,
+            count,
+        } = self;
         let (spo, pos, ops) = std::thread::scope(|scope| {
             let spo = scope.spawn(|| -> Result<Vec<DraftSection>> {
-                let mut layer = LayerWriter::new(temp_dir, orders[0], triples, reverse_width)?;
+                let mut layer =
+                    LayerWriter::new(temp_dir, orders[0], triples, count, reverse_width)?;
                 layer_from_spo(&mut layer, spo)?;
                 layer.finish(temp_dir)
             });
             let pos = scope.spawn(|| -> Result<Vec<DraftSection>> {
-                let mut layer = LayerWriter::new(temp_dir, orders[1], triples, reverse_width)?;
+                let mut layer =
+                    LayerWriter::new(temp_dir, orders[1], triples, count, reverse_width)?;
                 layer_from_permutation(perm, hdt, PermutationComponent::Pos, &mut layer, pos)?;
                 layer.finish(temp_dir)
             });
-            let mut layer = LayerWriter::new(temp_dir, orders[2], triples, reverse_width)?;
+            let mut layer = LayerWriter::new(temp_dir, orders[2], triples, count, reverse_width)?;
             let ops = layer_from_permutation(perm, hdt, PermutationComponent::Ops, &mut layer, ops)
                 .and_then(|()| layer.finish(temp_dir));
             let join = |handle: std::thread::ScopedJoinHandle<'_, Result<Vec<DraftSection>>>| {
@@ -1282,4 +1351,178 @@ pub(crate) fn finish(
         asserted: asserted_count,
         unasserted: unasserted_count,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::triple_terms::reader::Layer;
+    use std::os::unix::fs::FileExt;
+
+    /// Write `marks` (ascending) as a layer over `positions` positions and
+    /// read it back from one file, as the index would hold it.
+    fn layer(dir: &Path, positions: u64, marks: &[u64]) -> (Layer, File, format::LayerEncoding) {
+        let mut writer =
+            LayerWriter::new(dir, component::DATA_SPO, positions, marks.len() as u64, 32).unwrap();
+        for (rank, &mark) in marks.iter().enumerate() {
+            writer.set(mark, rank as u64 * 7 + 3).unwrap();
+        }
+        let encoding = writer.encoding;
+        let drafts = writer.finish(dir).unwrap();
+        let path = dir.join(format!("layer-{positions}-{}", marks.len()));
+        let file = File::options()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let mut sections = Vec::new();
+        let mut offset = 0u64;
+        for draft in drafts {
+            let payload = std::fs::read(&draft.payload).unwrap();
+            file.write_all_at(&payload, offset).unwrap();
+            sections.push(format::Section {
+                section_type: draft.section_type,
+                flags: 1,
+                offset,
+                length: payload.len() as u64,
+                entry_count: draft.entry_count,
+                bits_per_entry: draft.bits_per_entry,
+                payload_crc: 0,
+                parameter: draft.parameter,
+                indexed_bits: draft.indexed_bits,
+            });
+            offset += payload.len() as u64;
+        }
+        let layer = Layer::from_sections(&file, positions, |k| {
+            sections
+                .iter()
+                .find(|s| s.section_type & 0xFF == k)
+                .cloned()
+        })
+        .unwrap();
+        (layer, file, encoding)
+    }
+
+    /// Either encoding answers every rank, select and membership query as the
+    /// marks themselves do — at densities from a handful of marks to most
+    /// positions, scattered and in runs that fill whole buckets.
+    #[test]
+    fn a_layer_reads_back_its_marks_in_either_encoding() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = 0xD1B5_4A32_D192_ED03u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut sparse_seen = 0;
+        let mut cases: Vec<(u64, Vec<u64>)> = Vec::new();
+        for (positions, per_ten_thousand) in [
+            (1u64, 10_000u64),
+            (100, 300),
+            (5_000, 20),
+            (70_000, 1),
+            (70_000, 30),
+            (70_000, 100),
+            (70_000, 900),
+            (70_000, 3_000),
+            (70_000, 7_000),
+        ] {
+            let marks = (0..positions)
+                .filter(|_| next() % 10_000 < per_ten_thousand)
+                .collect();
+            cases.push((positions, marks));
+        }
+        // Runs: whole buckets full, then long gaps; the first and last
+        // positions; none at all.
+        let runs = (0..70_000u64).filter(|p| p % 9_000 < 200).collect();
+        cases.push((70_000, runs));
+        cases.push((70_000, vec![0, 69_999]));
+        cases.push((70_000, vec![]));
+        for (positions, marks) in cases {
+            let (layer, file, encoding) = layer(dir.path(), positions, &marks);
+            assert_eq!(
+                encoding,
+                format::layer_encoding(positions, marks.len() as u64)
+            );
+            if matches!(encoding, format::LayerEncoding::Sparse { .. }) {
+                sparse_seen += 1;
+            }
+            assert_eq!(layer.len(), positions);
+            assert_eq!(layer.marked(), marks.len() as u64);
+            assert_eq!(layer.population(&file).unwrap(), marks.len() as u64);
+            let mut rank = 0usize;
+            for position in 0..=positions {
+                assert_eq!(
+                    layer.rank1(&file, position).unwrap(),
+                    rank as u64,
+                    "{positions} {encoding:?} rank1({position})"
+                );
+                if position == positions {
+                    break;
+                }
+                let marked = marks.get(rank) == Some(&position);
+                assert_eq!(
+                    layer.bit(&file, position).unwrap(),
+                    marked,
+                    "bit({position})"
+                );
+                if marked {
+                    assert_eq!(layer.select1(&file, rank as u64).unwrap(), position);
+                    assert_eq!(
+                        layer.reverse(&file, rank as u64).unwrap(),
+                        rank as u64 * 7 + 3
+                    );
+                    rank += 1;
+                }
+            }
+        }
+        assert!(sparse_seen >= 5, "only {sparse_seen} cases were sparse");
+    }
+
+    /// A cursor over a range enumerates exactly its marks with their reverse
+    /// entries, whether it scans or selects: scanning where the marks are
+    /// many, selecting where a range's buckets or bits far outnumber them —
+    /// a few marks far from a dense cluster.
+    #[test]
+    fn a_layer_cursor_enumerates_a_range_in_either_encoding() {
+        use crate::triple_terms::reader::LayerCursor;
+        let dir = tempfile::tempdir().unwrap();
+        let positions = 10_000_000u64;
+        let clustered: Vec<u64> = (0..20_000).chain([3_000_000, 9_999_999]).collect();
+        let scattered: Vec<u64> = (0..positions).step_by(97).collect();
+        let dense: Vec<u64> = (0..200_000).filter(|p| p % 3 != 0).collect();
+        for (marks, total) in [
+            (clustered, positions),
+            (scattered, positions),
+            (dense, 200_000),
+        ] {
+            let (layer, _file, encoding) = layer(dir.path(), total, &marks);
+            let path = dir.path().join(format!("layer-{total}-{}", marks.len()));
+            for range in [
+                0..total,
+                1..total - 1,
+                10_000..20_001,
+                1_000_000.min(total / 2)..total,
+                total / 3..total / 3 + 5_000,
+                total..total,
+            ] {
+                let expected: Vec<(u64, u64)> = marks
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, p)| range.contains(*p))
+                    .map(|(rank, &p)| (p, rank as u64 * 7 + 3))
+                    .collect();
+                let mut cursor = LayerCursor::from_layer(&path, &layer, range.clone()).unwrap();
+                let mut found = Vec::new();
+                while let Some(mark) = cursor.next().unwrap() {
+                    found.push(mark);
+                }
+                assert_eq!(found, expected, "{encoding:?} {range:?}");
+            }
+        }
+    }
 }

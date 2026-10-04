@@ -251,10 +251,12 @@ set. A reader MUST reject an unknown section type.
 | `TARGET_SUBJECT` | `0x01` | Packed: `(subject << 1) \| unasserted` | runs |
 | `TARGET_PREDICATE` | `0x02` | Packed: predicate identifier | runs |
 | `TARGET_OBJECT` | `0x03` | Packed: object identifier | runs |
-| `LAYER` | `0x04` | Bitmap | layers |
+| `LAYER` | `0x04` | Bitmap | dense layers (§8.1) |
 | `LAYER_SUPERRANK` | `0x05` | Packed `u64` (permutation-index-format.md §7.2) | layers |
 | `LAYER_SUBRANK` | `0x06` | Packed `u16` (ibid.) | layers |
 | `REVERSE` | `0x07` | Packed: `data.hdt` object identifier | layers |
+| `LAYER_HIGH` | `0x08` | Bitmap: Elias–Fano high bits | sparse layers (§8.1) |
+| `LAYER_LOW` | `0x09` | Packed: Elias–Fano low bits | sparse layers (§8.1) |
 
 Both run components are always present, with zero-length payloads when their
 run is empty. The three `DATA_*` layer components are always present. The
@@ -264,6 +266,11 @@ Packed widths are fixed by the header's identifier spaces, not by the values
 present (§7, §8), so an empty run still declares them; the rank directories'
 widths are fixed at 64 and 16, with `Parameter` and `Indexed bit length` as in
 the permutation index.
+
+Each layer component holds `LAYER_SUPERRANK`, `LAYER_SUBRANK` and `REVERSE`,
+and either `LAYER` (dense) or both `LAYER_HIGH` and `LAYER_LOW` (sparse) — the
+encoding §8.1 chooses, and no other. The rank directory indexes whichever
+bitmap is present.
 
 ## 7. Runs
 
@@ -309,6 +316,45 @@ proposition — because a layer exists to serve patterns over `data.hdt`
 inside another proposition is the object of no `data.hdt` triple. Marking it
 would make a range contain positions that resolve to nothing, and enumeration
 would lose its bound.
+
+### 8.1 Dense and sparse layers
+
+A layer over `N` positions with `M` of them set is stored in one of two
+encodings, chosen by `N` and `M` alone:
+
+- **Dense:** `LAYER` is the bitmap of `N` bits itself.
+- **Sparse:** the Elias–Fano encoding of the set positions `x_0 < … < x_{M-1}`,
+  with `l = floor(log2(floor(N / max(M, 1))))` low bits. `LAYER_LOW` holds
+  `x_i mod 2^l` for each `i`, packed `l` bits wide, in rank order. `LAYER_HIGH`
+  is a bitmap of `M + ((N - 1) >> l) + 1` bits in which bit `(x_i >> l) + i` is
+  set for each `i` and every other bit is clear: positions fall into buckets of
+  `2^l`, and each bucket's set bits are followed by one clear bit closing it.
+
+The **sparse** encoding is used exactly when `l ≥ 1` and its payload is
+smaller in bytes than the dense one's, where a bitmap of `b` bits with its rank
+directory takes `ceil(b/8) + 8 * super_count(b) + 2 * sub_count(b)` bytes
+(permutation-index-format.md §7.2) and the sparse layer adds `ceil(M * l / 8)`
+for its low bits. Ties are dense. The choice is a function of the counts, so a
+layer's bytes remain a function of its contents, and a reader or validator can
+recompute it from `N` and `REVERSE`'s entry count.
+
+Sparse is the smaller below about a quarter of the positions set — at 10%, about
+0.5 bits per position against 1.05 — and much the smaller when few triples are
+reified: at 0.1%, about twelve bits per mark rather than a thousand. Both
+encodings answer the same queries, and the rest of the format does not depend
+on which is used:
+
+- `rank1(z)`, the set positions before `z`: dense, as for any ranked bitmap;
+  sparse, the marks before `z`'s bucket `h = z >> l` are
+  `select0(h - 1) - (h - 1)` in the high bits (`0` when `h = 0`), the marks in
+  it end at `select0(h) - h`, and among those the low bits, ascending, are
+  searched for `z mod 2^l`.
+- `select1(r)`, the `r`-th set position: sparse,
+  `((select1_high(r) - r) << l) | LOW[r]`.
+- Enumeration from a rank reads the high bits forward from `select1_high(r)`,
+  skipping one clear bit per bucket passed, and `LOW` and `REVERSE` from `r`;
+  where a range's buckets far outnumber its marks, each mark is selected
+  instead, as for a dense layer's sparse ranges.
 
 ## 9. Binding
 
@@ -390,14 +436,15 @@ footer that disagrees with the header, checksum failures, and a header whose
 counts disagree with the bound HDTs. Strict validation MUST additionally verify:
 
 1. both digests (§9), every payload checksum, and every rank directory against
-   its bitmap;
+   its bitmap — `LAYER`, or a sparse layer's `LAYER_HIGH`;
 2. each run against the dictionary's triple-term IRIs (§7 requirement 1);
 3. every run entry, by decoding its proposition and minting it again (§7
    requirement 2);
-4. each layer: that every set bit's triple is the target of the IRI its
+4. each layer: that every set position's triple is the target of the IRI its
    `REVERSE` entry names — which, with item 3, is the IRI that triple's
-   proposition mints — and that each layer has exactly one bit per IRI of the
-   data run whose proposition it covers (§8);
+   proposition mints — that each layer has exactly one set position per IRI
+   of the data run whose proposition it covers (§8), and, sparse, that the
+   positions decoded are strictly increasing and below `N` (§8.1);
 5. that every target is a triple of the HDT its flag names, that the
    propositions HDT holds exactly the unasserted targets, and that none of
    them is a triple of `data.hdt` (§7 requirement 3, §3);
@@ -410,8 +457,12 @@ With `T` triple terms, `A` of them asserted, and `N` triples in `data.hdt`:
 
 ```text
 runs     ≈ T * (ceil(log2 S) + 1 + ceil(log2 P) + ceil(log2 O)) bits
-layers   ≈ 3 * (N + N/85) bits                     bitmaps and directories
+layers   ≈ 3 * min(1.05 * N, 1.05 * (A + N / 2^l) + A * l) bits,  l = floor(log2(N / A))
 reverse  ≈ 3 * A * ceil(log2 O) bits
 ```
 
-plus the same for the propositions HDT's `T - A` triples.
+plus the same for the propositions HDT's `T - A` triples (§8.1 has the exact
+rule). For ROBOKOP annotated (`N` = 1.40 G, `A` = 133 M, every triple term
+asserted) the layers are sparse with `l = 3`, 90 MB each against 183 MB dense,
+and the index 2.75 GB rather than 3.03 GB. With a tenth as many triple terms
+they would take 15 MB each, and with a hundredth, 2 MB.

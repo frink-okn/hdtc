@@ -1095,3 +1095,105 @@ fn unasserted_triple_terms_keep_whatever_lenient_ingest_stored() {
         }
     }
 }
+
+/// A few triple terms among many triples: the data layers are stored sparse
+/// (`docs/triple-terms-format.md` §8.1) and the propositions HDT's dense, and
+/// every pattern inside a triple term answers exactly the reifiers whose
+/// triples match it, by every plan, the count included.
+#[test]
+fn sparse_layers_answer_every_inner_pattern() {
+    let dir = tempfile::tempdir().unwrap();
+    let iri = |kind: &str, n: u64| format!("<http://ex/{kind}{n}>");
+    let mut source = String::new();
+    let mut triples = Vec::new();
+    for i in 0..3_000u64 {
+        let triple = (iri("s", i % 300), iri("p", i % 10), iri("o", (i * 7) % 200));
+        source.push_str(&format!("{} {} {} .\n", triple.0, triple.1, triple.2));
+        triples.push(triple);
+    }
+    // Reifiers and the triple each names: asserted ones from the data, and
+    // unasserted ones about objects the data does not hold.
+    let mut reified = Vec::new();
+    for i in 0..40u64 {
+        let triple = triples[(i * 73 % 3_000) as usize].clone();
+        reified.push((iri("r", i), triple));
+    }
+    for i in 0..15u64 {
+        let triple = (iri("s", i), iri("p", i % 10), iri("u", i));
+        reified.push((iri("n", i), triple));
+    }
+    for (reifier, (s, p, o)) in &reified {
+        source.push_str(&format!(
+            "{reifier} <{RDF_REIFIES}> <<( {s} {p} {o} )>> .\n"
+        ));
+    }
+    let input = dir.path().join("in.nt");
+    common::write_file(&input, source.as_bytes());
+    let hdt = create(dir.path(), &[&input], "sparse.hdt");
+    validate(&hdt, dir.path());
+
+    // The data layers are sparse; the propositions HDT's, every position
+    // marked, are dense.
+    let (_, sections) = hdtc::format::read_triple_term_directory(&tt_path(&hdt, ".tt")).unwrap();
+    let kinds = |component: u32| -> Vec<u32> {
+        sections
+            .iter()
+            .filter(|s| s.section_type >> 8 == component)
+            .map(|s| s.section_type & 0xFF)
+            .collect()
+    };
+    for component in [0x11, 0x12, 0x13] {
+        assert!(
+            kinds(component).contains(&0x08),
+            "{component:#x}: {:?}",
+            kinds(component)
+        );
+    }
+    for component in [0x21, 0x22, 0x23] {
+        assert!(
+            kinds(component).contains(&0x04),
+            "{component:#x}: {:?}",
+            kinds(component)
+        );
+    }
+
+    // Every inner pattern a reified triple fixes, wildcards in each mix.
+    let mut patterns = vec![("?".to_owned(), "?".to_owned(), "?".to_owned())];
+    for (_, (s, p, o)) in reified.iter().step_by(4) {
+        for mask in 1..8u8 {
+            let pick = |bit: u8, term: &String| {
+                if mask & bit != 0 {
+                    term.clone()
+                } else {
+                    "?".to_owned()
+                }
+            };
+            patterns.push((pick(1, s), pick(2, p), pick(4, o)));
+        }
+    }
+    for (s, p, o) in patterns {
+        let expected: Vec<String> = reified
+            .iter()
+            .filter(|(_, (rs, rp, ro))| {
+                (s == "?" || &s == rs) && (p == "?" || &p == rp) && (o == "?" || &o == ro)
+            })
+            .map(|(reifier, _)| reifier.clone())
+            .collect();
+        let query = format!("? ? <<( {s} {p} {o} )>>");
+        let mut found: Vec<String> = search(&hdt, &query, &[])
+            .iter()
+            .map(|line| line.split(' ').next().unwrap().to_owned())
+            .collect();
+        found.sort();
+        let mut expected_sorted = expected.clone();
+        expected_sorted.sort();
+        assert_eq!(found, expected_sorted, "{query}");
+        let counted = search(&hdt, &query, &["--count"]);
+        assert_eq!(counted, vec![expected.len().to_string()], "{query} --count");
+        // With the outer subject bound, the plan may start from it.
+        if let Some(first) = expected.first() {
+            let bound = format!("{first} ? <<( {s} {p} {o} )>>");
+            assert_eq!(search(&hdt, &bound, &[]).len(), 1, "{bound}");
+        }
+    }
+}

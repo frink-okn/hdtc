@@ -55,6 +55,57 @@ pub mod kind {
     /// Order component: `data.hdt` object identifier of each set bit's
     /// triple-term IRI, in rank order.
     pub const REVERSE: u32 = 0x07;
+    /// Order component, sparse layers (§8.1): the Elias–Fano high bits, a
+    /// bitmap the rank directory indexes in place of `LAYER`.
+    pub const LAYER_HIGH: u32 = 0x08;
+    /// Order component, sparse layers (§8.1): the Elias–Fano low bits of each
+    /// set position, in rank order.
+    pub const LAYER_LOW: u32 = 0x09;
+}
+
+/// How a layer is stored (§8.1): a bitmap over its positions, or the
+/// Elias–Fano encoding of its set positions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayerEncoding {
+    Dense,
+    /// Each set position split into its low `low_bits` bits, stored packed,
+    /// and the rest, stored in unary in a bitmap of [`sparse_high_bits`].
+    Sparse {
+        low_bits: u8,
+    },
+}
+
+/// The encoding a layer over `positions` positions with `marked` of them set
+/// is stored in: the smaller in payload bytes, the bitmap on a tie (§8.1). A
+/// function of the two counts alone, so a layer's bytes are a function of its
+/// contents and a reader or validator can recompute the choice.
+pub fn layer_encoding(positions: u64, marked: u64) -> LayerEncoding {
+    use crate::permutation::format::{sub_count, super_count};
+    let ranked = |bits: u64| bits.div_ceil(8) + super_count(bits) * 8 + sub_count(bits) * 2;
+    if positions == 0 || marked > positions {
+        return LayerEncoding::Dense;
+    }
+    let low_bits = (positions / marked.max(1)).ilog2() as u8;
+    if low_bits == 0 {
+        return LayerEncoding::Dense;
+    }
+    let sparse = ranked(sparse_high_bits(positions, marked, low_bits))
+        + (marked * u64::from(low_bits)).div_ceil(8);
+    if sparse < ranked(positions) {
+        LayerEncoding::Sparse { low_bits }
+    } else {
+        LayerEncoding::Dense
+    }
+}
+
+/// The length of a sparse layer's high-bits bitmap: one set bit per set
+/// position, and one clear bit closing each of the `((positions - 1) >>
+/// low_bits) + 1` buckets of `2^low_bits` positions.
+pub fn sparse_high_bits(positions: u64, marked: u64, low_bits: u8) -> u64 {
+    if positions == 0 {
+        return 0;
+    }
+    marked + ((positions - 1) >> low_bits) + 1
 }
 
 pub const fn section_type(component: u32, kind: u32) -> u32 {
@@ -340,7 +391,7 @@ fn check_section_set(header: &Header, sections: &[Section]) -> Result<()> {
         let known = if is_run(component) {
             (kind::TARGET_SUBJECT..=kind::TARGET_OBJECT).contains(&kind_value)
         } else if DATA_ORDERS.contains(&component) || PROPS_ORDERS.contains(&component) {
-            (kind::LAYER..=kind::REVERSE).contains(&kind_value)
+            (kind::LAYER..=kind::LAYER_LOW).contains(&kind_value)
         } else {
             false
         };
@@ -429,25 +480,51 @@ fn check_section_set(header: &Header, sections: &[Section]) -> Result<()> {
             find(section_type(component, k))
                 .with_context(|| format!("missing section {:#06x}", section_type(component, k)))
         };
-        let (layer, superrank, subrank, reverse) = (
-            get(kind::LAYER)?,
+        let (superrank, subrank, reverse) = (
             get(kind::LAYER_SUPERRANK)?,
             get(kind::LAYER_SUBRANK)?,
             get(kind::REVERSE)?,
         );
-        ensure!(
-            layer.entry_count == triples && layer.bits_per_entry == 1,
-            "layer {component:#04x} does not cover its HDT's triples"
+        // §8.1: the encoding is the one the counts choose, and its bitmap —
+        // the layer itself, or the high bits — is the one indexed.
+        let marked = reverse.entry_count;
+        let (dense, high, low) = (
+            find(section_type(component, kind::LAYER)),
+            find(section_type(component, kind::LAYER_HIGH)),
+            find(section_type(component, kind::LAYER_LOW)),
         );
+        let indexed = match (layer_encoding(triples, marked), dense, high, low) {
+            (LayerEncoding::Dense, Some(layer), None, None) => {
+                ensure!(
+                    layer.entry_count == triples && layer.bits_per_entry == 1,
+                    "layer {component:#04x} does not cover its HDT's triples"
+                );
+                triples
+            }
+            (LayerEncoding::Sparse { low_bits }, None, Some(high), Some(low)) => {
+                let bits = sparse_high_bits(triples, marked, low_bits);
+                ensure!(
+                    high.entry_count == bits
+                        && high.bits_per_entry == 1
+                        && low.entry_count == marked
+                        && low.bits_per_entry == low_bits,
+                    "sparse layer {component:#04x} does not cover its HDT's triples"
+                );
+                bits
+            }
+            (encoding, ..) => {
+                bail!("layer {component:#04x} is not stored as its counts require ({encoding:?})")
+            }
+        };
         ensure!(
             superrank.bits_per_entry == 64
                 && superrank.parameter == u64::from(SUPERBLOCK_BITS)
-                && superrank.entry_count == super_count(triples)
-                && superrank.indexed_bits == if triples == 0 { 0 } else { triples }
+                && superrank.entry_count == super_count(indexed)
+                && superrank.indexed_bits == indexed
                 && subrank.bits_per_entry == 16
                 && subrank.parameter == u64::from(SUBBLOCK_BITS)
-                && subrank.entry_count == sub_count(triples)
-                && subrank.indexed_bits == if triples == 0 { 0 } else { triples },
+                && subrank.entry_count == sub_count(indexed)
+                && subrank.indexed_bits == indexed,
             "layer {component:#04x} rank directory has the wrong shape"
         );
         ensure!(
@@ -611,4 +688,42 @@ pub(crate) fn assemble(
         "written triple-term index size mismatch"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The smaller encoding wins, with whole bits of low part: sparse at
+    /// low densities, dense from about a quarter up, dense when there is
+    /// nothing to cover, and never sparse with no low bits.
+    #[test]
+    fn a_layer_is_stored_in_the_smaller_encoding() {
+        assert_eq!(layer_encoding(0, 0), LayerEncoding::Dense);
+        assert_eq!(layer_encoding(100, 100), LayerEncoding::Dense);
+        assert_eq!(layer_encoding(1_000_000, 300_000), LayerEncoding::Dense);
+        assert_eq!(
+            layer_encoding(1_000_000, 100_000),
+            LayerEncoding::Sparse { low_bits: 3 }
+        );
+        assert_eq!(
+            layer_encoding(1_000_000, 0),
+            LayerEncoding::Sparse { low_bits: 19 }
+        );
+        // ROBOKOP's layers: 133 M marks over 1.4 G positions.
+        assert_eq!(
+            layer_encoding(1_402_044_173, 132_960_364),
+            LayerEncoding::Sparse { low_bits: 3 }
+        );
+        // Small layers are dominated by the rank directory either way.
+        assert_eq!(layer_encoding(20, 5), LayerEncoding::Dense);
+        for positions in [1u64, 7, 100, 4096, 70_000, 1 << 33] {
+            for marked in [0, 1, positions / 3, positions / 2, positions] {
+                if let LayerEncoding::Sparse { low_bits } = layer_encoding(positions, marked) {
+                    assert!(low_bits >= 1, "{positions} {marked}");
+                    assert!(sparse_high_bits(positions, marked, low_bits) >= marked);
+                }
+            }
+        }
+    }
 }

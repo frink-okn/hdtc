@@ -248,6 +248,7 @@ type Groups = (u32, u64, u64, u64, u64, u64);
 /// directory is about 0.6% of the bitmap, so holding it costs a few megabytes
 /// per billion positions, and turns each select into one read of the final
 /// 512-bit block instead of a binary search over reads.
+#[derive(Debug)]
 pub(crate) struct CachedBitmap {
     bits_offset: u64,
     length: u64,
@@ -336,6 +337,77 @@ impl CachedBitmap {
                 }
             }
             remaining -= ones;
+        }
+        bail!("rank directory and bitmap disagree")
+    }
+
+    /// Position of the zero-based `ordinal`-th clear bit: the descent of
+    /// [`select1`](Self::select1) over the complement. A sample counts the set
+    /// bits before its boundary, so the clear bits before it are the boundary
+    /// less the sample, and no second directory is needed.
+    pub(crate) fn select0(&self, bits: &File, ordinal: u64) -> Result<u64> {
+        use std::os::unix::fs::FileExt;
+        let total = self.length - self.superrank.last().copied().unwrap_or(0);
+        ensure!(ordinal < total, "select ordinal out of range");
+        let superblock_bits = u64::from(SUPERBLOCK_BITS);
+        let subblock_bits = u64::from(SUBBLOCK_BITS);
+        let per_super = (SUPERBLOCK_BITS / SUBBLOCK_BITS) as usize;
+        // The last superblock whose clear bits before it do not exceed
+        // `ordinal`; the sentinel holds them all, so it is never chosen.
+        let zeros_before_super =
+            |k: usize| (k as u64 * superblock_bits).min(self.length) - self.superrank[k];
+        let (mut low, mut high) = (0usize, self.superrank.len() - 1);
+        while low < high {
+            let mid = low + (high - low).div_ceil(2);
+            if zeros_before_super(mid) <= ordinal {
+                low = mid;
+            } else {
+                high = mid - 1;
+            }
+        }
+        let k = low;
+        let base = zeros_before_super(k);
+        let first = k * per_super;
+        let last = (first + per_super).min(self.subrank.len()) - 1;
+        let zeros_before_sub = |j: usize| {
+            base + (j as u64 * subblock_bits - k as u64 * superblock_bits)
+                - u64::from(self.subrank[j])
+        };
+        let (mut low, mut high) = (first, last);
+        while low < high {
+            let mid = low + (high - low).div_ceil(2);
+            if zeros_before_sub(mid) <= ordinal {
+                low = mid;
+            } else {
+                high = mid - 1;
+            }
+        }
+        let j = low;
+        let mut remaining = ordinal - zeros_before_sub(j);
+        let start = j as u64 * subblock_bits;
+        let bits_here = (self.length - start).min(subblock_bits);
+        let mut block = [0u8; 64];
+        let byte_count = bits_here.div_ceil(8) as usize;
+        bits.read_exact_at(&mut block[..byte_count], self.bits_offset + start / 8)?;
+        for (i, byte) in block[..byte_count].iter().enumerate() {
+            // Only the declared bits count; the last byte may run past them.
+            let width = (bits_here - i as u64 * 8).min(8);
+            let mask = if width == 8 { 0xFF } else { (1u8 << width) - 1 };
+            let clear = !*byte & mask;
+            let zeros = u64::from(clear.count_ones());
+            if remaining < zeros {
+                let mut b = clear;
+                for bit in 0..8u64 {
+                    if b & 1 == 1 {
+                        if remaining == 0 {
+                            return Ok(start + i as u64 * 8 + bit);
+                        }
+                        remaining -= 1;
+                    }
+                    b >>= 1;
+                }
+            }
+            remaining -= zeros;
         }
         bail!("rank directory and bitmap disagree")
     }
@@ -1900,6 +1972,88 @@ pub fn validate_permutation_index(
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// A bitmap's selects and ranks, answered through its directory held in
+    /// memory, are what a scan of the bits answers — across the 512- and
+    /// 4096-bit block boundaries, at every density, empty and full included.
+    #[test]
+    fn a_cached_bitmap_selects_and_ranks_as_a_scan_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for (bits, per_mille) in [
+            (1u64, 500u64),
+            (511, 300),
+            (512, 100),
+            (513, 900),
+            (4095, 20),
+            (4096, 50),
+            (4097, 999),
+            (10_000, 10),
+            (20_000, 500),
+            (9_000, 0),
+            (9_000, 1000),
+        ] {
+            let set: Vec<bool> = (0..bits).map(|_| next() % 1000 < per_mille).collect();
+            let mut bytes = vec![0u8; bits.div_ceil(8) as usize];
+            for (i, _) in set.iter().enumerate().filter(|(_, b)| **b) {
+                bytes[i / 8] |= 1 << (i % 8);
+            }
+            let path = dir.path().join(format!("bits-{bits}-{per_mille}"));
+            std::fs::write(&path, &bytes).unwrap();
+            let (superrank, subrank) = crate::permutation::build_rank_directories(
+                &crate::permutation::RawBitmap {
+                    path: path.clone(),
+                    data_offset: 0,
+                    bits,
+                },
+                dir.path(),
+            )
+            .unwrap();
+            let words = |path: &Path, width: usize| -> Vec<u64> {
+                std::fs::read(path)
+                    .unwrap()
+                    .chunks_exact(width)
+                    .map(|chunk| {
+                        let mut value = [0u8; 8];
+                        value[..width].copy_from_slice(chunk);
+                        u64::from_le_bytes(value)
+                    })
+                    .collect()
+            };
+            let cached = CachedBitmap::from_samples(
+                0,
+                bits,
+                words(&superrank, 8),
+                words(&subrank, 2).into_iter().map(|v| v as u16).collect(),
+            );
+            let file = File::open(&path).unwrap();
+            let (mut ones, mut zeros) = (0u64, 0u64);
+            for (position, &bit) in set.iter().enumerate() {
+                let position = position as u64;
+                assert_eq!(
+                    cached.rank1(&file, position).unwrap(),
+                    ones,
+                    "{bits} {position}"
+                );
+                if bit {
+                    assert_eq!(cached.select1(&file, ones).unwrap(), position);
+                    ones += 1;
+                } else {
+                    assert_eq!(cached.select0(&file, zeros).unwrap(), position);
+                    zeros += 1;
+                }
+            }
+            assert_eq!(cached.rank1(&file, bits).unwrap(), ones);
+            assert!(cached.select1(&file, ones).is_err());
+            assert!(cached.select0(&file, zeros).is_err());
+        }
+    }
 
     fn packed_reader(path: &Path, offset: u64, entry_count: u64) -> BarePackedReader {
         BarePackedReader::new(

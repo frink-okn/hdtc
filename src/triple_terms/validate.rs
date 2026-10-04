@@ -15,7 +15,7 @@
 
 use super::format::{self, Section};
 use super::iri::{Component, Proposition, TT_NAMESPACE, iri_for};
-use super::reader::{Layer, Order, Source, Target, TripleTermIndex};
+use super::reader::{Layer, LayerCursor, Order, Source, Target, TripleTermIndex};
 use crate::hdt::artifacts::SourceIdentity;
 use crate::hdt::reader::{BitmapTriplesScanner, DictionaryResolver, open_hdt};
 use crate::io::crc_utils::CRC32C_ALGO;
@@ -141,13 +141,15 @@ fn ordered_triples<'a>(hdt: &'a Path, perm: &'a Path, order: Order) -> Result<Tr
     }
 }
 
-/// Check one layer against its HDT, read in the layer's order: each set bit
-/// marks a triple whose reverse entry names it.
+/// Check one layer against its HDT, read in the layer's order: each mark is
+/// on a triple whose reverse entry names it.
 ///
 /// The run check has already minted every IRI from its target's proposition,
 /// so a reverse entry names a position's triple exactly when the entry's
 /// target is that triple — a packed read, with no dictionary lookup and no
-/// hashing per position.
+/// hashing per position. The marks are read through the layer's own cursor,
+/// in either encoding (§8.1), so a sparse layer's positions are checked as
+/// decoded: strictly increasing, each on a triple of the HDT.
 fn check_layer(
     index: &TripleTermIndex,
     source: Source,
@@ -165,25 +167,28 @@ fn check_layer(
         "{source:?} {order:?} layer covers {} positions, the HDT has {triples_total}",
         layer.len()
     );
-    let population = layer.rank1(index.file(), layer.len())?;
+    let population = layer.population(index.file())?;
     ensure!(
-        population == expected && layer.reverse.entry_count == expected,
+        population == expected && layer.marked() == expected,
         "{source:?} {order:?} layer marks {population} triples, expected {expected}"
     );
     let perm = crate::permutation::canonical_path(hdt);
+    let mut marks = LayerCursor::new(index, source, order, 0..layer.len())?;
+    let mut next = marks.next()?;
     let mut rank = 0u64;
-    let mut bitmap = vec![0u8; layer.len().div_ceil(8) as usize];
-    if !bitmap.is_empty() {
-        index
-            .file()
-            .read_exact_at(&mut bitmap, layer.bitmap.offset)?;
-    }
     for (position, triple) in ordered_triples(hdt, &perm, order)?.enumerate() {
-        let (s, p, o) = triple?;
-        if bitmap[position / 8] >> (position % 8) & 1 == 0 {
+        let Some((marked, data_term)) = next else {
+            break;
+        };
+        let position = position as u64;
+        ensure!(
+            marked >= position,
+            "{source:?} {order:?} layer's marks are out of order at rank {rank}"
+        );
+        if marked > position {
             continue;
         }
-        let data_term = layer.reverse(index.file(), rank)?;
+        let (s, p, o) = triple?;
         let target = index.target(Source::Data, data_term)?.with_context(|| {
             format!("{source:?} {order:?} reverse entry {rank} is no triple-term IRI")
         })?;
@@ -194,8 +199,12 @@ fn check_layer(
              but its reverse entry {data_term} names another proposition"
         );
         rank += 1;
+        next = marks.next()?;
     }
-    ensure!(rank == expected, "{source:?} {order:?} layer is truncated");
+    ensure!(
+        next.is_none() && rank == expected,
+        "{source:?} {order:?} layer marks positions past its HDT's triples"
+    );
     Ok(())
 }
 
@@ -217,7 +226,9 @@ fn check_rank_directories(index: &TripleTermIndex, temp_dir: &Path) -> Result<()
                 &RawBitmap {
                     path: index.path().to_path_buf(),
                     data_offset: layer.bitmap.offset,
-                    bits: layer.len(),
+                    // The bitmap the directory indexes: the layer, or a
+                    // sparse layer's high bits.
+                    bits: layer.bitmap.entry_count,
                 },
                 temp_dir,
             )?;
