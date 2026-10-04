@@ -136,6 +136,16 @@ impl Layer {
                 .sum::<u64>())
     }
 
+    pub fn bit(&self, file: &File, position: u64) -> Result<bool> {
+        ensure!(
+            position < self.bitmap.entry_count,
+            "bit position out of range"
+        );
+        let mut byte = [0u8; 1];
+        file.read_exact_at(&mut byte, self.bitmap.offset + position / 8)?;
+        Ok(byte[0] >> (position % 8) & 1 == 1)
+    }
+
     /// The `data.hdt` object identifier of the triple-term IRI at `rank`.
     pub fn reverse(&self, file: &File, rank: u64) -> Result<u64> {
         read_packed(file, &self.reverse, rank)

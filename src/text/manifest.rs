@@ -88,6 +88,20 @@ pub struct TextManifest {
     pub exclusions: DatatypeExclusions,
     /// Language tags in ascending order, each with its document count.
     pub languages: Vec<LanguageCount>,
+    /// Present when the index also covers the literals of the HDT's
+    /// propositions HDT (`docs/text-index-format.md` §2.4).
+    pub propositions: Option<PropositionsCoverage>,
+}
+
+/// How an index covers the literals of unasserted RDF 1.2 triple terms: their
+/// documents carry `object_offset` plus their object ID in the propositions HDT.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PropositionsCoverage {
+    /// SHA-256 over the propositions HDT's dictionary-and-triples suffix.
+    pub digest: [u8; 32],
+    /// The data HDT's object count; a document ID above it addresses the
+    /// propositions HDT.
+    pub object_offset: u64,
 }
 
 impl TextManifest {
@@ -118,6 +132,14 @@ impl TextManifest {
         for language in &self.languages {
             let _ = writeln!(out, "language\t{}\t{}", language.tag, language.documents);
         }
+        if let Some(coverage) = &self.propositions {
+            let _ = writeln!(out, "propositions_digest\t{}", hex(&coverage.digest));
+            let _ = writeln!(
+                out,
+                "propositions_object_offset\t{}",
+                coverage.object_offset
+            );
+        }
         out
     }
 
@@ -138,6 +160,8 @@ impl TextManifest {
         let mut excluded_no_tokens = 0u64;
         let mut exclusion_iris = Vec::new();
         let mut languages = Vec::new();
+        let mut propositions_digest = None;
+        let mut propositions_object_offset = None;
 
         for (number, line) in text.lines().enumerate() {
             if line.is_empty() {
@@ -181,6 +205,12 @@ impl TextManifest {
                         tag: value.to_string(),
                         documents: number_value(documents)?,
                     });
+                }
+                "propositions_digest" => {
+                    propositions_digest = Some(parse_hex(value).with_context(at)?);
+                }
+                "propositions_object_offset" => {
+                    propositions_object_offset = Some(number_value(value)?);
                 }
                 // Unknown keys are ignored, so a later version may add lines
                 // without making this one refuse the file outright.
@@ -233,6 +263,16 @@ impl TextManifest {
             excluded_no_tokens,
             exclusions: DatatypeExclusions::from_iris(exclusion_iris),
             languages,
+            propositions: match (propositions_digest, propositions_object_offset) {
+                (Some(digest), Some(object_offset)) => Some(PropositionsCoverage {
+                    digest,
+                    object_offset,
+                }),
+                (None, None) => None,
+                _ => anyhow::bail!(
+                    "Text index manifest names a propositions digest or offset without the other"
+                ),
+            },
         })
     }
 
@@ -306,6 +346,7 @@ mod tests {
                 "http://www.w3.org/2001/XMLSchema#integer".to_string(),
                 "http://www.w3.org/2001/XMLSchema#date".to_string(),
             ]),
+            propositions: None,
             languages: vec![
                 LanguageCount {
                     tag: "en".to_string(),

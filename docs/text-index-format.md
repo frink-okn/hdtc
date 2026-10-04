@@ -118,6 +118,34 @@ strings a cross-language caller most wants.
 A literal whose actual language tag is `und` is indistinguishable from an
 untagged one. This is accepted: the two make the same claim.
 
+### 2.4 Literals of unasserted triple terms
+
+An HDT with RDF 1.2 triple terms may carry a propositions HDT
+(`triple-terms-format.md` §3) holding the propositions of its *unasserted*
+triple terms, whose literals occur nowhere in the data HDT's dictionary. An
+index over such an HDT **covers them too**, so that a search can reach every
+literal in the dataset, asserted or not:
+
+- each literal of the propositions HDT's object-only section is a document,
+  under the same rules as §2.1 and §3;
+- its ID is the data HDT's object count (`shared + objects`, the
+  `propositions_object_offset` of §4) **plus** its object ID in the
+  propositions HDT, so the two ID spaces never collide and a consumer tells
+  them apart by comparing with the offset;
+- the manifest records the coverage (§4), and counts include these documents.
+
+A literal that occurs both asserted and inside an unasserted triple term is two
+documents, one in each space, ranked by one shared model; each resolves to its
+own occurrences.
+
+A hit in the propositions space resolves not to the literal's own occurrences —
+those are propositions, never asserted — but to the triples of the data HDT
+whose object is a triple term containing it, found through the triple-term
+index: `r q <<( s p "literal" )>>`. A predicate filter (§7.3) then applies to
+the triple term's predicate `p`.
+
+An HDT without a propositions HDT is indexed exactly as before.
+
 ## 3. The analyzer (`analyzer_id = 1`)
 
 Every index records an `analyzer_id`. It asserts every rule in this section. A
@@ -323,6 +351,8 @@ Keys, each at most once except where noted:
 | `excluded_no_tokens` | count | Literals excluded by §3.4 rule 3. |
 | `excluded_datatype_iri` | IRI | One member of the §3.5 set. Repeated, ascending. |
 | `language` | tag, count | One language value and its document count. Repeated, ascending by tag. |
+| `propositions_digest` | 64 hex chars | SHA-256 over the propositions HDT's identity suffix, when the index covers it (§2.4). |
+| `propositions_object_offset` | count | The data HDT's object count; document IDs above it address the propositions HDT (§2.4). Present iff `propositions_digest` is. |
 
 `literals_scanned = indexed_docs + excluded_oversize + excluded_datatype +
 excluded_no_tokens`, and the `language` counts sum to `indexed_docs`.

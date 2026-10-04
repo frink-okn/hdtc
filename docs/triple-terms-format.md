@@ -333,6 +333,12 @@ A pattern whose *outer* subject is bound is better answered from the other
 side: the subject's SPO group is small, and each triple-term object in it is
 decoded and tested.
 
+**Text search.** A text index over `data.hdt` also covers the literals of the
+propositions HDT (text-index-format.md §2.4), so a literal that occurs only
+inside unasserted claims is still found; it resolves through the propositions
+HDT's OPS group, its SPO layer and reverse entry, to the `data.hdt` triples that
+name the triple term.
+
 ## 11. Construction (non-normative)
 
 hdtc builds these artifacts after `data.hdt` and its permutation index:

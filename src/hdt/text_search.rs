@@ -104,6 +104,9 @@ pub fn search_text_streaming(options: &TextSearchOptions<'_>) -> Result<u64> {
         None => None,
         Some(iri) => match dictionary.locate_predicate(iri.as_bytes())? {
             Some(id) => Some(id),
+            // It may still be the predicate of an unasserted triple term,
+            // whose literals the index covers; no data.hdt row can match.
+            None if searcher.manifest().propositions.is_some() => Some(0),
             None => {
                 tracing::info!("Predicate {iri} is not in the dictionary; no rows can match");
                 return finish_empty(options);
@@ -116,7 +119,11 @@ pub fn search_text_streaming(options: &TextSearchOptions<'_>) -> Result<u64> {
     }
 
     let skip = options.offset.unwrap_or(0);
-    let mut resolver = OccurrenceResolver::open(options, &offsets)?;
+    let mut resolver = OccurrenceResolver::open(options, &offsets, searcher.manifest())?;
+    if resolver.propositions.is_some() {
+        // Rows from unasserted triple terms carry the triple term as object.
+        dictionary.enable_triple_terms(options.hdt_path, options.memory_limit / 8)?;
+    }
 
     // Counting needs neither scores nor ranking. Stream the matching document
     // IDs and resolve them in bounded batches instead of constructing a
@@ -238,7 +245,7 @@ fn count_object_batch(
         let occurrences = resolver.occurrences(object_id, predicate_filter)?;
         outcome.literals_resolved += 1;
         outcome.occurrences_examined += occurrences.examined;
-        outcome.rows += occurrences.pairs.len() as u64;
+        outcome.rows += (occurrences.pairs.len() + occurrences.rows.len()) as u64;
     }
     Ok(())
 }
@@ -511,6 +518,30 @@ fn emit_rows(
         let occurrences = resolver.occurrences(hit.object_id, options.predicate_filter)?;
         state.outcome.literals_resolved += 1;
         state.outcome.occurrences_examined += occurrences.examined;
+        for (subject, predicate, object) in occurrences.rows {
+            if state.remaining_skip > 0 {
+                state.remaining_skip -= 1;
+                continue;
+            }
+            state.outcome.rows += 1;
+            dictionary.subject_term(subject, &mut subject_buf)?;
+            dictionary.predicate_term(predicate, &mut predicate_buf)?;
+            dictionary.object_term(object, &mut object_buf)?;
+            if options.scores {
+                write_scored_triple_tab(
+                    writer,
+                    &subject_buf,
+                    &predicate_buf,
+                    &object_buf,
+                    hit.score,
+                )?;
+            } else {
+                write_triple_tab(writer, &subject_buf, &predicate_buf, &object_buf)?;
+            }
+            if options.take.is_some_and(|take| state.outcome.rows >= take) {
+                return Ok(true);
+            }
+        }
         if occurrences.pairs.is_empty() {
             continue;
         }
@@ -577,7 +608,7 @@ fn write_scored_triple_tab(
 // ---------------------------------------------------------------------------
 
 /// The two ways to find every `(subject, predicate)` that uses an object.
-enum OccurrenceResolver {
+enum DataResolver {
     /// Through the OPS permutation, reading each object's contiguous run.
     Permutation(PermutationResolver),
     /// Through the HDT-FoQ index, resolving a whole page in one pass.
@@ -615,7 +646,7 @@ struct ScannedResolver {
     occurrences: HashMap<u64, Vec<(u64, u64)>>,
 }
 
-impl OccurrenceResolver {
+impl DataResolver {
     fn open(options: &TextSearchOptions<'_>, offsets: &HdtSectionOffsets) -> Result<Self> {
         if options.no_index {
             return Ok(Self::Scanned(ScannedResolver {
@@ -743,6 +774,7 @@ impl OccurrenceResolver {
             Self::Permutation(resolver) => {
                 if let Some(pairs) = resolver.occurrences.get(&object_id) {
                     return Ok(ResolvedOccurrences {
+                        rows: Vec::new(),
                         examined: pairs.len() as u64,
                         pairs: pairs
                             .iter()
@@ -762,13 +794,18 @@ impl OccurrenceResolver {
                         pairs.push((subject, predicate));
                     }
                 }
-                Ok(ResolvedOccurrences { pairs, examined })
+                Ok(ResolvedOccurrences {
+                    pairs,
+                    examined,
+                    rows: Vec::new(),
+                })
             }
             Self::Indexed(resolver) => {
                 // Resolved with the rest of the page unless its group was too
                 // large to hold; only then does it cost a pass of its own.
                 if let Some(pairs) = resolver.occurrences.get(&object_id) {
                     return Ok(ResolvedOccurrences {
+                        rows: Vec::new(),
                         examined: pairs.len() as u64,
                         pairs: pairs
                             .iter()
@@ -799,13 +836,18 @@ impl OccurrenceResolver {
                         Ok(Visit::Continue)
                     },
                 )?;
-                Ok(ResolvedOccurrences { pairs, examined })
+                Ok(ResolvedOccurrences {
+                    pairs,
+                    examined,
+                    rows: Vec::new(),
+                })
             }
             Self::Scanned(resolver) => {
                 let Some(pairs) = resolver.occurrences.get(&object_id) else {
                     return Ok(ResolvedOccurrences::default());
                 };
                 Ok(ResolvedOccurrences {
+                    rows: Vec::new(),
                     examined: pairs.len() as u64,
                     pairs: pairs
                         .iter()
@@ -825,6 +867,71 @@ struct ResolvedOccurrences {
     pairs: Vec<(u64, u64)>,
     /// Pair count before applying `--predicate`.
     examined: u64,
+    /// For a literal of an unasserted triple term: whole `data.hdt` rows whose
+    /// object is a triple term containing it. `pairs` is then empty.
+    rows: Vec<(u64, u64, u64)>,
+}
+
+/// Resolves hits to occurrences: in `data.hdt` for its own literals, and
+/// through the triple-term index for literals of unasserted triple terms.
+struct OccurrenceResolver {
+    data: DataResolver,
+    propositions: Option<crate::triple_terms::text::PropositionHits>,
+}
+
+impl OccurrenceResolver {
+    fn open(
+        options: &TextSearchOptions<'_>,
+        offsets: &HdtSectionOffsets,
+        manifest: &crate::text::TextManifest,
+    ) -> Result<Self> {
+        let propositions = match &manifest.propositions {
+            Some(coverage) => Some(crate::triple_terms::text::PropositionHits::open(
+                options.hdt_path,
+                coverage.object_offset,
+                options.predicate,
+                options.memory_limit,
+            )?),
+            None => None,
+        };
+        Ok(Self {
+            data: DataResolver::open(options, offsets)?,
+            propositions,
+        })
+    }
+
+    fn prepare_ids(&mut self, object_ids: &[u64]) -> Result<()> {
+        match &self.propositions {
+            Some(props) => {
+                let data_ids: Vec<u64> = object_ids
+                    .iter()
+                    .copied()
+                    .filter(|id| !props.covers(*id))
+                    .collect();
+                self.data.prepare_ids(&data_ids)
+            }
+            None => self.data.prepare_ids(object_ids),
+        }
+    }
+
+    fn occurrences(
+        &mut self,
+        object_id: u64,
+        predicate_filter: Option<u64>,
+    ) -> Result<ResolvedOccurrences> {
+        if let Some(props) = self.propositions.as_mut()
+            && props.covers(object_id)
+        {
+            let mut rows = Vec::new();
+            let examined = props.rows(object_id, &mut rows)?;
+            return Ok(ResolvedOccurrences {
+                pairs: Vec::new(),
+                examined,
+                rows,
+            });
+        }
+        self.data.occurrences(object_id, predicate_filter)
+    }
 }
 
 #[cfg(test)]

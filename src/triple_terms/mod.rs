@@ -22,6 +22,7 @@ pub mod merge;
 pub mod reader;
 pub mod search;
 pub mod spool;
+pub mod text;
 pub mod validate;
 
 pub use iri::{Component, Proposition, PropositionRecord, TT_NAMESPACE};

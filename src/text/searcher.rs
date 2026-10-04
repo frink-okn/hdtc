@@ -1062,6 +1062,7 @@ mod tests {
                     excluded_no_tokens: 0,
                     exclusions: DatatypeExclusions::default(),
                     languages: Vec::new(),
+                    propositions: None,
                 },
                 text_field,
                 stemmed_field,

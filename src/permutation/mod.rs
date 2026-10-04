@@ -15,5 +15,5 @@ pub use builder::{
     PermutationCollector, PositionMaps, create_permutation_index, finish_prepared_index,
 };
 pub use format::{Header, PermutationComponent, PermutationSectionKind, Section, canonical_path};
-pub(crate) use reader::ObjectGroups;
+pub(crate) use reader::{ObjectGroups, SpoAccess};
 pub use reader::{PermutationIndex, PermutationIndexOpenError, validate_permutation_index};

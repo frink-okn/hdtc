@@ -599,7 +599,7 @@ fn triple_terms_render_through_every_route() {
         &["-q", "-m", "quads", "--graphs-index", "--perm"],
     );
     validate(&hdt, dir.path());
-    let rendered = format!("<<( <http://ex/s> <http://ex/p> <http://ex/o> )>>");
+    let rendered = "<<( <http://ex/s> <http://ex/p> <http://ex/o> )>>".to_owned();
     // ? P ? (permutation index), S ? ?, and ? ? O by its IRI rendered back.
     for query in [
         format!("? <{RDF_REIFIES}> ?"),
@@ -629,4 +629,73 @@ fn triple_terms_render_through_every_route() {
     // So does a quad pattern.
     let lines = search(&hdt, "? ? ? <http://ex/g>", &[]);
     assert!(lines.iter().any(|l| l.contains(&rendered)), "{lines:#?}");
+}
+
+#[test]
+fn text_search_reaches_literals_of_unasserted_triple_terms() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.ttl");
+    common::write_file(
+        &input,
+        format!(
+            "{TURTLE}:alice :label \"Alice the asserted\"@en .\n\
+             :e5 rdf:reifies <<( :bob :label \"Bob the rumoured\"@en )>> .\n\
+             :e6 rdf:reifies <<( :alice :label \"Alice the asserted\"@en )>> .\n"
+        )
+        .as_bytes(),
+    );
+    let hdt = create(dir.path(), &[&input], "x.hdt");
+    let output = hdtc(&["text", "-q", hdt.to_str().unwrap()]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let manifest = std::fs::read_to_string(PathBuf::from(format!(
+        "{}.text/hdtc-text.meta",
+        hdt.display()
+    )))
+    .unwrap();
+    assert!(
+        manifest.contains("propositions_object_offset\t"),
+        "{manifest}"
+    );
+
+    let text = |query: &str, extra: &[&str]| -> Vec<String> {
+        let mut args = vec!["search", "-q", hdt.to_str().unwrap(), "--text", query];
+        args.extend_from_slice(extra);
+        let output = hdtc(&args);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let mut lines: Vec<String> = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|l| l.replace('\t', " "))
+            .collect();
+        lines.sort();
+        lines
+    };
+    // Only inside an unasserted claim: found, as the claim's reifying triple.
+    assert_eq!(
+        text("rumoured", &[]),
+        vec![format!(
+            "<http://ex/e5> <{RDF_REIFIES}> <<( <http://ex/bob> <http://ex/label> \"Bob the rumoured\"@en )>> ."
+        )]
+    );
+    assert_eq!(text("rumoured", &["--count"]), vec!["1".to_owned()]);
+    assert_eq!(
+        text("rumoured", &["--predicate", "http://ex/label"]).len(),
+        1
+    );
+    assert!(text("rumoured", &["--predicate", "http://ex/name"]).is_empty());
+    // Asserted (and also reified): found as the asserted triple.
+    assert_eq!(
+        text("asserted", &[]),
+        vec!["<http://ex/alice> <http://ex/label> \"Alice the asserted\"@en .".to_owned()]
+    );
+    // Nested two levels down inside an unasserted claim is still reachable.
+    assert_eq!(text("quoted", &[]).len(), 1);
 }

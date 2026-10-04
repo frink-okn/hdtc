@@ -80,6 +80,9 @@ pub fn create_text_index(config: &TextConfig) -> Result<TextSummary> {
     // the `ensure_unchanged` below.
     let source = SourceIdentity::capture(&config.hdt_path)?;
     let adapter = HdtInputAdapter::scan(&config.hdt_path)?;
+    // An HDT with unasserted triple terms has literals in its propositions HDT
+    // too; the index covers them so a search can reach every literal.
+    let propositions = propositions_source(&config.hdt_path)?;
 
     let staging = StagingDir::create(&config.output_dir)?;
     let index = Index::create_in_dir(staging.path(), text_schema()).with_context(|| {
@@ -115,33 +118,28 @@ pub fn create_text_index(config: &TextConfig) -> Result<TextSummary> {
     let mut languages: HashMap<String, u64> = HashMap::new();
 
     tracing::info!("Scanning HDT object dictionary for literals");
-    // Object IDs in the object-only section continue after the shared section
-    // (`docs/text-index-format.md` §2), which is the ID a search resolves.
-    let shared_count = adapter.shared_count;
-    for (offset, term) in adapter.object_terms()?.enumerate() {
-        let term = term?;
-        let Some(literal) = parse_literal(&term) else {
-            continue;
+    let mut index_literal = |term: &[u8], object_id: u64| -> Result<()> {
+        let Some(literal) = parse_literal(term) else {
+            return Ok(());
         };
         counts.literals_scanned += 1;
 
         match analyzer::classify(&literal, config.max_literal_bytes, &config.exclusions) {
             Some(Exclusion::Oversize) => {
                 counts.excluded_oversize += 1;
-                continue;
+                return Ok(());
             }
             Some(Exclusion::Datatype) => {
                 counts.excluded_datatype += 1;
-                continue;
+                return Ok(());
             }
             Some(Exclusion::NoTokens) => {
                 counts.excluded_no_tokens += 1;
-                continue;
+                return Ok(());
             }
             None => {}
         }
 
-        let object_id = shared_count + offset as u64 + 1;
         let language = literal
             .language
             .map(normalize_language)
@@ -173,6 +171,24 @@ pub fn create_text_index(config: &TextConfig) -> Result<TextSummary> {
         counts.indexed_docs += 1;
         if counts.indexed_docs.is_multiple_of(1_000_000) {
             tracing::info!("Indexed {} literals", counts.indexed_docs);
+        }
+        Ok(())
+    };
+    // Object IDs in the object-only section continue after the shared section
+    // (`docs/text-index-format.md` §2), which is the ID a search resolves.
+    let shared_count = adapter.shared_count;
+    for (offset, term) in adapter.object_terms()?.enumerate() {
+        index_literal(&term?, shared_count + offset as u64 + 1)?;
+    }
+    // The literals of unasserted RDF 1.2 triple terms live in the
+    // propositions HDT; their documents follow the data HDT's object IDs
+    // (`docs/text-index-format.md` §2.4).
+    if let Some((props, object_offset)) = propositions.as_ref() {
+        tracing::info!("Scanning the propositions HDT's object dictionary for literals");
+        let props_adapter = HdtInputAdapter::scan(&props.path)?;
+        let props_shared = props_adapter.shared_count;
+        for (offset, term) in props_adapter.object_terms()?.enumerate() {
+            index_literal(&term?, object_offset + props_shared + offset as u64 + 1)?;
         }
     }
 
@@ -209,6 +225,12 @@ pub fn create_text_index(config: &TextConfig) -> Result<TextSummary> {
         excluded_no_tokens: counts.excluded_no_tokens,
         exclusions: config.exclusions.clone(),
         languages,
+        propositions: propositions.as_ref().map(|(props, object_offset)| {
+            super::manifest::PropositionsCoverage {
+                digest: *props.identity.digest(),
+                object_offset: *object_offset,
+            }
+        }),
     };
     manifest.write(staging.path())?;
     let index_bytes = directory_bytes(staging.path())?;
@@ -216,6 +238,9 @@ pub fn create_text_index(config: &TextConfig) -> Result<TextSummary> {
     // The dictionary was read by path after the digest was taken. Confirm it is
     // still the file that was digested before this index becomes public.
     source.ensure_unchanged(&config.hdt_path)?;
+    if let Some((props, _)) = &propositions {
+        props.identity.ensure_unchanged(&props.path)?;
+    }
     staging.publish(&config.output_dir)?;
 
     Ok(TextSummary {
@@ -223,6 +248,33 @@ pub fn create_text_index(config: &TextConfig) -> Result<TextSummary> {
         manifest,
         index_bytes,
     })
+}
+
+/// The propositions HDT an index must also cover.
+struct PropositionsSource {
+    path: PathBuf,
+    identity: SourceIdentity,
+}
+
+/// The propositions HDT beside `hdt` and the object offset its documents take
+/// — the data HDT's object count — when there is one.
+fn propositions_source(hdt: &Path) -> Result<Option<(PropositionsSource, u64)>> {
+    let index_path = crate::triple_terms::format::canonical_path(hdt);
+    if !index_path.exists() {
+        return Ok(None);
+    }
+    let index = crate::triple_terms::reader::TripleTermIndex::open(hdt)?;
+    if !index.has_propositions() {
+        return Ok(None);
+    }
+    let path = crate::triple_terms::format::propositions_path(hdt);
+    Ok(Some((
+        PropositionsSource {
+            identity: SourceIdentity::capture(&path)?,
+            path,
+        },
+        index.header().data.objects,
+    )))
 }
 
 /// One stemming analyzer per language seen, built on first use.

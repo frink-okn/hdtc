@@ -732,6 +732,96 @@ impl Iterator for OpsRangeTriples {
     }
 }
 
+/// Repeated SPO lookups in an HDT through this index's persisted SPO rank
+/// directories, held in memory: the position range of a subject, pair, or
+/// triple without a scan from the first subject.
+pub(crate) struct SpoAccess {
+    hdt: File,
+    sections: crate::hdt::sections::HdtSections,
+    y: CachedBitmap,
+    z: CachedBitmap,
+    subjects: u64,
+}
+
+impl SpoAccess {
+    pub(crate) fn open(index: &PermutationIndex, hdt_path: &Path) -> Result<Self> {
+        let mut reader = BufReader::new(File::open(hdt_path)?);
+        let sections = crate::hdt::sections::scan_hdt_sections(&mut reader)?;
+        let hdt = reader.into_inner();
+        let perm = File::open(&index.path)?;
+        Ok(Self {
+            y: CachedBitmap::load(
+                &perm,
+                index.section(SPO_Y_SUPER)?,
+                index.section(SPO_Y_SUB)?,
+                sections.bitmap_y.data_start,
+                sections.bitmap_y.num_bits,
+            )?,
+            z: CachedBitmap::load(
+                &perm,
+                index.section(SPO_Z_SUPER)?,
+                index.section(SPO_Z_SUB)?,
+                sections.bitmap_z.data_start,
+                sections.bitmap_z.num_bits,
+            )?,
+            subjects: index.header.subjects,
+            sections,
+            hdt,
+        })
+    }
+
+    /// The SPO position range of `subject`, narrowed to `predicate` and then
+    /// `object` when given.
+    pub(crate) fn range(
+        &self,
+        subject: u64,
+        predicate: Option<u64>,
+        object: Option<u64>,
+    ) -> Result<std::ops::Range<u64>> {
+        ensure!(
+            object.is_none() || predicate.is_some(),
+            "an SPO range needs the predicate to narrow by object"
+        );
+        if subject == 0 || subject > self.subjects {
+            return Ok(0..0);
+        }
+        let mut ys = self.y.group(&self.hdt, subject)?;
+        if let Some(predicate) = predicate {
+            match binary_search_log_array(
+                &self.hdt,
+                &self.sections.array_y,
+                ys.start,
+                ys.end,
+                predicate,
+            )? {
+                Some(y) => ys = y..y + 1,
+                None => return Ok(0..0),
+            }
+        }
+        let z_start = if ys.start == 0 {
+            0
+        } else {
+            self.z.select1(&self.hdt, ys.start - 1)? + 1
+        };
+        let z_end = self.z.select1(&self.hdt, ys.end - 1)? + 1;
+        if let Some(object) = object {
+            return Ok(
+                match binary_search_log_array(
+                    &self.hdt,
+                    &self.sections.array_z,
+                    z_start,
+                    z_end,
+                    object,
+                )? {
+                    Some(z) => z..z + 1,
+                    None => 0..0,
+                },
+            );
+        }
+        Ok(z_start..z_end)
+    }
+}
+
 /// A bitmap whose bits live in one file and whose rank directory in another:
 /// the HDT's own SPO bitmaps, indexed by this sidecar's SPO directories.
 struct SplitBitmap<'a> {
