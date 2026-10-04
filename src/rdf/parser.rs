@@ -180,12 +180,13 @@ fn subject_to_hdt_string(
 }
 
 /// A term as a triple-term component: blank labels scoped by `blank_prefix`,
-/// literals in dictionary form, nested triple terms kept structurally.
+/// literals in dictionary form, nested triple terms kept structurally. An IRI
+/// is read as the dictionary will hold it (`Component::from_dictionary`).
 fn component_of(term: &Term, blank_prefix: &str, trusted: bool, depth: usize) -> Result<Component> {
     Ok(match term {
         Term::NamedNode(n) => {
             check_not_reserved(n.as_str(), trusted)?;
-            Component::Iri(n.as_str().to_string())
+            Component::from_dictionary(n.as_str().to_string())
         }
         Term::BlankNode(b) => Component::Blank(format!("{blank_prefix}{}", b.as_str())),
         Term::Literal(l) => Component::Literal(literal_to_hdt_string(l, trusted)?),
@@ -211,7 +212,7 @@ fn proposition_of(
     let subject = match &triple.subject {
         NamedOrBlankNode::NamedNode(n) => {
             check_not_reserved(n.as_str(), trusted)?;
-            Component::Iri(n.as_str().to_string())
+            Component::from_dictionary(n.as_str().to_string())
         }
         NamedOrBlankNode::BlankNode(b) => Component::Blank(format!("{blank_prefix}{}", b.as_str())),
     };
@@ -776,6 +777,8 @@ impl ParseError {
             )
         } else if let Some(e) = self.io_error() {
             read_failure(e)
+        } else if matches!(self, Self::Record(_)) {
+            "a term record the build wrote does not read back".to_owned()
         } else {
             // Only the strict path sends a syntax error here; the lenient ones
             // skip it. The cause says what was wrong, and where.
@@ -1434,7 +1437,7 @@ fn line_start_in(bytes: &[u8]) -> usize {
 /// through [`crate::format`]; this function only adapts oxrdf's literal to it.
 /// An RDF 1.2 directional language-tagged string keeps its base direction
 /// after the tag, as N-Triples 1.2 writes it: `"…"@ar--rtl`.
-fn literal_to_hdt_string(l: &Literal, trusted: bool) -> Result<String> {
+pub(crate) fn literal_to_hdt_string(l: &Literal, trusted: bool) -> Result<String> {
     check_not_reserved(l.datatype().as_str(), trusted)?;
     Ok(match (l.language(), l.direction()) {
         (Some(language), Some(direction)) => {

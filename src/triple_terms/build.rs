@@ -750,8 +750,8 @@ fn build_propositions_hdt(ctx: &FinishContext<'_>, records: &Path) -> Result<(Te
         trust_triple_term_iris: true,
         // Every term here was accepted once already — parsed under
         // --max-term-bytes, or read from an HDT input, which no bound ever
-        // applied to — and writing it as N-Triples can lengthen it. Bounding
-        // it again could only refuse data the build has already taken.
+        // applied to. Bounding it again could only refuse data the build has
+        // already taken.
         max_term_bytes: usize::MAX,
         ..ParserParallelismConfig::default()
     };

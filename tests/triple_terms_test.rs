@@ -972,7 +972,8 @@ fn namespace_inventories_do_not_count_triple_terms_as_iris() {
 /// What lenient ingest stores inside an unasserted triple term survives the
 /// propositions HDT's build unchanged, though no RDF syntax spells all of it:
 /// IRIs and datatype IRIs holding `>`, `\`, a space or a quote, a blank-node
-/// label ending in `.`, a language tag with `_`.
+/// label ending in `.`, a language tag with `_`, and IRIs spelled like a blank
+/// node or a literal.
 #[test]
 fn unasserted_triple_terms_keep_whatever_lenient_ingest_stored() {
     let dir = tempfile::tempdir().unwrap();
@@ -1006,7 +1007,38 @@ fn unasserted_triple_terms_keep_whatever_lenient_ingest_stored() {
         )
         .as_bytes(),
     );
+    // IRIs spelled like a blank node or a literal: the dictionary stores
+    // them as one, and every path names the triple term from that spelling.
+    // Two are also asserted, so data.hdt decodes them; the last differs
+    // from `<"a"@EN>` only in a capital, and must not share its IRI.
+    let lookalikes = dir.path().join("lookalikes.nt");
+    common::write_file(
+        &lookalikes,
+        format!(
+            "<http://ex/e1> <{RDF_REIFIES}> <<( <_:x> <http://ex/p> <http://ex/o> )>> .\n\
+             <http://ex/e2> <{RDF_REIFIES}> <<( <http://ex/s> <http://ex/p> <\\u0022x> )>> .\n\
+             <http://ex/e3> <{RDF_REIFIES}> <<( <http://ex/s> <http://ex/p> <\\u0022a\\u0022@EN> )>> .\n\
+             <http://ex/e4> <{RDF_REIFIES}> <<( <http://ex/s> <http://ex/p> \
+             <\\u0022a\\u0022^^\\u003Chttp://www.w3.org/2001/XMLSchema#string\\u003E> )>> .\n\
+             <http://ex/e5> <{RDF_REIFIES}> <<( <http://ex/s> <http://ex/q> <\\u0022b\\u0022> )>> .\n\
+             <http://ex/s> <http://ex/q> <\\u0022b\\u0022> .\n\
+             <http://ex/e6> <{RDF_REIFIES}> <<( <_:y> <http://ex/q> <http://ex/o> )>> .\n\
+             <_:y> <http://ex/q> <http://ex/o> .\n\
+             <http://ex/e7> <{RDF_REIFIES}> <<( <http://ex/s> <http://ex/p> \"a\"@en )>> .\n"
+        )
+        .as_bytes(),
+    );
     for (input, name, expected) in [
+        (
+            &lookalikes,
+            "lookalikes.hdt",
+            vec![
+                "<<( _:x <http://ex/p>",
+                "\"a\"@EN",
+                "XMLSchema#string>",
+                "_:y <http://ex/q>",
+            ],
+        ),
         (
             &ntriples,
             "nt.hdt",
@@ -1028,7 +1060,8 @@ fn unasserted_triple_terms_keep_whatever_lenient_ingest_stored() {
         assert!(tt_path(&hdt, ".props.hdt").exists(), "{name}");
         validate(&hdt, dir.path());
         let lines = dump(&hdt);
-        assert_eq!(lines.len(), 3, "{name}: {lines:?}");
+        let rows = if name == "lookalikes.hdt" { 9 } else { 3 };
+        assert_eq!(lines.len(), rows, "{name}: {lines:?}");
         for needle in expected {
             assert!(
                 lines.iter().any(|l| l.contains(needle)),

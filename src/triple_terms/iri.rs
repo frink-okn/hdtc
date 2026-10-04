@@ -61,6 +61,24 @@ pub enum Component {
     Triple(Box<Proposition>),
 }
 
+impl Component {
+    /// The component a dictionary string names: `_:` starts a blank node, `"`
+    /// a literal, anything else is an IRI. Every path that names a triple term
+    /// — the build, validation, a query — reads a component this way, so its
+    /// name is a function of the strings the dictionary holds. A lenient IRI
+    /// spelled like a blank node or a literal is stored as one in the
+    /// dictionary, and is named as one.
+    pub fn from_dictionary(term: String) -> Self {
+        if let Some(label) = term.strip_prefix("_:") {
+            Self::Blank(label.to_owned())
+        } else if term.starts_with('"') {
+            Self::Literal(term)
+        } else {
+            Self::Iri(term)
+        }
+    }
+}
+
 /// The content of a triple term: subject, predicate, object.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Proposition {
@@ -226,11 +244,19 @@ fn write_canonical_iri_body(out: &mut Vec<u8>, iri: &[u8]) {
 /// A dictionary literal in canonical N-Triples 1.2 form. The dictionary already
 /// lowercases language tags and drops `xsd:string`; this escapes the value as
 /// the canonical form requires.
+///
+/// Only a string hdtc's literal encoding writes is a literal here. Lenient
+/// ingest also stores, from an IRI spelled like a literal (`<"x>`,
+/// `<"a"@EN>`), strings that open with a quote but are not in that form: one
+/// read as a literal could end early or lose a capital and spell like another
+/// term. Such a string is written as the IRI it came from, escaped as every
+/// IRI is, so the canonical form stays a function of the dictionary string
+/// that no two strings share.
 fn write_canonical_literal(out: &mut Vec<u8>, literal: &str) {
-    let parsed = crate::text::analyzer::parse_literal(literal.as_bytes());
+    let parsed = crate::text::analyzer::parse_literal(literal.as_bytes())
+        .filter(|parsed| is_encoded_literal(literal, parsed));
     let Some(parsed) = parsed else {
-        // Not a dictionary literal; cannot happen for terms the parser made.
-        out.extend_from_slice(literal.as_bytes());
+        write_canonical_iri(out, literal);
         return;
     };
     out.push(b'"');
@@ -261,12 +287,36 @@ fn write_canonical_literal(out: &mut Vec<u8>, literal: &str) {
     out.push(b'"');
     if let Some(language) = parsed.language {
         out.push(b'@');
-        out.extend_from_slice(&language.to_ascii_lowercase());
+        out.extend_from_slice(language);
     } else if let Some(datatype) = parsed.datatype {
         out.extend_from_slice(b"^^<");
         write_canonical_iri_body(out, datatype);
         out.push(b'>');
     }
+}
+
+/// Whether `literal` is exactly what hdtc's literal encoding writes for its
+/// parts — the form every literal the parser stores takes.
+fn is_encoded_literal(literal: &str, parsed: &crate::text::analyzer::ParsedLiteral<'_>) -> bool {
+    let encoded = || -> Option<String> {
+        fn part(bytes: &[u8]) -> Option<&str> {
+            std::str::from_utf8(bytes).ok()
+        }
+        let language = match parsed.language {
+            Some(tag) => Some(part(tag)?),
+            None => None,
+        };
+        let datatype = match parsed.datatype {
+            Some(iri) => Some(part(iri)?),
+            None => None,
+        };
+        Some(crate::dictionary::term::encode_literal(
+            part(parsed.value)?,
+            language,
+            datatype,
+        ))
+    };
+    encoded().is_some_and(|encoded| encoded == literal)
 }
 
 /// Rename the blank nodes inside a triple-term IRI the way hdtc renames blank
@@ -391,6 +441,26 @@ mod tests {
             canonical(&prop(iri("http://ex/s"), "http://ex/p", iri("http://ex/o"))),
             "<<( <http://ex/s> <http://ex/p> <http://ex/o> )>>"
         );
+    }
+
+    /// A string that opens with a quote but is not a literal hdtc writes —
+    /// stored from an IRI spelled like one — is written as that IRI, so it
+    /// spells like no literal; literals the parser stores are untouched.
+    #[test]
+    fn literal_lookalikes_do_not_collide() {
+        let lit = |s: &str| Component::Literal(s.to_owned());
+        let with = |object| canonical(&prop(iri("s"), "p", object));
+        assert_eq!(with(lit("\"a\"@en")), "<<( <s> <p> \"a\"@en )>>");
+        assert_eq!(with(lit("\"a\"")), "<<( <s> <p> \"a\" )>>");
+        assert_eq!(
+            with(lit("\"a\"@EN")),
+            "<<( <s> <p> <\\u0022a\\u0022@EN> )>>"
+        );
+        assert_eq!(
+            with(lit("\"a\"^^<http://www.w3.org/2001/XMLSchema#string>")),
+            "<<( <s> <p> <\\u0022a\\u0022\\u005E\\u005E\\u003Chttp://www.w3.org/2001/XMLSchema#string\\u003E> )>>"
+        );
+        assert_eq!(with(lit("\"x")), "<<( <s> <p> <\\u0022x> )>>");
     }
 
     #[test]

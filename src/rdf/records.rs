@@ -14,8 +14,10 @@
 //! A line is `subject TAB predicate TAB object LF`, each field a dictionary
 //! string with `\`, TAB, LF and CR escaped as `\\`, `\t`, `\n` and `\r`. A
 //! field is read back with oxrdf's unchecked constructors, which validate
-//! nothing, so the parser's own conversion to dictionary strings reproduces
-//! it byte for byte.
+//! nothing; a field that opens with a quote becomes a literal only when the
+//! parser writes that literal back as the same string, and is otherwise an
+//! IRI, which it stores as given. Either way the parser's own conversion to
+//! dictionary strings reproduces the field byte for byte.
 
 use anyhow::{Context, Result, bail};
 use oxrdf::{BlankNode, Literal, NamedNode, NamedOrBlankNode, Term, Triple};
@@ -87,27 +89,44 @@ fn object(text: String) -> Term {
     if !text.starts_with('"') {
         return subject(text).into();
     }
-    // A dictionary literal is `"value"`, `"value"@tag` or `"value"^^<iri>`,
-    // the value unescaped. Its suffix is found from the end, where the value
-    // cannot reach: a tag holds no quote, and a datatype closes the string.
+    match literal(&text) {
+        // Only a literal the parser writes back as this very string: lenient
+        // ingest also stores strings that open with a quote but are not in
+        // that form (a tag in capitals, an explicit `xsd:string`, an IRI
+        // spelled `<"x>`), and those pass through whole as IRIs, which the
+        // parser stores as given.
+        Some(literal)
+            if crate::rdf::parser::literal_to_hdt_string(&literal, true)
+                .is_ok_and(|written| written == text) =>
+        {
+            literal.into()
+        }
+        _ => NamedNode::new_unchecked(text).into(),
+    }
+}
+
+/// The literal a dictionary string spells, if it has a literal's shape:
+/// `"value"`, `"value"@tag` or `"value"^^<iri>`, the value unescaped. The
+/// suffix is found from the end, where the value cannot reach: a tag holds no
+/// quote, and a datatype closes the string.
+fn literal(text: &str) -> Option<Literal> {
     if text.len() >= 2 && text.ends_with('"') {
-        return Literal::new_simple_literal(&text[1..text.len() - 1]).into();
+        return Some(Literal::new_simple_literal(&text[1..text.len() - 1]));
     }
     if text.ends_with('>')
         && let Some(cut) = text.rfind("\"^^<")
     {
         let datatype = &text[cut + 4..text.len() - 1];
-        return Literal::new_typed_literal(&text[1..cut], NamedNode::new_unchecked(datatype))
-            .into();
+        return Some(Literal::new_typed_literal(
+            &text[1..cut],
+            NamedNode::new_unchecked(datatype),
+        ));
     }
-    match text.rfind("\"@") {
-        Some(cut) => {
-            Literal::new_language_tagged_literal_unchecked(&text[1..cut], &text[cut + 2..]).into()
-        }
-        // Not a literal the dictionary could hold; kept whole rather than
-        // guessed at, so the mismatch surfaces where the record is placed.
-        None => Literal::new_simple_literal(&text[1..]).into(),
-    }
+    let cut = text.rfind("\"@")?;
+    Some(Literal::new_language_tagged_literal_unchecked(
+        &text[1..cut],
+        &text[cut + 2..],
+    ))
 }
 
 /// Reads records back as triples.
@@ -157,7 +176,6 @@ impl<R: Read> Iterator for RecordReader<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dictionary::term::encode_literal;
 
     /// The dictionary spelling of a subject, as the parser writes it.
     fn named_or_blank_to_string(term: &NamedOrBlankNode) -> String {
@@ -169,18 +187,14 @@ mod tests {
 
     /// The dictionary spelling of a literal, as the parser writes it.
     fn literal_to_hdt_string(literal: &Literal) -> String {
-        encode_literal(
-            literal.value(),
-            literal.language(),
-            Some(literal.datatype().as_str()),
-        )
+        crate::rdf::parser::literal_to_hdt_string(literal, true).unwrap()
     }
 
     /// Every string the dictionary can hold reads back as itself, including
     /// those no RDF syntax spells.
     #[test]
     fn a_record_reads_back_the_strings_it_was_written_from() {
-        let rows: [[&str; 3]; 6] = [
+        let rows: [[&str; 3]; 10] = [
             ["http://ex/s", "http://ex/p", "http://ex/o"],
             ["_:x.", "http://ex/p a", "\"v\"@en_us"],
             [
@@ -191,6 +205,16 @@ mod tests {
             ["http://ex/a>b", "http://ex/p", "\"x\"@ar--rtl"],
             ["http://ex/s", "http://ex/p", "\"\""],
             ["http://ex/s", "http://ex/p", "\"line\nbreak\\\"@x\""],
+            // Strings that open with a quote but are no literal the parser
+            // writes: they come back as IRIs, spelled the same.
+            ["http://ex/s", "http://ex/p", "\"x"],
+            ["http://ex/s", "http://ex/p", "\"a\"@EN"],
+            [
+                "http://ex/s",
+                "http://ex/p",
+                "\"a\"^^<http://www.w3.org/2001/XMLSchema#string>",
+            ],
+            ["\"q\"", "http://ex/p", "_:x"],
         ];
         let mut buffer = Vec::new();
         for [s, p, o] in rows {

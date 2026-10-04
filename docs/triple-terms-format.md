@@ -91,6 +91,19 @@ separated by exactly one space, nested triple terms written inline, and
   omitted;
 - blank nodes as placeholders, described next.
 
+The form is computed from dictionary strings, and is a function of them that no
+two strings share. A component's kind is read from its string the way HDT
+distinguishes terms: `_:` opens a blank node, `"` a literal, anything else is an
+IRI. An IRI that lenient ingest stored spelled like a blank node (`<_:x>`) or a
+literal (`<"a">`) is held in the dictionary as one, so it is named as one. A
+string that opens with `"` but is not in the form hdtc's literal encoding
+writes — `"value"`, `"value"@tag` with the tag lowercased, or `"value"^^<iri>`
+with `xsd:string` dropped — arises only from such an IRI (`<"x>`, `<"a"@EN>`);
+written as a literal it could end early or lose a capital and spell like
+another term, so it is written as an IRI, escaped as above:
+`<\u0022a\u0022@EN>`. Every literal hdtc parses is in that form, so this
+changes no name minted from valid input.
+
 ### 2.2 The two forms
 
 A **ground** triple term — no blank node at any depth — is named

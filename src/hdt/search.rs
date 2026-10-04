@@ -392,13 +392,7 @@ fn parse_triple_term_positions(
                 bail!("Unexpected term inside a triple term");
             };
             let text = String::from_utf8(term).context("Non-UTF-8 term in query")?;
-            let component = if let Some(label) = text.strip_prefix("_:") {
-                Component::Blank(label.to_owned())
-            } else if text.starts_with('"') {
-                Component::Literal(text)
-            } else {
-                Component::Iri(text)
-            };
+            let component = Component::from_dictionary(text);
             match (index, &component) {
                 (0, Component::Literal(_)) => bail!("A triple term's subject cannot be a literal"),
                 (1, Component::Iri(_)) | (0 | 2, _) => {}

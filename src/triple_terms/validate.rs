@@ -48,17 +48,7 @@ fn component_of(
     dictionaries
         .get(source)?
         .object_term_raw(object, &mut buf)?;
-    Ok(term_component(String::from_utf8(buf)?))
-}
-
-fn term_component(term: String) -> Component {
-    if let Some(label) = term.strip_prefix("_:") {
-        Component::Blank(label.to_owned())
-    } else if term.starts_with('"') {
-        Component::Literal(term)
-    } else {
-        Component::Iri(term)
-    }
+    Ok(Component::from_dictionary(String::from_utf8(buf)?))
 }
 
 struct Dictionaries {
@@ -88,7 +78,7 @@ fn proposition_of(
     let mut buf = Vec::new();
     let dictionary = dictionaries.get(source)?;
     dictionary.subject_term_raw(target.subject, &mut buf)?;
-    let subject = term_component(String::from_utf8(buf.clone())?);
+    let subject = Component::from_dictionary(String::from_utf8(buf.clone())?);
     dictionary.predicate_term(target.predicate, &mut buf)?;
     let predicate = String::from_utf8(buf)?;
     let object = component_of(index, source, dictionaries, target.object, depth)?;
