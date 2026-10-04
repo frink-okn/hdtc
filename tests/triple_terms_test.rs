@@ -910,6 +910,42 @@ fn text_search_reaches_literals_of_unasserted_triple_terms() {
     );
     // Nested two levels down inside an unasserted claim is still reachable.
     assert_eq!(text("quoted", &[]).len(), 1);
+
+    // Through the library, those literals are opt-in: a caller resolving hits
+    // through data.hdt alone never matches, scores or counts them.
+    use hdtc::format::{TextQuery, TextSearcher};
+    let searcher = TextSearcher::open(&PathBuf::from(format!("{}.text", hdt.display()))).unwrap();
+    for (propositions, expected) in [(false, 0usize), (true, 1usize)] {
+        let query = TextQuery {
+            text: "rumoured".to_owned(),
+            propositions,
+            ..TextQuery::default()
+        };
+        assert_eq!(searcher.count(&query).unwrap(), expected, "{propositions}");
+        assert_eq!(searcher.search(&query, 10).unwrap().len(), expected);
+        let ranked = searcher.search_up_to(&query, 10, 100).unwrap();
+        assert_eq!(
+            (ranked.hits.len(), ranked.examined),
+            (expected, expected as u64)
+        );
+        assert_eq!(
+            searcher
+                .scan_matching_objects(&query, None, 10)
+                .unwrap()
+                .object_ids
+                .len(),
+            expected
+        );
+    }
+    // A literal of data.hdt is found either way.
+    for propositions in [false, true] {
+        let query = TextQuery {
+            text: "asserted".to_owned(),
+            propositions,
+            ..TextQuery::default()
+        };
+        assert_eq!(searcher.count(&query).unwrap(), 1, "{propositions}");
+    }
 }
 
 #[test]

@@ -93,6 +93,9 @@ pub fn search_text_streaming(options: &TextSearchOptions<'_>) -> Result<u64> {
         fuzzy: options.fuzzy,
         prefix: options.prefix,
         languages: options.languages.to_vec(),
+        // This command resolves those hits itself, to the triples naming the
+        // triple terms that hold them.
+        propositions: true,
     };
 
     let (offsets, mut dictionary) = open_hdt(options.hdt_path, options.memory_limit)

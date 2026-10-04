@@ -17,7 +17,8 @@ use std::collections::BinaryHeap;
 use std::path::Path;
 use tantivy::collector::{Count, TopDocs};
 use tantivy::query::{
-    BooleanQuery, EnableScoring, FuzzyTermQuery, Occur, PhraseQuery, Query, QueryClone, TermQuery,
+    BooleanQuery, EnableScoring, FuzzyTermQuery, Occur, PhraseQuery, Query, QueryClone, RangeQuery,
+    TermQuery,
 };
 use tantivy::schema::{Field, IndexRecordOption};
 use tantivy::tokenizer::{Language, TextAnalyzer, TokenStream};
@@ -46,6 +47,14 @@ pub struct TextQuery {
     pub prefix: bool,
     /// BCP 47 language ranges to restrict to; empty means no restriction.
     pub languages: Vec<String>,
+    /// Whether hits may be literals found only inside unasserted RDF 1.2
+    /// triple terms, which an index over an HDT with a propositions HDT
+    /// numbers past the data HDT's objects (`docs/text-index-format.md`
+    /// §2.4). Such a literal is the object of no triple of the data HDT, so a
+    /// caller resolving hits through that HDT's permutations sets this false,
+    /// and they are excluded where the query runs — never matched, scored or
+    /// counted. No effect on an index without that coverage.
+    pub propositions: bool,
 }
 
 /// How a hit matched, used to keep broader analysis below literal matches.
@@ -204,6 +213,8 @@ pub struct TextSearcher {
     text_field: Field,
     stemmed_field: Field,
     lang_field: Field,
+    /// The object-ID column, which scopes a query to the data HDT's objects.
+    object_field: Field,
     /// One analyzer per stemming algorithm the index actually used, so a query
     /// token is stemmed the same way the documents were. Empty when the index
     /// stems nothing, which skips the stemmed phase entirely.
@@ -245,9 +256,9 @@ impl TextSearcher {
         let stemmed_field = schema.get_field(FIELD_TEXT_STEMMED)?;
         let lang_field = schema.get_field(FIELD_LANG)?;
         let stemmers = build_stemmers(&manifest);
-        // Read through the fast-field column by name, so the schema is only
-        // consulted for the two fields queries are built against.
-        schema.get_field(FIELD_OBJECT)?;
+        // Read through the fast-field column by name; the field itself scopes
+        // a query that leaves out the propositions HDT's literals.
+        let object_field = schema.get_field(FIELD_OBJECT)?;
         let analyzer = index
             .tokenizers()
             .get(TOKENIZER_NAME)
@@ -269,6 +280,7 @@ impl TextSearcher {
             text_field,
             stemmed_field,
             lang_field,
+            object_field,
             stemmers,
         })
     }
@@ -807,13 +819,36 @@ impl TextSearcher {
             Box::new(BooleanQuery::new(clauses))
         };
 
-        let Some(language_query) = self.language_query(&query.languages) else {
-            return Ok(Some(text_query));
+        let built: Box<dyn Query> = match self.language_query(&query.languages) {
+            None => text_query,
+            Some(language_query) => Box::new(BooleanQuery::new(vec![
+                (Occur::Must, text_query),
+                (Occur::Must, language_query),
+            ])),
         };
-        Ok(Some(Box::new(BooleanQuery::new(vec![
-            (Occur::Must, text_query),
-            (Occur::Must, language_query),
-        ]))))
+        Ok(Some(self.scoped(built, query)))
+    }
+
+    /// Exclude the propositions HDT's literals unless the query asks for
+    /// them: a must-not range on the object column, which neither scores nor
+    /// counts the documents it removes.
+    fn scoped(&self, built: Box<dyn Query>, query: &TextQuery) -> Box<dyn Query> {
+        match &self.manifest.propositions {
+            Some(coverage) if !query.propositions => {
+                let past_data = RangeQuery::new(
+                    std::ops::Bound::Excluded(Term::from_field_u64(
+                        self.object_field,
+                        coverage.object_offset,
+                    )),
+                    std::ops::Bound::Unbounded,
+                );
+                Box::new(BooleanQuery::new(vec![
+                    (Occur::Must, built),
+                    (Occur::MustNot, Box::new(past_data)),
+                ]))
+            }
+            _ => built,
+        }
     }
 
     /// A phrase query needs at least two tokens; one token is just a term.
@@ -1067,6 +1102,7 @@ mod tests {
                 text_field,
                 stemmed_field,
                 lang_field,
+                object_field,
                 stemmers: Vec::new(),
             },
         ))
