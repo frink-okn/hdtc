@@ -726,4 +726,128 @@ mod tests {
             }
         }
     }
+
+    /// The directory a layer of `marked` marks over `triples` positions would
+    /// have, stored in `encoding`; runs empty, no propositions HDT.
+    fn directory(triples: u64, marked: u64, encoding: LayerEncoding) -> (Header, Vec<Section>) {
+        use crate::permutation::format::{
+            REQUIRED, SUBBLOCK_BITS, SUPERBLOCK_BITS, id_width, sub_count, super_count,
+        };
+        let objects = 1000;
+        let section = |section_type: u32, entry_count: u64, bits_per_entry: u8| Section {
+            section_type,
+            flags: REQUIRED,
+            offset: 0,
+            length: crate::io::packed_len(entry_count, bits_per_entry).unwrap(),
+            entry_count,
+            bits_per_entry,
+            payload_crc: 0,
+            parameter: 0,
+            indexed_bits: 0,
+        };
+        let placed = |mut s: Section| {
+            if s.length > 0 {
+                s.offset = 64;
+            }
+            s
+        };
+        let mut sections = Vec::new();
+        for run in [component::DATA_RUN, component::PROPS_RUN] {
+            sections.push(section(section_type(run, kind::TARGET_SUBJECT), 0, 2));
+            sections.push(section(section_type(run, kind::TARGET_PREDICATE), 0, 1));
+            sections.push(section(
+                section_type(run, kind::TARGET_OBJECT),
+                0,
+                id_width(objects),
+            ));
+        }
+        for component in DATA_ORDERS {
+            let indexed = match encoding {
+                LayerEncoding::Dense => {
+                    sections.push(placed(section(
+                        section_type(component, kind::LAYER),
+                        triples,
+                        1,
+                    )));
+                    triples
+                }
+                LayerEncoding::Sparse { low_bits } => {
+                    let bits = sparse_high_bits(triples, marked, low_bits);
+                    sections.push(placed(section(
+                        section_type(component, kind::LAYER_HIGH),
+                        bits,
+                        1,
+                    )));
+                    sections.push(placed(section(
+                        section_type(component, kind::LAYER_LOW),
+                        marked,
+                        low_bits,
+                    )));
+                    bits
+                }
+            };
+            let mut superrank = placed(section(
+                section_type(component, kind::LAYER_SUPERRANK),
+                super_count(indexed),
+                64,
+            ));
+            superrank.parameter = u64::from(SUPERBLOCK_BITS);
+            superrank.indexed_bits = indexed;
+            let mut subrank = placed(section(
+                section_type(component, kind::LAYER_SUBRANK),
+                sub_count(indexed),
+                16,
+            ));
+            subrank.parameter = u64::from(SUBBLOCK_BITS);
+            subrank.indexed_bits = indexed;
+            sections.push(superrank);
+            sections.push(subrank);
+            sections.push(placed(section(
+                section_type(component, kind::REVERSE),
+                marked,
+                id_width(objects),
+            )));
+        }
+        let header = Header {
+            flags: 0,
+            convention: IRI_CONVENTION,
+            section_count: sections.len() as u32,
+            sidecar_size: 0,
+            directory_offset: 0,
+            directory_length: 0,
+            footer_offset: 0,
+            data: SourceFacts {
+                triples,
+                objects,
+                ..SourceFacts::default()
+            },
+            props: SourceFacts::default(),
+        };
+        (header, sections)
+    }
+
+    /// A layer stored in the encoding its counts choose is accepted; the same
+    /// layer in the other encoding is refused, so its bytes stay canonical.
+    #[test]
+    fn a_layer_in_the_other_encoding_is_refused() {
+        for (triples, marked) in [(1_000_000u64, 1_000u64), (1_000_000, 500_000)] {
+            let chosen = layer_encoding(triples, marked);
+            let other = match chosen {
+                LayerEncoding::Dense => LayerEncoding::Sparse {
+                    low_bits: (triples / marked).ilog2() as u8,
+                },
+                LayerEncoding::Sparse { .. } => LayerEncoding::Dense,
+            };
+            let (header, sections) = directory(triples, marked, chosen);
+            check_section_set(&header, &sections).unwrap();
+            let (header, sections) = directory(triples, marked, other);
+            let error = check_section_set(&header, &sections).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("not stored as its counts require"),
+                "{triples} {marked}: {error}"
+            );
+        }
+    }
 }
