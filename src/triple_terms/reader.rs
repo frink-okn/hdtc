@@ -367,6 +367,11 @@ impl TripleTermDecoder {
         }))
     }
 
+    /// The propositions HDT's dictionary, when there is one.
+    pub fn propositions(&mut self) -> Option<&mut DictionaryResolver> {
+        self.propositions.as_mut()
+    }
+
     /// Whether `data.hdt` object identifier `object` names a triple term.
     #[inline]
     pub fn is_data_term(&self, object: u64) -> bool {
@@ -431,13 +436,29 @@ impl TripleTermDecoder {
 
 /// Streams the set bits of a layer within a position range, with the
 /// `data.hdt` object identifier each one's reverse entry gives.
+///
+/// The work is proportional to the matches, not the range: the cursor knows
+/// from two ranks how many set bits the range holds and stops after the last;
+/// where the bits are sparse it jumps to each through the layer's rank
+/// directory instead of reading the bitmap between them.
 pub(crate) struct LayerCursor {
-    bitmap: BufReader<File>,
+    file: File,
+    bitmap_offset: u64,
     position: u64,
     end: u64,
-    byte: u8,
+    /// Set bits not yet returned.
+    remaining: u64,
+    /// The next rank, for select mode.
+    rank: u64,
+    /// Present in select mode: the layer's rank directory, in memory.
+    directory: Option<crate::permutation::CachedBitmap>,
+    word: u64,
     reverse: PackedStream,
 }
+
+/// Positions per match above which a range is read by select rather than by
+/// scanning: one 64-byte read per match against `range / 8` bytes in total.
+const SELECT_DENSITY: u64 = 4096;
 
 impl LayerCursor {
     pub(crate) fn new(
@@ -447,44 +468,88 @@ impl LayerCursor {
         range: std::ops::Range<u64>,
     ) -> Result<Self> {
         let layer = index.layer(source, order)?;
-        let rank = layer.rank1(index.file(), range.start)?;
-        let mut bitmap = BufReader::with_capacity(64 * 1024, File::open(index.path())?);
-        bitmap.seek(SeekFrom::Start(layer.bitmap.offset + range.start / 8))?;
-        let mut cursor = Self {
-            bitmap,
+        let file = File::open(index.path())?;
+        let start_rank = layer.rank1(&file, range.start)?;
+        let end_rank = layer.rank1(&file, range.end)?;
+        let matches = end_rank - start_rank;
+        let directory = if matches > 0 && (range.end - range.start) / matches > SELECT_DENSITY {
+            Some(crate::permutation::CachedBitmap::from_samples(
+                layer.bitmap.offset,
+                layer.bitmap.entry_count,
+                read_samples(&file, &layer.superrank, 8)?,
+                read_samples(&file, &layer.subrank, 2)?
+                    .into_iter()
+                    .map(|v| v as u16)
+                    .collect(),
+            ))
+        } else {
+            None
+        };
+        Ok(Self {
+            bitmap_offset: layer.bitmap.offset,
             position: range.start,
             end: range.end,
-            byte: 0,
-            reverse: PackedStream::new(index.path(), &layer.reverse, rank)?,
-        };
-        if range.start < range.end && !range.start.is_multiple_of(8) {
-            let mut byte = [0u8; 1];
-            cursor.bitmap.read_exact(&mut byte)?;
-            cursor.byte = byte[0];
-        }
-        Ok(cursor)
+            remaining: matches,
+            rank: start_rank,
+            directory,
+            word: 0,
+            reverse: PackedStream::new(index.path(), &layer.reverse, start_rank)?,
+            file,
+        })
     }
 
     pub(crate) fn next(&mut self) -> Result<Option<(u64, u64)>> {
-        while self.position < self.end {
-            if self.position.is_multiple_of(8) {
-                // Skip whole zero bytes quickly.
-                let mut byte = [0u8; 1];
-                self.bitmap.read_exact(&mut byte)?;
-                self.byte = byte[0];
-                if self.byte == 0 {
-                    self.position = (self.position + 8).min(self.end);
+        if self.remaining == 0 {
+            return Ok(None);
+        }
+        self.remaining -= 1;
+        if let Some(directory) = &self.directory {
+            let position = directory.select1(&self.file, self.rank)?;
+            self.rank += 1;
+            return Ok(Some((position, self.reverse.next()?)));
+        }
+        loop {
+            ensure!(
+                self.position < self.end,
+                "layer range holds fewer bits than ranked"
+            );
+            let offset_in_word = self.position % 64;
+            if offset_in_word == 0 || self.word == 0 {
+                // Load the word holding `position`, masked below it.
+                let word_start = self.position - offset_in_word;
+                let mut bytes = [0u8; 8];
+                let available = ((self.end - word_start).div_ceil(8)).min(8) as usize;
+                self.file
+                    .read_exact_at(&mut bytes[..available], self.bitmap_offset + word_start / 8)?;
+                self.word = u64::from_le_bytes(bytes) & (u64::MAX << offset_in_word);
+                if self.word == 0 {
+                    self.position = word_start + 64;
                     continue;
                 }
             }
-            let position = self.position;
-            self.position += 1;
-            if self.byte >> (position % 8) & 1 == 1 {
-                return Ok(Some((position, self.reverse.next()?)));
+            let bit = u64::from(self.word.trailing_zeros());
+            let position = self.position - offset_in_word + bit;
+            self.word &= self.word - 1;
+            self.position = position + 1;
+            if self.word == 0 {
+                self.position = (self.position + 63) / 64 * 64;
             }
+            return Ok(Some((position, self.reverse.next()?)));
         }
-        Ok(None)
     }
+}
+
+fn read_samples(file: &File, section: &Section, width: usize) -> Result<Vec<u64>> {
+    let mut bytes = vec![0u8; section.entry_count as usize * width];
+    file.read_exact_at(&mut bytes, section.offset)?;
+    Ok(bytes
+        .chunks_exact(width)
+        .map(|chunk| {
+            let mut value = [0u8; 8];
+            value[..width].copy_from_slice(chunk);
+            u64::from_le_bytes(value)
+        })
+        .collect())
 }
 
 /// Sequential reads of a packed array from a starting index.

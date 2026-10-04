@@ -277,9 +277,10 @@ fn parse_one_term(bytes: &[u8], pos: &mut usize) -> Result<QueryTerm> {
             Ok(QueryTerm::Bound(iri))
         }
         b'_' if bytes.get(*pos + 1) == Some(&b':') => {
-            // Blank node: read until whitespace
+            // Blank node: read until whitespace, or the `)` that may close a
+            // triple term — a character no blank-node label contains.
             let start = *pos;
-            while *pos < bytes.len() && !bytes[*pos].is_ascii_whitespace() {
+            while *pos < bytes.len() && !bytes[*pos].is_ascii_whitespace() && bytes[*pos] != b')' {
                 *pos += 1;
             }
             Ok(QueryTerm::Bound(bytes[start..*pos].to_vec()))
@@ -507,14 +508,23 @@ fn parse_nt_literal(bytes: &[u8], pos: &mut usize) -> Result<QueryTerm> {
         *pos += 1; // consume '>'
     }
 
-    // Reconstruct HDT literal: "raw_value" + optional suffix
-    let mut hdt_literal: Vec<u8> = Vec::with_capacity(1 + value.len() + 1 + suffix.len());
-    hdt_literal.push(b'"');
-    hdt_literal.extend_from_slice(&value);
-    hdt_literal.push(b'"');
-    hdt_literal.extend_from_slice(&suffix);
+    // The dictionary form: `encode_literal` folds the language tag and drops
+    // `xsd:string`, exactly as the parser did when the data was loaded, so
+    // `"x"@EN` and `"x"^^xsd:string` find the terms stored as `"x"@en` and `"x"`.
+    let value = String::from_utf8(value).context("Non-UTF-8 literal in query")?;
+    let suffix = String::from_utf8(suffix).context("Non-UTF-8 literal suffix in query")?;
+    let encoded = if let Some(language) = suffix.strip_prefix('@') {
+        crate::dictionary::term::encode_literal(&value, Some(language), None)
+    } else if let Some(datatype) = suffix
+        .strip_prefix("^^<")
+        .and_then(|rest| rest.strip_suffix('>'))
+    {
+        crate::dictionary::term::encode_literal(&value, None, Some(datatype))
+    } else {
+        crate::dictionary::term::encode_literal(&value, None, None)
+    };
 
-    Ok(QueryTerm::Bound(hdt_literal))
+    Ok(QueryTerm::Bound(encoded.into_bytes()))
 }
 
 fn parse_hex_digits(bytes: &[u8], pos: &mut usize, n: usize) -> Result<u32> {
@@ -1359,7 +1369,6 @@ pub fn search_hdt_streaming(
             count_only,
             offset,
             limit,
-            memory_limit,
         )?;
         if count_only {
             writeln!(writer, "{count}")?;

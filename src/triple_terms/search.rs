@@ -4,26 +4,30 @@
 //! search finds it. This module answers the other case, where some of the
 //! inner positions are wildcards, with one of two plans:
 //!
-//! - **Inner first** (the outer subject is unbound). The inner pattern is a
-//!   range in SPO, POS or OPS of each HDT that holds propositions, and the
-//!   triple-term index's layer marks which positions in it are reified; the
-//!   reverse array names each one's IRI. Each IRI is then a `? ? O` (or
-//!   `? P O`) lookup in `data.hdt`'s permutation index. Work is proportional to
-//!   the matching triple terms, never to the range.
-//! - **Outer first** (the outer subject is bound). The subject's triples are
-//!   few; each triple-term object among them is decoded and tested.
+//! - **Inner first.** The inner pattern is a range in SPO, POS or OPS of each
+//!   HDT that holds propositions, and the triple-term index's layer marks which
+//!   positions in it are reified; the reverse array names each one's IRI. Each
+//!   IRI is then one OPS group of `data.hdt`. Work is proportional to the
+//!   matching triple terms, never to the range.
+//! - **Outer first**, when the outer subject is bound and its group is smaller
+//!   than the inner matches: the subject's triples are streamed, and each
+//!   triple-term object among them is decoded and tested.
 //!
-//! Both stream: rows are written as they are found, and memory does not grow
-//! with the result.
+//! Both sizes are known before either plan runs — a group's size and a layer
+//! range's set bits are each two directory lookups — so the cheaper is chosen.
+//! When every inner position is a wildcard no layer is needed: the triples
+//! whose object is a triple term are one contiguous range of OPS, or of POS
+//! within a bound outer predicate.
+//!
+//! Every plan streams: rows are written as they are found, and memory does not
+//! grow with the result.
 
 use super::format;
 use super::reader::{LayerCursor, Order, Source, Target, TripleTermIndex};
-use crate::hdt::reader::{DictionaryResolver, OutputWriter, open_hdt, write_triple_tab};
-use crate::permutation::{ObjectGroups, PermutationIndex, canonical_path};
+use crate::hdt::reader::{DictionaryResolver, OutputWriter, write_triple_tab};
+use crate::permutation::{ObjectGroups, PermutationIndex, SpoAccess, canonical_path};
 use anyhow::{Context, Result};
-use std::fs::File;
-use std::io::BufReader;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// The inner positions of a triple-term pattern, as dictionary strings; `None`
 /// is a wildcard. A nested triple term in object position is given by its IRI.
@@ -81,7 +85,8 @@ fn resolve(dictionary: &mut DictionaryResolver, inner: &InnerPattern) -> Result<
     }))
 }
 
-/// Writes matching rows, applying offset and limit.
+/// Writes matching rows, applying offset and limit. With `count_only` the
+/// limit does not apply, as for every other counted pattern.
 struct Emitter<'a> {
     writer: &'a mut OutputWriter,
     count_only: bool,
@@ -95,7 +100,7 @@ struct Emitter<'a> {
 
 impl Emitter<'_> {
     fn full(&self) -> bool {
-        self.limit.is_some_and(|limit| self.count >= limit)
+        !self.count_only && self.limit.is_some_and(|limit| self.count >= limit)
     }
 
     /// Count `n` rows without writing them (`--count`).
@@ -126,12 +131,28 @@ impl Emitter<'_> {
     }
 }
 
-/// One HDT that holds propositions: `data.hdt` or the propositions HDT.
+/// One HDT that holds propositions, with the inner pattern resolved there.
 struct PropositionSource {
     source: Source,
-    hdt: PathBuf,
+    triples: u64,
+    spo: SpoAccess,
     perm: PermutationIndex,
-    dictionary: Option<DictionaryResolver>,
+    resolved: Resolved,
+}
+
+impl PropositionSource {
+    /// The inner pattern's range in this HDT, and the object to probe for when
+    /// the range is a subject's group but the predicate is unbound (`s ? o`).
+    fn range(&self) -> Result<(Order, std::ops::Range<u64>, Option<u64>)> {
+        let r = self.resolved;
+        Ok(match (r.subject, r.predicate, r.object) {
+            (Some(s), Some(p), o) => (Order::Spo, self.spo.range(s, Some(p), o)?, None),
+            (Some(s), None, o) => (Order::Spo, self.spo.range(s, None, None)?, o),
+            (None, Some(p), o) => (Order::Pos, self.perm.index_range(Some(p), o)?.1, None),
+            (None, None, Some(o)) => (Order::Ops, self.perm.index_range(None, Some(o))?.1, None),
+            (None, None, None) => (Order::Spo, 0..self.triples, None),
+        })
+    }
 }
 
 /// Answer `S P <<( inner )>>`.
@@ -146,7 +167,6 @@ pub(crate) fn search_inner_pattern(
     count_only: bool,
     offset: Option<u64>,
     limit: Option<u64>,
-    memory_limit: usize,
 ) -> Result<u64> {
     let mut emitter = Emitter {
         writer,
@@ -179,127 +199,137 @@ pub(crate) fn search_inner_pattern(
     };
     let data_perm = PermutationIndex::open(&canonical_path(hdt_path), hdt_path)
         .context("triple-term patterns need the permutation index")?;
-    let props_path = format::propositions_path(hdt_path);
-    let mut props_dictionary = if index.has_propositions() {
-        Some(open_hdt(&props_path, memory_limit / 4)?.1)
-    } else {
-        None
-    };
+    let data_spo = SpoAccess::open(&data_perm, hdt_path)?;
 
-    // Outer first: the subject's triples, each triple-term object tested.
-    if let Some(subject) = outer_subject {
-        let data_resolved = resolve(dictionary, inner)?;
-        let props_resolved = match props_dictionary.as_mut() {
-            Some(props) => resolve(props, inner)?,
-            None => None,
-        };
-        for triple in data_perm.spo_triples(hdt_path, subject, outer_predicate)? {
-            let Some(target) = index.target(Source::Data, triple.2)? else {
-                continue;
-            };
-            let resolved = if target.asserted {
-                data_resolved
-            } else {
-                props_resolved
-            };
-            if resolved.is_some_and(|r| r.matches(&target)) && !emitter.emit(dictionary, triple)? {
-                break;
-            }
-        }
-        return Ok(emitter.count);
-    }
-
-    let mut groups = ObjectGroups::open(&data_perm)?;
-
-    // Every inner position a wildcard: the triples whose object is any triple
-    // term, one contiguous range of OPS, since triple-term IRIs are one run of
-    // object identifiers.
+    // Every inner position a wildcard: one contiguous range, no layer.
     if inner.subject.is_none() && inner.predicate.is_none() && inner.object.is_none() {
-        let range = groups.objects_range(index.run(Source::Data))?;
-        if count_only && outer_predicate.is_none() {
+        let run = index.run(Source::Data);
+        if let Some(subject) = outer_subject {
+            for triple in data_spo.subject_triples(subject, outer_predicate)? {
+                let triple = triple?;
+                if run.contains(&triple.2) && !emitter.emit(dictionary, triple)? {
+                    break;
+                }
+            }
+            return Ok(emitter.count);
+        }
+        let (groups, range) = match outer_predicate {
+            Some(p) => {
+                let groups = ObjectGroups::open_pos(&data_perm)?;
+                let range = groups.second_range(p, run)?;
+                (groups, range)
+            }
+            None => {
+                let groups = ObjectGroups::open(&data_perm)?;
+                let range = groups.objects_range(run)?;
+                (groups, range)
+            }
+        };
+        if count_only {
             emitter.add(range.end - range.start);
             return Ok(emitter.count);
         }
-        for triple in groups.range_triples(&canonical_path(hdt_path), range)? {
-            let triple = triple?;
-            if outer_predicate.is_some_and(|p| p != triple.1) {
-                continue;
-            }
-            if count_only {
-                emitter.add(1);
-            } else if !emitter.emit(dictionary, triple)? {
+        for triple in groups.range_triples(range)? {
+            if !emitter.emit(dictionary, triple?)? {
                 break;
             }
         }
         return Ok(emitter.count);
     }
 
-    // Inner first, over each HDT that holds propositions.
-    let mut sources = vec![PropositionSource {
-        source: Source::Data,
-        hdt: hdt_path.to_path_buf(),
-        perm: data_perm.clone(),
-        dictionary: None,
-    }];
-    if let Some(props) = props_dictionary.take() {
+    // Each HDT that holds propositions, with the inner pattern resolved in it.
+    let mut sources = Vec::with_capacity(2);
+    if let Some(resolved) = resolve(dictionary, inner)? {
         sources.push(PropositionSource {
-            source: Source::Propositions,
-            perm: PermutationIndex::open(&canonical_path(&props_path), &props_path)?,
-            hdt: props_path,
-            dictionary: Some(props),
+            source: Source::Data,
+            triples: index.header().data.triples,
+            spo: SpoAccess::open(&data_perm, hdt_path)?,
+            perm: data_perm.clone(),
+            resolved,
         });
     }
-    'sources: for mut source in sources {
-        let resolved = match source.dictionary.as_mut() {
+    if index.has_propositions() {
+        let resolved = match dictionary.propositions_mut() {
             Some(props) => resolve(props, inner)?,
-            None => resolve(dictionary, inner)?,
-        };
-        let Some(resolved) = resolved else {
-            continue;
-        };
-        let triples = match source.source {
-            Source::Data => index.header().data.triples,
-            Source::Propositions => index.header().props.triples,
-        };
-        // The inner pattern's range, and whether S?O needs an object probe.
-        let (order, range, probe_object) =
-            match (resolved.subject, resolved.predicate, resolved.object) {
-                (Some(s), p, o) => {
-                    let narrowed = p.is_some();
-                    (
-                        Order::Spo,
-                        source.perm.spo_range(
-                            &source.hdt,
-                            s,
-                            p,
-                            if narrowed { o } else { None },
-                        )?,
-                        if narrowed { None } else { o },
-                    )
-                }
-                (None, Some(p), o) => (Order::Pos, source.perm.index_range(Some(p), o)?.1, None),
-                (None, None, Some(o)) => {
-                    (Order::Ops, source.perm.index_range(None, Some(o))?.1, None)
-                }
-                (None, None, None) => (Order::Spo, 0..triples, None),
-            };
-        let objects = match probe_object {
-            Some(_) => Some(ArrayZ::open(&source.hdt)?),
             None => None,
         };
+        if let Some(resolved) = resolved {
+            let props_path = format::propositions_path(hdt_path);
+            let perm = PermutationIndex::open(&canonical_path(&props_path), &props_path)?;
+            sources.push(PropositionSource {
+                source: Source::Propositions,
+                triples: index.header().props.triples,
+                spo: SpoAccess::open(&perm, &props_path)?,
+                perm,
+                resolved,
+            });
+        }
+    }
+
+    // How many triple terms each side would visit.
+    let mut planned = Vec::with_capacity(sources.len());
+    let mut inner_matches = 0u64;
+    for source in sources {
+        let (order, range, probe) = source.range()?;
+        let layer = index.layer(source.source, order)?;
+        inner_matches +=
+            layer.rank1(index.file(), range.end)? - layer.rank1(index.file(), range.start)?;
+        planned.push((source, order, range, probe));
+    }
+
+    // Outer first, when the subject's group is the smaller side.
+    if let Some(subject) = outer_subject {
+        let group = data_spo.range(subject, outer_predicate, None)?;
+        if group.end - group.start <= inner_matches {
+            let resolved_for = |source: Source| {
+                planned
+                    .iter()
+                    .find(|(p, ..)| p.source == source)
+                    .map(|(p, ..)| p.resolved)
+            };
+            let (data_resolved, props_resolved) = (
+                resolved_for(Source::Data),
+                resolved_for(Source::Propositions),
+            );
+            for triple in data_spo.subject_triples(subject, outer_predicate)? {
+                let triple = triple?;
+                let Some(target) = index.target(Source::Data, triple.2)? else {
+                    continue;
+                };
+                let resolved = if target.asserted {
+                    data_resolved
+                } else {
+                    props_resolved
+                };
+                if resolved.is_some_and(|r| r.matches(&target))
+                    && !emitter.emit(dictionary, triple)?
+                {
+                    break;
+                }
+            }
+            return Ok(emitter.count);
+        }
+    }
+
+    // Inner first.
+    let mut groups = ObjectGroups::open(&data_perm)?;
+    'sources: for (source, order, range, probe) in planned {
         let mut cursor = LayerCursor::new(&index, source.source, order, range)?;
         while let Some((position, term)) = cursor.next()? {
-            if let (Some(object), Some(objects)) = (probe_object, objects.as_ref())
-                && objects.get(position)? != object
+            if let Some(object) = probe
+                && source.spo.object_at(position)? != object
             {
                 continue;
             }
-            if count_only {
+            if count_only && outer_subject.is_none() {
                 emitter.add(groups.for_object(term, outer_predicate, true, |_, _| Ok(true))?);
                 continue;
             }
             let mut more = true;
             groups.for_object(term, outer_predicate, false, |subject, predicate| {
+                if outer_subject.is_some_and(|s| s != subject) {
+                    return Ok(true);
+                }
                 more = emitter.emit(dictionary, (subject, predicate, term))?;
                 Ok(more)
             })?;
@@ -309,41 +339,4 @@ pub(crate) fn search_inner_pattern(
         }
     }
     Ok(emitter.count)
-}
-
-/// Random reads of an HDT's `ArrayZ`: the object at an SPO position.
-struct ArrayZ {
-    file: File,
-    offset: u64,
-    width: u8,
-}
-
-impl ArrayZ {
-    fn open(hdt: &Path) -> Result<Self> {
-        let mut reader = BufReader::new(File::open(hdt)?);
-        let sections = crate::hdt::sections::scan_hdt_sections(&mut reader)?;
-        Ok(Self {
-            file: reader.into_inner(),
-            offset: sections.array_z.data_start,
-            width: sections.array_z.bits_per_entry,
-        })
-    }
-
-    fn get(&self, index: u64) -> Result<u64> {
-        use std::os::unix::fs::FileExt;
-        let width = u64::from(self.width);
-        if width == 0 {
-            return Ok(0);
-        }
-        let bit = index * width;
-        let needed = ((bit % 8) + width).div_ceil(8) as usize;
-        let mut bytes = [0u8; 9];
-        self.file
-            .read_exact_at(&mut bytes[..needed], self.offset + bit / 8)?;
-        let mut value = 0u128;
-        for (i, byte) in bytes[..needed].iter().enumerate() {
-            value |= u128::from(*byte) << (i * 8);
-        }
-        Ok(((value >> (bit % 8)) & ((1u128 << width) - 1)) as u64)
-    }
 }

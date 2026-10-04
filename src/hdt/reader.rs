@@ -620,6 +620,13 @@ impl DictionaryResolver {
         Ok(enabled)
     }
 
+    /// The propositions HDT's dictionary, when triple terms are enabled and the
+    /// HDT has unasserted ones: so a caller resolving terms there shares this
+    /// resolver's cache budget rather than opening a second one.
+    pub(crate) fn propositions_mut(&mut self) -> Option<&mut DictionaryResolver> {
+        self.triple_terms.as_mut()?.propositions()
+    }
+
     /// Resolve a subject ID to raw term bytes.
     pub fn subject_term(&mut self, subject_id: u64, buf: &mut Vec<u8>) -> Result<()> {
         self.subject_term_raw(subject_id, buf)
