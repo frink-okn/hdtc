@@ -1025,7 +1025,9 @@ pub(crate) fn find_literal_boundary(term: &[u8]) -> (usize, usize) {
             {
                 tag_start -= 1;
             }
-            if tag_start >= 2 && term[tag_start - 1] == b'@' && term[tag_start - 2] == b'"' {
+            // The closing quote must come after the opening one: `"@en`,
+            // which lenient ingest stores from the IRI `<"@en>`, has none.
+            if tag_start >= 3 && term[tag_start - 1] == b'@' && term[tag_start - 2] == b'"' {
                 return (tag_start - 2, tag_start - 1);
             }
         }
@@ -1420,5 +1422,20 @@ mod tests {
         let (ve, ss) = find_literal_boundary(term);
         assert_eq!(&term[1..ve], b"value");
         assert_eq!(ss, term.len());
+    }
+
+    /// The opening quote is never the closing one: `"@en`, stored from the
+    /// IRI `<"@en>`, has no suffix, while `""@en` is empty and tagged.
+    #[test]
+    fn test_find_boundary_quote_then_tag() {
+        let term = b"\"@en";
+        let (ve, ss) = find_literal_boundary(term);
+        assert_eq!(&term[1..ve], b"@en");
+        assert_eq!(ss, term.len());
+        let term = b"\"\"@en";
+        let (ve, ss) = find_literal_boundary(term);
+        assert_eq!(&term[1..ve], b"");
+        assert_eq!(&term[ss..], b"@en");
+        assert_eq!(write_to_string(|w| write_nt_object(w, b"\"@en")), "\"@en\"");
     }
 }

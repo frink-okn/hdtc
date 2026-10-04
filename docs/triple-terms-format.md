@@ -92,16 +92,21 @@ separated by exactly one space, nested triple terms written inline, and
 - blank nodes as placeholders, described next.
 
 The form is computed from dictionary strings, and is a function of them that no
-two strings share. A component's kind is read from its string the way HDT
-distinguishes terms: `_:` opens a blank node, `"` a literal, anything else is an
-IRI. An IRI that lenient ingest stored spelled like a blank node (`<_:x>`) or a
-literal (`<"a">`) is held in the dictionary as one, so it is named as one. A
-string that opens with `"` but is not in the form hdtc's literal encoding
-writes — `"value"`, `"value"@tag` with the tag lowercased, or `"value"^^<iri>`
-with `xsd:string` dropped — arises only from such an IRI (`<"x>`, `<"a"@EN>`);
-written as a literal it could end early or lose a capital and spell like
-another term, so it is written as an IRI, escaped as above:
-`<\u0022a\u0022@EN>`. Every literal hdtc parses is in that form, so this
+two strings share. The predicate is always written as an IRI. The subject's and
+object's kind is read from the string the way HDT distinguishes terms: `_:`
+opens a blank node, `"` a literal, anything else is an IRI. An IRI that lenient
+ingest stored spelled like a blank node (`<_:x>`) or a literal (`<"a">`) is
+held in the dictionary as one, so it is named as one.
+
+A string is written as a literal only when it is in the form hdtc's literal
+encoding writes and can be split back into its parts — `"value"`,
+`"value"@tag` with the tag lowercased, or `"value"^^<iri>` with `xsd:string`
+dropped — and otherwise as an IRI, escaped as above: `<\u0022a\u0022@EN>`.
+Written as a literal, such a string could end early, lose a capital, or split
+in two ways, and spell like another term. It arises from an IRI spelled like a
+literal (`<"x>`, `<"a"@EN>`), or from a language tag lenient ingest kept that
+is not a well-formed BCP 47 tag (`xml:lang="en_US"`, stored as `"v"@en_us`).
+Every literal with a well-formed tag or datatype is in the encoded form, so this
 changes no name minted from valid input.
 
 ### 2.2 The two forms

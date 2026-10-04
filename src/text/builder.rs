@@ -342,9 +342,8 @@ struct ScanCounts {
 /// happened to leave. Returns the searchable segments afterwards.
 ///
 /// The data HDT's literals are one segment, and the propositions HDT's another
-/// (`docs/text-index-format.md` §5.3): leaving the propositions out of a query
-/// is then a range on the object column that each segment's column bounds
-/// decide whole, at no cost per document.
+/// (`docs/text-index-format.md` §5.3), so a query leaves the propositions out
+/// whole segments at a time.
 fn commit_as_one_segment(
     index: &Index,
     writer: &mut IndexWriter<TantivyDocument>,

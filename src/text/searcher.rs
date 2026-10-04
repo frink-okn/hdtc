@@ -513,14 +513,17 @@ impl TextSearcher {
         // turn a harmless sparse query into an allocation failure.
         let mut object_ids = Vec::new();
         for (segment_ord, segment) in segments.iter().enumerate().skip(start_segment) {
-            let column = segment
-                .fast_fields()
-                .u64(FIELD_OBJECT)
-                .context("Text index has no object ID column")?;
             let mut scorer = weight.scorer(segment, 1.0)?;
             if segment_ord == start_segment && start.doc_id() != 0 {
                 scorer.seek(start.doc_id());
             }
+            if scorer.doc() == TERMINATED {
+                // Opening the column costs time in proportion to the segment,
+                // so a segment with no match — a propositions segment the
+                // query leaves out, among others — never opens it.
+                continue;
+            }
+            let column = object_column(segment)?;
             while scorer.doc() != TERMINATED {
                 let doc = scorer.doc();
                 if segment
@@ -570,11 +573,11 @@ impl TextSearcher {
         let mut count = 0usize;
 
         for segment in searcher.segment_readers() {
-            let object_ids = segment
-                .fast_fields()
-                .u64(FIELD_OBJECT)
-                .context("Text index has no object ID column")?;
             let mut scorer = weight.scorer(segment, 1.0)?;
+            if scorer.doc() == TERMINATED {
+                continue;
+            }
+            let object_ids = object_column(segment)?;
             while scorer.doc() != TERMINATED {
                 let doc = scorer.doc();
                 if segment
@@ -609,11 +612,11 @@ impl TextSearcher {
         for (built, kind) in self.phase_queries(query)? {
             let weight = built.weight(EnableScoring::enabled_from_searcher(&searcher))?;
             for segment in searcher.segment_readers() {
-                let object_ids = segment
-                    .fast_fields()
-                    .u64(FIELD_OBJECT)
-                    .context("Text index has no object ID column")?;
                 let mut scorer = weight.scorer(segment, 1.0)?;
+                if scorer.doc() == TERMINATED {
+                    continue;
+                }
+                let object_ids = object_column(segment)?;
                 while scorer.doc() != TERMINATED {
                     let doc = scorer.doc();
                     if segment
@@ -681,10 +684,15 @@ impl TextSearcher {
         // after collection. Tantivy otherwise breaks a score tie by DocAddress,
         // so a top-k boundary could discard the lower object ID before we ever
         // had a chance to impose the published ordering.
-        let collector = TopDocs::with_limit(top_k).tweak_score(|segment| {
-            let object_ids = segment.fast_fields().u64(FIELD_OBJECT).ok();
+        let collector = TopDocs::with_limit(top_k).tweak_score(|segment: &SegmentReader| {
+            // Opened at the segment's first hit, so a segment with none —
+            // a propositions segment the query leaves out, among others —
+            // never pays to open it.
+            let segment = segment.clone();
+            let object_ids = std::sync::OnceLock::new();
             move |doc, score| {
                 let object_id = object_ids
+                    .get_or_init(|| segment.fast_fields().u64(FIELD_OBJECT).ok())
                     .as_ref()
                     .and_then(|column| column.first(doc))
                     .unwrap_or(0);
@@ -733,11 +741,11 @@ impl TextSearcher {
         let mut heap = BinaryHeap::new();
 
         for segment in searcher.segment_readers() {
-            let object_ids = segment
-                .fast_fields()
-                .u64(FIELD_OBJECT)
-                .context("Text index has no object ID column")?;
             let mut scorer = weight.scorer(segment, 1.0)?;
+            if scorer.doc() == TERMINATED {
+                continue;
+            }
+            let object_ids = object_column(segment)?;
             while scorer.doc() != TERMINATED {
                 let doc = scorer.doc();
                 if segment
@@ -835,8 +843,11 @@ impl TextSearcher {
     /// Leave out the propositions HDT's literals unless the query asks for
     /// them. Their documents are segments of their own, so the query matches
     /// nothing there and runs unchanged everywhere else: nothing excluded is
-    /// matched, scored or counted, and the exclusion costs nothing per query
-    /// or per document.
+    /// matched or counted, and the exclusion costs nothing per document. A
+    /// score still uses the index-wide statistics, propositions included —
+    /// one ranking model for the whole index (`docs/text-index-format.md`
+    /// §2.4). Every path opens a segment's object column only when the segment
+    /// has a match, so a left-out segment costs no more than an empty one.
     fn scoped(&self, built: Box<dyn Query>, query: &TextQuery) -> Box<dyn Query> {
         if query.propositions || self.proposition_segments.is_empty() {
             return built;
@@ -1036,6 +1047,16 @@ fn stem_with(analyzer: &mut TextAnalyzer, token: &str) -> String {
     } else {
         token.to_string()
     }
+}
+
+/// A segment's object-ID column. Tantivy decodes the column's block headers
+/// to open it, a cost in proportion to the segment, so callers open it only
+/// for a segment that has a match.
+fn object_column(segment: &SegmentReader) -> Result<tantivy::columnar::Column<u64>> {
+    segment
+        .fast_fields()
+        .u64(FIELD_OBJECT)
+        .context("Text index has no object ID column")
 }
 
 /// The segments of an index covering a propositions HDT that hold its

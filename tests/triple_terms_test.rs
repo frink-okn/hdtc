@@ -342,7 +342,6 @@ fn search_refuses_misplaced_triple_terms() {
     for query in [
         "<<( <http://ex/a> <http://ex/b> <http://ex/c> )>> ? ?",
         "? ? <<( ? ? <<( ? <http://ex/b> <http://ex/c> )>> )>>",
-        "? ? <<( ? \"lit\" ? )>>",
     ] {
         let output = hdtc(&["search", "-q", hdt.to_str().unwrap(), "--query", query]);
         assert!(!output.status.success(), "{query} was accepted");
@@ -1034,7 +1033,11 @@ fn unasserted_triple_terms_keep_whatever_lenient_ingest_stored() {
              <http://ex/s> <http://ex/q> <\\u0022b\\u0022> .\n\
              <http://ex/e6> <{RDF_REIFIES}> <<( <_:y> <http://ex/q> <http://ex/o> )>> .\n\
              <_:y> <http://ex/q> <http://ex/o> .\n\
-             <http://ex/e7> <{RDF_REIFIES}> <<( <http://ex/s> <http://ex/p> \"a\"@en )>> .\n"
+             <http://ex/e7> <{RDF_REIFIES}> <<( <http://ex/s> <http://ex/p> \"a\"@en )>> .\n\
+             <http://ex/e8> <{RDF_REIFIES}> <<( <http://ex/s> <http://ex/p> <\\u0022@en> )>> .\n\
+             <http://ex/e9> <{RDF_REIFIES}> <<( <http://ex/s> <http://ex/p> \
+             <\\u0022^^\\u003Chttp://ex/d\\u003E> )>> .\n\
+             <http://ex/e10> <{RDF_REIFIES}> <<( <\\u0022q\\u0022> <\\u0022p\\u0022> <http://ex/o> )>> .\n"
         )
         .as_bytes(),
     );
@@ -1070,8 +1073,17 @@ fn unasserted_triple_terms_keep_whatever_lenient_ingest_stored() {
         assert!(tt_path(&hdt, ".props.hdt").exists(), "{name}");
         validate(&hdt, dir.path());
         let lines = dump(&hdt);
-        let rows = if name == "lookalikes.hdt" { 9 } else { 3 };
+        let rows = if name == "lookalikes.hdt" { 12 } else { 3 };
         assert_eq!(lines.len(), rows, "{name}: {lines:?}");
+        if name == "lookalikes.hdt" {
+            // A search finds them as the build stored them: the subject by its
+            // spelling, the predicate as it is.
+            assert_eq!(
+                search(&hdt, "? ? <<( \"q\" \"p\" ? )>>", &[]).len(),
+                1,
+                "{lines:?}"
+            );
+        }
         for needle in expected {
             assert!(
                 lines.iter().any(|l| l.contains(needle)),

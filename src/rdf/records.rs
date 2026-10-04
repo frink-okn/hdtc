@@ -113,8 +113,10 @@ fn literal(text: &str) -> Option<Literal> {
     if text.len() >= 2 && text.ends_with('"') {
         return Some(Literal::new_simple_literal(&text[1..text.len() - 1]));
     }
+    // A cut at 0 is the opening quote itself, as in `"^^<x>` or `"@en`:
+    // no closing quote, so no literal.
     if text.ends_with('>')
-        && let Some(cut) = text.rfind("\"^^<")
+        && let Some(cut) = text.rfind("\"^^<").filter(|&cut| cut > 0)
     {
         let datatype = &text[cut + 4..text.len() - 1];
         return Some(Literal::new_typed_literal(
@@ -122,7 +124,7 @@ fn literal(text: &str) -> Option<Literal> {
             NamedNode::new_unchecked(datatype),
         ));
     }
-    let cut = text.rfind("\"@")?;
+    let cut = text.rfind("\"@").filter(|&cut| cut > 0)?;
     Some(Literal::new_language_tagged_literal_unchecked(
         &text[1..cut],
         &text[cut + 2..],
@@ -194,7 +196,7 @@ mod tests {
     /// those no RDF syntax spells.
     #[test]
     fn a_record_reads_back_the_strings_it_was_written_from() {
-        let rows: [[&str; 3]; 10] = [
+        let rows: [[&str; 3]; 12] = [
             ["http://ex/s", "http://ex/p", "http://ex/o"],
             ["_:x.", "http://ex/p a", "\"v\"@en_us"],
             [
@@ -215,6 +217,8 @@ mod tests {
                 "\"a\"^^<http://www.w3.org/2001/XMLSchema#string>",
             ],
             ["\"q\"", "http://ex/p", "_:x"],
+            ["http://ex/s", "http://ex/p", "\"@en"],
+            ["http://ex/s", "http://ex/p", "\"^^<http://ex/d>"],
         ];
         let mut buffer = Vec::new();
         for [s, p, o] in rows {

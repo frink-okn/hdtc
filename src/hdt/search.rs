@@ -392,14 +392,14 @@ fn parse_triple_term_positions(
                 bail!("Unexpected term inside a triple term");
             };
             let text = String::from_utf8(term).context("Non-UTF-8 term in query")?;
-            let component = Component::from_dictionary(text);
-            match (index, &component) {
-                (0, Component::Literal(_)) => bail!("A triple term's subject cannot be a literal"),
-                (1, Component::Iri(_)) | (0 | 2, _) => {}
-                (1, _) => bail!("A triple term's predicate must be an IRI"),
-                _ => unreachable!(),
-            }
-            InnerTerm::Ground(component)
+            // As the build reads them: the predicate is the dictionary string
+            // as stored, and a subject or object is classified by its
+            // spelling — so a lenient IRI stored like a literal or a blank
+            // node (`<"q">`, `<_:p>`) is found where the build put it.
+            InnerTerm::Ground(match index {
+                1 => Component::Iri(text),
+                _ => Component::from_dictionary(text),
+            })
         };
         positions.push(term);
     }
