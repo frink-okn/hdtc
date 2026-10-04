@@ -36,9 +36,13 @@ use xxhash_rust::xxh64::xxh64;
 /// `docs/keyset-format.md` §1.2: absolute IRIs only. HDT stores IRIs as their
 /// raw UTF-8 bytes, blank nodes with `_:`, and literals with a leading quote.
 /// Current hdtc output retains blank nodes; a future documented skolem prefix
-/// can be excluded here as well.
+/// can be excluded here as well. An RDF 1.2 triple term is stored as an IRI
+/// under `urn:x-kgf:tt:` but is not one, and is excluded too.
 pub(crate) fn iri_hash(term: &[u8]) -> Option<u64> {
-    if term.starts_with(b"_:") || term.starts_with(b"\"") {
+    if term.starts_with(b"_:")
+        || term.starts_with(b"\"")
+        || crate::triple_terms::iri::is_triple_term_iri(term)
+    {
         None
     } else {
         Some(xxh64(term, 0))
@@ -511,6 +515,14 @@ pub(crate) fn format_bytes(bytes: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn triple_term_iris_are_not_keys() {
+        assert!(super::iri_hash(b"urn:x-kgf:tt:g:00000000000000000000000000000000").is_none());
+        assert!(super::iri_hash(b"urn:x-kgf:tt:b:00000000000000000000000000000000:x").is_none());
+        assert!(super::iri_hash(b"urn:x-kgf:unnamed").is_some());
+        assert!(super::iri_hash(b"http://ex/a").is_some());
+    }
+
     use super::*;
 
     #[test]

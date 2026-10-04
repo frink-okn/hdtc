@@ -699,3 +699,24 @@ fn text_search_reaches_literals_of_unasserted_triple_terms() {
     // Nested two levels down inside an unasserted claim is still reachable.
     assert_eq!(text("quoted", &[]).len(), 1);
 }
+
+#[test]
+fn namespace_inventories_do_not_count_triple_terms_as_iris() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.ttl");
+    common::write_file(&input, TURTLE.as_bytes());
+    let hdt = create(dir.path(), &[&input], "x.hdt");
+    let table = dir.path().join("prefixes.yaml");
+    common::write_file(&table, b"kgf: \"urn:x-kgf:\"\nex: \"http://ex/\"\n");
+    let output = hdtc(&[
+        "namespaces",
+        "-q",
+        hdt.to_str().unwrap(),
+        "--prefixes",
+        table.to_str().unwrap(),
+    ]);
+    assert!(output.status.success());
+    let json = String::from_utf8_lossy(&output.stdout);
+    assert!(!json.contains("\"kgf\""), "{json}");
+    assert!(!json.contains("urn:x-kgf:tt:"), "{json}");
+}

@@ -370,9 +370,12 @@ fn section_iri_ranges(section: &mut PfcSectionIndex) -> Result<Vec<Range<u64>>> 
         .string_count
         .checked_add(1)
         .context("PFC string count has no past-the-end position")?;
+    // Literals, blank nodes, and RDF 1.2 triple terms, which the dictionary
+    // stores as IRIs under a reserved namespace but which name no resource.
     let excluded = merge_ranges(vec![
         section.prefix_range(b"\"")?,
         section.prefix_range(b"_:")?,
+        section.prefix_range(crate::triple_terms::TT_NAMESPACE.as_bytes())?,
     ]);
 
     let mut ranges = Vec::new();

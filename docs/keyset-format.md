@@ -95,6 +95,10 @@ asserts. A dictionary term qualifies iff it is an **absolute IRI**. Excluded:
 - **Blank nodes** — dataset-local by construction. Recognised by a leading `_:`.
 - **Skolem IRIs** — dataset-local for the same reason, and MUST be excluded when
   the producer applies a documented skolem prefix.
+- **RDF 1.2 triple terms** — stored as IRIs under the reserved namespace
+  `urn:x-kgf:tt:` ([triple-terms-format.md](triple-terms-format.md) §2) but not
+  IRIs: such a string names a statement, not a resource. Recognised by that
+  prefix. No artifact produced before triple terms existed is affected.
 
 This applies to every role. A dictionary's literals and blank nodes never appear
 in any key set, including section roles whose source section contains them.

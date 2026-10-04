@@ -39,6 +39,11 @@ pub const HASH_HEX_LEN: usize = 32;
 /// follow any term it meets (`docs/triple-terms-format.md` §2.4).
 pub const MAX_NESTING: usize = 64;
 
+/// Whether a dictionary string is a triple-term IRI.
+pub fn is_triple_term_iri(term: &[u8]) -> bool {
+    term.starts_with(TT_NAMESPACE.as_bytes())
+}
+
 /// One position of a proposition, in dictionary form.
 ///
 /// `Blank` holds the label without its `_:`; `Literal` holds the dictionary
