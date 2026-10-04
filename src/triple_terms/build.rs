@@ -470,12 +470,14 @@ fn section_terms(
     hdt: &Path,
     section: &crate::hdt::pfc_reader::PfcSection,
     name: &str,
-) -> Result<std::iter::Peekable<PfcTerms>> {
+) -> Result<PfcTerms> {
     use std::io::{Seek, SeekFrom};
     let mut reader = std::io::BufReader::with_capacity(256 * 1024, File::open(hdt)?);
     reader.seek(SeekFrom::Start(section.section_start))?;
     let header = crate::hdt::pfc_reader::PfcSectionHeader::read_from(&mut reader, name)?;
-    Ok(crate::hdt::pfc_reader::PfcSectionIterator::new(reader, header, name).peekable())
+    Ok(crate::hdt::pfc_reader::PfcSectionIterator::new(
+        reader, header, name,
+    ))
 }
 
 /// One role's terms in byte order with their global identifiers: the shared
@@ -497,8 +499,8 @@ impl RoleTerms {
             Role::Object => &sections.objects,
         };
         Ok(Self {
-            shared: section_terms(hdt, &sections.shared, "shared")?,
-            own: section_terms(hdt, own, "own")?,
+            shared: section_terms(hdt, &sections.shared, "shared")?.peekable(),
+            own: section_terms(hdt, own, "own")?.peekable(),
             next_shared: 1,
             next_own: sections.shared.string_count + 1,
         })
@@ -628,8 +630,18 @@ pub(super) fn place(
         })?;
     }
     drop(predicates);
-    let subject_ids = join_role(hdt, Role::Subject, subjects, temp_dir, budget / 6)?;
-    let object_ids = join_role(hdt, Role::Object, objects, temp_dir, budget / 6)?;
+    // The two joins read different dictionary sections and sort different
+    // keys, so they run side by side.
+    let (subject_ids, object_ids) = std::thread::scope(|scope| {
+        let subject_ids =
+            scope.spawn(|| join_role(hdt, Role::Subject, subjects, temp_dir, budget / 6));
+        let object_ids = join_role(hdt, Role::Object, objects, temp_dir, budget / 6);
+        let subject_ids = subject_ids
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        (subject_ids, object_ids)
+    });
+    let (subject_ids, object_ids) = (subject_ids?, object_ids?);
 
     // Zip the three identifier streams by rank.
     let mut candidates = Sorted::<Row<4>>::new(temp_dir, budget / 3);
@@ -942,31 +954,65 @@ impl LayerEntries {
         temp_dir: &Path,
         drafts: &mut Vec<DraftSection>,
     ) -> Result<()> {
-        let mut spo = LayerWriter::new(temp_dir, orders[0], triples, reverse_width)?;
-        layer_from_spo(&mut spo, self.spo)?;
-        drafts.extend(spo.finish(temp_dir)?);
-        let mut pos = LayerWriter::new(temp_dir, orders[1], triples, reverse_width)?;
-        layer_from_permutation(perm, hdt, PermutationComponent::Pos, &mut pos, self.pos)?;
-        drafts.extend(pos.finish(temp_dir)?);
-        let mut ops = LayerWriter::new(temp_dir, orders[2], triples, reverse_width)?;
-        layer_from_permutation(perm, hdt, PermutationComponent::Ops, &mut ops, self.ops)?;
-        drafts.extend(ops.finish(temp_dir)?);
+        // The three orders read different streams into different files, so
+        // they are built side by side; their sections are kept in order.
+        let Self { spo, pos, ops } = self;
+        let (spo, pos, ops) = std::thread::scope(|scope| {
+            let spo = scope.spawn(|| -> Result<Vec<DraftSection>> {
+                let mut layer = LayerWriter::new(temp_dir, orders[0], triples, reverse_width)?;
+                layer_from_spo(&mut layer, spo)?;
+                layer.finish(temp_dir)
+            });
+            let pos = scope.spawn(|| -> Result<Vec<DraftSection>> {
+                let mut layer = LayerWriter::new(temp_dir, orders[1], triples, reverse_width)?;
+                layer_from_permutation(perm, hdt, PermutationComponent::Pos, &mut layer, pos)?;
+                layer.finish(temp_dir)
+            });
+            let mut layer = LayerWriter::new(temp_dir, orders[2], triples, reverse_width)?;
+            let ops = layer_from_permutation(perm, hdt, PermutationComponent::Ops, &mut layer, ops)
+                .and_then(|()| layer.finish(temp_dir));
+            let join = |handle: std::thread::ScopedJoinHandle<'_, Result<Vec<DraftSection>>>| {
+                handle
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            };
+            Ok::<_, anyhow::Error>((join(spo), join(pos), ops))
+        })?;
+        drafts.extend(spo?);
+        drafts.extend(pos?);
+        drafts.extend(ops?);
         Ok(())
     }
 }
 
-/// Walks one dictionary's run of triple-term IRIs in order.
-struct RunCursor<'a> {
-    dictionary: Option<&'a mut DictionaryResolver>,
+/// Walks one dictionary's run of triple-term IRIs in order, reading the
+/// object section sequentially from the run's first block: the IRIs share a
+/// prefix, so they are one stretch of the section, and reading it as a
+/// stream costs one seek where a lookup per IRI would cost one per block.
+struct RunCursor {
+    terms: Option<PfcTerms>,
     next: u64,
     end: u64,
     current: Vec<u8>,
 }
 
-impl<'a> RunCursor<'a> {
-    fn new(dictionary: Option<&'a mut DictionaryResolver>, shape: &HdtShape) -> Result<Self> {
+impl RunCursor {
+    fn new(hdt: Option<&Path>, shape: &HdtShape) -> Result<Self> {
+        let terms = match hdt {
+            Some(hdt) if shape.run_end > shape.run_start => {
+                let file = File::open(hdt)?;
+                let mut reader = std::io::BufReader::new(file);
+                let sections = crate::hdt::sections::scan_hdt_sections(&mut reader)?;
+                let mut terms = section_terms(hdt, &sections.objects, "objects")?;
+                // Triple-term IRIs are never subjects, so the run lies in the
+                // object-only section, after the shared one.
+                terms.seek_to(shape.run_start - sections.shared.string_count - 1)?;
+                Some(terms)
+            }
+            _ => None,
+        };
         let mut cursor = Self {
-            dictionary,
+            terms,
             next: shape.run_start,
             end: shape.run_end,
             current: Vec::new(),
@@ -977,15 +1023,17 @@ impl<'a> RunCursor<'a> {
 
     fn load(&mut self) -> Result<()> {
         if self.next < self.end
-            && let Some(dictionary) = self.dictionary.as_mut()
+            && let Some(terms) = self.terms.as_mut()
         {
-            dictionary.object_term(self.next, &mut self.current)?;
+            self.current = terms
+                .next()
+                .context("the triple-term run ends before its recorded length")??;
         }
         Ok(())
     }
 
     fn exhausted(&self) -> bool {
-        self.dictionary.is_none() || self.next >= self.end
+        self.terms.is_none() || self.next >= self.end
     }
 
     /// If the run's next IRI is `iri`, consume it and return its identifier.
@@ -1112,7 +1160,6 @@ pub(crate) fn finish(
 
     // 3. Store the unasserted propositions.
     let mut propositions = None;
-    let mut props_dictionary = None;
     let mut props_shape = HdtShape::default();
     let mut placed_unasserted = None;
     if unasserted_count > 0 {
@@ -1121,8 +1168,7 @@ pub(crate) fn finish(
         write_propositions_ntriples(&distinct, &unasserted_ranks, &ntriples)?;
         let (hdt, perm) = build_propositions_hdt(ctx, &ntriples)?;
         let _ = std::fs::remove_file(&ntriples);
-        let (_, mut dictionary) = open_hdt(&hdt, budget / 4)?;
-        props_shape = shape_of(&hdt, &mut dictionary)?;
+        props_shape = shape_of(&hdt, &mut open_hdt(&hdt, budget / 8)?.1)?;
         let (found, _) = place(
             &hdt,
             &distinct,
@@ -1132,7 +1178,6 @@ pub(crate) fn finish(
             true,
         )?;
         placed_unasserted = Some(found);
-        props_dictionary = Some(dictionary);
         propositions = Some((hdt, perm));
         tracing::info!(
             "Triple terms: propositions HDT built ({:.1}s)",
@@ -1154,7 +1199,6 @@ pub(crate) fn finish(
     let mut props_run = RunWriter::new(temp_dir, component::PROPS_RUN, widths)?;
     let mut data_layers = LayerEntries::new(temp_dir, budget / 4);
     let mut props_layers = LayerEntries::new(temp_dir, budget / 4);
-    let (_, mut data_dictionary) = open_hdt(ctx.hdt, budget / 4)?;
     {
         let mut asserted = asserted.peekable();
         let mut placed = match placed_unasserted {
@@ -1164,8 +1208,11 @@ pub(crate) fn finish(
             }
             None => None,
         };
-        let mut data_cursor = RunCursor::new(Some(&mut data_dictionary), &data_shape)?;
-        let mut props_cursor = RunCursor::new(props_dictionary.as_mut(), &props_shape)?;
+        let mut data_cursor = RunCursor::new(Some(ctx.hdt), &data_shape)?;
+        let mut props_cursor = RunCursor::new(
+            propositions.as_ref().map(|(hdt, _)| hdt.as_ref()),
+            &props_shape,
+        )?;
         for (rank, record) in distinct.reader()?.enumerate() {
             let record = record?;
             let rank = rank as u64;
