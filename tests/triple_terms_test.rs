@@ -932,3 +932,38 @@ fn namespace_inventories_do_not_count_triple_terms_as_iris() {
     assert!(!json.contains("\"kgf\""), "{json}");
     assert!(!json.contains("urn:x-kgf:tt:"), "{json}");
 }
+
+/// What lenient ingest stores inside an unasserted triple term survives the
+/// propositions HDT's build: an IRI holding a space, a datatype IRI holding a
+/// quote, a language tag no validator passes.
+#[test]
+fn unasserted_triple_terms_keep_whatever_lenient_ingest_stored() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.nt");
+    common::write_file(
+        &input,
+        format!(
+            "<http://ex/e1> <{RDF_REIFIES}> <<( <http://ex/s> <http://ex/p> <http://ex/c d> )>> .\n\
+             <http://ex/e2> <{RDF_REIFIES}> <<( <http://ex/s> <http://ex/p> \"y\"^^<http://ex/d\\u0022t> )>> .\n\
+             <http://ex/e3> <{RDF_REIFIES}> <<( <http://ex/s> <http://ex/p> \"x\"@zh-classical )>> .\n"
+        )
+        .as_bytes(),
+    );
+    let hdt = create(dir.path(), &[&input], "o.hdt");
+    assert!(tt_path(&hdt, ".props.hdt").exists());
+    validate(&hdt, dir.path());
+    let lines = dump(&hdt);
+    assert_eq!(lines.len(), 3, "{lines:?}");
+    assert!(
+        lines.iter().any(|l| l.contains("<http://ex/c d>")),
+        "{lines:?}"
+    );
+    assert!(
+        lines.iter().any(|l| l.contains("^^<http://ex/d\"t>")),
+        "{lines:?}"
+    );
+    assert!(
+        lines.iter().any(|l| l.contains("@zh-classical")),
+        "{lines:?}"
+    );
+}

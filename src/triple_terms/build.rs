@@ -31,7 +31,8 @@ use super::spool::{PropositionSpool, SpoolWriter};
 use crate::cli::InputSidecarPolicy;
 use crate::hdt::artifacts::SourceIdentity;
 use crate::hdt::reader::{
-    BitmapTriplesScanner, DictionaryResolver, open_hdt, write_nt_object, write_nt_subject,
+    BitmapTriplesScanner, DictionaryResolver, find_literal_boundary, open_hdt,
+    write_escaped_literal_value,
 };
 use crate::io::{BitPacker, StreamingLogArrayEncoder};
 use crate::permutation::format::{
@@ -714,15 +715,61 @@ fn write_propositions_ntriples(
             None => break,
             _ => continue,
         }
-        write_nt_subject(&mut encoder, record.subject.as_bytes())?;
-        encoder.write_all(b" <")?;
-        encoder.write_all(record.predicate.as_bytes())?;
-        encoder.write_all(b"> ")?;
-        write_nt_object(&mut encoder, record.object.as_bytes())?;
+        write_nt_term(&mut encoder, record.subject.as_bytes())?;
+        encoder.write_all(b" ")?;
+        write_nt_iri(&mut encoder, record.predicate.as_bytes())?;
+        encoder.write_all(b" ")?;
+        write_nt_term(&mut encoder, record.object.as_bytes())?;
         encoder.write_all(b" .\n")?;
     }
     encoder.finish()?.flush()?;
     Ok(())
+}
+
+/// Write a dictionary term as an N-Triples term that parses back to it.
+///
+/// Lenient ingest can store an IRI — or a literal's datatype IRI — holding
+/// characters an N-Triples IRIREF excludes, decoded from `UCHAR` escapes in
+/// the source. Written raw, such a term would not parse back, and the
+/// propositions HDT could not be built; escaped, the parser decodes it to the
+/// same dictionary string.
+fn write_nt_term(w: &mut impl Write, term: &[u8]) -> std::io::Result<()> {
+    if term.starts_with(b"_:") {
+        return w.write_all(term);
+    }
+    if term.starts_with(b"\"") {
+        let (value_end, suffix_start) = find_literal_boundary(term);
+        w.write_all(b"\"")?;
+        write_escaped_literal_value(w, &term[1..value_end])?;
+        w.write_all(b"\"")?;
+        let suffix = &term[suffix_start..];
+        return match suffix
+            .strip_prefix(b"^^<")
+            .and_then(|datatype| datatype.strip_suffix(b">"))
+        {
+            Some(datatype) => {
+                w.write_all(b"^^")?;
+                write_nt_iri(w, datatype)
+            }
+            None => w.write_all(suffix),
+        };
+    }
+    write_nt_iri(w, term)
+}
+
+/// Write an IRI as an N-Triples IRIREF, escaping what IRIREF excludes.
+fn write_nt_iri(w: &mut impl Write, iri: &[u8]) -> std::io::Result<()> {
+    w.write_all(b"<")?;
+    let mut start = 0;
+    for (i, &byte) in iri.iter().enumerate() {
+        if byte <= 0x20 || b"<>\"{}|^`\\".contains(&byte) {
+            w.write_all(&iri[start..i])?;
+            write!(w, "\\u{byte:04X}")?;
+            start = i + 1;
+        }
+    }
+    w.write_all(&iri[start..])?;
+    w.write_all(b">")
 }
 
 /// Build the propositions HDT and its permutation index with the ordinary
