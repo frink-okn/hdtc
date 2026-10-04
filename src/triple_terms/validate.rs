@@ -140,9 +140,15 @@ fn ordered_triples<'a>(hdt: &'a Path, perm: &'a Path, order: Order) -> Result<Tr
     }
 }
 
+/// Check one layer against its HDT, read in the layer's order: each set bit
+/// marks a triple whose reverse entry names it.
+///
+/// The run check has already minted every IRI from its target's proposition,
+/// so a reverse entry names a position's triple exactly when the entry's
+/// target is that triple — a packed read, with no dictionary lookup and no
+/// hashing per position.
 fn check_layer(
     index: &TripleTermIndex,
-    dictionaries: &mut Dictionaries,
     source: Source,
     order: Order,
     hdt: &Path,
@@ -164,7 +170,6 @@ fn check_layer(
         "{source:?} {order:?} layer marks {population} triples, expected {expected}"
     );
     let perm = crate::permutation::canonical_path(hdt);
-    let mut data_buf = Vec::new();
     let mut rank = 0u64;
     let mut bitmap = vec![0u8; layer.len().div_ceil(8) as usize];
     if !bitmap.is_empty() {
@@ -177,22 +182,15 @@ fn check_layer(
         if bitmap[position / 8] >> (position % 8) & 1 == 0 {
             continue;
         }
-        let target = Target {
-            subject: s,
-            predicate: p,
-            object: o,
-            asserted: source == Source::Data,
-        };
-        let iri = iri_for(&proposition_of(index, dictionaries, target, 0)?);
         let data_term = layer.reverse(index.file(), rank)?;
-        dictionaries
-            .data
-            .object_term_raw(data_term, &mut data_buf)
-            .with_context(|| format!("{source:?} {order:?} reverse entry {rank}"))?;
+        let target = index.target(Source::Data, data_term)?.with_context(|| {
+            format!("{source:?} {order:?} reverse entry {rank} is no triple-term IRI")
+        })?;
         ensure!(
-            data_buf == iri.as_bytes(),
-            "{source:?} {order:?} layer position {position} names {} but is {iri}",
-            String::from_utf8_lossy(&data_buf)
+            (target.subject, target.predicate, target.object) == (s, p, o)
+                && target.asserted == (source == Source::Data),
+            "{source:?} {order:?} layer position {position} holds ({s}, {p}, {o}), \
+             but its reverse entry {data_term} names another proposition"
         );
         rank += 1;
     }
@@ -446,18 +444,10 @@ pub fn validate_triple_terms(hdt_path: &Path, temp_dir: &Path, memory_limit: usi
 
     // Layers: each marked position's triple is named by its reverse entry.
     for order in [Order::Spo, Order::Pos, Order::Ops] {
-        check_layer(
-            &index,
-            &mut dictionaries,
-            Source::Data,
-            order,
-            hdt_path,
-            data_layer_expected,
-        )?;
+        check_layer(&index, Source::Data, order, hdt_path, data_layer_expected)?;
         if index.has_propositions() {
             check_layer(
                 &index,
-                &mut dictionaries,
                 Source::Propositions,
                 order,
                 &props_path,
