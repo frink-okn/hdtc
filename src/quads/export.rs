@@ -23,6 +23,7 @@ pub fn export_dataset_nquads(
         .saturating_sub(dictionary_budget)
         .max(std::mem::size_of::<PositionGraphMembership>());
     let (offsets, mut dictionary) = open_hdt(hdt_path, dictionary_budget)?;
+    dictionary.enable_triple_terms(hdt_path, dictionary_budget / 4)?;
     let mut scanner = BitmapTriplesScanner::new(&offsets, hdt_path)?;
     let mut sidecar = GraphSidecarReader::open_for_hdt(hdt_path)?;
     ensure!(

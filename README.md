@@ -20,6 +20,7 @@ Development of hdtc is done primarily through Claude Code.
 - **Namespace inventories** — count distinct subject, predicate, object, and graph-wide IRIs against curated YAML or JSON prefix tables
 - **Structural validation** — walk an HDT's triple structures and checksums, plus discovered graph and permutation sidecars, end to end
 - **Resilient parsing** — skips malformed triples with warnings, reports total skipped at the end
+- **[RDF 1.2 triple terms](#rdf-12-triple-terms)** — `<<( s p o )>>` terms, reification, and annotation syntax are stored beside a standard HDT, rendered back as N-Triples 1.2, and indexed for patterns inside triple terms
 - **[Named graphs](#named-graphs)** — optional packed `<data.hdt>.graphs` sidecars preserve N-Quads/TriG datasets while the standard HDT remains the deduplicated triples union
 - **[Membership and overlap sketches](#membership-and-overlap-sketches)** — build source-bound binary fuse filters and bottom-k MinHash files directly from an HDT dictionary
 - **[Exact key sets](#exact-key-sets)** — publish the complete distinct key set for a role, Elias-Fano encoded, for membership and overlap without approximation
@@ -882,6 +883,40 @@ an ordinary HDT that software knowing nothing about these files can still read.
 
 Each of these formats is specified normatively in [`docs/`](docs/), because they
 are meant to be read by other tools, in other languages, built by other parties.
+
+### RDF 1.2 triple terms
+
+RDF 1.2 adds the *triple term*, `<<( s p o )>>`, which can appear as an object —
+most often of `rdf:reifies`, where a reifier names an occurrence of a statement
+and carries metadata about it. Turtle 1.2's annotation syntax produces exactly
+that:
+
+```turtle
+:alice :knows :bob {| :source :survey1 |} .
+```
+
+hdtc parses RDF 1.2 in every Turtle-family syntax and keeps `data.hdt` a standard
+HDT by naming each distinct triple term with an IRI in the reserved namespace
+`urn:x-kgf:tt:` — a content hash for a ground term, so equal terms get equal
+names in every build. What each name denotes is kept beside the HDT, split by
+whether the triple is asserted:
+
+- `data.hdt.props.hdt` (with its `.perm`) is a standard HDT holding the
+  propositions of the *unasserted* triple terms. An asserted triple term's
+  proposition is already a triple of `data.hdt`, so it is not stored again; a
+  dataset with provenance on every triple pays one index entry per triple, not a
+  second copy of itself.
+- `data.hdt.tt` maps each triple-term IRI to its proposition, and marks the
+  reified triples of each HDT in SPO, POS and OPS order, so a pattern *inside*
+  a triple term is a range like any other.
+
+An HDT with triple terms is always written with its `.perm`. `dump` and `search`
+render triple terms as N-Triples 1.2, and `validate` re-derives every
+triple-term IRI from its decoded proposition. Source RDF that uses the reserved
+namespace is refused. RDF 1.2's directional language tags are stored as
+N-Triples 1.2 writes them, `"…"@ar--rtl`.
+
+See the normative [triple-terms format](docs/triple-terms-format.md).
 
 ### Named graphs
 

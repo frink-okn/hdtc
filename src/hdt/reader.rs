@@ -599,11 +599,34 @@ pub struct DictionaryResolver {
     pub subjects: PfcSectionIndex,
     pub predicates: PfcSectionIndex,
     pub objects: PfcSectionIndex,
+    /// When enabled, [`Self::object_term`] renders triple-term IRIs as the
+    /// triple terms they name ([`Self::enable_triple_terms`]).
+    pub(crate) triple_terms: Option<Box<crate::triple_terms::reader::TripleTermDecoder>>,
 }
 
 impl DictionaryResolver {
+    /// Render triple-term IRIs as N-Triples 1.2 triple terms from now on.
+    ///
+    /// [`Self::object_term`] then yields `<<( s p o )>>` text for an object
+    /// that names a triple term — already in N-Triples form, which
+    /// [`write_nt_object`] passes through — and the dictionary string for
+    /// everything else. A dictionary string never begins with `<`, so the two
+    /// cannot be confused. Returns whether the HDT has triple terms.
+    pub fn enable_triple_terms(&mut self, hdt_path: &Path, memory_limit: usize) -> Result<bool> {
+        let decoder =
+            crate::triple_terms::reader::TripleTermDecoder::open(hdt_path, self, memory_limit)?;
+        let enabled = decoder.is_some();
+        self.triple_terms = decoder.map(Box::new);
+        Ok(enabled)
+    }
+
     /// Resolve a subject ID to raw term bytes.
     pub fn subject_term(&mut self, subject_id: u64, buf: &mut Vec<u8>) -> Result<()> {
+        self.subject_term_raw(subject_id, buf)
+    }
+
+    /// Resolve a subject ID to its dictionary string.
+    pub fn subject_term_raw(&mut self, subject_id: u64, buf: &mut Vec<u8>) -> Result<()> {
         let shared_count = self.shared.string_count;
         if subject_id == 0 {
             bail!("Invalid subject ID 0");
@@ -620,8 +643,23 @@ impl DictionaryResolver {
         self.predicates.get_bytes(predicate_id, buf)
     }
 
-    /// Resolve an object ID to raw term bytes.
+    /// Resolve an object ID to raw term bytes — or, when triple terms are
+    /// enabled and the object names one, to its N-Triples 1.2 rendering.
     pub fn object_term(&mut self, object_id: u64, buf: &mut Vec<u8>) -> Result<()> {
+        if let Some(decoder) = self.triple_terms.as_ref()
+            && decoder.is_data_term(object_id)
+        {
+            let mut decoder = self.triple_terms.take().expect("checked above");
+            buf.clear();
+            let rendered = decoder.render_data(self, object_id, buf);
+            self.triple_terms = Some(decoder);
+            return rendered;
+        }
+        self.object_term_raw(object_id, buf)
+    }
+
+    /// Resolve an object ID to its dictionary string, never rendering it.
+    pub fn object_term_raw(&mut self, object_id: u64, buf: &mut Vec<u8>) -> Result<()> {
         let shared_count = self.shared.string_count;
         if object_id == 0 {
             bail!("Invalid object ID 0");
@@ -717,6 +755,7 @@ pub fn open_hdt(
         subjects: index_of(&sections.subjects, "subjects")?,
         predicates: index_of(&sections.predicates, "predicates")?,
         objects: index_of(&sections.objects, "objects")?,
+        triple_terms: None,
     };
 
     let offsets = HdtSectionOffsets {
@@ -912,7 +951,11 @@ pub(crate) fn write_nt_subject(w: &mut impl Write, term: &[u8]) -> std::io::Resu
 ///
 /// Literal values are escaped for N-Triples (HDT stores raw unescaped UTF-8).
 pub(crate) fn write_nt_object(w: &mut impl Write, term: &[u8]) -> std::io::Result<()> {
-    if term.starts_with(b"\"") {
+    if term.starts_with(b"<<(") {
+        // A triple term rendered by `DictionaryResolver::object_term`: already
+        // N-Triples 1.2. No dictionary string begins with `<`.
+        w.write_all(term)
+    } else if term.starts_with(b"\"") {
         write_nt_literal(w, term)
     } else if term.starts_with(b"_:") {
         w.write_all(term)

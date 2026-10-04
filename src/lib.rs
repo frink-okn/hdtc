@@ -17,6 +17,7 @@ mod quads;
 mod rdf;
 mod sort;
 mod text;
+mod triple_terms;
 mod triples;
 
 pub mod format;
@@ -277,6 +278,7 @@ fn create_hdt(args: cli::CreateArgs, benchmark: bool) -> Result<()> {
         chunk_size_bytes: args.parse_chunk_bytes,
         max_inflight_bytes: args.parse_max_inflight_bytes,
         max_term_bytes: args.max_term_bytes.as_bytes(),
+        trust_triple_term_iris: false,
     };
 
     // Compute base URI: use provided value, or derive from first input file
@@ -401,8 +403,7 @@ fn create_hdt(args: cli::CreateArgs, benchmark: bool) -> Result<()> {
                 )
             })?
             .into_temp_path();
-        let prepared_perm = args
-            .perm
+        let prepared_perm = (args.perm || pipeline_result.propositions.is_some())
             .then(|| {
                 tempfile::Builder::new()
                     .prefix(".hdtc-perm-")
@@ -435,7 +436,7 @@ fn create_hdt(args: cli::CreateArgs, benchmark: bool) -> Result<()> {
         perm_temp = prepared_perm;
         Some(graph_temp)
     } else {
-        if args.perm {
+        if args.perm || pipeline_result.propositions.is_some() {
             let prepared = pipeline_result
                 .permutation
                 .take()
@@ -462,10 +463,91 @@ fn create_hdt(args: cli::CreateArgs, benchmark: bool) -> Result<()> {
         None
     };
 
+    // RDF 1.2 triple terms: classify, store, and index them. An HDT with
+    // triple terms is always published with its permutation index: the
+    // triple-term index's POS and OPS layers are positions in it, and
+    // inner-pattern queries need its ranges.
+    let built_triple_terms = match pipeline_result.propositions.take() {
+        None => None,
+        Some(spool) => {
+            if perm_temp.is_none() {
+                tracing::info!(
+                    "Input has RDF 1.2 triple terms; building the permutation index they require"
+                );
+                let built = permutation::create_permutation_index(
+                    &hdt_temp,
+                    memory_budget,
+                    &temp_dir,
+                    permutation_maps.unwrap_or_default(),
+                )?;
+                perm_temp = Some(tempfile::TempPath::from_path(built));
+            }
+            let context = triple_terms::build::FinishContext {
+                hdt: &hdt_temp,
+                perm: perm_temp
+                    .as_deref()
+                    .context("permutation index missing for triple terms")?,
+                output_dir: output_parent,
+                temp_dir: &temp_dir,
+                memory_budget,
+                dataset_uri: &dataset_uri,
+            };
+            let built = triple_terms::build::finish(&context, vec![spool])?;
+            tracing::info!(
+                "Triple terms: {} distinct, {} asserted, {} unasserted",
+                built.distinct,
+                built.asserted,
+                built.unasserted
+            );
+            Some(built)
+        }
+    };
+    let publish_perm = args.perm || built_triple_terms.is_some();
+
+    // The triple-term artifacts bind to the HDT, so the old ones leave their
+    // canonical names before anything is replaced.
+    let canonical_tt_path = triple_terms::format::canonical_path(&args.output);
+    let canonical_props_path = triple_terms::format::propositions_path(&args.output);
+    let canonical_props_perm_path = permutation::canonical_path(&canonical_props_path);
+    let mut retired_triple_terms = Vec::new();
+    for (path, label) in [
+        (&canonical_tt_path, "triple-term index"),
+        (&canonical_props_perm_path, "propositions permutation index"),
+        (&canonical_props_path, "propositions HDT"),
+    ] {
+        match retire_existing_artifact(path, output_parent, label) {
+            Ok(Some(retired)) => retired_triple_terms.push(retired),
+            Ok(None) => {}
+            Err(error) => {
+                for retired in retired_triple_terms.iter().rev() {
+                    if let Err(restore_error) = retired.restore() {
+                        return Err(anyhow::anyhow!(
+                            "{error:#}; additionally failed to roll back a triple-term artifact: \
+                             {restore_error:#}"
+                        ));
+                    }
+                }
+                return Err(error);
+            }
+        }
+    }
+    let restore_triple_terms = |error: anyhow::Error| -> anyhow::Error {
+        for retired in retired_triple_terms.iter().rev() {
+            if let Err(restore_error) = retired.restore() {
+                return anyhow::anyhow!(
+                    "{error:#}; additionally failed to roll back a triple-term artifact: \
+                     {restore_error:#}"
+                );
+            }
+        }
+        error
+    };
+
     // Move derived graph data out first: a graph index binds to both the HDT
     // and sidecar, so it must never survive replacement of either parent.
     let retired_graph_index =
-        retire_existing_artifact(&canonical_graph_index_path, output_parent, "graph index")?;
+        retire_existing_artifact(&canonical_graph_index_path, output_parent, "graph index")
+            .map_err(restore_triple_terms)?;
     // Move the old sidecar out of its canonical name before replacing the HDT.
     // A crash can therefore leave detectably missing artifacts, but never a
     // new HDT next to stale graph data.
@@ -529,7 +611,7 @@ fn create_hdt(args: cli::CreateArgs, benchmark: bool) -> Result<()> {
                 "{publish_error:#}; additionally failed to roll back an artifact: {restore_error:#}"
             ));
         }
-        return Err(publish_error);
+        return Err(restore_triple_terms(publish_error));
     }
 
     if !include_graphs && retired_sidecar.is_some() {
@@ -557,7 +639,7 @@ fn create_hdt(args: cli::CreateArgs, benchmark: bool) -> Result<()> {
         tracing::info!("Graph sidecar written: {}", canonical_graphs_path.display());
     }
 
-    if !args.perm && retired_perm.is_some() {
+    if !publish_perm && retired_perm.is_some() {
         tracing::info!(
             "Removed stale permutation index: {}",
             canonical_perm_path.display()
@@ -588,6 +670,43 @@ fn create_hdt(args: cli::CreateArgs, benchmark: bool) -> Result<()> {
             "Graph index written: {}",
             canonical_graph_index_path.display()
         );
+    }
+
+    match built_triple_terms {
+        Some(built) => {
+            // Data before index: the triple-term index binds to both HDTs.
+            if let Some((props_hdt, props_perm)) = built.propositions {
+                props_hdt.persist(&canonical_props_path).with_context(|| {
+                    format!(
+                        "Failed to publish propositions HDT {}",
+                        canonical_props_path.display()
+                    )
+                })?;
+                props_perm
+                    .persist(&canonical_props_perm_path)
+                    .with_context(|| {
+                        format!("Failed to publish {}", canonical_props_perm_path.display())
+                    })?;
+                tracing::info!(
+                    "Propositions HDT written: {}",
+                    canonical_props_path.display()
+                );
+            }
+            built.index.persist(&canonical_tt_path).with_context(|| {
+                format!(
+                    "Failed to publish triple-term index {}",
+                    canonical_tt_path.display()
+                )
+            })?;
+            tracing::info!("Triple-term index written: {}", canonical_tt_path.display());
+        }
+        None if !retired_triple_terms.is_empty() => {
+            tracing::info!(
+                "Removed stale triple-term artifacts beside {}",
+                args.output.display()
+            );
+        }
+        None => {}
     }
 
     // Clean up dict section and triples temp files
@@ -1354,6 +1473,27 @@ fn validate_hdt_file(args: cli::ValidateArgs, benchmark: bool) -> Result<()> {
                     &temp_dir,
                     args.memory_limit.as_bytes(),
                 )?;
+            }
+            let triple_terms_path = triple_terms::format::canonical_path(&args.hdt_file);
+            if triple_terms_path.exists() {
+                tracing::info!("Validating triple terms: {}", triple_terms_path.display());
+                let temp_dir = match &args.temp_dir {
+                    Some(path) => {
+                        std::fs::create_dir_all(path)?;
+                        path.clone()
+                    }
+                    None => make_default_temp_dir()?,
+                };
+                triple_terms::validate::validate_triple_terms(
+                    &args.hdt_file,
+                    &temp_dir,
+                    args.memory_limit.as_bytes(),
+                )?;
+            } else {
+                // An HDT whose dictionary holds triple-term IRIs needs its index.
+                let (_, mut dictionary) =
+                    hdt::reader::open_hdt(&args.hdt_file, args.memory_limit.as_bytes())?;
+                dictionary.enable_triple_terms(&args.hdt_file, args.memory_limit.as_bytes())?;
             }
             if graph_index_path.exists() {
                 tracing::info!(

@@ -714,7 +714,10 @@ fn rank_draft(
     }
 }
 
-fn build_rank_directories(bitmap: &RawBitmap, temp_dir: &Path) -> Result<(TempPath, TempPath)> {
+pub(crate) fn build_rank_directories(
+    bitmap: &RawBitmap,
+    temp_dir: &Path,
+) -> Result<(TempPath, TempPath)> {
     let mut super_file = temp_file(temp_dir, ".hdtc-perm-super-")?;
     let mut sub_file = temp_file(temp_dir, ".hdtc-perm-sub-")?;
     if bitmap.bits > 0 {

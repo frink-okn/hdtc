@@ -97,6 +97,7 @@ pub fn search_text_streaming(options: &TextSearchOptions<'_>) -> Result<u64> {
 
     let (offsets, mut dictionary) = open_hdt(options.hdt_path, options.memory_limit)
         .with_context(|| format!("Failed to open HDT file {}", options.hdt_path.display()))?;
+    dictionary.enable_triple_terms(options.hdt_path, options.memory_limit / 4)?;
 
     // A predicate the dataset does not use cannot match anything, which is an
     // empty result rather than an error.

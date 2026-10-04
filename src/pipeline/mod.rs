@@ -29,6 +29,7 @@ use crate::rdf::{
     DEFAULT_MAX_TERM_BYTES, ExtractedQuad, ParseOptions, RdfInput, stream_quads_with_options,
 };
 use crate::sort::{ExternalSorter, Sortable};
+use crate::triple_terms::spool::{self, PropositionSink, PropositionSpool};
 use crate::triples::id_triple::IdTriple;
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, bounded};
@@ -130,6 +131,8 @@ pub struct ParserParallelismConfig {
     pub max_inflight_bytes: Option<usize>,
     /// Largest single IRI or literal accepted (`--max-term-bytes`).
     pub max_term_bytes: usize,
+    /// See [`ParseOptions::trust_triple_term_iris`]; never set from the CLI.
+    pub trust_triple_term_iris: bool,
 }
 
 impl Default for ParserParallelismConfig {
@@ -140,6 +143,7 @@ impl Default for ParserParallelismConfig {
             chunk_size_bytes: None,
             max_inflight_bytes: None,
             max_term_bytes: DEFAULT_MAX_TERM_BYTES,
+            trust_triple_term_iris: false,
         }
     }
 }
@@ -162,6 +166,9 @@ pub struct PipelineResult {
     /// permutation index construction.
     pub graph_permutation: Option<crate::graph_index::PreparedGraphIndexCollector>,
     pub ntriples_size: u64, // N-Triples serialization size of parsed data
+    /// Every RDF 1.2 triple term the parser met, one record per occurrence;
+    /// `None` when the input had none.
+    pub propositions: Option<PropositionSpool>,
 }
 
 /// Batch of parsed quads (Stage 1 → Stage 2).
@@ -608,6 +615,7 @@ fn parser_stage(
     parser_parallelism: ParserParallelismConfig,
     batch_tx: Sender<BatchedQuads>,
     total_input_count: usize,
+    proposition_sink: Arc<PropositionSink>,
 ) -> Result<u64> {
     let expected_files = inputs.len();
     let disambiguate_blank_nodes = total_input_count > 1;
@@ -674,6 +682,7 @@ fn parser_stage(
         chunk_workers,
         max_inflight_bytes,
         max_term_bytes: parser_parallelism.max_term_bytes,
+        trust_triple_term_iris: parser_parallelism.trust_triple_term_iris,
     };
 
     let assembler = Arc::new(SharedBatchAssembler::new(batch_size, batch_tx));
@@ -703,6 +712,7 @@ fn parser_stage(
         let base_uri = base_uri.clone();
         let parse_options = parse_options.clone();
         let aborted = Arc::clone(&aborted);
+        let proposition_sink = Arc::clone(&proposition_sink);
 
         worker_handles.push(std::thread::spawn(move || {
             for (file_index, input, source_assignment) in file_rx {
@@ -712,6 +722,10 @@ fn parser_stage(
                 tracing::info!("Parsing: {}", input.path.display());
 
                 let mut staged_quads = Vec::with_capacity(4096);
+                // Triple-term propositions, encoded for the spool. Only inputs
+                // with triple terms ever put anything here.
+                let mut staged_propositions = Vec::new();
+                let mut staged_proposition_count = 0u64;
                 let parse_result = stream_quads_with_options(
                     &input,
                     file_index,
@@ -721,6 +735,18 @@ fn parser_stage(
                     |mut quad| {
                         if aborted.load(Ordering::Relaxed) {
                             anyhow::bail!("parse abandoned: another input failed");
+                        }
+                        if let Some(records) = quad.triple_terms.take() {
+                            for record in &records.0 {
+                                spool::encode_record(&mut staged_propositions, record);
+                            }
+                            staged_proposition_count += records.0.len() as u64;
+                            if staged_propositions.len() >= spool::WORKER_FLUSH_BYTES {
+                                proposition_sink
+                                    .append(&staged_propositions, staged_proposition_count)?;
+                                staged_propositions.clear();
+                                staged_proposition_count = 0;
+                            }
                         }
                         if include_graphs {
                             // Preserving the parsed graph with no graph-map rules is by far
@@ -765,6 +791,7 @@ fn parser_stage(
                         let chunk = std::mem::take(&mut staged_quads);
                         assembler.push_many(chunk)?;
                     }
+                    proposition_sink.append(&staged_propositions, staged_proposition_count)?;
                     Ok(stats.original_ntriples_size)
                 });
 
@@ -1338,6 +1365,8 @@ pub fn run_pipeline(
     let graph_assignments_owned = (*graph_assignments).clone();
     let parser_budget = memory_plan.parser_budget_bytes;
     let total_input_count = inputs.len() + hdt_inputs.len();
+    let proposition_sink = Arc::new(PropositionSink::new(temp_dir, "propositions.zst"));
+    let parser_sink = Arc::clone(&proposition_sink);
     let parser_handle = std::thread::spawn(move || {
         parser_stage(
             inputs_owned,
@@ -1349,6 +1378,7 @@ pub fn run_pipeline(
             parser_parallelism_owned,
             batch_tx,
             total_input_count,
+            parser_sink,
         )
     });
 
@@ -1672,6 +1702,14 @@ pub fn run_pipeline(
     // Stage 6: External sort + BitmapTriples construction
     tracing::info!("Stage 6: Sorting global-ID quad memberships in SPO+G order");
 
+    // Parsing is over, so whether the input had RDF 1.2 triple terms is known.
+    // Their index needs the permutation index, which is cheapest to collect
+    // from the SPO stream below rather than rebuild from the finished HDT.
+    let permutation_maps = match permutation_maps {
+        None if proposition_sink.has_records()? => Some(Default::default()),
+        maps => maps,
+    };
+
     // The SPO sort finishes before any derived sort starts, and each match arm
     // drops its drained input buffer before filling the later sorters. It can
     // therefore use the whole stage budget. During a quads build, however, the
@@ -1873,6 +1911,7 @@ pub fn run_pipeline(
         permutation,
         graph_permutation,
         ntriples_size,
+        propositions: proposition_sink.finish()?,
     })
 }
 

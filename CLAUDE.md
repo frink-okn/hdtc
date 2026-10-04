@@ -98,6 +98,7 @@ src/
   io/              - VByte, LogArray, Bitmap, CRC utilities, Control Information
   pipeline/        - 6-stage pipeline (batch vocab, partial vocab, merger, ID remapper)
   quads/           - HDTQ quad support (graph dictionary, membership bitmaps)
+  triple_terms/    - RDF 1.2 triple terms: IRI minting, propositions HDT, `.tt` index
   sort/            - External merge sort
 tests/
   integration_test.rs - End-to-end pipeline tests
@@ -109,6 +110,7 @@ tests/
   data/               - Sample RDF fixtures
 docs/
   graphs-sidecar-format.md - Normative .graphs sidecar format
+  triple-terms-format.md   - Normative RDF 1.2 triple-term IRIs, propositions HDT, .tt index
   sketch-format.md         - Normative .filter / .minhash formats
   keyset-format.md         - Normative .keys format
   text-index-format.md     - Normative .text index convention
@@ -157,6 +159,22 @@ Untagged literals are stemmed as a declared default language (`en` unless
 inconsistent *within* a merged graph — Ubergraph has untagged UBERON labels and
 `@en` GO labels — so the cautious-looking rule would make recall depend on a
 term's source ontology. The assumption is recorded in every manifest.
+
+### RDF 1.2 triple terms
+
+A triple term is stored in `data.hdt` as an IRI under `urn:x-kgf:tt:`
+(`src/triple_terms/iri.rs`): a SHA-256 of its canonical N-Triples 1.2 form when
+ground, or a skeleton hash plus its blank-node labels in clear when not, so that
+a merge's blank-node rename (`input_adapter.rs` `disambiguate`) can rename the
+labels in place and keep the dictionary sorted. The parser records each triple
+term's proposition in a spool; after `data.hdt` and its `.perm` exist,
+`triple_terms::build::finish` deduplicates the records, classifies them as
+asserted or not by sorted joins with the dictionary and the SPO stream (never by
+per-record lookups — those are ~20 syscalls each), builds `data.hdt.props.hdt`
+from the unasserted ones with the ordinary pipeline, and writes `data.hdt.tt`.
+Output paths render triple terms through `DictionaryResolver::enable_triple_terms`,
+which makes `object_term` return `<<( … )>>` text for a triple-term IRI; nothing
+else changes for an HDT without them. Source RDF using the namespace is refused.
 
 ### VoID descriptions
 

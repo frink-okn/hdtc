@@ -1188,6 +1188,7 @@ pub fn search_hdt_streaming(
 
     let (offsets, mut dictionary) = open_hdt(hdt_path, memory_limit)
         .with_context(|| format!("Failed to open HDT file {}", hdt_path.display()))?;
+    dictionary.enable_triple_terms(hdt_path, memory_limit / 4)?;
 
     // A zero-sized page is empty by definition. Stop before resolving terms or
     // selecting an indexed route so `--limit 0` neither emits a row nor

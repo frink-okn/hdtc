@@ -541,15 +541,21 @@ impl StreamingFourWayMerge {
 
     /// Apply blank node prefix if needed. Preserves sort order because the
     /// prefix is inserted after the common `_:` marker.
+    ///
+    /// A triple-term IRI that names a term containing blank nodes carries those
+    /// nodes' labels, and is renamed with them (`triple_terms::iri::prefix_labels`),
+    /// which preserves order among such IRIs for the same reason.
     fn disambiguate(&self, mut term: Vec<u8>) -> Vec<u8> {
-        if let Some(ref prefix) = self.bnode_prefix
-            && term.starts_with(b"_:")
-        {
-            let mut new_term = Vec::with_capacity(2 + prefix.len() + term.len() - 2);
-            new_term.extend_from_slice(b"_:");
-            new_term.extend_from_slice(prefix.as_bytes());
-            new_term.extend_from_slice(&term[2..]);
-            term = new_term;
+        if let Some(ref prefix) = self.bnode_prefix {
+            if term.starts_with(b"_:") {
+                let mut new_term = Vec::with_capacity(2 + prefix.len() + term.len() - 2);
+                new_term.extend_from_slice(b"_:");
+                new_term.extend_from_slice(prefix.as_bytes());
+                new_term.extend_from_slice(&term[2..]);
+                term = new_term;
+            } else if let Some(renamed) = crate::triple_terms::iri::prefix_labels(&term, prefix) {
+                term = renamed;
+            }
         }
         term
     }
