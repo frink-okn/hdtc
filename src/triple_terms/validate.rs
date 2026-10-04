@@ -396,13 +396,16 @@ pub fn validate_triple_terms(hdt_path: &Path, temp_dir: &Path, memory_limit: usi
             );
             continue;
         };
-        ensure!(
-            dictionary
-                .shared
-                .prefix_range(TT_NAMESPACE.as_bytes())?
-                .is_empty(),
-            "a triple-term IRI is a subject"
-        );
+        for (section, role) in [
+            (&mut dictionary.shared, "subject"),
+            (&mut dictionary.subjects, "subject"),
+            (&mut dictionary.predicates, "predicate"),
+        ] {
+            ensure!(
+                section.prefix_range(TT_NAMESPACE.as_bytes())?.is_empty(),
+                "a triple-term IRI is a {role}"
+            );
+        }
         let local = dictionary.objects.prefix_range(TT_NAMESPACE.as_bytes())?;
         let offset = dictionary.shared.string_count;
         let expected = if local.is_empty() {

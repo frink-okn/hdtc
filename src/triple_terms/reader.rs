@@ -6,9 +6,8 @@
 //! `kgf-store`) use [`TripleTermIndex::sections`] and the format instead.
 
 use super::format::{self, Header, Section, component, kind, section_type};
-use super::iri::TT_NAMESPACE;
 use crate::hdt::reader::{DictionaryResolver, open_hdt, write_nt_object, write_nt_subject};
-use crate::permutation::format::{SUBBLOCK_BITS, SUPERBLOCK_BITS};
+use crate::permutation::format::{SUBBLOCK_BITS, SUPERBLOCK_BITS, id_width};
 use crate::permutation::scan_hdt;
 use anyhow::{Context, Result, ensure};
 use std::fs::File;
@@ -169,6 +168,7 @@ impl TripleTermIndex {
             path.display(),
             hdt_path.display()
         );
+        let (mut subjects, mut predicates) = (data.subjects, data.predicates);
         if header.has_propositions() {
             let props_path = format::propositions_path(hdt_path);
             let props = scan_hdt(&props_path)
@@ -181,7 +181,23 @@ impl TripleTermIndex {
                 path.display(),
                 props_path.display()
             );
+            subjects = subjects.max(props.subjects);
+            predicates = predicates.max(props.predicates);
         }
+        // §7's run widths, which follow from the bound HDTs' identifier spaces.
+        let width_of = |k: u32| {
+            sections
+                .iter()
+                .find(|s| s.section_type == section_type(component::DATA_RUN, k))
+                .map(|s| s.bits_per_entry)
+        };
+        ensure!(
+            width_of(kind::TARGET_SUBJECT) == Some(id_width(subjects) + 1)
+                && width_of(kind::TARGET_PREDICATE) == Some(id_width(predicates)),
+            "{} run arrays have the wrong widths for {}",
+            path.display(),
+            hdt_path.display()
+        );
         let index = Self {
             path,
             file,
@@ -342,10 +358,8 @@ impl TripleTermDecoder {
     ) -> Result<Option<Self>> {
         let index_path = format::canonical_path(hdt_path);
         if !index_path.exists() {
-            let shared = data.shared.prefix_range(TT_NAMESPACE.as_bytes())?;
-            let objects = data.objects.prefix_range(TT_NAMESPACE.as_bytes())?;
             ensure!(
-                shared.is_empty() && objects.is_empty(),
+                !super::merge::has_triple_term_iris(data)?,
                 "{} contains RDF 1.2 triple terms but its triple-term index {} is missing",
                 hdt_path.display(),
                 index_path.display()
@@ -532,7 +546,7 @@ impl LayerCursor {
             self.word &= self.word - 1;
             self.position = position + 1;
             if self.word == 0 {
-                self.position = (self.position + 63) / 64 * 64;
+                self.position = self.position.div_ceil(64) * 64;
             }
             return Ok(Some((position, self.reverse.next()?)));
         }

@@ -150,6 +150,21 @@ impl RuleRecognizer for NQuadsRecognizer {
                     }
                     #[cfg(feature = "rdf-12")]
                     N3Token::Punctuation("<<(") => {
+                        // hdtc change 7: bound the nesting before building it.
+                        let open = self
+                            .stack
+                            .iter()
+                            .filter(|state| matches!(state, NQuadsState::AfterQuotedTriple))
+                            .count();
+                        if open >= crate::MAX_TRIPLE_TERM_NESTING {
+                            return self.error(
+                                context,
+                                results,
+                                errors,
+                                TokenOrLineJump::Token(token),
+                                "triple term nested more than 64 levels deep",
+                            );
+                        }
                         self.stack.push(NQuadsState::AfterQuotedTriple);
                         self.stack.push(NQuadsState::ExpectSubject);
                         self

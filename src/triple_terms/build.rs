@@ -375,8 +375,6 @@ pub(crate) struct FinishContext<'a> {
     pub temp_dir: &'a Path,
     pub memory_budget: usize,
     pub dataset_uri: &'a str,
-    /// `--max-term-bytes`, which the propositions HDT's build honours too.
-    pub max_term_bytes: usize,
 }
 
 /// The staged triple-term artifacts.
@@ -741,7 +739,11 @@ fn build_propositions_hdt(
     };
     let parallelism = ParserParallelismConfig {
         trust_triple_term_iris: true,
-        max_term_bytes: ctx.max_term_bytes,
+        // Every term here was accepted once already — parsed under
+        // --max-term-bytes, or read from an HDT input, which no bound ever
+        // applied to — and writing it as N-Triples can lengthen it. Bounding
+        // it again could only refuse data the build has already taken.
+        max_term_bytes: usize::MAX,
         ..ParserParallelismConfig::default()
     };
     // The pipeline names its scratch files by role, not uniquely, so a second

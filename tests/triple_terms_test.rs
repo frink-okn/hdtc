@@ -465,6 +465,23 @@ fn a_propositions_hdt_is_never_an_input_of_its_own() {
     ]);
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("propositions HDT"));
+    // Found in a directory without its owner: refused, not merged as data.
+    let orphans = dir.path().join("orphans");
+    std::fs::create_dir(&orphans).unwrap();
+    std::fs::copy(
+        tt_path(&built, ".props.hdt"),
+        orphans.join("a.hdt.props.hdt"),
+    )
+    .unwrap();
+    let output = hdtc(&[
+        "create",
+        "-q",
+        orphans.to_str().unwrap(),
+        "-o",
+        dir.path().join("y.hdt").to_str().unwrap(),
+    ]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("without the HDT it belongs to"));
 }
 
 #[test]
@@ -546,6 +563,52 @@ fn nesting_beyond_the_limit_is_skipped_not_crashed_on() {
         dump(&hdt),
         vec![format!("<http://ex/a> <http://ex/b> {term} .")]
     );
+
+    // The statement after a rejected one is kept: the depth count does not
+    // leak across the parser's recovery, in either syntax.
+    let mut deep = "<http://ex/o>".to_owned();
+    for _ in 0..65 {
+        deep = format!("<<( <http://ex/s> <http://ex/p> {deep} )>>");
+    }
+    for (name, prefix) in [
+        ("leak.nt", ""),
+        ("leak.ttl", "@prefix ex: <http://ex/> .\n"),
+    ] {
+        let input = dir.path().join(name);
+        common::write_file(
+            &input,
+            format!(
+                "{prefix}<http://ex/a> <http://ex/b> {deep} .\n\
+                 <http://ex/c> <http://ex/d> <<( <http://ex/s> <http://ex/p> <http://ex/o> )>> .\n"
+            )
+            .as_bytes(),
+        );
+        let hdt = create(dir.path(), &[&input], &format!("{name}.hdt"));
+        assert_eq!(
+            dump(&hdt),
+            vec![
+                "<http://ex/c> <http://ex/d> <<( <http://ex/s> <http://ex/p> <http://ex/o> )>> ."
+                    .to_owned()
+            ],
+            "{name}"
+        );
+    }
+
+    // Reified triples nest through their reifiers, not through triple terms,
+    // so they are not bounded by the limit: 65 levels are kept whole.
+    let mut reified = "<http://ex/o>".to_owned();
+    for _ in 0..65 {
+        reified = format!("<< <http://ex/s> <http://ex/p> {reified} >>");
+    }
+    let input = dir.path().join("reified.ttl");
+    common::write_file(
+        &input,
+        format!("{reified} <http://ex/q> <http://ex/z> .\n").as_bytes(),
+    );
+    let hdt = create(dir.path(), &[&input], "reified.hdt");
+    validate(&hdt, dir.path());
+    // One rdf:reifies triple per level, and the asserted one.
+    assert_eq!(dump(&hdt).len(), 66);
 }
 
 #[test]

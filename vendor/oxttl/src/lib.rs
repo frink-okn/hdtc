@@ -29,3 +29,10 @@ pub(crate) const MIN_BUFFER_SIZE: usize = 4096;
 pub(crate) const DEFAULT_MAX_BUFFER_SIZE: usize = 4096 * 4096;
 #[expect(clippy::decimal_literal_representation)]
 pub(crate) const MIN_PARALLEL_CHUNK_SIZE: usize = 16384;
+
+/// Deepest RDF 1.2 triple-term nesting the parsers accept (hdtc change 7).
+/// Nested terms are boxed, and their `Clone` and `Drop` recurse, so unbounded
+/// nesting overflows the stack long before any term-size bound applies. The
+/// parsers count open triple terms on their own state stacks, which error
+/// recovery clears, so a malformed statement cannot leak depth into the next.
+pub const MAX_TRIPLE_TERM_NESTING: usize = 64;

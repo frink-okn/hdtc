@@ -137,6 +137,15 @@ pub fn discover_inputs(paths: &[PathBuf]) -> Result<DiscoveredInputs> {
                 // input of its own: merged as one, its unasserted claims
                 // would become asserted triples.
                 if let Some(owner) = propositions_owner(entry.path()) {
+                    // Merged with its owner, which is in this walk too; alone,
+                    // it is unasserted claims with nothing to say so.
+                    if !owner.exists() {
+                        bail!(
+                            "{} is a propositions HDT without the HDT it belongs to ({})",
+                            entry.path().display(),
+                            owner.display()
+                        );
+                    }
                     tracing::debug!(
                         "Skipping {}: the propositions HDT of {}",
                         entry.path().display(),
@@ -175,15 +184,16 @@ pub fn discover_inputs(paths: &[PathBuf]) -> Result<DiscoveredInputs> {
     })
 }
 
-/// The HDT that `path` is the propositions HDT of (`X.hdt.props.hdt` beside
-/// `X.hdt` and its triple-term index `X.hdt.tt`), if it is one.
+/// The HDT that `path` is the propositions HDT of, if its name says it is one
+/// (`X.hdt.props.hdt` belongs to `X.hdt`). Decided by name alone: the
+/// triple-term index beside the owner is droppable, and an interrupted build
+/// can publish the propositions HDT before it, so neither may be required.
 fn propositions_owner(path: &Path) -> Option<PathBuf> {
     let name = path.file_name()?.to_str()?;
     let owner_name = name.strip_suffix(".props.hdt")?;
-    let owner = path.with_file_name(owner_name);
-    let mut index = owner.clone().into_os_string();
-    index.push(".tt");
-    (owner.exists() && Path::new(&index).exists()).then_some(owner)
+    owner_name
+        .ends_with(".hdt")
+        .then(|| path.with_file_name(owner_name))
 }
 
 /// Check if a file has an `.hdt` extension.

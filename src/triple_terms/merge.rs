@@ -21,7 +21,7 @@ use super::reader::{LayerCursor, Order, Source, TripleTermIndex};
 use super::spool::{PropositionSpool, SpoolWriter};
 use crate::hdt::reader::{BitmapTriplesScanner, DictionaryResolver, open_hdt};
 use crate::permutation::scan_hdt;
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result};
 use std::path::Path;
 
 /// Rename one dictionary string as the merge renames its input: blank nodes
@@ -51,29 +51,21 @@ pub(crate) fn has_triple_term_iris(dictionary: &mut DictionaryResolver) -> Resul
         || !dictionary.objects.prefix_range(prefix)?.is_empty())
 }
 
-/// Whether an HDT input to a merge carries triple terms. An input whose
-/// dictionary holds triple-term IRIs without the index that defines them is
-/// refused: its triple terms could only be merged as opaque IRIs.
-pub(crate) fn input_has_triple_terms(hdt: &Path) -> Result<bool> {
-    if format::canonical_path(hdt).exists() {
-        return Ok(true);
-    }
-    let (_, mut dictionary) = open_hdt(hdt, 64 << 20)?;
-    ensure!(
-        !has_triple_term_iris(&mut dictionary)?,
-        "HDT input {} contains RDF 1.2 triple terms but its triple-term index {} is missing",
-        hdt.display(),
-        format::canonical_path(hdt).display()
-    );
-    Ok(false)
+/// Whether an HDT input to a merge carries triple terms: whether it has the
+/// index that defines them. An input whose dictionary holds triple-term IRIs
+/// without one is refused as its dictionary is merged
+/// (`hdt::input_adapter`), where every term passes anyway.
+pub(crate) fn input_has_triple_terms(hdt: &Path) -> bool {
+    format::canonical_path(hdt).exists()
 }
 
-/// Write the records of the marked triples of one HDT's SPO layer.
+/// Write the records of the marked triples of one HDT's SPO layer: of
+/// `data.hdt` when `props` is `None`, else of the propositions HDT at `hdt`.
 fn layer_records(
     index: &TripleTermIndex,
     source: Source,
     hdt: &Path,
-    dictionary: &mut DictionaryResolver,
+    mut props: Option<&mut DictionaryResolver>,
     data: &mut DictionaryResolver,
     prefix: Option<&str>,
     out: &mut SpoolWriter,
@@ -93,6 +85,10 @@ fn layer_records(
         next += 1;
         data.object_term_raw(data_term, &mut buf)?;
         let iri = rename(buf.clone(), prefix)?;
+        let dictionary: &mut DictionaryResolver = match props.as_deref_mut() {
+            Some(props) => props,
+            None => data,
+        };
         dictionary.subject_term_raw(triple.0, &mut buf)?;
         let subject = rename(buf.clone(), prefix)?;
         dictionary.predicate_term(triple.1, &mut buf)?;
@@ -117,7 +113,7 @@ pub(crate) fn rederive(
     spool_path: std::path::PathBuf,
     memory_limit: usize,
 ) -> Result<Option<PropositionSpool>> {
-    if !input_has_triple_terms(hdt)? {
+    if !input_has_triple_terms(hdt) {
         return Ok(None);
     }
     let started = std::time::Instant::now();
@@ -132,25 +128,14 @@ pub(crate) fn rederive(
     let mut out = SpoolWriter::create(spool_path)?;
 
     // Asserted propositions named in data.hdt: its marked triples.
-    {
-        let mut scratch = open_hdt(hdt, memory_limit / 8)?.1;
-        layer_records(
-            &index,
-            Source::Data,
-            hdt,
-            &mut scratch,
-            &mut data,
-            prefix,
-            &mut out,
-        )?;
-    }
+    layer_records(&index, Source::Data, hdt, None, &mut data, prefix, &mut out)?;
     if let Some(props) = props.as_mut() {
         // Unasserted propositions named in data.hdt.
         layer_records(
             &index,
             Source::Propositions,
             &props_path,
-            props,
+            Some(props),
             &mut data,
             prefix,
             &mut out,

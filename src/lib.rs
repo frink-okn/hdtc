@@ -67,16 +67,39 @@ fn make_default_temp_dir() -> Result<std::path::PathBuf> {
     Ok(dir)
 }
 
-/// An existing graph sidecar moved out of its canonical name while a new HDT
+/// An existing artifact moved out of its canonical name while a new HDT
 /// is published. Keeping the backup in a sibling directory makes both moves
 /// atomic on supported filesystems.
 struct RetiredArtifact {
     original_path: PathBuf,
     backup_path: PathBuf,
-    _quarantine: tempfile::TempDir,
+    quarantine: Option<tempfile::TempDir>,
+    /// Keep the backup on drop instead of deleting it: set when it could not
+    /// be restored, or when what replaced it could not be published.
+    preserved: std::cell::Cell<bool>,
+}
+
+impl Drop for RetiredArtifact {
+    fn drop(&mut self) {
+        if self.preserved.get()
+            && let Some(quarantine) = self.quarantine.take()
+        {
+            let _ = quarantine.keep();
+        }
+    }
 }
 
 impl RetiredArtifact {
+    /// Keep the backup past this run, and say where it is.
+    fn preserve(&self) -> String {
+        self.preserved.set(true);
+        format!(
+            "the previous {} is kept at {}",
+            self.original_path.display(),
+            self.backup_path.display()
+        )
+    }
+
     fn restore(&self) -> Result<()> {
         match std::fs::symlink_metadata(&self.original_path) {
             Ok(_) => anyhow::bail!(
@@ -146,7 +169,8 @@ fn retire_existing_artifact(
     Ok(Some(RetiredArtifact {
         original_path: artifact_path.to_path_buf(),
         backup_path,
-        _quarantine: quarantine,
+        quarantine: Some(quarantine),
+        preserved: std::cell::Cell::new(false),
     }))
 }
 
@@ -157,8 +181,12 @@ fn roll_back(error: anyhow::Error, retired: &[&Option<RetiredArtifact>]) -> anyh
         .iter()
         .rev()
         .filter_map(|artifact| artifact.as_ref())
-        .filter_map(|artifact| artifact.restore().err())
-        .map(|restore_error| format!("{restore_error:#}"))
+        .filter_map(|artifact| {
+            artifact
+                .restore()
+                .err()
+                .map(|restore_error| format!("{restore_error:#} ({})", artifact.preserve()))
+        })
         .collect();
     if failures.is_empty() {
         error
@@ -168,6 +196,36 @@ fn roll_back(error: anyhow::Error, retired: &[&Option<RetiredArtifact>]) -> anyh
             failures.join("; ")
         )
     }
+}
+
+/// Publish a staged artifact after the HDT has been replaced. On failure the
+/// staged file and every retired artifact are kept rather than deleted — the
+/// HDT is already new, so restoring would be wrong, and either may hold the
+/// only copy of data — and the error says where they are.
+fn publish_staged(
+    staged: tempfile::TempPath,
+    destination: &Path,
+    label: &str,
+    retired: &[&Option<RetiredArtifact>],
+) -> Result<()> {
+    staged.persist(destination).map_err(|error| {
+        let kept = match error.path.keep() {
+            Ok(path) => format!("the new {label} is kept at {}", path.display()),
+            Err(keep) => format!("the new {label} could not be kept: {}", keep.error),
+        };
+        let previous: Vec<String> = retired
+            .iter()
+            .filter_map(|artifact| artifact.as_ref())
+            .map(RetiredArtifact::preserve)
+            .collect();
+        anyhow::anyhow!(
+            "Failed to publish {label} {}: {}; {kept}{}{}",
+            destination.display(),
+            error.error,
+            if previous.is_empty() { "" } else { "; " },
+            previous.join("; ")
+        )
+    })
 }
 
 /// Run the `hdtc` command-line interface.
@@ -324,7 +382,7 @@ fn create_hdt(args: cli::CreateArgs, benchmark: bool) -> Result<()> {
     let hdt_inputs_with_triple_terms = hdt_inputs
         .iter()
         .map(|path| triple_terms::merge::input_has_triple_terms(path))
-        .collect::<Result<Vec<bool>>>()?;
+        .collect::<Vec<bool>>();
     let merges_triple_terms = hdt_inputs_with_triple_terms.contains(&true);
 
     // Run the pipelined HDT construction
@@ -530,7 +588,6 @@ fn create_hdt(args: cli::CreateArgs, benchmark: bool) -> Result<()> {
                 temp_dir: &temp_dir,
                 memory_budget,
                 dataset_uri: &dataset_uri,
-                max_term_bytes: args.max_term_bytes.as_bytes(),
             };
             let built = triple_terms::build::finish(&context, spools)?;
             tracing::info!(
@@ -629,15 +686,21 @@ fn create_hdt(args: cli::CreateArgs, benchmark: bool) -> Result<()> {
         );
     }
 
+    let all_retired = [
+        &retired_tt,
+        &retired_props_perm,
+        &retired_props,
+        &retired_graph_index,
+        &retired_sidecar,
+        &retired_perm,
+    ];
     if let Some(sidecar_temp) = sidecar_temp {
-        sidecar_temp
-            .persist(&canonical_graphs_path)
-            .with_context(|| {
-                format!(
-                    "Failed to publish graph sidecar {}",
-                    canonical_graphs_path.display()
-                )
-            })?;
+        publish_staged(
+            sidecar_temp,
+            &canonical_graphs_path,
+            "graph sidecar",
+            &all_retired,
+        )?;
         tracing::info!("Graph sidecar written: {}", canonical_graphs_path.display());
     }
 
@@ -648,26 +711,24 @@ fn create_hdt(args: cli::CreateArgs, benchmark: bool) -> Result<()> {
         );
     }
     if let Some(perm_temp) = perm_temp {
-        perm_temp.persist(&canonical_perm_path).with_context(|| {
-            format!(
-                "Failed to publish permutation index {}",
-                canonical_perm_path.display()
-            )
-        })?;
+        publish_staged(
+            perm_temp,
+            &canonical_perm_path,
+            "permutation index",
+            &all_retired,
+        )?;
         tracing::info!(
             "Permutation index written: {}",
             canonical_perm_path.display()
         );
     }
     if let Some(graph_index_temp) = graph_index_temp {
-        graph_index_temp
-            .persist(&canonical_graph_index_path)
-            .with_context(|| {
-                format!(
-                    "Failed to publish graph index {}",
-                    canonical_graph_index_path.display()
-                )
-            })?;
+        publish_staged(
+            graph_index_temp,
+            &canonical_graph_index_path,
+            "graph index",
+            &all_retired,
+        )?;
         tracing::info!(
             "Graph index written: {}",
             canonical_graph_index_path.display()
@@ -678,28 +739,29 @@ fn create_hdt(args: cli::CreateArgs, benchmark: bool) -> Result<()> {
         Some(built) => {
             // Data before index: the triple-term index binds to both HDTs.
             if let Some((props_hdt, props_perm)) = built.propositions {
-                props_hdt.persist(&canonical_props_path).with_context(|| {
-                    format!(
-                        "Failed to publish propositions HDT {}",
-                        canonical_props_path.display()
-                    )
-                })?;
-                props_perm
-                    .persist(&canonical_props_perm_path)
-                    .with_context(|| {
-                        format!("Failed to publish {}", canonical_props_perm_path.display())
-                    })?;
+                publish_staged(
+                    props_hdt,
+                    &canonical_props_path,
+                    "propositions HDT",
+                    &all_retired,
+                )?;
+                publish_staged(
+                    props_perm,
+                    &canonical_props_perm_path,
+                    "propositions permutation index",
+                    &all_retired,
+                )?;
                 tracing::info!(
                     "Propositions HDT written: {}",
                     canonical_props_path.display()
                 );
             }
-            built.index.persist(&canonical_tt_path).with_context(|| {
-                format!(
-                    "Failed to publish triple-term index {}",
-                    canonical_tt_path.display()
-                )
-            })?;
+            publish_staged(
+                built.index,
+                &canonical_tt_path,
+                "triple-term index",
+                &all_retired,
+            )?;
             tracing::info!("Triple-term index written: {}", canonical_tt_path.display());
         }
         None if retired_triple_terms => {

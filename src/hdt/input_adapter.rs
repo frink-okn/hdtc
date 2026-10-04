@@ -211,6 +211,8 @@ impl HdtInputAdapter {
 
         Box::new(move || {
             let bnode_prefix = file_index.map(|idx| format!("f{idx}_"));
+            let unindexed =
+                (!crate::triple_terms::merge::input_has_triple_terms(&path)).then(|| path.clone());
 
             let base = StreamingFourWayMerge::open(
                 &path,
@@ -222,6 +224,7 @@ impl HdtInputAdapter {
                 subjects_count,
                 batch_id,
                 bnode_prefix,
+                unindexed,
             )?;
             if let Some(graph_vocabulary) = graph_vocabulary {
                 let graphs =
@@ -424,6 +427,9 @@ struct StreamingFourWayMerge {
     subjects_count: u64,
     batch_id: usize,
     bnode_prefix: Option<String>,
+    /// The input, when it has no triple-term index: a triple-term IRI in its
+    /// dictionary would then name nothing, and is refused.
+    unindexed: Option<PathBuf>,
     // Per-section counters (0-based index of next term to yield)
     shared_index: u64,
     subjects_index: u64,
@@ -443,6 +449,7 @@ impl StreamingFourWayMerge {
         subjects_count: u64,
         batch_id: usize,
         bnode_prefix: Option<String>,
+        unindexed: Option<PathBuf>,
     ) -> Result<Self> {
         let open_section =
             |offset: u64, name: &str| -> Result<PfcSectionIterator<BufReader<File>>> {
@@ -496,6 +503,7 @@ impl StreamingFourWayMerge {
             subjects_count,
             batch_id,
             bnode_prefix,
+            unindexed,
             shared_index: 0,
             subjects_index: 0,
             objects_index: 0,
@@ -605,6 +613,15 @@ impl Iterator for StreamingFourWayMerge {
         let entry = self.heap.pop()?;
         let section = entry.section;
         let term = entry.term;
+        if let Some(path) = &self.unindexed
+            && term.starts_with(crate::triple_terms::iri::TT_NAMESPACE.as_bytes())
+        {
+            return Some(Err(anyhow::anyhow!(
+                "HDT input {} contains RDF 1.2 triple terms but its triple-term index {} is missing",
+                path.display(),
+                crate::triple_terms::format::canonical_path(path).display()
+            )));
+        }
 
         let index = self.take_index(section);
         let disambiguated = self.disambiguate(term.clone());

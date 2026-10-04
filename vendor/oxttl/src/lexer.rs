@@ -52,14 +52,7 @@ pub struct N3LexerOptions {
 pub struct N3Lexer {
     mode: N3LexerMode,
     lenient: bool,
-    /// Open `<<(` / `<<` in the current statement (hdtc change 7).
-    nesting: usize,
 }
-
-/// Deepest triple-term nesting the lexer lets through (hdtc change 7). The
-/// parsers build nested terms whose `Clone` and `Drop` recurse, so unbounded
-/// nesting overflows the stack long before any term-size bound applies.
-pub const MAX_TRIPLE_TERM_NESTING: usize = 64;
 
 // TODO: there are a lot of 'None' (missing data) returned even if the stream is ending!!!
 // TODO: simplify by not giving is_end and fail with an "unexpected eof" is none is returned when is_end=true?
@@ -77,24 +70,11 @@ impl TokenRecognizer for N3Lexer {
         match *data.first()? {
             b'<' => match *data.get(1)? {
                 b'<' => {
-                    let length = if *data.get(2)? == b'(' { 3 } else { 2 };
-                    if self.nesting >= MAX_TRIPLE_TERM_NESTING {
-                        return Some((
-                            length,
-                            Err((
-                                0..length,
-                                format!(
-                                    "triple term nested more than {MAX_TRIPLE_TERM_NESTING} levels deep"
-                                ),
-                            )
-                                .into()),
-                        ));
+                    if *data.get(2)? == b'(' {
+                        Some((3, Ok(N3Token::Punctuation("<<("))))
+                    } else {
+                        Some((2, Ok(N3Token::Punctuation("<<"))))
                     }
-                    self.nesting += 1;
-                    Some((
-                        length,
-                        Ok(N3Token::Punctuation(if length == 3 { "<<(" } else { "<<" })),
-                    ))
                 }
                 b'=' if self.mode == N3LexerMode::N3 => {
                     if let Some((consumed, result)) = self.recognize_iri(data, options) {
@@ -126,7 +106,6 @@ impl TokenRecognizer for N3Lexer {
             },
             b'>' => {
                 if *data.get(1)? == b'>' {
-                    self.nesting = self.nesting.saturating_sub(1);
                     Some((2, Ok(N3Token::Punctuation(">>"))))
                 } else {
                     Some((1, Ok(N3Token::Punctuation(">"))))
@@ -159,15 +138,8 @@ impl TokenRecognizer for N3Lexer {
             b'@' => self.recognize_lang_tag(data),
             b'.' => match data.get(1) {
                 Some(b'0'..=b'9') => Self::recognize_number(data, is_ending),
-                Some(_) => {
-                    // A statement ends: so does any nesting a syntax error left open.
-                    self.nesting = 0;
-                    Some((1, Ok(N3Token::Punctuation("."))))
-                }
-                None => is_ending.then(|| {
-                    self.nesting = 0;
-                    (1, Ok(N3Token::Punctuation(".")))
-                }),
+                Some(_) => Some((1, Ok(N3Token::Punctuation(".")))),
+                None => is_ending.then_some((1, Ok(N3Token::Punctuation(".")))),
             },
             b'^' => {
                 if *data.get(1)? == b'^' {
@@ -179,7 +151,6 @@ impl TokenRecognizer for N3Lexer {
             b'(' => Some((1, Ok(N3Token::Punctuation("(")))),
             b')' => {
                 if *data.get(1)? == b'>' && *data.get(2)? == b'>' {
-                    self.nesting = self.nesting.saturating_sub(1);
                     Some((3, Ok(N3Token::Punctuation(")>>"))))
                 } else {
                     Some((1, Ok(N3Token::Punctuation(")"))))
@@ -222,11 +193,7 @@ impl TokenRecognizer for N3Lexer {
 
 impl N3Lexer {
     pub fn new(mode: N3LexerMode, lenient: bool) -> Self {
-        Self {
-            mode,
-            lenient,
-            nesting: 0,
-        }
+        Self { mode, lenient }
     }
 
     fn recognize_iri(

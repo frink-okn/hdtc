@@ -182,6 +182,11 @@ pub fn parse_header(bytes: &[u8; 256]) -> Result<Header> {
         "unsupported triple-term index major version {}",
         get_u16(bytes, 8)
     );
+    ensure!(
+        get_u16(bytes, 10) == MINOR_VERSION,
+        "unsupported triple-term index minor version {}",
+        get_u16(bytes, 10)
+    );
     ensure!(get_u32(bytes, 12) == HEADER_SIZE as u32, "bad header size");
     ensure!(
         crc32c(&bytes[..252]) == get_u32(bytes, 252),
@@ -373,6 +378,10 @@ fn check_section_set(header: &Header, sections: &[Section]) -> Result<()> {
                 .all(|s| !PROPS_ORDERS.contains(&(s.section_type >> 8))),
             "propositions layers without HAS_PROPOSITIONS"
         );
+        ensure!(
+            header.props == SourceFacts::default(),
+            "propositions HDT fields set without HAS_PROPOSITIONS"
+        );
     }
     for component in components {
         if is_run(component) {
@@ -393,6 +402,21 @@ fn check_section_set(header: &Header, sections: &[Section]) -> Result<()> {
                     section.entry_count == run_length,
                     "run arrays do not match the run"
                 );
+                // §7: both runs share widths; the object width is fixed by
+                // the header, the others by the HDTs (checked on open).
+                let data_run = find(section_type(component::DATA_RUN, k))
+                    .context("missing data run section")?;
+                ensure!(
+                    section.bits_per_entry == data_run.bits_per_entry,
+                    "the two runs' arrays have different widths"
+                );
+                if k == kind::TARGET_OBJECT {
+                    ensure!(
+                        section.bits_per_entry
+                            == id_width(header.data.objects.max(header.props.objects)),
+                        "run object array has the wrong width"
+                    );
+                }
             }
             continue;
         }
