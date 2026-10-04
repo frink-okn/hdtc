@@ -112,6 +112,20 @@ fn check_payloads(path: &Path, sections: &[Section]) -> Result<()> {
             "section {:#06x} fails its checksum",
             section.section_type
         );
+        // Every payload is bits — a bitmap, or packed entries — and the bits
+        // past its last entry in its last byte are zero
+        // (permutation-index-format.md §2), so equal contents are equal bytes.
+        let used = section.entry_count * u64::from(section.bits_per_entry);
+        let remainder = (used % 8) as u8;
+        if remainder != 0 {
+            let mut last = [0u8; 1];
+            file.read_exact_at(&mut last, section.offset + section.length - 1)?;
+            ensure!(
+                last[0] >> remainder == 0,
+                "section {:#06x} has nonzero unused high bits",
+                section.section_type
+            );
+        }
     }
     Ok(())
 }
@@ -173,7 +187,7 @@ fn check_layer(
         "{source:?} {order:?} layer marks {population} triples, expected {expected}"
     );
     let perm = crate::permutation::canonical_path(hdt);
-    let mut marks = LayerCursor::new(index, source, order, 0..layer.len())?;
+    let mut marks = LayerCursor::from_layer(index.path(), &layer, 0..layer.len())?;
     let mut next = marks.next()?;
     let mut rank = 0u64;
     for (position, triple) in ordered_triples(hdt, &perm, order)?.enumerate() {

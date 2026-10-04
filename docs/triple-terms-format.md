@@ -302,7 +302,8 @@ Requirements:
 ## 8. Layers
 
 A layer covers one HDT's triples in one order: SPO as stored in the HDT, POS and
-OPS as stored in its permutation index. It has one bit per triple position, and
+OPS as stored in its permutation index. It has, logically, one bit per triple
+position — §8.1 says how it is stored — and
 **bit `z` is set iff the triple at position `z` is a proposition whose
 triple-term IRI is an object in `data.hdt`'s dictionary.**
 

@@ -1197,3 +1197,43 @@ fn sparse_layers_answer_every_inner_pattern() {
         }
     }
 }
+
+/// Bits past a section's last entry are zero, so equal contents are equal
+/// bytes: one set there, its checksums made right, fails validation.
+#[test]
+fn a_set_unused_bit_fails_validation() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.ttl");
+    common::write_file(&input, TURTLE.as_bytes());
+    let hdt = create(dir.path(), &[&input], "o.hdt");
+    validate(&hdt, dir.path());
+    let index = tt_path(&hdt, ".tt");
+    let (header, sections) = hdtc::format::read_triple_term_directory(&index).unwrap();
+    let (at, section) = sections
+        .iter()
+        .enumerate()
+        .find(|(_, s)| s.length > 0 && (s.entry_count * u64::from(s.bits_per_entry)) % 8 != 0)
+        .expect("a section with unused bits");
+    let crc = |bytes: &[u8]| crc::Crc::<u32>::new(&crc::CRC_32_ISCSI).checksum(bytes);
+    let mut bytes = std::fs::read(&index).unwrap();
+    let (offset, length) = (section.offset as usize, section.length as usize);
+    bytes[offset + length - 1] |= 0x80;
+    let payload_crc = crc(&bytes[offset..offset + length]);
+    let directory = header.directory_offset as usize;
+    let entry = directory + at * 64;
+    bytes[entry + 36..entry + 40].copy_from_slice(&payload_crc.to_le_bytes());
+    let entries = sections.len() * 64;
+    let directory_crc = crc(&bytes[directory..directory + entries]);
+    bytes[directory + entries..directory + entries + 4]
+        .copy_from_slice(&directory_crc.to_le_bytes());
+    std::fs::write(&index, bytes).unwrap();
+    let output = hdtc(&[
+        "validate",
+        hdt.to_str().unwrap(),
+        "--temp-dir",
+        dir.path().join("v").to_str().unwrap(),
+    ]);
+    assert!(!output.status.success(), "a set unused bit was accepted");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("unused high bits"), "{stderr}");
+}

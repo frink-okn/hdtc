@@ -245,15 +245,26 @@ impl PermutationIndex {
 type Groups = (u32, u64, u64, u64, u64, u64);
 
 /// A bitmap with its rank directory held in memory, for many selects. The
-/// directory is about 0.6% of the bitmap, so holding it costs a few megabytes
+/// directory is about 5% of the bitmap's size, so holding it costs a few megabytes
 /// per billion positions, and turns each select into one read of the final
 /// 512-bit block instead of a binary search over reads.
-#[derive(Debug)]
 pub(crate) struct CachedBitmap {
     bits_offset: u64,
     length: u64,
     superrank: Vec<u64>,
     subrank: Vec<u16>,
+}
+
+/// The shape, not the samples: a layer's directory can run to megabytes.
+impl std::fmt::Debug for CachedBitmap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CachedBitmap")
+            .field("bits_offset", &self.bits_offset)
+            .field("length", &self.length)
+            .field("superrank_samples", &self.superrank.len())
+            .field("subrank_samples", &self.subrank.len())
+            .finish()
+    }
 }
 
 impl CachedBitmap {

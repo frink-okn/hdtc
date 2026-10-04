@@ -274,7 +274,7 @@ pub(crate) fn search_inner_pattern(
         let layer = index.layer(source.source, order)?;
         inner_matches +=
             layer.rank1(index.file(), range.end)? - layer.rank1(index.file(), range.start)?;
-        planned.push((source, order, range, probe));
+        planned.push((source, layer, range, probe));
     }
 
     // Outer first, when the subject's group is the smaller side.
@@ -313,8 +313,9 @@ pub(crate) fn search_inner_pattern(
 
     // Inner first.
     let mut groups = ObjectGroups::open(&data_perm)?;
-    'sources: for (source, order, range, probe) in planned {
-        let mut cursor = LayerCursor::new(&index, source.source, order, range)?;
+    'sources: for (source, layer, range, probe) in planned {
+        // The layer planning opened: a sparse one holds its directory, read once.
+        let mut cursor = LayerCursor::from_layer(index.path(), &layer, range)?;
         while let Some((position, term)) = cursor.next()? {
             if let Some(object) = probe
                 && source.spo.object_at(position)? != object

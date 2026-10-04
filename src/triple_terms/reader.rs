@@ -94,8 +94,8 @@ fn read_packed(file: &File, section: &Section, index: u64) -> Result<u64> {
 ///
 /// Stored dense or sparse, as its counts choose (§8.1); the queries are the
 /// same either way. A sparse layer holds its high bits' rank directory in
-/// memory — about 0.6% of those bits — because each of its ranks is two
-/// selects there.
+/// memory — about 5% of the high bits' size, 1.8 MB for ROBOKOP's — because
+/// each of its ranks is two selects there.
 #[derive(Debug, Clone)]
 pub struct Layer {
     /// Positions covered: the HDT's triples.
@@ -139,10 +139,7 @@ impl Layer {
                     high.offset,
                     high.entry_count,
                     read_samples(file, &superrank, 8)?,
-                    read_samples(file, &subrank, 2)?
-                        .into_iter()
-                        .map(|v| v as u16)
-                        .collect(),
+                    read_subrank(file, &subrank)?,
                 );
                 let sparse = SparseLayer {
                     low_bits: low.bits_per_entry,
@@ -202,8 +199,11 @@ impl Layer {
         Ok(low)
     }
 
-    /// The position of the `rank`-th mark.
-    pub fn select1(&self, file: &File, rank: u64) -> Result<u64> {
+    /// The position of the `rank`-th mark. Sparse, through the directory
+    /// held in memory; dense, by loading the layer's directory for this one
+    /// call — fine for a test or a single lookup, not for a loop, where a
+    /// [`LayerCursor`] in select mode is the tool.
+    pub(crate) fn select1(&self, file: &File, rank: u64) -> Result<u64> {
         ensure!(rank < self.marked(), "select rank out of range");
         match &self.sparse {
             Some(sparse) => {
@@ -214,10 +214,7 @@ impl Layer {
                 self.bitmap.offset,
                 self.bitmap.entry_count,
                 read_samples(file, &self.superrank, 8)?,
-                read_samples(file, &self.subrank, 2)?
-                    .into_iter()
-                    .map(|v| v as u16)
-                    .collect(),
+                read_subrank(file, &self.subrank)?,
             )
             .select1(file, rank),
         }
@@ -663,10 +660,7 @@ impl LayerCursor {
                     layer.bitmap.offset,
                     layer.bitmap.entry_count,
                     read_samples(&file, &layer.superrank, 8)?,
-                    read_samples(&file, &layer.subrank, 2)?
-                        .into_iter()
-                        .map(|v| v as u16)
-                        .collect(),
+                    read_subrank(&file, &layer.subrank)?,
                 ),
             ))
         } else {
@@ -758,6 +752,16 @@ impl LayerCursor {
             return Ok(Some((position, self.reverse.next()?)));
         }
     }
+}
+
+/// A rank directory's 16-bit subblock samples, as they are stored.
+fn read_subrank(file: &File, section: &Section) -> Result<Vec<u16>> {
+    let mut bytes = vec![0u8; section.entry_count as usize * 2];
+    file.read_exact_at(&mut bytes, section.offset)?;
+    Ok(bytes
+        .chunks_exact(2)
+        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+        .collect())
 }
 
 fn read_samples(file: &File, section: &Section, width: usize) -> Result<Vec<u64>> {
