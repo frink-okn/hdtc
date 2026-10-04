@@ -44,7 +44,12 @@ pub enum QueryTerm {
     /// - IRIs: plain UTF-8 IRI string (no `<>` brackets)
     /// - Blank nodes: `_:id`
     /// - Literals: `"value"`, `"value"@lang`, or `"value"^^<type>`
+    ///
+    /// A ground triple term `<<( s p o )>>` is bound to the IRI that names it.
     Bound(Vec<u8>),
+    /// A triple term with wildcards inside, `<<( s ? ? )>>`; object position
+    /// only.
+    TripleTerm(Box<crate::triple_terms::search::InnerPattern>),
 }
 
 /// The fourth position in a quad pattern.
@@ -103,6 +108,13 @@ pub enum PatternKind {
 
 impl PatternKind {
     fn from_terms(s: &QueryTerm, p: &QueryTerm, o: &QueryTerm) -> Self {
+        // A triple-term pattern is answered before kinds are consulted.
+        let bound = QueryTerm::Bound(Vec::new());
+        let o = if matches!(o, QueryTerm::TripleTerm(_)) {
+            &bound
+        } else {
+            o
+        };
         match (s, p, o) {
             (QueryTerm::Wildcard, QueryTerm::Wildcard, QueryTerm::Wildcard) => Self::ScanAll,
             (QueryTerm::Bound(_), QueryTerm::Wildcard, QueryTerm::Wildcard) => Self::SubjectBound,
@@ -118,6 +130,7 @@ impl PatternKind {
             (QueryTerm::Wildcard, QueryTerm::Bound(_), QueryTerm::Bound(_)) => {
                 Self::PredicateObjectBound
             }
+            _ => unreachable!("triple terms are rejected outside object position"),
         }
     }
 }
@@ -140,6 +153,9 @@ pub fn parse_search_query(query: &str) -> Result<SearchQuery> {
         skip_query_whitespace(bytes, &mut pos);
         if pos >= bytes.len() {
             break;
+        }
+        if terms.len() < 2 && bytes[pos..].starts_with(b"<<(") {
+            bail!("A triple term may appear only in object position");
         }
 
         let term = parse_one_term(bytes, &mut pos)
@@ -216,9 +232,10 @@ fn parse_graph_term(bytes: &[u8], pos: &mut usize) -> Result<GraphQueryTerm> {
             *pos += 1;
             Ok(GraphQueryTerm::Wildcard)
         }
+        _ if bytes[*pos..].starts_with(b"<<(") => bail!("Graph position cannot be a triple term"),
         b'<' | b'_' => match parse_one_term(bytes, pos)? {
             QueryTerm::Bound(value) => Ok(GraphQueryTerm::Named(value)),
-            QueryTerm::Wildcard => unreachable!(),
+            QueryTerm::Wildcard | QueryTerm::TripleTerm(_) => unreachable!(),
         },
         b'"' => bail!("Graph position cannot be a literal"),
         _ => {
@@ -237,6 +254,9 @@ fn parse_graph_term(bytes: &[u8], pos: &mut usize) -> Result<GraphQueryTerm> {
 }
 
 fn parse_one_term(bytes: &[u8], pos: &mut usize) -> Result<QueryTerm> {
+    if bytes[*pos..].starts_with(b"<<(") {
+        return parse_triple_term(bytes, pos);
+    }
     match bytes[*pos] {
         b'?' | b'*' => {
             *pos += 1;
@@ -274,6 +294,129 @@ fn parse_one_term(bytes: &[u8], pos: &mut usize) -> Result<QueryTerm> {
             pos
         ),
     }
+}
+
+/// One position inside a triple-term pattern.
+enum InnerTerm {
+    Wildcard,
+    Ground(crate::triple_terms::Component),
+}
+
+/// Parse `<<( s p o )>>` at `bytes[*pos..]`. A ground term becomes the IRI that
+/// names it; one with wildcards inside becomes a [`QueryTerm::TripleTerm`].
+/// Wildcards are allowed one level deep only: a nested triple term must be
+/// ground.
+fn parse_triple_term(bytes: &[u8], pos: &mut usize) -> Result<QueryTerm> {
+    use crate::triple_terms::{Component, Proposition, iri::iri_for};
+    let (subject, predicate, object) = parse_triple_term_positions(bytes, pos)?;
+    let ground = |term: &InnerTerm| matches!(term, InnerTerm::Ground(_));
+    if ground(&subject) && ground(&predicate) && ground(&object) {
+        let take = |term: InnerTerm| match term {
+            InnerTerm::Ground(component) => component,
+            InnerTerm::Wildcard => unreachable!(),
+        };
+        let predicate = match take(predicate) {
+            Component::Iri(iri) => iri,
+            _ => bail!("A triple term's predicate must be an IRI"),
+        };
+        let proposition = Proposition {
+            subject: take(subject),
+            predicate,
+            object: take(object),
+        };
+        return Ok(QueryTerm::Bound(iri_for(&proposition).into_bytes()));
+    }
+    let as_bytes = |term: InnerTerm| -> Option<Vec<u8>> {
+        match term {
+            InnerTerm::Wildcard => None,
+            InnerTerm::Ground(Component::Iri(iri)) => Some(iri.into_bytes()),
+            InnerTerm::Ground(Component::Blank(label)) => Some(format!("_:{label}").into_bytes()),
+            InnerTerm::Ground(Component::Literal(literal)) => Some(literal.into_bytes()),
+            InnerTerm::Ground(Component::Triple(nested)) => Some(iri_for(&nested).into_bytes()),
+        }
+    };
+    Ok(QueryTerm::TripleTerm(Box::new(
+        crate::triple_terms::search::InnerPattern {
+            subject: as_bytes(subject),
+            predicate: as_bytes(predicate),
+            object: as_bytes(object),
+        },
+    )))
+}
+
+fn parse_triple_term_positions(
+    bytes: &[u8],
+    pos: &mut usize,
+) -> Result<(InnerTerm, InnerTerm, InnerTerm)> {
+    use crate::triple_terms::Component;
+    debug_assert!(bytes[*pos..].starts_with(b"<<("));
+    *pos += 3;
+    let mut positions = Vec::with_capacity(3);
+    for index in 0..3 {
+        skip_query_whitespace(bytes, pos);
+        if *pos >= bytes.len() {
+            bail!("Unclosed triple term in query");
+        }
+        let term = if matches!(bytes[*pos], b'?' | b'*') {
+            *pos += 1;
+            InnerTerm::Wildcard
+        } else if bytes[*pos..].starts_with(b"<<(") {
+            if index != 2 {
+                bail!("A nested triple term may appear only in object position");
+            }
+            let (s, p, o) = parse_triple_term_positions(bytes, pos)?;
+            let mut ground = Vec::with_capacity(3);
+            for term in [s, p, o] {
+                match term {
+                    InnerTerm::Ground(component) => ground.push(component),
+                    InnerTerm::Wildcard => {
+                        bail!("Wildcards inside a nested triple term are not supported")
+                    }
+                }
+            }
+            let object = ground.pop().unwrap();
+            let predicate = match ground.pop().unwrap() {
+                Component::Iri(iri) => iri,
+                _ => bail!("A triple term's predicate must be an IRI"),
+            };
+            InnerTerm::Ground(Component::Triple(Box::new(
+                crate::triple_terms::Proposition {
+                    subject: ground.pop().unwrap(),
+                    predicate,
+                    object,
+                },
+            )))
+        } else {
+            let QueryTerm::Bound(term) = parse_one_term(bytes, pos)? else {
+                bail!("Unexpected term inside a triple term");
+            };
+            let text = String::from_utf8(term).context("Non-UTF-8 term in query")?;
+            let component = if let Some(label) = text.strip_prefix("_:") {
+                Component::Blank(label.to_owned())
+            } else if text.starts_with('"') {
+                Component::Literal(text)
+            } else {
+                Component::Iri(text)
+            };
+            match (index, &component) {
+                (0, Component::Literal(_)) => bail!("A triple term's subject cannot be a literal"),
+                (1, Component::Iri(_)) | (0 | 2, _) => {}
+                (1, _) => bail!("A triple term's predicate must be an IRI"),
+                _ => unreachable!(),
+            }
+            InnerTerm::Ground(component)
+        };
+        positions.push(term);
+    }
+    skip_query_whitespace(bytes, pos);
+    if !bytes[*pos..].starts_with(b")>>") {
+        bail!("Expected `)>>` to close the triple term");
+    }
+    *pos += 3;
+    let object = positions.pop().unwrap();
+    let predicate = positions.pop().unwrap();
+    let subject = positions.pop().unwrap();
+    Ok((subject, predicate, object))
 }
 
 /// Parse an N-Triples literal at `bytes[*pos..]`, advance `*pos` past it,
@@ -1190,6 +1333,35 @@ pub fn search_hdt_streaming(
         .with_context(|| format!("Failed to open HDT file {}", hdt_path.display()))?;
     dictionary.enable_triple_terms(hdt_path, memory_limit / 4)?;
 
+    if let QueryTerm::TripleTerm(inner) = &o_term {
+        if !count_only && limit == Some(0) {
+            write_empty_output_if_needed(output)?;
+            return Ok(0);
+        }
+        let bound = |term: &QueryTerm| match term {
+            QueryTerm::Bound(bytes) => Some(bytes.clone()),
+            _ => None,
+        };
+        let mut writer = crate::hdt::reader::make_writer(output)?;
+        let count = crate::triple_terms::search::search_inner_pattern(
+            hdt_path,
+            &mut dictionary,
+            bound(&s_term).as_deref(),
+            bound(&p_term).as_deref(),
+            inner,
+            &mut writer,
+            count_only,
+            offset,
+            limit,
+            memory_limit,
+        )?;
+        if count_only {
+            writeln!(writer, "{count}")?;
+        }
+        writer.flush()?;
+        return Ok(count);
+    }
+
     // A zero-sized page is empty by definition. Stop before resolving terms or
     // selecting an indexed route so `--limit 0` neither emits a row nor
     // requires an index.
@@ -1202,6 +1374,7 @@ pub fn search_hdt_streaming(
     // the result set is empty — return immediately (not an error).
     let s_id: Option<u64> = match &s_term {
         QueryTerm::Wildcard => None,
+        QueryTerm::TripleTerm(_) => unreachable!("answered above"),
         QueryTerm::Bound(bytes) => match dictionary.locate_subject(bytes)? {
             Some(id) => Some(id),
             None => {
@@ -1213,6 +1386,7 @@ pub fn search_hdt_streaming(
 
     let p_id: Option<u64> = match &p_term {
         QueryTerm::Wildcard => None,
+        QueryTerm::TripleTerm(_) => unreachable!("answered above"),
         QueryTerm::Bound(bytes) => match dictionary.locate_predicate(bytes)? {
             Some(id) => Some(id),
             None => {
@@ -1224,6 +1398,7 @@ pub fn search_hdt_streaming(
 
     let o_id: Option<u64> = match &o_term {
         QueryTerm::Wildcard => None,
+        QueryTerm::TripleTerm(_) => unreachable!("answered above"),
         QueryTerm::Bound(bytes) => match dictionary.locate_object(bytes)? {
             Some(id) => Some(id),
             None => {

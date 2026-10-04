@@ -235,6 +235,9 @@ fn resolve_triple_pattern(
     let mut missing = false;
     let subject = match &pattern.subject {
         QueryTerm::Wildcard => None,
+        QueryTerm::TripleTerm(_) => {
+            anyhow::bail!("wildcards inside a triple term are supported in triple patterns only")
+        }
         QueryTerm::Bound(term) => match dictionary.locate_subject(term)? {
             Some(id) => Some(id),
             None => {
@@ -245,6 +248,9 @@ fn resolve_triple_pattern(
     };
     let predicate = match &pattern.predicate {
         QueryTerm::Wildcard => None,
+        QueryTerm::TripleTerm(_) => {
+            anyhow::bail!("wildcards inside a triple term are supported in triple patterns only")
+        }
         QueryTerm::Bound(term) => match dictionary.locate_predicate(term)? {
             Some(id) => Some(id),
             None => {
@@ -255,6 +261,9 @@ fn resolve_triple_pattern(
     };
     let object = match &pattern.object {
         QueryTerm::Wildcard => None,
+        QueryTerm::TripleTerm(_) => {
+            anyhow::bail!("wildcards inside a triple term are supported in triple patterns only")
+        }
         QueryTerm::Bound(term) => match dictionary.locate_object(term)? {
             Some(id) => Some(id),
             None => {

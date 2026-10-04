@@ -392,6 +392,18 @@ Find triples with a specific predicate and object:
 hdtc search data.hdt --query "? <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/Person>"
 ```
 
+Match inside RDF 1.2 triple terms (object position; see
+[RDF 1.2 triple terms](#rdf-12-triple-terms)). A ground triple term is matched
+like any other term; wildcards inside one are answered from the triple-term
+index, one level deep:
+
+```sh
+# Every reifier of a statement whose subject is alice
+hdtc search data.hdt --query "? <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> <<( <http://example.org/alice> ? ? )>>"
+# Every triple whose object is a triple term
+hdtc search data.hdt --query "? ? <<( ? ? ? )>>" --count
+```
+
 **Supported patterns:**
 
 | Pattern | Index required?       | Description                                   |

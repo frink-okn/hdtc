@@ -112,10 +112,33 @@ impl PermutationIndex {
             .map_err(|_| anyhow::anyhow!("missing permutation-index section {section_type:#06x}"))
     }
 
-    /// Stream an index-side triple pattern. At least one of predicate/object
-    /// must be bound. POS is used whenever the predicate is known; otherwise
-    /// OPS is used for the object-rooted pattern.
-    pub fn triples(&self, predicate: Option<u64>, object: Option<u64>) -> Result<IndexedTriples> {
+    /// The position range of an index-side pattern: in POS when the predicate
+    /// is bound, otherwise in OPS for the object. At least one must be bound.
+    /// An absent identifier yields an empty range.
+    pub(crate) fn index_range(
+        &self,
+        predicate: Option<u64>,
+        object: Option<u64>,
+    ) -> Result<(PermutationComponent, std::ops::Range<u64>)> {
+        let order = if predicate.is_some() {
+            PermutationComponent::Pos
+        } else {
+            PermutationComponent::Ops
+        };
+        let range = match self.locate_groups(predicate, object)? {
+            Some((_, _, _, _, z_start, z_end)) => z_start..z_end,
+            None => 0..0,
+        };
+        Ok((order, range))
+    }
+
+    /// The groups an index-side pattern selects, or `None` when the pattern
+    /// matches nothing.
+    fn locate_groups(
+        &self,
+        predicate: Option<u64>,
+        object: Option<u64>,
+    ) -> Result<Option<Groups>> {
         ensure!(
             predicate.is_some() || object.is_some(),
             "permutation lookup needs a predicate or object"
@@ -131,14 +154,12 @@ impl PermutationIndex {
             self.header.objects
         };
         if first == 0 || first > first_max || self.header.triples == 0 {
-            return IndexedTriples::empty(self.path.clone(), component, first);
+            return Ok(None);
         }
-
         let base = component << 8;
-        let array_y = self.section(base | 1)?.clone();
+        let array_y = self.section(base | 1)?;
         let bitmap_y = self.section(base | 2)?;
-        let array_z = self.section(base | 3)?.clone();
-        let bitmap_z = self.section(base | 4)?.clone();
+        let bitmap_z = self.section(base | 4)?;
         let y_super = self.section(base | 5)?;
         let y_sub = self.section(base | 6)?;
         let z_super = self.section(base | 7)?;
@@ -154,22 +175,171 @@ impl PermutationIndex {
             y_end <= pair_count && y_start < y_end,
             "invalid permutation level-1 group"
         );
-
         if let Some(target) = second_filter {
-            match binary_search_packed(&mut file, &array_y, y_start, y_end, target)? {
+            match binary_search_packed(&mut file, array_y, y_start, y_end, target)? {
                 Some(position) => {
                     y_start = position;
                     y_end = position + 1;
                 }
-                None => return IndexedTriples::empty(self.path.clone(), component, first),
+                None => return Ok(None),
             }
         }
         let z_start = if y_start == 0 {
             0
         } else {
-            select1(&mut file, &bitmap_z, z_super, z_sub, y_start - 1)? + 1
+            select1(&mut file, bitmap_z, z_super, z_sub, y_start - 1)? + 1
         };
-        let z_end = select1(&mut file, &bitmap_z, z_super, z_sub, y_end - 1)? + 1;
+        let z_end = select1(&mut file, bitmap_z, z_super, z_sub, y_end - 1)? + 1;
+        Ok(Some((component, first, y_start, y_end, z_start, z_end)))
+    }
+
+    /// The SPO position range of `subject`, narrowed to `predicate` and then
+    /// `object` when given, using this index's persisted SPO rank directories
+    /// over the HDT's own bitmaps. `object` without `predicate` is not a range.
+    pub(crate) fn spo_range(
+        &self,
+        hdt_path: &Path,
+        subject: u64,
+        predicate: Option<u64>,
+        object: Option<u64>,
+    ) -> Result<std::ops::Range<u64>> {
+        ensure!(
+            object.is_none() || predicate.is_some(),
+            "an SPO range needs the predicate to narrow by object"
+        );
+        if subject == 0 || subject > self.header.subjects || self.header.triples == 0 {
+            return Ok(0..0);
+        }
+        let mut reader = BufReader::new(File::open(hdt_path)?);
+        let sections = crate::hdt::sections::scan_hdt_sections(&mut reader)?;
+        let hdt = reader.into_inner();
+        let perm = File::open(&self.path)?;
+        let by = SplitBitmap {
+            dirs: &perm,
+            superrank: self.section(SPO_Y_SUPER)?,
+            subrank: self.section(SPO_Y_SUB)?,
+            bits: &hdt,
+            offset: sections.bitmap_y.data_start,
+            length: sections.bitmap_y.num_bits,
+        };
+        let bz = SplitBitmap {
+            dirs: &perm,
+            superrank: self.section(SPO_Z_SUPER)?,
+            subrank: self.section(SPO_Z_SUB)?,
+            bits: &hdt,
+            offset: sections.bitmap_z.data_start,
+            length: sections.bitmap_z.num_bits,
+        };
+        let mut y_start = if subject == 1 {
+            0
+        } else {
+            by.select1(subject - 2)? + 1
+        };
+        let mut y_end = by.select1(subject - 1)? + 1;
+        if let Some(predicate) = predicate {
+            let array_y = &sections.array_y;
+            match binary_search_log_array(&hdt, array_y, y_start, y_end, predicate)? {
+                Some(y) => {
+                    y_start = y;
+                    y_end = y + 1;
+                }
+                None => return Ok(0..0),
+            }
+        }
+        let z_start = if y_start == 0 {
+            0
+        } else {
+            bz.select1(y_start - 1)? + 1
+        };
+        let z_end = bz.select1(y_end - 1)? + 1;
+        if let Some(object) = object {
+            return Ok(
+                match binary_search_log_array(&hdt, &sections.array_z, z_start, z_end, object)? {
+                    Some(z) => z..z + 1,
+                    None => 0..0,
+                },
+            );
+        }
+        Ok(z_start..z_end)
+    }
+
+    /// The triples of `subject`, narrowed to `predicate` when given, in SPO
+    /// order, read through the SPO rank directories rather than by scanning
+    /// from the first subject.
+    pub(crate) fn spo_triples(
+        &self,
+        hdt_path: &Path,
+        subject: u64,
+        predicate: Option<u64>,
+    ) -> Result<Vec<(u64, u64, u64)>> {
+        let range = self.spo_range(hdt_path, subject, predicate, None)?;
+        if range.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut reader = BufReader::new(File::open(hdt_path)?);
+        let sections = crate::hdt::sections::scan_hdt_sections(&mut reader)?;
+        let hdt = reader.into_inner();
+        let perm = File::open(&self.path)?;
+        let bz = SplitBitmap {
+            dirs: &perm,
+            superrank: self.section(SPO_Z_SUPER)?,
+            subrank: self.section(SPO_Z_SUB)?,
+            bits: &hdt,
+            offset: sections.bitmap_z.data_start,
+            length: sections.bitmap_z.num_bits,
+        };
+        // The pair of position z is the number of pairs completed before it.
+        let mut y = bz.rank1(range.start)?;
+        let mut out = Vec::with_capacity((range.end - range.start) as usize);
+        let mut current_predicate = read_packed_at_file(
+            &hdt,
+            sections.array_y.data_start,
+            sections.array_y.bits_per_entry,
+            y,
+        )?;
+        for z in range {
+            let object = read_packed_at_file(
+                &hdt,
+                sections.array_z.data_start,
+                sections.array_z.bits_per_entry,
+                z,
+            )?;
+            out.push((subject, current_predicate, object));
+            use std::os::unix::fs::FileExt;
+            let mut byte = [0u8; 1];
+            hdt.read_exact_at(&mut byte, sections.bitmap_z.data_start + z / 8)?;
+            if byte[0] >> (z % 8) & 1 == 1 {
+                y += 1;
+                if y < sections.array_y.num_entries {
+                    current_predicate = read_packed_at_file(
+                        &hdt,
+                        sections.array_y.data_start,
+                        sections.array_y.bits_per_entry,
+                        y,
+                    )?;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Stream an index-side triple pattern. At least one of predicate/object
+    /// must be bound. POS is used whenever the predicate is known; otherwise
+    /// OPS is used for the object-rooted pattern.
+    pub fn triples(&self, predicate: Option<u64>, object: Option<u64>) -> Result<IndexedTriples> {
+        let Some((component, first, y_start, y_end, z_start, z_end)) =
+            self.locate_groups(predicate, object)?
+        else {
+            let (component, first) = match predicate {
+                Some(predicate) => (1u32, predicate),
+                None => (2u32, object.unwrap_or(0)),
+            };
+            return IndexedTriples::empty(self.path.clone(), component, first);
+        };
+        let base = component << 8;
+        let array_y = self.section(base | 1)?.clone();
+        let array_z = self.section(base | 3)?.clone();
+        let bitmap_z = self.section(base | 4)?.clone();
         IndexedTriples::new(
             self.path.clone(),
             component,
@@ -202,6 +372,475 @@ impl PermutationIndex {
             finished: false,
         })
     }
+}
+
+/// What [`PermutationIndex::locate_groups`] selects:
+/// `(component, first, y_start, y_end, z_start, z_end)`.
+type Groups = (u32, u64, u64, u64, u64, u64);
+
+/// A bitmap with its rank directory held in memory, for many selects. The
+/// directory is about 0.6% of the bitmap, so holding it costs a few megabytes
+/// per billion positions, and turns each select into one read of the final
+/// 512-bit block instead of a binary search over reads.
+pub(crate) struct CachedBitmap {
+    bits_offset: u64,
+    length: u64,
+    superrank: Vec<u64>,
+    subrank: Vec<u16>,
+}
+
+impl CachedBitmap {
+    fn load(
+        dirs: &File,
+        superrank: &Section,
+        subrank: &Section,
+        bits_offset: u64,
+        length: u64,
+    ) -> Result<Self> {
+        use std::os::unix::fs::FileExt;
+        let mut supers = vec![0u8; (superrank.entry_count * 8) as usize];
+        dirs.read_exact_at(&mut supers, superrank.offset)?;
+        let mut subs = vec![0u8; (subrank.entry_count * 2) as usize];
+        dirs.read_exact_at(&mut subs, subrank.offset)?;
+        Ok(Self {
+            bits_offset,
+            length,
+            superrank: supers
+                .chunks_exact(8)
+                .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+                .collect(),
+            subrank: subs
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes(c.try_into().unwrap()))
+                .collect(),
+        })
+    }
+
+    /// Position of the zero-based `ordinal`-th set bit.
+    pub(crate) fn select1(&self, bits: &File, ordinal: u64) -> Result<u64> {
+        use std::os::unix::fs::FileExt;
+        ensure!(
+            self.superrank.last().is_some_and(|total| ordinal < *total),
+            "select ordinal out of range"
+        );
+        let per_super = (SUPERBLOCK_BITS / SUBBLOCK_BITS) as usize;
+        let k = self.superrank.partition_point(|&count| count <= ordinal) - 1;
+        let first = k * per_super;
+        let last = (first + per_super).min(self.subrank.len());
+        let base = self.superrank[k];
+        let j = first
+            + self.subrank[first..last]
+                .partition_point(|&count| base + u64::from(count) <= ordinal)
+            - 1;
+        let mut remaining = ordinal - base - u64::from(self.subrank[j]);
+        let start = j as u64 * u64::from(SUBBLOCK_BITS);
+        let bits_here = (self.length - start).min(u64::from(SUBBLOCK_BITS));
+        let mut block = [0u8; 64];
+        let byte_count = bits_here.div_ceil(8) as usize;
+        bits.read_exact_at(&mut block[..byte_count], self.bits_offset + start / 8)?;
+        for (i, byte) in block[..byte_count].iter().enumerate() {
+            let ones = u64::from(byte.count_ones());
+            if remaining < ones {
+                let mut b = *byte;
+                for bit in 0..8u64 {
+                    if b & 1 == 1 {
+                        if remaining == 0 {
+                            return Ok(start + i as u64 * 8 + bit);
+                        }
+                        remaining -= 1;
+                    }
+                    b >>= 1;
+                }
+            }
+            remaining -= ones;
+        }
+        bail!("rank directory and bitmap disagree")
+    }
+
+    /// Set bits in `[0, position)`.
+    pub(crate) fn rank1(&self, bits: &File, position: u64) -> Result<u64> {
+        use std::os::unix::fs::FileExt;
+        ensure!(position <= self.length, "rank position out of range");
+        if position == self.length {
+            return Ok(self.superrank.last().copied().unwrap_or(0));
+        }
+        let sub = position / u64::from(SUBBLOCK_BITS);
+        let base = self.superrank[(position / u64::from(SUPERBLOCK_BITS)) as usize]
+            + u64::from(self.subrank[sub as usize]);
+        let start = sub * u64::from(SUBBLOCK_BITS);
+        let count = position - start;
+        let byte_count = count.div_ceil(8) as usize;
+        if byte_count == 0 {
+            return Ok(base);
+        }
+        let mut block = [0u8; 64];
+        bits.read_exact_at(&mut block[..byte_count], self.bits_offset + start / 8)?;
+        if !count.is_multiple_of(8) {
+            block[byte_count - 1] &= (1u8 << (count % 8)) - 1;
+        }
+        Ok(base
+            + block[..byte_count]
+                .iter()
+                .map(|b| u64::from(b.count_ones()))
+                .sum::<u64>())
+    }
+
+    /// The level-2 range of level-1 identifier `id` (one-based), given the
+    /// level-2 bitmap.
+    fn group(&self, bits: &File, id: u64) -> Result<std::ops::Range<u64>> {
+        let start = if id == 1 {
+            0
+        } else {
+            self.select1(bits, id - 2)? + 1
+        };
+        Ok(start..self.select1(bits, id - 1)? + 1)
+    }
+}
+
+/// Repeated lookups of one object's triples in OPS: `? ? O` and `? P O` for
+/// many objects, with the OPS rank directories held in memory.
+pub(crate) struct ObjectGroups {
+    file: File,
+    y: CachedBitmap,
+    z: CachedBitmap,
+    array_y: Section,
+    array_z: Section,
+    objects: u64,
+    scratch: Vec<u8>,
+}
+
+impl ObjectGroups {
+    pub(crate) fn open(index: &PermutationIndex) -> Result<Self> {
+        let file = File::open(&index.path)?;
+        let by = index.section(OPS_BITMAP_Y)?;
+        let bz = index.section(OPS_BITMAP_Z)?;
+        Ok(Self {
+            y: CachedBitmap::load(
+                &file,
+                index.section(OPS_Y_SUPER)?,
+                index.section(OPS_Y_SUB)?,
+                by.offset,
+                by.entry_count,
+            )?,
+            z: CachedBitmap::load(
+                &file,
+                index.section(OPS_Z_SUPER)?,
+                index.section(OPS_Z_SUB)?,
+                bz.offset,
+                bz.entry_count,
+            )?,
+            array_y: index.section(OPS_ARRAY_Y)?.clone(),
+            array_z: index.section(OPS_ARRAY_Z)?.clone(),
+            objects: index.header.objects,
+            scratch: Vec::new(),
+            file,
+        })
+    }
+
+    /// The OPS position range of every triple whose object is in `objects`
+    /// (identifiers, half-open), which is contiguous in OPS.
+    pub(crate) fn objects_range(
+        &self,
+        objects: std::ops::Range<u64>,
+    ) -> Result<std::ops::Range<u64>> {
+        if objects.is_empty() {
+            return Ok(0..0);
+        }
+        let first = self.y.group(&self.file, objects.start)?.start;
+        let last = self.y.group(&self.file, objects.end - 1)?.end;
+        let z_start = if first == 0 {
+            0
+        } else {
+            self.z.select1(&self.file, first - 1)? + 1
+        };
+        Ok(z_start..self.z.select1(&self.file, last - 1)? + 1)
+    }
+
+    /// Stream the triples at OPS positions `range`, as `(subject, predicate,
+    /// object)`, by sequential reads of the four OPS arrays.
+    pub(crate) fn range_triples(
+        &self,
+        path: &Path,
+        range: std::ops::Range<u64>,
+    ) -> Result<OpsRangeTriples> {
+        if range.is_empty() {
+            return Ok(OpsRangeTriples {
+                remaining: 0,
+                ..OpsRangeTriples::empty()
+            });
+        }
+        let y = self.z.rank1(&self.file, range.start)?;
+        let object = self.y.rank1(&self.file, y)? + 1;
+        let section_reader = |section: &Section, start: u64| {
+            BarePackedReader::new(path, section, start, section.entry_count - start)
+        };
+        let by = Section {
+            offset: self.y.bits_offset,
+            entry_count: self.y.length,
+            bits_per_entry: 1,
+            ..self.array_y.clone()
+        };
+        let bz = Section {
+            offset: self.z.bits_offset,
+            entry_count: self.z.length,
+            bits_per_entry: 1,
+            ..self.array_z.clone()
+        };
+        let mut array_y = section_reader(&self.array_y, y)?;
+        let predicate = array_y.next_value()?.context("empty OPS level-2 array")?;
+        Ok(OpsRangeTriples {
+            array_z: Some(section_reader(&self.array_z, range.start)?),
+            bitmap_z: Some(BareBitmapReader {
+                reader: section_reader(&bz, range.start)?,
+            }),
+            bitmap_y: Some(BareBitmapReader {
+                reader: section_reader(&by, y)?,
+            }),
+            array_y: Some(array_y),
+            object,
+            predicate,
+            remaining: range.end - range.start,
+        })
+    }
+
+    /// Call `visit(subject, predicate)` for every triple with object `object`,
+    /// and predicate `predicate` when given. With `count_only`, only the
+    /// number is computed: no subject is read.
+    pub(crate) fn for_object(
+        &mut self,
+        object: u64,
+        predicate: Option<u64>,
+        count_only: bool,
+        mut visit: impl FnMut(u64, u64) -> Result<bool>,
+    ) -> Result<u64> {
+        if object == 0 || object > self.objects {
+            return Ok(0);
+        }
+        let ys = self.y.group(&self.file, object)?;
+        // An object's predicates are few: read them whole.
+        let width = u64::from(self.array_y.bits_per_entry);
+        let first_bit = ys.start * width;
+        let last_bit = ys.end * width;
+        let bytes = ((last_bit.div_ceil(8)) - first_bit / 8) as usize;
+        self.scratch.resize(bytes + 9, 0);
+        use std::os::unix::fs::FileExt;
+        self.file.read_exact_at(
+            &mut self.scratch[..bytes],
+            self.array_y.offset + first_bit / 8,
+        )?;
+        let predicate_at = |scratch: &[u8], y: u64| -> u64 {
+            let bit = y * width - (first_bit / 8) * 8;
+            let mut value = 0u128;
+            for (i, byte) in scratch[(bit / 8) as usize..(bit / 8) as usize + 9]
+                .iter()
+                .enumerate()
+            {
+                value |= u128::from(*byte) << (i * 8);
+            }
+            ((value >> (bit % 8)) & ((1u128 << width) - 1)) as u64
+        };
+        let mut count = 0u64;
+        for y in ys.clone() {
+            let p = predicate_at(&self.scratch, y);
+            if predicate.is_some_and(|wanted| wanted != p) {
+                continue;
+            }
+            let z_start = if y == 0 {
+                0
+            } else {
+                self.z.select1(&self.file, y - 1)? + 1
+            };
+            let z_end = self.z.select1(&self.file, y)? + 1;
+            count += z_end - z_start;
+            if count_only {
+                continue;
+            }
+            for z in z_start..z_end {
+                let subject = read_packed_at_file(
+                    &self.file,
+                    self.array_z.offset,
+                    self.array_z.bits_per_entry,
+                    z,
+                )?;
+                if !visit(subject, p)? {
+                    return Ok(count);
+                }
+            }
+        }
+        Ok(count)
+    }
+}
+
+/// Triples of a contiguous OPS range, streamed.
+pub(crate) struct OpsRangeTriples {
+    array_z: Option<BarePackedReader>,
+    bitmap_z: Option<BareBitmapReader>,
+    bitmap_y: Option<BareBitmapReader>,
+    array_y: Option<BarePackedReader>,
+    object: u64,
+    predicate: u64,
+    remaining: u64,
+}
+
+impl OpsRangeTriples {
+    fn empty() -> Self {
+        Self {
+            array_z: None,
+            bitmap_z: None,
+            bitmap_y: None,
+            array_y: None,
+            object: 0,
+            predicate: 0,
+            remaining: 0,
+        }
+    }
+
+    fn next_triple(&mut self) -> Result<Option<(u64, u64, u64)>> {
+        if self.remaining == 0 {
+            return Ok(None);
+        }
+        self.remaining -= 1;
+        let (Some(array_z), Some(bitmap_z)) = (self.array_z.as_mut(), self.bitmap_z.as_mut())
+        else {
+            return Ok(None);
+        };
+        let subject = array_z.next_value()?.context("OPS ArrayZ ended early")?;
+        let triple = (subject, self.predicate, self.object);
+        let last_of_pair = bitmap_z.next_bit()?.context("OPS BitmapZ ended early")?;
+        if last_of_pair && self.remaining > 0 {
+            let last_of_object = self
+                .bitmap_y
+                .as_mut()
+                .unwrap()
+                .next_bit()?
+                .context("OPS BitmapY ended early")?;
+            if last_of_object {
+                self.object += 1;
+            }
+            self.predicate = self
+                .array_y
+                .as_mut()
+                .unwrap()
+                .next_value()?
+                .context("OPS ArrayY ended early")?;
+        }
+        Ok(Some(triple))
+    }
+}
+
+impl Iterator for OpsRangeTriples {
+    type Item = Result<(u64, u64, u64)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next_triple().transpose()
+    }
+}
+
+/// A bitmap whose bits live in one file and whose rank directory in another:
+/// the HDT's own SPO bitmaps, indexed by this sidecar's SPO directories.
+struct SplitBitmap<'a> {
+    dirs: &'a File,
+    superrank: &'a Section,
+    subrank: &'a Section,
+    bits: &'a File,
+    offset: u64,
+    length: u64,
+}
+
+fn read_packed_at_file(file: &File, offset: u64, width: u8, index: u64) -> Result<u64> {
+    use std::os::unix::fs::FileExt;
+    let width = u64::from(width);
+    if width == 0 {
+        return Ok(0);
+    }
+    let bit = index * width;
+    let shift = (bit % 8) as u32;
+    let needed = (u64::from(shift) + width).div_ceil(8) as usize;
+    let mut bytes = [0u8; 9];
+    file.read_exact_at(&mut bytes[..needed], offset + bit / 8)?;
+    let mut value = 0u128;
+    for (i, byte) in bytes[..needed].iter().enumerate() {
+        value |= u128::from(*byte) << (i * 8);
+    }
+    let mask = if width == 64 {
+        u128::from(u64::MAX)
+    } else {
+        (1u128 << width) - 1
+    };
+    Ok(((value >> shift) & mask) as u64)
+}
+
+impl SplitBitmap<'_> {
+    fn rank1(&self, position: u64) -> Result<u64> {
+        use std::os::unix::fs::FileExt;
+        ensure!(position <= self.length, "rank position out of range");
+        if self.length == 0 {
+            return Ok(0);
+        }
+        let sample = |section: &Section, index: u64| {
+            read_packed_at_file(self.dirs, section.offset, section.bits_per_entry, index)
+        };
+        if position == self.length {
+            return sample(self.superrank, self.superrank.entry_count - 1);
+        }
+        let sub_index = position / u64::from(SUBBLOCK_BITS);
+        let base = sample(self.superrank, position / u64::from(SUPERBLOCK_BITS))?
+            + sample(self.subrank, sub_index)?;
+        let start = sub_index * u64::from(SUBBLOCK_BITS);
+        let bits = position - start;
+        let byte_count = bits.div_ceil(8) as usize;
+        if byte_count == 0 {
+            return Ok(base);
+        }
+        let mut bytes = [0u8; 64];
+        self.bits
+            .read_exact_at(&mut bytes[..byte_count], self.offset + start / 8)?;
+        if !bits.is_multiple_of(8) {
+            bytes[byte_count - 1] &= (1u8 << (bits % 8)) - 1;
+        }
+        Ok(base
+            + bytes[..byte_count]
+                .iter()
+                .map(|b| u64::from(b.count_ones()))
+                .sum::<u64>())
+    }
+
+    fn select1(&self, ordinal: u64) -> Result<u64> {
+        let (mut low, mut high) = (0u64, self.length);
+        ensure!(
+            ordinal < self.rank1(self.length)?,
+            "select ordinal out of range"
+        );
+        while low < high {
+            let middle = low + (high - low) / 2;
+            if self.rank1(middle + 1)? > ordinal {
+                high = middle;
+            } else {
+                low = middle + 1;
+            }
+        }
+        Ok(low)
+    }
+}
+
+/// Binary search a sorted range of an HDT LogArray for `target`.
+fn binary_search_log_array(
+    file: &File,
+    array: &crate::io::LogArraySection,
+    mut low: u64,
+    mut high: u64,
+    target: u64,
+) -> Result<Option<u64>> {
+    while low < high {
+        let middle = low + (high - low) / 2;
+        let value = read_packed_at_file(file, array.data_start, array.bits_per_entry, middle)?;
+        match value.cmp(&target) {
+            std::cmp::Ordering::Less => low = middle + 1,
+            std::cmp::Ordering::Greater => high = middle,
+            std::cmp::Ordering::Equal => return Ok(Some(middle)),
+        }
+    }
+    Ok(None)
 }
 
 fn validate_source_metadata(header: &Header, hdt: &HdtMetadata) -> Result<()> {

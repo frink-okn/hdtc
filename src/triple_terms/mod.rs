@@ -19,6 +19,7 @@ pub mod build;
 pub mod format;
 pub mod iri;
 pub mod reader;
+pub mod search;
 pub mod spool;
 pub mod validate;
 

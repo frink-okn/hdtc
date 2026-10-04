@@ -222,3 +222,129 @@ fn blank_nodes_in_triple_terms_stay_apart_across_files() {
         "r2's term is unasserted"
     );
 }
+
+fn search(hdt: &Path, query: &str, extra: &[&str]) -> Vec<String> {
+    let mut args = vec!["search", "-q", hdt.to_str().unwrap(), "--query", query];
+    args.extend_from_slice(extra);
+    let output = hdtc(&args);
+    assert!(
+        output.status.success(),
+        "search {query} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mut lines: Vec<String> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| line.replace('\t', " "))
+        .collect();
+    lines.sort();
+    lines
+}
+
+#[test]
+fn search_matches_patterns_inside_triple_terms() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.ttl");
+    common::write_file(&input, TURTLE.as_bytes());
+    let hdt = create(dir.path(), &[&input], "out.hdt");
+    let all = dump(&hdt);
+    let with_term: Vec<String> = all.iter().filter(|l| l.contains("<<(")).cloned().collect();
+    let reifies = format!("<{RDF_REIFIES}>");
+    let filter = |needle: &str| -> Vec<String> {
+        with_term
+            .iter()
+            .filter(|l| l.contains(needle))
+            .cloned()
+            .collect()
+    };
+
+    // Every inner position a wildcard.
+    assert_eq!(search(&hdt, "? ? <<( ? ? ? )>>", &[]), with_term);
+    assert_eq!(
+        search(&hdt, &format!("? {reifies} <<( ? ? ? )>>"), &[]),
+        filter(&reifies)
+    );
+    // Subject-, predicate-, and object-rooted inner patterns, asserted and not.
+    // Only the outer triple term's subject: e3's bob is one level down.
+    assert_eq!(
+        search(&hdt, "? ? <<( <http://ex/bob> ? ? )>>", &[]),
+        filter(&format!("{reifies} <<( <http://ex/bob>"))
+    );
+    assert_eq!(
+        search(&hdt, "? ? <<( ? <http://ex/knows> ? )>>", &[]),
+        filter(&format!("{reifies} <<( "))
+            .into_iter()
+            .filter(|l| l.contains("<http://ex/knows>"))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        search(&hdt, "? ? <<( ? ? <http://ex/bob> )>>", &[]),
+        filter("<http://ex/bob> )>>")
+    );
+    // S ? O inside, a literal inside, and a ground nested term inside.
+    assert_eq!(
+        search(&hdt, "? ? <<( <http://ex/alice> ? <http://ex/bob> )>>", &[]).len(),
+        1
+    );
+    assert_eq!(
+        search(&hdt, "? ? <<( ? ? \"a \\\"quoted\\\"\\nline\"@en )>>", &[]),
+        filter("<http://ex/e4>")
+    );
+    assert_eq!(
+        search(
+            &hdt,
+            "? ? <<( ? ? <<( <http://ex/bob> <http://ex/knows> <http://ex/carol> )>> )>>",
+            &[]
+        ),
+        filter("<http://ex/e3>")
+    );
+    // A ground triple term is just its IRI.
+    assert_eq!(
+        search(
+            &hdt,
+            "? ? <<( <http://ex/bob> <http://ex/knows> <http://ex/carol> )>>",
+            &[]
+        ),
+        filter("<http://ex/e2>")
+    );
+    // Outer subject bound.
+    assert_eq!(
+        search(&hdt, "<http://ex/e3> ? <<( ? ? ? )>>", &[]),
+        filter("<http://ex/e3>")
+    );
+    // Counting, offset, and limit.
+    assert_eq!(
+        search(&hdt, "? ? <<( ? ? ? )>>", &["--count"]),
+        vec![with_term.len().to_string()]
+    );
+    assert_eq!(
+        search(&hdt, "? ? <<( ? <http://ex/knows> ? )>>", &["--count"]),
+        vec!["2".to_owned()]
+    );
+    assert_eq!(
+        search(&hdt, "? ? <<( ? ? ? )>>", &["--limit", "2"]).len(),
+        2
+    );
+    assert_eq!(
+        search(&hdt, "? ? <<( ? ? ? )>>", &["--offset", "1"]).len(),
+        with_term.len() - 1
+    );
+    // Nothing matches a term the data does not have.
+    assert!(search(&hdt, "? ? <<( <http://ex/nobody> ? ? )>>", &[]).is_empty());
+}
+
+#[test]
+fn search_refuses_misplaced_triple_terms() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.ttl");
+    common::write_file(&input, TURTLE.as_bytes());
+    let hdt = create(dir.path(), &[&input], "out.hdt");
+    for query in [
+        "<<( <http://ex/a> <http://ex/b> <http://ex/c> )>> ? ?",
+        "? ? <<( ? ? <<( ? <http://ex/b> <http://ex/c> )>> )>>",
+        "? ? <<( ? \"lit\" ? )>>",
+    ] {
+        let output = hdtc(&["search", "-q", hdt.to_str().unwrap(), "--query", query]);
+        assert!(!output.status.success(), "{query} was accepted");
+    }
+}

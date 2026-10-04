@@ -315,6 +315,15 @@ Counting the *triples* that use the matched terms is not a range operation: it
 is the sum of each term's group size. Readers that need it exactly pay per
 matched term.
 
+When every inner position is a wildcard, no layer is needed: the triples whose
+object is any triple term are exactly those whose object is in the data run, and
+because the run is a contiguous range of object identifiers, they are one
+contiguous range of OPS.
+
+A pattern whose *outer* subject is bound is better answered from the other
+side: the subject's SPO group is small, and each triple-term object in it is
+decoded and tested.
+
 ## 11. Construction (non-normative)
 
 hdtc builds these artifacts after `data.hdt` and its permutation index:
