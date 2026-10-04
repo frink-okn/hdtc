@@ -476,6 +476,8 @@ mod tests {
             ("\"a\"", true),
             ("\"a\"^^<http://ex/d>", true),
             ("\"\"@en", true),
+            ("\"a\"@en--ltr", true),
+            ("\"a\"b\"", true),
             ("\"a\"@EN", false),
             ("\"a\"^^<http://www.w3.org/2001/XMLSchema#string>", false),
             ("\"x", false),

@@ -300,7 +300,7 @@ impl TextSearcher {
     fn object_column(&self, segment: &SegmentReader) -> Result<&Column<u64>> {
         self.object_columns
             .get(&segment.segment_id())
-            .context("Text index segment has no object ID column")
+            .context("Text index segment was not opened with the index")
     }
 
     /// What the build recorded about this index.
