@@ -11,7 +11,7 @@
 //!
 //! - **Ground** terms, with no blank node at any depth, are named by content:
 //!   `urn:x-kgf:tt:g:{h}`, where `h` is the first 16 bytes of the SHA-256 of
-//!   the term's canonical N-Triples 1.2 form, in lowercase hex. Equal terms get
+//!   the term's canonical N-Triples 1.2 form, in unpadded base64url. Equal terms get
 //!   equal IRIs in every build, which is what lets separately built HDTs merge
 //!   their triple terms by string equality.
 //! - Terms with a blank node are named by **skeleton and labels**:
@@ -32,8 +32,8 @@ pub const TT_NAMESPACE: &str = "urn:x-kgf:tt:";
 pub const GROUND_PREFIX: &str = "urn:x-kgf:tt:g:";
 /// Prefix of a blank-node-bearing triple term's IRI.
 pub const BLANK_PREFIX: &str = "urn:x-kgf:tt:b:";
-/// Hex digits of the hash in either form.
-pub const HASH_HEX_LEN: usize = 32;
+/// Characters of the hash in either form: 16 bytes as unpadded base64url.
+pub const HASH_LEN: usize = 22;
 /// The deepest nesting accepted, counting the outermost triple term as the
 /// first level. Deeper input is refused when parsed, so every reader can
 /// follow any term it meets (`docs/triple-terms-format.md` §2.4).
@@ -117,13 +117,13 @@ pub fn iri_for(proposition: &Proposition) -> String {
     let mut text = Vec::with_capacity(256);
     write_canonical_triple(&mut text, proposition, &mut labels);
     let digest = Sha256::digest(&text);
-    let mut iri = String::with_capacity(BLANK_PREFIX.len() + HASH_HEX_LEN + labels.len() * 16);
+    let mut iri = String::with_capacity(BLANK_PREFIX.len() + HASH_LEN + labels.len() * 16);
     iri.push_str(if labels.is_empty() {
         GROUND_PREFIX
     } else {
         BLANK_PREFIX
     });
-    push_hex(&mut iri, &digest[..HASH_HEX_LEN / 2]);
+    push_base64url(&mut iri, &digest[..16]);
     for label in labels {
         iri.push(':');
         push_percent_encoded(&mut iri, label.as_bytes());
@@ -131,11 +131,19 @@ pub fn iri_for(proposition: &Proposition) -> String {
     iri
 }
 
-fn push_hex(out: &mut String, bytes: &[u8]) {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    for byte in bytes {
-        out.push(HEX[usize::from(byte >> 4)] as char);
-        out.push(HEX[usize::from(byte & 0x0F)] as char);
+/// Unpadded base64url (RFC 4648 §5). Chosen over hex because the hash is
+/// stored once per distinct triple term, in the dictionary and in every sort
+/// the build makes of those IRIs: 22 characters rather than 32 for the same
+/// 128 bits, none of them `:`, which separates an IRI's labels.
+fn push_base64url(out: &mut String, bytes: &[u8]) {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    for chunk in bytes.chunks(3) {
+        let mut group = [0u8; 3];
+        group[..chunk.len()].copy_from_slice(chunk);
+        let bits = u32::from(group[0]) << 16 | u32::from(group[1]) << 8 | u32::from(group[2]);
+        for i in 0..=chunk.len() {
+            out.push(ALPHABET[(bits >> (18 - 6 * i) & 0x3F) as usize] as char);
+        }
     }
 }
 
@@ -328,14 +336,46 @@ mod tests {
         );
     }
 
+    /// An independent decoder, so the test is an oracle rather than an echo.
+    fn decode_base64url(text: &str) -> Vec<u8> {
+        let value = |c: u8| match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'-' => 62,
+            b'_' => 63,
+            other => panic!("{} is not base64url", other as char),
+        };
+        let mut bits = 0u32;
+        let mut held = 0;
+        let mut out = Vec::new();
+        for c in text.bytes() {
+            bits = bits << 6 | u32::from(value(c));
+            held += 6;
+            if held >= 8 {
+                held -= 8;
+                out.push((bits >> held) as u8);
+            }
+        }
+        out
+    }
+
     #[test]
     fn a_ground_iri_is_a_content_hash() {
         let p = prop(iri("http://ex/s"), "http://ex/p", iri("http://ex/o"));
         let name = iri_for(&p);
-        let expected = Sha256::digest(b"<<( <http://ex/s> <http://ex/p> <http://ex/o> )>>");
-        let mut hex = String::new();
-        push_hex(&mut hex, &expected[..16]);
-        assert_eq!(name, format!("{GROUND_PREFIX}{hex}"));
+        // The first 16 bytes of the SHA-256 of
+        // `<<( <http://ex/s> <http://ex/p> <http://ex/o> )>>`, base64url
+        // without padding, computed independently of this module.
+        let digest = Sha256::digest(b"<<( <http://ex/s> <http://ex/p> <http://ex/o> )>>");
+        let hex: String = digest[..16].iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(name.len(), GROUND_PREFIX.len() + HASH_LEN);
+        assert_eq!(
+            decode_base64url(&name[GROUND_PREFIX.len()..]),
+            digest[..16].to_vec(),
+            "{name} does not carry {hex}"
+        );
+        assert_eq!(name, iri_for(&p.clone()));
         assert_eq!(name, iri_for(&p.clone()));
     }
 
@@ -347,8 +387,8 @@ mod tests {
         let name_b = iri_for(&b);
         // Same skeleton, so the same hash; different labels, so different IRIs.
         assert_eq!(
-            name_a[..BLANK_PREFIX.len() + HASH_HEX_LEN],
-            name_b[..BLANK_PREFIX.len() + HASH_HEX_LEN]
+            name_a[..BLANK_PREFIX.len() + HASH_LEN],
+            name_b[..BLANK_PREFIX.len() + HASH_LEN]
         );
         assert_ne!(name_a, name_b);
         assert!(name_a.ends_with(":x:y"));
@@ -356,8 +396,8 @@ mod tests {
         let same = prop(blank("x"), "http://ex/p", blank("x"));
         assert!(iri_for(&same).ends_with(":x"));
         assert_ne!(
-            iri_for(&same)[..BLANK_PREFIX.len() + HASH_HEX_LEN],
-            name_a[..BLANK_PREFIX.len() + HASH_HEX_LEN]
+            iri_for(&same)[..BLANK_PREFIX.len() + HASH_LEN],
+            name_a[..BLANK_PREFIX.len() + HASH_LEN]
         );
     }
 
