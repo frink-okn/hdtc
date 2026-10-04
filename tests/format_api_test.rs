@@ -1207,3 +1207,106 @@ fn the_input_classification_agrees_with_what_a_quads_build_preserves() {
     assert!(!rdf_input_carries_graphs(&temp.path().join("data.hdt")));
     assert!(!rdf_input_carries_graphs(&temp.path().join("notes.txt")));
 }
+
+/// The triple-term surface a mapped reader needs.
+///
+/// A server answers a request naming a ground triple term by minting its IRI
+/// and looking that up, so the minting function is the load-bearing export:
+/// a second implementation that disagreed by one byte would find nothing. The
+/// directory must also describe both runs and every layer well enough to map
+/// them, and name the propositions HDT that unasserted terms live in.
+#[test]
+fn the_triple_term_surface_mints_describes_and_validates() {
+    use hdtc::format::{
+        MAX_TRIPLE_TERM_NESTING, TRIPLE_TERM_HAS_PROPOSITIONS, TRIPLE_TERM_NAMESPACE,
+        TripleTermComponent, TripleTermProposition, is_triple_term_iri, propositions_hdt_path,
+        read_triple_term_directory, triple_term_component, triple_term_index_path, triple_term_iri,
+        triple_term_section_kind, triple_term_section_type, validate_triple_terms,
+    };
+
+    let temp = tempfile::tempdir().unwrap();
+    let hdt = build_fixture_from(
+        temp.path(),
+        concat!(
+            "<http://ex/e1> <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> ",
+            "<<( <http://ex/a> <http://ex/p> \"x\"@en )>> .\n",
+            "<http://ex/a> <http://ex/p> \"x\"@en .\n",
+            "<http://ex/e2> <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> ",
+            "<<( <http://ex/b> <http://ex/q> <http://ex/c> )>> .\n",
+        ),
+    );
+
+    // Minting agrees with the dictionary hdtc wrote: both IRIs are objects.
+    let asserted = triple_term_iri(&TripleTermProposition {
+        subject: TripleTermComponent::Iri("http://ex/a".to_owned()),
+        predicate: "http://ex/p".to_owned(),
+        object: TripleTermComponent::Literal("\"x\"@en".to_owned()),
+    });
+    let unasserted = triple_term_iri(&TripleTermProposition {
+        subject: TripleTermComponent::Iri("http://ex/b".to_owned()),
+        predicate: "http://ex/q".to_owned(),
+        object: TripleTermComponent::Iri("http://ex/c".to_owned()),
+    });
+    assert!(asserted.starts_with(TRIPLE_TERM_NAMESPACE));
+    assert!(is_triple_term_iri(unasserted.as_bytes()));
+    let mut reader = BufReader::new(File::open(&hdt).unwrap());
+    let sections = scan_hdt_sections(&mut reader).unwrap();
+    reader
+        .seek(SeekFrom::Start(sections.objects.section_start))
+        .unwrap();
+    let header = PfcSectionHeader::read_from(&mut reader, "objects").unwrap();
+    let objects: Vec<Vec<u8>> = PfcSectionIterator::new(&mut reader, header, "objects")
+        .collect::<Result<_, _>>()
+        .unwrap();
+    for iri in [&asserted, &unasserted] {
+        assert!(
+            objects.iter().any(|term| term == iri.as_bytes()),
+            "{iri} is not in the object dictionary"
+        );
+    }
+
+    // The directory names both runs and the layers of both HDTs.
+    let (header, directory) = read_triple_term_directory(&triple_term_index_path(&hdt)).unwrap();
+    assert_eq!(
+        header.flags & TRIPLE_TERM_HAS_PROPOSITIONS,
+        TRIPLE_TERM_HAS_PROPOSITIONS
+    );
+    assert!(header.has_propositions());
+    assert_eq!(header.data.run_length, 2);
+    assert_eq!(header.props.run_length, 0);
+    assert!(propositions_hdt_path(&hdt).exists());
+    for component in [
+        triple_term_component::DATA_SPO,
+        triple_term_component::PROPS_OPS,
+    ] {
+        for kind in [
+            triple_term_section_kind::LAYER,
+            triple_term_section_kind::LAYER_SUPERRANK,
+            triple_term_section_kind::LAYER_SUBRANK,
+            triple_term_section_kind::REVERSE,
+        ] {
+            let wanted = triple_term_section_type(component, kind);
+            assert!(
+                directory
+                    .iter()
+                    .any(|section| section.section_type == wanted),
+                "no section {wanted:#06x}"
+            );
+        }
+    }
+    let subjects = directory
+        .iter()
+        .find(|section| {
+            section.section_type
+                == triple_term_section_type(
+                    triple_term_component::DATA_RUN,
+                    triple_term_section_kind::TARGET_SUBJECT,
+                )
+        })
+        .unwrap();
+    assert_eq!(subjects.entry_count, 2);
+    // docs/triple-terms-format.md §2.4.
+    assert_eq!(MAX_TRIPLE_TERM_NESTING, 64);
+
+    validate_triple_terms(&hdt, &temp.path().join("validate"), 64 << 20).unwrap();
+}

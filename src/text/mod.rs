@@ -35,7 +35,7 @@ pub use analyzer::{
     DEFAULT_MAX_LITERAL_BYTES, DEFAULT_UNTAGGED_LANGUAGE, DatatypeExclusions, normalize_language,
 };
 pub use builder::{TextConfig, create_text_index};
-pub use manifest::{LanguageCount, TextManifest};
+pub use manifest::{LanguageCount, PropositionsCoverage, TextManifest};
 pub use searcher::{
     MatchKind, MatchMode, TextHit, TextMatchPage, TextQuery, TextScanPosition, TextSearch,
     TextSearcher,

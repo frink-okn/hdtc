@@ -343,8 +343,13 @@ fn check_targets(
     Ok(())
 }
 
-/// Validate the triple-term index and propositions HDT beside `hdt_path`.
+/// Validate the triple-term index and propositions HDT beside `hdt_path`
+/// strictly (`docs/triple-terms-format.md` §12): both digests, every payload,
+/// every run entry minted again, every layer bit, every target. Sorts spill
+/// into `temp_dir`, which is created if missing; `memory_limit` bounds them.
 pub fn validate_triple_terms(hdt_path: &Path, temp_dir: &Path, memory_limit: usize) -> Result<()> {
+    std::fs::create_dir_all(temp_dir)
+        .with_context(|| format!("Failed to create {}", temp_dir.display()))?;
     let index = TripleTermIndex::open(hdt_path)?;
     let header = index.header().clone();
     let props_path = format::propositions_path(hdt_path);
