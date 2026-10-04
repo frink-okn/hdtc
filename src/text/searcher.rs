@@ -13,10 +13,11 @@ use super::readonly::ReadOnlyDirectory;
 use super::schema::{FIELD_LANG, FIELD_OBJECT, FIELD_TEXT, FIELD_TEXT_STEMMED, register_tokenizer};
 use anyhow::{Context, Result, ensure};
 use std::cmp::{Ordering, Reverse};
-use std::collections::{BinaryHeap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use tantivy::collector::{Count, TopDocs};
+use tantivy::columnar::Column;
 use tantivy::index::SegmentId;
 use tantivy::query::{
     BooleanQuery, EmptyScorer, EnableScoring, Explanation, FuzzyTermQuery, Occur, PhraseQuery,
@@ -220,6 +221,11 @@ pub struct TextSearcher {
     /// The segments holding the propositions HDT's literals, which a query
     /// leaves out unless it asks for them (`docs/text-index-format.md` §5.3).
     proposition_segments: Arc<HashSet<SegmentId>>,
+    /// Each segment's object-ID column, opened once. Tantivy decodes a
+    /// column's block headers to open it, a cost in proportion to the segment,
+    /// so opening one per query would make every query pay for the index's
+    /// size; the published index is immutable, so these never go stale.
+    object_columns: Arc<ObjectColumns>,
     /// One analyzer per stemming algorithm the index actually used, so a query
     /// token is stemmed the same way the documents were. Empty when the index
     /// stems nothing, which skips the stemmed phase entirely.
@@ -274,7 +280,8 @@ impl TextSearcher {
             .reload_policy(ReloadPolicy::Manual)
             .try_into()
             .with_context(|| format!("Failed to open text index reader {}", dir.display()))?;
-        let proposition_segments = Arc::new(proposition_segments(&reader, &manifest)?);
+        let object_columns = Arc::new(object_columns(&reader)?);
+        let proposition_segments = Arc::new(proposition_segments(&object_columns, &manifest)?);
 
         Ok(Self {
             reader,
@@ -284,8 +291,16 @@ impl TextSearcher {
             stemmed_field,
             lang_field,
             proposition_segments,
+            object_columns,
             stemmers,
         })
+    }
+
+    /// A segment's object-ID column, opened when the index was.
+    fn object_column(&self, segment: &SegmentReader) -> Result<&Column<u64>> {
+        self.object_columns
+            .get(&segment.segment_id())
+            .context("Text index segment has no object ID column")
     }
 
     /// What the build recorded about this index.
@@ -517,13 +532,7 @@ impl TextSearcher {
             if segment_ord == start_segment && start.doc_id() != 0 {
                 scorer.seek(start.doc_id());
             }
-            if scorer.doc() == TERMINATED {
-                // Opening the column costs time in proportion to the segment,
-                // so a segment with no match — a propositions segment the
-                // query leaves out, among others — never opens it.
-                continue;
-            }
-            let column = object_column(segment)?;
+            let column = self.object_column(segment)?;
             while scorer.doc() != TERMINATED {
                 let doc = scorer.doc();
                 if segment
@@ -573,11 +582,8 @@ impl TextSearcher {
         let mut count = 0usize;
 
         for segment in searcher.segment_readers() {
+            let object_ids = self.object_column(segment)?;
             let mut scorer = weight.scorer(segment, 1.0)?;
-            if scorer.doc() == TERMINATED {
-                continue;
-            }
-            let object_ids = object_column(segment)?;
             while scorer.doc() != TERMINATED {
                 let doc = scorer.doc();
                 if segment
@@ -612,11 +618,8 @@ impl TextSearcher {
         for (built, kind) in self.phase_queries(query)? {
             let weight = built.weight(EnableScoring::enabled_from_searcher(&searcher))?;
             for segment in searcher.segment_readers() {
+                let object_ids = self.object_column(segment)?;
                 let mut scorer = weight.scorer(segment, 1.0)?;
-                if scorer.doc() == TERMINATED {
-                    continue;
-                }
-                let object_ids = object_column(segment)?;
                 while scorer.doc() != TERMINATED {
                     let doc = scorer.doc();
                     if segment
@@ -684,15 +687,13 @@ impl TextSearcher {
         // after collection. Tantivy otherwise breaks a score tie by DocAddress,
         // so a top-k boundary could discard the lower object ID before we ever
         // had a chance to impose the published ordering.
-        let collector = TopDocs::with_limit(top_k).tweak_score(|segment: &SegmentReader| {
-            // Opened at the segment's first hit, so a segment with none —
-            // a propositions segment the query leaves out, among others —
-            // never pays to open it.
-            let segment = segment.clone();
-            let object_ids = std::sync::OnceLock::new();
+        let columns = Arc::clone(&self.object_columns);
+        let collector = TopDocs::with_limit(top_k).tweak_score(move |segment: &SegmentReader| {
+            let column = columns.get(&segment.segment_id()).cloned();
+            // Object IDs start at 1, so 0 marks a document without one, which
+            // fails the search below rather than ranking as an ID.
             move |doc, score| {
-                let object_id = object_ids
-                    .get_or_init(|| segment.fast_fields().u64(FIELD_OBJECT).ok())
+                let object_id = column
                     .as_ref()
                     .and_then(|column| column.first(doc))
                     .unwrap_or(0);
@@ -702,14 +703,8 @@ impl TextSearcher {
         let collected = searcher.search(query, &collector)?;
 
         let mut hits = Vec::with_capacity(collected.len());
-        for ((score, _), address) in collected {
-            let segment = searcher.segment_reader(address.segment_ord);
-            let object_id = segment
-                .fast_fields()
-                .u64(FIELD_OBJECT)
-                .context("Text index has no object ID column")?
-                .first(address.doc_id)
-                .context("Text index document carries no object ID")?;
+        for ((score, Reverse(object_id)), _) in collected {
+            ensure!(object_id != 0, "Text index document carries no object ID");
             hits.push(TextHit {
                 object_id,
                 score,
@@ -741,11 +736,8 @@ impl TextSearcher {
         let mut heap = BinaryHeap::new();
 
         for segment in searcher.segment_readers() {
+            let object_ids = self.object_column(segment)?;
             let mut scorer = weight.scorer(segment, 1.0)?;
-            if scorer.doc() == TERMINATED {
-                continue;
-            }
-            let object_ids = object_column(segment)?;
             while scorer.doc() != TERMINATED {
                 let doc = scorer.doc();
                 if segment
@@ -846,8 +838,7 @@ impl TextSearcher {
     /// matched or counted, and the exclusion costs nothing per document. A
     /// score still uses the index-wide statistics, propositions included —
     /// one ranking model for the whole index (`docs/text-index-format.md`
-    /// §2.4). Every path opens a segment's object column only when the segment
-    /// has a match, so a left-out segment costs no more than an empty one.
+    /// §2.4).
     fn scoped(&self, built: Box<dyn Query>, query: &TextQuery) -> Box<dyn Query> {
         if query.propositions || self.proposition_segments.is_empty() {
             return built;
@@ -1049,14 +1040,23 @@ fn stem_with(analyzer: &mut TextAnalyzer, token: &str) -> String {
     }
 }
 
-/// A segment's object-ID column. Tantivy decodes the column's block headers
-/// to open it, a cost in proportion to the segment, so callers open it only
-/// for a segment that has a match.
-fn object_column(segment: &SegmentReader) -> Result<tantivy::columnar::Column<u64>> {
-    segment
-        .fast_fields()
-        .u64(FIELD_OBJECT)
-        .context("Text index has no object ID column")
+/// Each segment's object-ID column, by segment.
+type ObjectColumns = HashMap<SegmentId, Column<u64>>;
+
+/// Open every segment's object-ID column, once, when the index opens.
+fn object_columns(reader: &IndexReader) -> Result<ObjectColumns> {
+    reader
+        .searcher()
+        .segment_readers()
+        .iter()
+        .map(|segment| {
+            let column = segment
+                .fast_fields()
+                .u64(FIELD_OBJECT)
+                .context("Text index has no object ID column")?;
+            Ok((segment.segment_id(), column))
+        })
+        .collect()
 }
 
 /// The segments of an index covering a propositions HDT that hold its
@@ -1066,29 +1066,25 @@ fn object_column(segment: &SegmentReader) -> Result<tantivy::columnar::Column<u6
 /// leaves them out segment by segment. Decided from each segment's object
 /// column bounds once, when the index opens.
 fn proposition_segments(
-    reader: &IndexReader,
+    columns: &ObjectColumns,
     manifest: &TextManifest,
 ) -> Result<HashSet<SegmentId>> {
     let mut segments = HashSet::new();
     let Some(coverage) = &manifest.propositions else {
         return Ok(segments);
     };
-    for segment in reader.searcher().segment_readers() {
-        if segment.num_docs() == 0 {
+    for (segment, column) in columns {
+        if column.num_docs() == 0 {
             continue;
         }
-        let column = segment
-            .fast_fields()
-            .u64(FIELD_OBJECT)
-            .context("Text index has no object ID column")?;
         if column.min_value() > coverage.object_offset {
-            segments.insert(segment.segment_id());
+            segments.insert(*segment);
         } else {
             ensure!(
                 column.max_value() <= coverage.object_offset,
                 "Text index segment {} holds literals of both data.hdt and the propositions \
                  HDT; rebuild the index with `hdtc text`",
-                segment.segment_id().uuid_string()
+                segment.uuid_string()
             );
         }
     }
@@ -1232,6 +1228,7 @@ mod tests {
             .tokenizers()
             .get(TOKENIZER_NAME)
             .context("hdtc tokenizer was not registered")?;
+        let columns = Arc::new(object_columns(&reader)?);
         Ok((
             index,
             TextSearcher {
@@ -1258,6 +1255,7 @@ mod tests {
                 stemmed_field,
                 lang_field,
                 proposition_segments: Arc::default(),
+                object_columns: columns,
                 stemmers: Vec::new(),
             },
         ))
@@ -1286,8 +1284,11 @@ mod tests {
             digest: [0; 32],
             object_offset: offset,
         });
-        searcher.proposition_segments =
-            Arc::new(proposition_segments(&searcher.reader, &searcher.manifest)?);
+        searcher.object_columns = Arc::new(object_columns(&searcher.reader)?);
+        searcher.proposition_segments = Arc::new(proposition_segments(
+            &searcher.object_columns,
+            &searcher.manifest,
+        )?);
         Ok(searcher)
     }
 
