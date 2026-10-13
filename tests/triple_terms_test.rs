@@ -352,13 +352,20 @@ fn search_refuses_misplaced_triple_terms() {
 
     // Nesting is bounded as the build bounds it: the deepest term accepted
     // matches nothing here, one deeper is refused, and a query thousands of
-    // levels deep is refused too rather than exhausting the stack.
+    // levels deep is refused too rather than exhausting the stack. Its IRIs
+    // are short because the query is one argument, and Linux refuses to exec
+    // with any argument over 128 KiB; 5,000 levels of these are 80 KB.
     let nested = |depth: usize| {
-        let mut term = "<<( <http://ex/a> <http://ex/p> <http://ex/o> )>>".to_owned();
+        let mut term = "<<( <a> <p> <o> )>>".to_owned();
         for _ in 1..depth {
-            term = format!("<<( <http://ex/a> <http://ex/p> {term} )>>");
+            term = format!("<<( <a> <p> {term} )>>");
         }
-        format!("? ? {term}")
+        let query = format!("? ? {term}");
+        assert!(
+            query.len() < 128 * 1024,
+            "{depth} levels exceed Linux's argument limit"
+        );
+        query
     };
     assert!(search(&hdt, &nested(64), &[]).is_empty());
     for depth in [65, 5_000] {
