@@ -5,12 +5,15 @@
 //! those four paths cannot drift on section identifiers or sizing rules.
 
 mod builder;
-mod format;
+pub(crate) mod format;
 mod reader;
 
-pub(crate) use builder::{PermEntry, PreparedPermutationAssembler, scan_hdt};
+pub(crate) use builder::{
+    PermEntry, PreparedPermutationAssembler, RawBitmap, build_rank_directories, scan_hdt,
+};
 pub use builder::{
     PermutationCollector, PositionMaps, create_permutation_index, finish_prepared_index,
 };
 pub use format::{Header, PermutationComponent, PermutationSectionKind, Section, canonical_path};
+pub(crate) use reader::{CachedBitmap, ObjectGroups, SpoAccess};
 pub use reader::{PermutationIndex, PermutationIndexOpenError, validate_permutation_index};

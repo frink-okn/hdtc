@@ -12,6 +12,11 @@ pub enum RdfFormat {
     RdfXml,
     JsonLd,
     N3,
+    /// hdtc's own record of dictionary terms, one triple per line — never
+    /// an input format a user names: it is how the propositions HDT of RDF
+    /// 1.2 triple terms is built from terms the build already holds, which
+    /// no RDF syntax can spell in every case (`src/rdf/records.rs`).
+    TermRecords,
 }
 
 impl RdfFormat {
@@ -115,6 +120,21 @@ pub fn discover_inputs(paths: &[PathBuf]) -> Result<DiscoveredInputs> {
         }
 
         if path.is_file() {
+            if let Some(owner) = propositions_owner(path) {
+                if owner.exists() {
+                    bail!(
+                        "{} is the propositions HDT of {}; give {} as the input instead",
+                        path.display(),
+                        owner.display(),
+                        owner.display()
+                    );
+                }
+                bail!(
+                    "{} is a propositions HDT without the HDT it belongs to ({})",
+                    path.display(),
+                    owner.display()
+                );
+            }
             classify_and_route(path, &mut rdf_inputs, &mut hdt_inputs, true);
         } else if path.is_dir() {
             for entry in WalkDir::new(path)
@@ -122,9 +142,30 @@ pub fn discover_inputs(paths: &[PathBuf]) -> Result<DiscoveredInputs> {
                 .into_iter()
                 .filter_map(|e| e.ok())
             {
-                if entry.file_type().is_file() {
-                    classify_and_route(entry.path(), &mut rdf_inputs, &mut hdt_inputs, false);
+                if !entry.file_type().is_file() {
+                    continue;
                 }
+                // A propositions HDT is part of the HDT beside it, never an
+                // input of its own: merged as one, its unasserted claims
+                // would become asserted triples.
+                if let Some(owner) = propositions_owner(entry.path()) {
+                    // Merged with its owner, which is in this walk too; alone,
+                    // it is unasserted claims with nothing to say so.
+                    if !owner.exists() {
+                        bail!(
+                            "{} is a propositions HDT without the HDT it belongs to ({})",
+                            entry.path().display(),
+                            owner.display()
+                        );
+                    }
+                    tracing::debug!(
+                        "Skipping {}: the propositions HDT of {}",
+                        entry.path().display(),
+                        owner.display()
+                    );
+                    continue;
+                }
+                classify_and_route(entry.path(), &mut rdf_inputs, &mut hdt_inputs, false);
             }
         } else {
             bail!(
@@ -153,6 +194,23 @@ pub fn discover_inputs(paths: &[PathBuf]) -> Result<DiscoveredInputs> {
         rdf_inputs,
         hdt_inputs,
     })
+}
+
+/// The HDT that `path` is the propositions HDT of, if it is one: `X.props.hdt`
+/// belongs to `X`. Decided by name, and by the owner's existence when the name
+/// alone cannot say — `-o` takes any name, so `data.props.hdt` belongs to an
+/// HDT called `data` when there is one — but never by the triple-term index,
+/// which is droppable and which an interrupted build can leave unpublished.
+/// An owner named `*.hdt` decides it even when missing, so that an orphaned
+/// propositions HDT is refused rather than merged as asserted data.
+fn propositions_owner(path: &Path) -> Option<PathBuf> {
+    let name = path.file_name()?.to_str()?;
+    let owner_name = name.strip_suffix(".props.hdt")?;
+    if owner_name.is_empty() {
+        return None;
+    }
+    let owner = path.with_file_name(owner_name);
+    (owner_name.ends_with(".hdt") || owner.is_file()).then_some(owner)
 }
 
 /// Check if a file has an `.hdt` extension.

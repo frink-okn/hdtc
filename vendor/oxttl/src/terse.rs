@@ -542,6 +542,13 @@ impl RuleRecognizer for TriGRecognizer {
                     }
                     #[cfg(feature = "rdf-12")]
                     N3Token::Punctuation("~") => {
+                        // hdtc change 7: the reified triple is one level
+                        // deeper than its object.
+                        if self.cur_object.last().map_or(0, crate::triple_term_depth)
+                            >= crate::MAX_TRIPLE_TERM_NESTING
+                        {
+                            return self.error(errors, crate::triple_term_nesting_error());
+                        }
                         self.stack
                             .push(TriGState::AnnotationBlock { with_reifier: true });
                         self.stack.push(TriGState::Reifier {
@@ -555,6 +562,14 @@ impl RuleRecognizer for TriGRecognizer {
                     }
                     #[cfg(feature = "rdf-12")]
                     N3Token::Punctuation("{|") => {
+                        // hdtc change 7, as for `~`, which has already
+                        // checked when there is a named reifier.
+                        if !with_reifier
+                            && self.cur_object.last().map_or(0, crate::triple_term_depth)
+                                >= crate::MAX_TRIPLE_TERM_NESTING
+                        {
+                            return self.error(errors, crate::triple_term_nesting_error());
+                        }
                         let reifier = if with_reifier {
                             self.cur_reifier.last().unwrap().clone()
                         } else {
@@ -722,6 +737,15 @@ impl RuleRecognizer for TriGRecognizer {
                     }
                     #[cfg(feature = "rdf-12")]
                     N3Token::Punctuation("<<(") => {
+                        // hdtc change 7: bound the nesting before building it.
+                        let open = self
+                            .stack
+                            .iter()
+                            .filter(|state| matches!(state, TriGState::TripleTermEnd { .. }))
+                            .count();
+                        if open >= crate::MAX_TRIPLE_TERM_NESTING {
+                            return self.error(errors, crate::triple_term_nesting_error());
+                        }
                         self.stack.push(TriGState::TripleTermEnd { emit: true });
                         self.stack
                             .push(TriGState::ReifiedTripleObject { is_reified: false });
@@ -966,6 +990,11 @@ impl RuleRecognizer for TriGRecognizer {
                         self.cur_predicate.pop().unwrap(),
                         self.cur_object.pop().unwrap(),
                     );
+                    // hdtc change 7: the reified triple is one level deeper
+                    // than its object.
+                    if crate::triple_term_depth(&triple.object) >= crate::MAX_TRIPLE_TERM_NESTING {
+                        return self.error(errors, crate::triple_term_nesting_error());
+                    }
                     if token == N3Token::Punctuation("~") {
                         self.stack.push(TriGState::Reifier { triple });
                         self
@@ -1162,6 +1191,15 @@ impl RuleRecognizer for TriGRecognizer {
                         self
                     }
                     N3Token::Punctuation("<<(") => {
+                        // hdtc change 7: bound the nesting before building it.
+                        let open = self
+                            .stack
+                            .iter()
+                            .filter(|state| matches!(state, TriGState::TripleTermEnd { .. }))
+                            .count();
+                        if open >= crate::MAX_TRIPLE_TERM_NESTING {
+                            return self.error(errors, crate::triple_term_nesting_error());
+                        }
                         self.stack.push(TriGState::TripleTermEnd { emit: false });
                         self.stack
                             .push(TriGState::ReifiedTripleObject { is_reified: false });

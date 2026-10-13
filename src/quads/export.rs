@@ -1,7 +1,7 @@
 //! Streaming lossless N-Quads export from an HDT/graphs-sidecar pair.
 
 use crate::hdt::reader::{
-    BitmapTriplesScanner, make_writer, open_hdt, write_nt_object, write_nt_subject,
+    BitmapTriplesScanner, ObjectTerm, make_writer, open_hdt, write_nt_subject, write_object_term,
 };
 use crate::quads::{GraphSidecarReader, GraphTerm, PositionGraphMembership};
 use crate::sort::ExternalSorter;
@@ -22,7 +22,11 @@ pub fn export_dataset_nquads(
     let sort_budget = memory_limit
         .saturating_sub(dictionary_budget)
         .max(std::mem::size_of::<PositionGraphMembership>());
-    let (offsets, mut dictionary) = open_hdt(hdt_path, dictionary_budget)?;
+    // Rendering triple terms takes its share out of the dictionary's.
+    let triple_term_budget =
+        crate::triple_terms::reader::TripleTermDecoder::budget(hdt_path, dictionary_budget);
+    let (offsets, mut dictionary) = open_hdt(hdt_path, dictionary_budget - triple_term_budget)?;
+    dictionary.enable_triple_terms(hdt_path, triple_term_budget)?;
     let mut scanner = BitmapTriplesScanner::new(&offsets, hdt_path)?;
     let mut sidecar = GraphSidecarReader::open_for_hdt(hdt_path)?;
     ensure!(
@@ -49,7 +53,7 @@ pub fn export_dataset_nquads(
     let mut writer = make_writer(output)?;
     let mut subject = Vec::new();
     let mut predicate = Vec::new();
-    let mut object = Vec::new();
+    let mut object = ObjectTerm::default();
     let mut position = 0u64;
     let mut written = 0u64;
     // Memberships arrive in position order, so consecutive rows repeat graph
@@ -70,7 +74,7 @@ pub fn export_dataset_nquads(
             writer.write_all(b"\t<")?;
             writer.write_all(&predicate)?;
             writer.write_all(b">\t")?;
-            write_nt_object(&mut writer, &object)?;
+            write_object_term(&mut writer, &object)?;
             if cached_graph.as_ref().map(|(id, _)| *id) != Some(membership.graph) {
                 cached_graph = Some((membership.graph, sidecar.graph(membership.graph)?));
             }

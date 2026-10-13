@@ -1,8 +1,8 @@
 //! Bounded-memory quad-pattern search over an HDT/graphs-sidecar pair.
 
 use crate::hdt::reader::{
-    BitmapTriplesScanner, DictionaryResolver, HdtSectionOffsets, OutputWriter, make_writer,
-    open_hdt, write_nt_object, write_nt_subject, write_triple_tab,
+    BitmapTriplesScanner, DictionaryResolver, HdtSectionOffsets, ObjectTerm, OutputWriter,
+    make_writer, open_hdt, write_nt_subject, write_object_term, write_triple_tab,
 };
 use crate::hdt::search::{GraphQueryTerm, QuadPattern, QueryTerm};
 use crate::quads::{GraphSidecarReader, GraphTerm, PositionGraphMembership};
@@ -113,8 +113,12 @@ pub fn search_dataset_streaming(
     } else {
         memory_limit
     };
-    let (offsets, mut dictionary) = open_hdt(hdt_path, dictionary_budget)
+    // Rendering triple terms takes its share out of the dictionary's.
+    let triple_term_budget =
+        crate::triple_terms::reader::TripleTermDecoder::budget(hdt_path, dictionary_budget);
+    let (offsets, mut dictionary) = open_hdt(hdt_path, dictionary_budget - triple_term_budget)
         .with_context(|| format!("Failed to open HDT file {}", hdt_path.display()))?;
+    dictionary.enable_triple_terms(hdt_path, triple_term_budget)?;
     let Some(resolved) = resolve_triple_pattern(pattern, &mut dictionary)? else {
         return write_empty_result(output, count_only);
     };
@@ -234,6 +238,9 @@ fn resolve_triple_pattern(
     let mut missing = false;
     let subject = match &pattern.subject {
         QueryTerm::Wildcard => None,
+        QueryTerm::TripleTerm(_) => {
+            anyhow::bail!("wildcards inside a triple term are supported in triple patterns only")
+        }
         QueryTerm::Bound(term) => match dictionary.locate_subject(term)? {
             Some(id) => Some(id),
             None => {
@@ -244,6 +251,9 @@ fn resolve_triple_pattern(
     };
     let predicate = match &pattern.predicate {
         QueryTerm::Wildcard => None,
+        QueryTerm::TripleTerm(_) => {
+            anyhow::bail!("wildcards inside a triple term are supported in triple patterns only")
+        }
         QueryTerm::Bound(term) => match dictionary.locate_predicate(term)? {
             Some(id) => Some(id),
             None => {
@@ -254,13 +264,18 @@ fn resolve_triple_pattern(
     };
     let object = match &pattern.object {
         QueryTerm::Wildcard => None,
-        QueryTerm::Bound(term) => match dictionary.locate_object(term)? {
-            Some(id) => Some(id),
-            None => {
-                missing = true;
-                None
+        QueryTerm::TripleTerm(_) => {
+            anyhow::bail!("wildcards inside a triple term are supported in triple patterns only")
+        }
+        QueryTerm::Bound(term) => {
+            match crate::hdt::search::locate_bound_object(dictionary, term)? {
+                Some(id) => Some(id),
+                None => {
+                    missing = true;
+                    None
+                }
             }
-        },
+        }
     };
 
     Ok((!missing).then_some(ResolvedTriplePattern {
@@ -296,7 +311,7 @@ where
     let mut count = 0u64;
     let mut subject_buf = Vec::new();
     let mut predicate_buf = Vec::new();
-    let mut object_buf = Vec::new();
+    let mut object_buf = ObjectTerm::default();
     let mut cached_graph: Option<(u64, GraphTerm)> = None;
 
     while let Some((subject, predicate, object)) = scanner.next_triple()? {
@@ -404,7 +419,7 @@ fn scan_wildcard_graph_direct(
     let mut count = 0u64;
     let mut subject_buf = Vec::new();
     let mut predicate_buf = Vec::new();
-    let mut object_buf = Vec::new();
+    let mut object_buf = ObjectTerm::default();
     let mut cached_graph: Option<(u64, GraphTerm)> = None;
 
     while let Some((subject, predicate, object)) = scanner.next_triple()? {
@@ -459,7 +474,7 @@ fn write_statement(
     writer: &mut impl Write,
     subject: &[u8],
     predicate: &[u8],
-    object: &[u8],
+    object: &ObjectTerm,
     graph: &GraphTerm,
 ) -> Result<()> {
     match graph {
@@ -469,7 +484,7 @@ fn write_statement(
             writer.write_all(b"\t<")?;
             writer.write_all(predicate)?;
             writer.write_all(b">\t")?;
-            write_nt_object(writer, object)?;
+            write_object_term(writer, object)?;
             writer.write_all(b"\t")?;
             write_nt_subject(writer, graph.as_bytes())?;
             writer.write_all(b"\t.\n")?;

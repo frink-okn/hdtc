@@ -35,7 +35,7 @@ pub use analyzer::{
     DEFAULT_MAX_LITERAL_BYTES, DEFAULT_UNTAGGED_LANGUAGE, DatatypeExclusions, normalize_language,
 };
 pub use builder::{TextConfig, create_text_index};
-pub use manifest::{LanguageCount, TextManifest};
+pub use manifest::{LanguageCount, PropositionsCoverage, TextManifest};
 pub use searcher::{
     MatchKind, MatchMode, TextHit, TextMatchPage, TextQuery, TextScanPosition, TextSearch,
     TextSearcher,
@@ -43,7 +43,8 @@ pub use searcher::{
 
 use std::path::{Path, PathBuf};
 
-/// Fail unless the index at `dir` was built from the HDT at `hdt_path`.
+/// Fail unless the index at `dir` was built from the HDT at `hdt_path` — and,
+/// when it covers the literals of that HDT's propositions HDT, from that too.
 ///
 /// **Costs a pass over the HDT's payload**, because that is what the binding
 /// is: the manifest records a SHA-256 over the dictionary-and-triples suffix,
@@ -75,6 +76,25 @@ pub fn verify_text_index_binding(dir: &Path, hdt_path: &Path) -> anyhow::Result<
         dir.display(),
         hdt_path.display()
     );
+    // An index that covers the propositions HDT's literals addresses them by
+    // its object identifiers (`docs/text-index-format.md` §2.4), so it binds
+    // to that HDT as well.
+    if let Some(coverage) = &manifest.propositions {
+        let props_path = crate::triple_terms::format::propositions_path(hdt_path);
+        let digest = crate::hdt::reader::hdt_data_digest(&props_path).with_context(|| {
+            format!(
+                "Text index {} covers the propositions HDT {}, which cannot be read",
+                dir.display(),
+                props_path.display()
+            )
+        })?;
+        ensure!(
+            digest == coverage.digest,
+            "Text index {} was not built from {}: propositions SHA-256 binding mismatch",
+            dir.display(),
+            props_path.display()
+        );
+    }
     Ok(())
 }
 

@@ -29,3 +29,31 @@ pub(crate) const MIN_BUFFER_SIZE: usize = 4096;
 pub(crate) const DEFAULT_MAX_BUFFER_SIZE: usize = 4096 * 4096;
 #[expect(clippy::decimal_literal_representation)]
 pub(crate) const MIN_PARALLEL_CHUNK_SIZE: usize = 16384;
+
+/// Deepest RDF 1.2 triple-term nesting the parsers accept (hdtc change 7).
+/// Nested terms are boxed, and their `Clone` and `Drop` recurse, so unbounded
+/// nesting overflows the stack long before any term-size bound applies. The
+/// parsers count open triple terms on their own state stacks, which error
+/// recovery clears, so a malformed statement cannot leak depth into the next.
+pub const MAX_TRIPLE_TERM_NESTING: usize = 64;
+
+/// The error a statement nesting deeper than [`MAX_TRIPLE_TERM_NESTING`] gets.
+pub(crate) fn triple_term_nesting_error() -> String {
+    format!("triple term nested more than {MAX_TRIPLE_TERM_NESTING} levels deep")
+}
+
+/// How many triple terms `term` nests: 0 unless it is one. Triple terms nest
+/// only in object position, so this follows a single chain.
+///
+/// Reifying a triple makes it a triple term, one level deeper than its
+/// object, so a statement reifying a triple whose object is already at the
+/// limit must be refused where the reifier is written (hdtc change 7).
+#[cfg(feature = "rdf-12")]
+pub(crate) fn triple_term_depth(mut term: &oxrdf::Term) -> usize {
+    let mut depth = 0;
+    while let oxrdf::Term::Triple(triple) = term {
+        depth += 1;
+        term = &triple.object;
+    }
+    depth
+}

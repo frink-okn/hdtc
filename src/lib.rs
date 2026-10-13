@@ -17,6 +17,7 @@ mod quads;
 mod rdf;
 mod sort;
 mod text;
+mod triple_terms;
 mod triples;
 
 pub mod format;
@@ -66,16 +67,39 @@ fn make_default_temp_dir() -> Result<std::path::PathBuf> {
     Ok(dir)
 }
 
-/// An existing graph sidecar moved out of its canonical name while a new HDT
+/// An existing artifact moved out of its canonical name while a new HDT
 /// is published. Keeping the backup in a sibling directory makes both moves
 /// atomic on supported filesystems.
 struct RetiredArtifact {
     original_path: PathBuf,
     backup_path: PathBuf,
-    _quarantine: tempfile::TempDir,
+    quarantine: Option<tempfile::TempDir>,
+    /// Keep the backup on drop instead of deleting it: set when it could not
+    /// be restored, or when what replaced it could not be published.
+    preserved: std::cell::Cell<bool>,
+}
+
+impl Drop for RetiredArtifact {
+    fn drop(&mut self) {
+        if self.preserved.get()
+            && let Some(quarantine) = self.quarantine.take()
+        {
+            let _ = quarantine.keep();
+        }
+    }
 }
 
 impl RetiredArtifact {
+    /// Keep the backup past this run, and say where it is.
+    fn preserve(&self) -> String {
+        self.preserved.set(true);
+        format!(
+            "the previous {} is kept at {}",
+            self.original_path.display(),
+            self.backup_path.display()
+        )
+    }
+
     fn restore(&self) -> Result<()> {
         match std::fs::symlink_metadata(&self.original_path) {
             Ok(_) => anyhow::bail!(
@@ -145,8 +169,77 @@ fn retire_existing_artifact(
     Ok(Some(RetiredArtifact {
         original_path: artifact_path.to_path_buf(),
         backup_path,
-        _quarantine: quarantine,
+        quarantine: Some(quarantine),
+        preserved: std::cell::Cell::new(false),
     }))
+}
+
+/// Restore retired artifacts in reverse order after `error`, reporting any
+/// that could not be restored alongside it.
+fn roll_back(error: anyhow::Error, retired: &[&Option<RetiredArtifact>]) -> anyhow::Error {
+    let failures: Vec<String> = retired
+        .iter()
+        .rev()
+        .filter_map(|artifact| artifact.as_ref())
+        .filter_map(|artifact| {
+            artifact
+                .restore()
+                .err()
+                .map(|restore_error| format!("{restore_error:#} ({})", artifact.preserve()))
+        })
+        .collect();
+    if failures.is_empty() {
+        error
+    } else {
+        anyhow::anyhow!(
+            "{error:#}; additionally failed to roll back: {}",
+            failures.join("; ")
+        )
+    }
+}
+
+/// An artifact staged beside its final name, waiting to be published.
+struct Staged {
+    file: tempfile::TempPath,
+    destination: PathBuf,
+    label: &'static str,
+}
+
+/// Publish the artifacts staged beside a new HDT, in order, after the HDT
+/// itself has been replaced. Restoring the old artifacts would be wrong by
+/// then, so a failure instead keeps everything that could hold the only copy
+/// of something: the artifact that failed, every one not yet published, and
+/// every retired one. The error says where each is.
+fn publish_staged(staged: Vec<Staged>, retired: &[&Option<RetiredArtifact>]) -> Result<()> {
+    let mut pending = staged.into_iter();
+    while let Some(next) = pending.next() {
+        let Err(error) = next.file.persist(&next.destination) else {
+            tracing::info!("{} written: {}", next.label, next.destination.display());
+            continue;
+        };
+        let keep = |file: tempfile::TempPath, label: &str| match file.keep() {
+            Ok(path) => format!("the new {label} is kept at {}", path.display()),
+            Err(keep) => format!("the new {label} could not be kept: {}", keep.error),
+        };
+        let mut kept = vec![keep(error.path, next.label)];
+        kept.extend(
+            pending.map(|later| format!("{} (not published)", keep(later.file, later.label))),
+        );
+        kept.extend(
+            retired
+                .iter()
+                .filter_map(|artifact| artifact.as_ref())
+                .map(RetiredArtifact::preserve),
+        );
+        anyhow::bail!(
+            "Failed to publish {} {}: {}; {}",
+            next.label,
+            next.destination.display(),
+            error.error,
+            kept.join("; ")
+        );
+    }
+    Ok(())
 }
 
 /// Run the `hdtc` command-line interface.
@@ -277,6 +370,7 @@ fn create_hdt(args: cli::CreateArgs, benchmark: bool) -> Result<()> {
         chunk_size_bytes: args.parse_chunk_bytes,
         max_inflight_bytes: args.parse_max_inflight_bytes,
         max_term_bytes: args.max_term_bytes.as_bytes(),
+        trust_triple_term_iris: false,
     };
 
     // Compute base URI: use provided value, or derive from first input file
@@ -297,8 +391,16 @@ fn create_hdt(args: cli::CreateArgs, benchmark: bool) -> Result<()> {
     // Dataset IRI for the header subject; defaults to the parse base URI.
     let dataset_uri = args.dataset_uri.clone().unwrap_or_else(|| base_uri.clone());
 
+    // HDT inputs with triple terms: their propositions are read back after the
+    // pipeline, and the result needs the permutation index.
+    let hdt_inputs_with_triple_terms = hdt_inputs
+        .iter()
+        .map(|path| triple_terms::merge::input_has_triple_terms(path))
+        .collect::<Vec<bool>>();
+    let merges_triple_terms = hdt_inputs_with_triple_terms.contains(&true);
+
     // Run the pipelined HDT construction
-    let permutation_maps = args.perm.then(|| permutation::PositionMaps {
+    let permutation_maps = (args.perm || merges_triple_terms).then(|| permutation::PositionMaps {
         pos: args
             .perm_position_maps
             .contains(&cli::PermutationPositionMap::Pos),
@@ -401,21 +503,21 @@ fn create_hdt(args: cli::CreateArgs, benchmark: bool) -> Result<()> {
                 )
             })?
             .into_temp_path();
-        let prepared_perm = args
-            .perm
-            .then(|| {
-                tempfile::Builder::new()
-                    .prefix(".hdtc-perm-")
-                    .tempfile_in(output_parent)
-                    .map(|file| file.into_temp_path())
-            })
-            .transpose()
-            .with_context(|| {
-                format!(
-                    "Failed to create permutation-index temp file in {}",
-                    output_parent.display()
-                )
-            })?;
+        let prepared_perm =
+            (args.perm || merges_triple_terms || pipeline_result.propositions.is_some())
+                .then(|| {
+                    tempfile::Builder::new()
+                        .prefix(".hdtc-perm-")
+                        .tempfile_in(output_parent)
+                        .map(|file| file.into_temp_path())
+                })
+                .transpose()
+                .with_context(|| {
+                    format!(
+                        "Failed to create permutation-index temp file in {}",
+                        output_parent.display()
+                    )
+                })?;
         let sidecar_path = sidecar_temp
             .as_deref()
             .context("Graph-index creation requires a staged graph sidecar")?;
@@ -435,7 +537,7 @@ fn create_hdt(args: cli::CreateArgs, benchmark: bool) -> Result<()> {
         perm_temp = prepared_perm;
         Some(graph_temp)
     } else {
-        if args.perm {
+        if args.perm || merges_triple_terms || pipeline_result.propositions.is_some() {
             let prepared = pipeline_result
                 .permutation
                 .take()
@@ -462,75 +564,128 @@ fn create_hdt(args: cli::CreateArgs, benchmark: bool) -> Result<()> {
         None
     };
 
-    // Move derived graph data out first: a graph index binds to both the HDT
-    // and sidecar, so it must never survive replacement of either parent.
+    // RDF 1.2 triple terms: classify, store, and index them. An HDT with
+    // triple terms is always published with its permutation index: the
+    // triple-term index's POS and OPS layers are positions in it, and
+    // inner-pattern queries need its ranges.
+    let mut triple_term_spools: Vec<_> = pipeline_result.propositions.take().into_iter().collect();
+    let disambiguate = inputs.len() + hdt_inputs.len() > 1;
+    for (i, (path, has)) in hdt_inputs
+        .iter()
+        .zip(&hdt_inputs_with_triple_terms)
+        .enumerate()
+    {
+        if !*has {
+            continue;
+        }
+        // The prefix the pipeline gives this input's blank nodes.
+        let prefix = disambiguate.then(|| format!("f{}_", inputs.len() + i));
+        if let Some(spool) = triple_terms::merge::rederive(
+            path,
+            prefix.as_deref(),
+            temp_dir.join(format!("tt-input-{i}.zst")),
+            memory_budget,
+        )? {
+            triple_term_spools.push(spool);
+        }
+    }
+    let built_triple_terms = match triple_term_spools.is_empty() {
+        true => None,
+        false => {
+            let spools = triple_term_spools;
+            let context = triple_terms::build::FinishContext {
+                hdt: &hdt_temp,
+                perm: perm_temp
+                    .as_deref()
+                    .context("permutation index missing for triple terms")?,
+                output_dir: output_parent,
+                temp_dir: &temp_dir,
+                memory_budget,
+                dataset_uri: &dataset_uri,
+            };
+            let built = triple_terms::build::finish(&context, spools)?;
+            tracing::info!(
+                "Triple terms: {} distinct, {} asserted, {} unasserted",
+                built.distinct,
+                built.asserted,
+                built.unasserted
+            );
+            Some(built)
+        }
+    };
+    let publish_perm = args.perm || built_triple_terms.is_some();
+
+    // Old artifacts leave their canonical names before anything is replaced,
+    // indexes before the data they bind to, so that a crash can leave
+    // detectably missing artifacts but never a new HDT beside stale ones. Any
+    // failure from here to the HDT's publication restores every artifact
+    // retired so far, in reverse order.
+    let canonical_tt_path = triple_terms::format::canonical_path(&args.output);
+    let canonical_props_path = triple_terms::format::propositions_path(&args.output);
+    let canonical_props_perm_path = permutation::canonical_path(&canonical_props_path);
+    let retired_tt =
+        retire_existing_artifact(&canonical_tt_path, output_parent, "triple-term index")?;
+    let retired_props_perm = retire_existing_artifact(
+        &canonical_props_perm_path,
+        output_parent,
+        "propositions permutation index",
+    )
+    .map_err(|error| roll_back(error, &[&retired_tt]))?;
+    let retired_props =
+        retire_existing_artifact(&canonical_props_path, output_parent, "propositions HDT")
+            .map_err(|error| roll_back(error, &[&retired_tt, &retired_props_perm]))?;
     let retired_graph_index =
-        retire_existing_artifact(&canonical_graph_index_path, output_parent, "graph index")?;
-    // Move the old sidecar out of its canonical name before replacing the HDT.
-    // A crash can therefore leave detectably missing artifacts, but never a
-    // new HDT next to stale graph data.
+        retire_existing_artifact(&canonical_graph_index_path, output_parent, "graph index")
+            .map_err(|error| {
+                roll_back(error, &[&retired_tt, &retired_props_perm, &retired_props])
+            })?;
     let retired_sidecar =
-        match retire_existing_artifact(&canonical_graphs_path, output_parent, "graph sidecar") {
-            Ok(retired) => retired,
-            Err(error) => {
-                if let Some(retired) = retired_graph_index.as_ref()
-                    && let Err(restore_error) = retired.restore()
-                {
-                    return Err(anyhow::anyhow!(
-                        "{error:#}; additionally failed to roll back the graph index: \
-                     {restore_error:#}"
-                    ));
-                }
-                return Err(error);
-            }
-        };
+        retire_existing_artifact(&canonical_graphs_path, output_parent, "graph sidecar").map_err(
+            |error| {
+                roll_back(
+                    error,
+                    &[
+                        &retired_tt,
+                        &retired_props_perm,
+                        &retired_props,
+                        &retired_graph_index,
+                    ],
+                )
+            },
+        )?;
     let retired_perm =
-        match retire_existing_artifact(&canonical_perm_path, output_parent, "permutation index") {
-            Ok(retired) => retired,
-            Err(error) => {
-                let graph_restore = (|| -> Result<()> {
-                    if let Some(retired) = retired_sidecar.as_ref() {
-                        retired.restore()?;
-                    }
-                    if let Some(retired) = retired_graph_index.as_ref() {
-                        retired.restore()?;
-                    }
-                    Ok(())
-                })();
-                if let Err(restore_error) = graph_restore {
-                    return Err(anyhow::anyhow!(
-                        "{error:#}; additionally failed to roll back a graph artifact: \
-                         {restore_error:#}"
-                    ));
-                }
-                return Err(error);
-            }
-        };
+        retire_existing_artifact(&canonical_perm_path, output_parent, "permutation index")
+            .map_err(|error| {
+                roll_back(
+                    error,
+                    &[
+                        &retired_tt,
+                        &retired_props_perm,
+                        &retired_props,
+                        &retired_graph_index,
+                        &retired_sidecar,
+                    ],
+                )
+            })?;
     if let Err(error) = hdt_temp.persist(&args.output) {
         let publish_error = anyhow::Error::new(error.error).context(format!(
             "Failed to publish HDT file {}",
             args.output.display()
         ));
-        let perm_restore = retired_perm
-            .as_ref()
-            .map(RetiredArtifact::restore)
-            .transpose();
-        let graph_restore = (|| -> Result<()> {
-            if let Some(retired) = retired_sidecar.as_ref() {
-                retired.restore()?;
-            }
-            if let Some(retired) = retired_graph_index.as_ref() {
-                retired.restore()?;
-            }
-            Ok(())
-        })();
-        if let Err(restore_error) = perm_restore.map(|_| ()).and(graph_restore) {
-            return Err(anyhow::anyhow!(
-                "{publish_error:#}; additionally failed to roll back an artifact: {restore_error:#}"
-            ));
-        }
-        return Err(publish_error);
+        return Err(roll_back(
+            publish_error,
+            &[
+                &retired_tt,
+                &retired_props_perm,
+                &retired_props,
+                &retired_graph_index,
+                &retired_sidecar,
+                &retired_perm,
+            ],
+        ));
     }
+    let retired_triple_terms =
+        retired_tt.is_some() || retired_props_perm.is_some() || retired_props.is_some();
 
     if !include_graphs && retired_sidecar.is_some() {
         tracing::info!(
@@ -545,50 +700,82 @@ fn create_hdt(args: cli::CreateArgs, benchmark: bool) -> Result<()> {
         );
     }
 
-    if let Some(sidecar_temp) = sidecar_temp {
-        sidecar_temp
-            .persist(&canonical_graphs_path)
-            .with_context(|| {
-                format!(
-                    "Failed to publish graph sidecar {}",
-                    canonical_graphs_path.display()
-                )
-            })?;
-        tracing::info!("Graph sidecar written: {}", canonical_graphs_path.display());
+    // Data before the indexes that bind to it: the graph sidecar before its
+    // index, and the propositions HDT before its permutation index and the
+    // triple-term index, which binds to both HDTs.
+    let mut staged = Vec::new();
+    if let Some(file) = sidecar_temp {
+        staged.push(Staged {
+            file,
+            destination: canonical_graphs_path.clone(),
+            label: "Graph sidecar",
+        });
     }
-
-    if !args.perm && retired_perm.is_some() {
+    let (props_perm_staged, tt_staged) = match built_triple_terms {
+        Some(built) => {
+            let props_perm = built.propositions.map(|(props_hdt, props_perm)| {
+                staged.push(Staged {
+                    file: props_hdt,
+                    destination: canonical_props_path.clone(),
+                    label: "Propositions HDT",
+                });
+                Staged {
+                    file: props_perm,
+                    destination: canonical_props_perm_path.clone(),
+                    label: "Propositions permutation index",
+                }
+            });
+            let tt = Staged {
+                file: built.index,
+                destination: canonical_tt_path.clone(),
+                label: "Triple-term index",
+            };
+            (props_perm, Some(tt))
+        }
+        None => (None, None),
+    };
+    if let Some(file) = perm_temp {
+        staged.push(Staged {
+            file,
+            destination: canonical_perm_path.clone(),
+            label: "Permutation index",
+        });
+    }
+    if let Some(file) = graph_index_temp {
+        staged.push(Staged {
+            file,
+            destination: canonical_graph_index_path.clone(),
+            label: "Graph index",
+        });
+    }
+    staged.extend(props_perm_staged);
+    staged.extend(tt_staged);
+    let publishes_triple_terms = staged
+        .iter()
+        .any(|artifact| artifact.destination == canonical_tt_path);
+    if !publish_perm && retired_perm.is_some() {
         tracing::info!(
             "Removed stale permutation index: {}",
             canonical_perm_path.display()
         );
     }
-    if let Some(perm_temp) = perm_temp {
-        perm_temp.persist(&canonical_perm_path).with_context(|| {
-            format!(
-                "Failed to publish permutation index {}",
-                canonical_perm_path.display()
-            )
-        })?;
+    if !publishes_triple_terms && retired_triple_terms {
         tracing::info!(
-            "Permutation index written: {}",
-            canonical_perm_path.display()
+            "Removed stale triple-term artifacts beside {}",
+            args.output.display()
         );
     }
-    if let Some(graph_index_temp) = graph_index_temp {
-        graph_index_temp
-            .persist(&canonical_graph_index_path)
-            .with_context(|| {
-                format!(
-                    "Failed to publish graph index {}",
-                    canonical_graph_index_path.display()
-                )
-            })?;
-        tracing::info!(
-            "Graph index written: {}",
-            canonical_graph_index_path.display()
-        );
-    }
+    publish_staged(
+        staged,
+        &[
+            &retired_tt,
+            &retired_props_perm,
+            &retired_props,
+            &retired_graph_index,
+            &retired_sidecar,
+            &retired_perm,
+        ],
+    )?;
 
     // Clean up dict section and triples temp files
     for path in &pipeline_result.dict_section_paths {
@@ -1354,6 +1541,35 @@ fn validate_hdt_file(args: cli::ValidateArgs, benchmark: bool) -> Result<()> {
                     &temp_dir,
                     args.memory_limit.as_bytes(),
                 )?;
+            }
+            let triple_terms_path = triple_terms::format::canonical_path(&args.hdt_file);
+            if triple_terms_path.exists() {
+                tracing::info!("Validating triple terms: {}", triple_terms_path.display());
+                let temp_dir = match &args.temp_dir {
+                    Some(path) => {
+                        std::fs::create_dir_all(path)?;
+                        path.clone()
+                    }
+                    None => make_default_temp_dir()?,
+                };
+                triple_terms::validate::validate_triple_terms(
+                    &args.hdt_file,
+                    &temp_dir,
+                    args.memory_limit.as_bytes(),
+                )?;
+            } else {
+                // An HDT whose dictionary holds triple-term IRIs needs its index,
+                // and a propositions HDT means nothing without one.
+                let (_, mut dictionary) =
+                    hdt::reader::open_hdt(&args.hdt_file, args.memory_limit.as_bytes())?;
+                dictionary.enable_triple_terms(&args.hdt_file, args.memory_limit.as_bytes())?;
+                let props = triple_terms::format::propositions_path(&args.hdt_file);
+                anyhow::ensure!(
+                    !props.exists(),
+                    "{} exists but there is no triple-term index beside {}",
+                    props.display(),
+                    args.hdt_file.display()
+                );
             }
             if graph_index_path.exists() {
                 tracing::info!(

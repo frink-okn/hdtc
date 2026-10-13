@@ -488,11 +488,13 @@ pub struct SearchArgs {
     #[arg(long, value_name = "N")]
     pub offset: Option<u64>,
 
-    /// Explicit FoQ index path (disables automatic .hdt.perm discovery)
+    /// Explicit FoQ index path (disables automatic .hdt.perm discovery). Not
+    /// used by triple-term patterns, which always need .hdt.perm
     #[arg(long, value_name = "PATH")]
     pub index: Option<PathBuf>,
 
-    /// Disable index use; fall back to sequential scan for all patterns
+    /// Disable index use; fall back to sequential scan for all patterns. Not
+    /// used by triple-term patterns, which always need .hdt.perm
     #[arg(long)]
     pub no_index: bool,
 

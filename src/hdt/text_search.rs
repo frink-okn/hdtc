@@ -14,8 +14,8 @@
 
 use crate::hdt::index_reader::open_index;
 use crate::hdt::reader::{
-    BitmapTriplesScanner, DictionaryResolver, HdtSectionOffsets, make_writer, open_hdt,
-    write_nt_object, write_nt_subject, write_triple_tab,
+    BitmapTriplesScanner, DictionaryResolver, HdtSectionOffsets, ObjectTerm, make_writer, open_hdt,
+    write_nt_subject, write_object_term, write_triple_tab,
 };
 use crate::hdt::search::{Visit, resolve_index_path, resolve_object_page, scan_object_occurrences};
 use crate::permutation::PermutationIndex;
@@ -93,10 +93,23 @@ pub fn search_text_streaming(options: &TextSearchOptions<'_>) -> Result<u64> {
         fuzzy: options.fuzzy,
         prefix: options.prefix,
         languages: options.languages.to_vec(),
+        // This command resolves those hits itself, to the triples naming the
+        // triple terms that hold them.
+        propositions: true,
     };
 
-    let (offsets, mut dictionary) = open_hdt(options.hdt_path, options.memory_limit)
-        .with_context(|| format!("Failed to open HDT file {}", options.hdt_path.display()))?;
+    // Hits on the propositions HDT's literals resolve and render through the
+    // triple-term index, whose share of the limit comes out of the dictionary's.
+    let triple_term_budget = match searcher.manifest().propositions {
+        Some(_) => crate::triple_terms::reader::TripleTermDecoder::budget(
+            options.hdt_path,
+            options.memory_limit,
+        ),
+        None => 0,
+    };
+    let (offsets, mut dictionary) =
+        open_hdt(options.hdt_path, options.memory_limit - triple_term_budget)
+            .with_context(|| format!("Failed to open HDT file {}", options.hdt_path.display()))?;
 
     // A predicate the dataset does not use cannot match anything, which is an
     // empty result rather than an error.
@@ -104,6 +117,9 @@ pub fn search_text_streaming(options: &TextSearchOptions<'_>) -> Result<u64> {
         None => None,
         Some(iri) => match dictionary.locate_predicate(iri.as_bytes())? {
             Some(id) => Some(id),
+            // It may still be the predicate of an unasserted triple term,
+            // whose literals the index covers; no data.hdt row can match.
+            None if searcher.manifest().propositions.is_some() => Some(0),
             None => {
                 tracing::info!("Predicate {iri} is not in the dictionary; no rows can match");
                 return finish_empty(options);
@@ -116,7 +132,16 @@ pub fn search_text_streaming(options: &TextSearchOptions<'_>) -> Result<u64> {
     }
 
     let skip = options.offset.unwrap_or(0);
-    let mut resolver = OccurrenceResolver::open(options, &offsets)?;
+    let mut resolver = OccurrenceResolver::open(
+        options,
+        &offsets,
+        searcher.manifest(),
+        triple_term_budget / 2,
+    )?;
+    if resolver.propositions.is_some() {
+        // Rows from unasserted triple terms carry the triple term as object.
+        dictionary.enable_triple_terms(options.hdt_path, triple_term_budget / 2)?;
+    }
 
     // Counting needs neither scores nor ranking. Stream the matching document
     // IDs and resolve them in bounded batches instead of constructing a
@@ -235,10 +260,17 @@ fn count_object_batch(
 ) -> Result<()> {
     resolver.prepare_ids(object_ids)?;
     for &object_id in object_ids {
-        let occurrences = resolver.occurrences(object_id, predicate_filter)?;
+        let (examined, rows) = match resolver.propositions_for(object_id) {
+            // Counted from group sizes: no row is read or held.
+            Some(props) => props.count_rows(object_id)?,
+            None => {
+                let occurrences = resolver.occurrences(object_id, predicate_filter)?;
+                (occurrences.examined, occurrences.pairs.len() as u64)
+            }
+        };
         outcome.literals_resolved += 1;
-        outcome.occurrences_examined += occurrences.examined;
-        outcome.rows += occurrences.pairs.len() as u64;
+        outcome.occurrences_examined += examined;
+        outcome.rows += rows;
     }
     Ok(())
 }
@@ -501,11 +533,44 @@ fn emit_rows(
     }
     let object_ids: Vec<u64> = hits.iter().map(|hit| hit.object_id).collect();
     resolver.prepare_ids(&object_ids)?;
-    let mut object_buf = Vec::new();
+    let mut object_buf = ObjectTerm::default();
     let mut subject_buf = Vec::new();
     let mut predicate_buf = Vec::new();
 
     for hit in hits {
+        // A literal of the propositions HDT: its rows are streamed, each
+        // written as it is found, so a page costs the rows it takes.
+        if let Some(props) = resolver.propositions_for(hit.object_id) {
+            let (examined, complete) =
+                props.visit_rows(hit.object_id, |subject, predicate, object| {
+                    if state.remaining_skip > 0 {
+                        state.remaining_skip -= 1;
+                        return Ok(true);
+                    }
+                    state.outcome.rows += 1;
+                    dictionary.subject_term(subject, &mut subject_buf)?;
+                    dictionary.predicate_term(predicate, &mut predicate_buf)?;
+                    dictionary.object_term(object, &mut object_buf)?;
+                    if options.scores {
+                        write_scored_triple_tab(
+                            writer,
+                            &subject_buf,
+                            &predicate_buf,
+                            &object_buf,
+                            hit.score,
+                        )?;
+                    } else {
+                        write_triple_tab(writer, &subject_buf, &predicate_buf, &object_buf)?;
+                    }
+                    Ok(options.take.is_none_or(|take| state.outcome.rows < take))
+                })?;
+            state.outcome.literals_resolved += 1;
+            state.outcome.occurrences_examined += examined;
+            if !complete {
+                return Ok(true);
+            }
+            continue;
+        }
         // Collected rather than visited in place, because writing needs the
         // dictionary and the resolver may already be borrowing the HDT.
         let occurrences = resolver.occurrences(hit.object_id, options.predicate_filter)?;
@@ -561,14 +626,14 @@ fn write_scored_triple_tab(
     writer: &mut impl Write,
     subject: &[u8],
     predicate: &[u8],
-    object: &[u8],
+    object: &ObjectTerm,
     score: f32,
 ) -> std::io::Result<()> {
     write_nt_subject(writer, subject)?;
     writer.write_all(b"\t<")?;
     writer.write_all(predicate)?;
     writer.write_all(b">\t")?;
-    write_nt_object(writer, object)?;
+    write_object_term(writer, object)?;
     writeln!(writer, "\t. # score={score:.4}")
 }
 
@@ -577,7 +642,7 @@ fn write_scored_triple_tab(
 // ---------------------------------------------------------------------------
 
 /// The two ways to find every `(subject, predicate)` that uses an object.
-enum OccurrenceResolver {
+enum DataResolver {
     /// Through the OPS permutation, reading each object's contiguous run.
     Permutation(PermutationResolver),
     /// Through the HDT-FoQ index, resolving a whole page in one pass.
@@ -615,7 +680,7 @@ struct ScannedResolver {
     occurrences: HashMap<u64, Vec<(u64, u64)>>,
 }
 
-impl OccurrenceResolver {
+impl DataResolver {
     fn open(options: &TextSearchOptions<'_>, offsets: &HdtSectionOffsets) -> Result<Self> {
         if options.no_index {
             return Ok(Self::Scanned(ScannedResolver {
@@ -825,6 +890,72 @@ struct ResolvedOccurrences {
     pairs: Vec<(u64, u64)>,
     /// Pair count before applying `--predicate`.
     examined: u64,
+}
+
+/// Resolves hits to occurrences: in `data.hdt` for its own literals, and
+/// through the triple-term index for literals of unasserted triple terms.
+struct OccurrenceResolver {
+    data: DataResolver,
+    propositions: Option<crate::triple_terms::text::PropositionHits>,
+}
+
+impl OccurrenceResolver {
+    /// `propositions_budget` bounds the propositions HDT's dictionary, which
+    /// resolving a hit on one of its literals may read.
+    fn open(
+        options: &TextSearchOptions<'_>,
+        offsets: &HdtSectionOffsets,
+        manifest: &crate::text::TextManifest,
+        propositions_budget: usize,
+    ) -> Result<Self> {
+        let propositions = match &manifest.propositions {
+            Some(coverage) => Some(crate::triple_terms::text::PropositionHits::open(
+                options.hdt_path,
+                coverage.object_offset,
+                options.predicate,
+                propositions_budget,
+            )?),
+            None => None,
+        };
+        Ok(Self {
+            data: DataResolver::open(options, offsets)?,
+            propositions,
+        })
+    }
+
+    fn prepare_ids(&mut self, object_ids: &[u64]) -> Result<()> {
+        match &self.propositions {
+            Some(props) => {
+                let data_ids: Vec<u64> = object_ids
+                    .iter()
+                    .copied()
+                    .filter(|id| !props.covers(*id))
+                    .collect();
+                self.data.prepare_ids(&data_ids)
+            }
+            None => self.data.prepare_ids(object_ids),
+        }
+    }
+
+    /// The resolver for a literal of the propositions HDT, which streams its
+    /// rows; `None` for a literal of `data.hdt`.
+    fn propositions_for(
+        &mut self,
+        object_id: u64,
+    ) -> Option<&mut crate::triple_terms::text::PropositionHits> {
+        self.propositions
+            .as_mut()
+            .filter(|props| props.covers(object_id))
+    }
+
+    /// The occurrences of a literal of `data.hdt`.
+    fn occurrences(
+        &mut self,
+        object_id: u64,
+        predicate_filter: Option<u64>,
+    ) -> Result<ResolvedOccurrences> {
+        self.data.occurrences(object_id, predicate_filter)
+    }
 }
 
 #[cfg(test)]

@@ -118,6 +118,37 @@ strings a cross-language caller most wants.
 A literal whose actual language tag is `und` is indistinguishable from an
 untagged one. This is accepted: the two make the same claim.
 
+### 2.4 Literals of unasserted triple terms
+
+An HDT with RDF 1.2 triple terms may carry a propositions HDT
+(`triple-terms-format.md` §3) holding the propositions of its *unasserted*
+triple terms, whose literals occur nowhere in the data HDT's dictionary. An
+index over such an HDT **covers them too**, so that a search can reach every
+literal in the dataset, asserted or not:
+
+- each literal of the propositions HDT's object-only section is a document,
+  under the same rules as §2.1 and §3;
+- its ID is the data HDT's object count (`shared + objects`, the
+  `propositions_object_offset` of §4) **plus** its object ID in the
+  propositions HDT, so the two ID spaces never collide and a consumer tells
+  them apart by comparing with the offset;
+- the manifest records the coverage (§4), and counts include these documents.
+
+A literal that occurs both asserted and inside an unasserted triple term is two
+documents, one in each space, ranked by one shared model; each resolves to its
+own occurrences.
+
+A hit in the propositions space resolves not to the literal's own occurrences —
+those are propositions, never asserted — but to the triples of the data HDT
+whose object is a triple term containing it, found through the triple-term
+index: `r q <<( s p "literal" )>>`. Containment is followed through unasserted
+triple terms at any depth, so a term named only inside another unasserted claim
+is reached through the claim that names it: `r q <<( s' p' <<( s p "literal"
+)>> )>>`. A predicate filter (§7.3) then applies to the predicate `p` of the
+triple term holding the literal.
+
+An HDT without a propositions HDT is indexed exactly as before.
+
 ## 3. The analyzer (`analyzer_id = 1`)
 
 Every index records an `analyzer_id`. It asserts every rule in this section. A
@@ -323,6 +354,8 @@ Keys, each at most once except where noted:
 | `excluded_no_tokens` | count | Literals excluded by §3.4 rule 3. |
 | `excluded_datatype_iri` | IRI | One member of the §3.5 set. Repeated, ascending. |
 | `language` | tag, count | One language value and its document count. Repeated, ascending by tag. |
+| `propositions_digest` | 64 hex chars | SHA-256 over the propositions HDT's identity suffix, when the index covers it (§2.4). |
+| `propositions_object_offset` | count | The data HDT's object count; document IDs above it address the propositions HDT (§2.4). Present iff `propositions_digest` is. |
 
 `literals_scanned = indexed_docs + excluded_oversize + excluded_datatype +
 excluded_no_tokens`, and the `language` counts sum to `indexed_docs`.
@@ -413,8 +446,16 @@ tokens at 40 bytes and would fail to match any longer term.
 
 ### 5.3 Segments
 
-A published index is merged to a single segment where it has any documents. This
-is a property of what hdtc publishes, not a requirement on readers.
+A published index is merged to a single segment where it has any documents —
+or, when it covers a propositions HDT (§2.4), to two: one of the data HDT's
+literals, then one of the propositions HDT's. The split lets a reader leave the
+propositions literals out whole segments at a time, at no cost per query: hdtc's
+reader decides at open, from each segment's `object` column bounds, which
+segments hold them, and refuses an index covering a propositions HDT whose
+segment mixes the two. A reader of its own may instead exclude IDs past
+`propositions_object_offset` with a range, which is correct on any
+segmentation, but in Tantivy costs time in proportion to the index on every
+query.
 
 ### 5.4 Reading writes nothing
 
@@ -598,6 +639,10 @@ bytes it covers* would be actively misleading.
 Object IDs are meaningful only against the HDT the index was built from. An
 index paired with a different HDT resolves to unrelated terms, which is the
 failure `source_digest` exists to make detectable.
+
+An index covering a propositions HDT (§2.4) addresses that HDT's literals by
+its object IDs too, so `propositions_digest` binds it the same way, with the
+same advisory standing; hdtc's binding check verifies both.
 
 ## 10. Versioning
 

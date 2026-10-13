@@ -1,7 +1,9 @@
 //! Sequential PFC (Plain Front Coding) section reader.
 //!
 //! Iterates all terms in a PFC dictionary section in lexicographic order,
-//! decoding blocks sequentially. O(block_size) memory — no seeking needed.
+//! decoding blocks sequentially. O(block_size) memory. A reader that can seek
+//! may start mid-section (`PfcSectionIterator::seek_to`); reading is still
+//! sequential from there.
 
 use crate::io::crc_utils::crc8;
 use crate::io::{
@@ -104,7 +106,8 @@ impl PfcSectionHeader {
 /// Sequential iterator over all terms in a PFC section.
 ///
 /// Yields terms in lexicographic order (1-based IDs: 1, 2, 3, ...).
-/// Reads blocks linearly from the underlying reader — no seeking.
+/// Reads blocks linearly from the underlying reader; the only seek is the
+/// optional initial `seek_to`.
 pub struct PfcSectionIterator<R: Read> {
     reader: R,
     section_name: String,
@@ -255,6 +258,42 @@ impl<R: Read> PfcSectionIterator<R> {
     }
 }
 
+impl<R: Read + Seek> PfcSectionIterator<R> {
+    /// Position a fresh iterator at the term with zero-based `index`, without
+    /// decoding the blocks before it: one seek to that term's block, then the
+    /// terms before it within the block. For reading a run in the middle of a
+    /// section, such as the triple-term IRIs, sequentially.
+    pub fn seek_to(&mut self, index: u64) -> Result<()> {
+        ensure!(
+            self.strings_yielded == 0 && self.blocks_decoded == 0,
+            "{} can only be positioned before it is read",
+            self.section_name
+        );
+        if index == 0 {
+            return Ok(());
+        }
+        if index >= self.string_count {
+            self.strings_yielded = self.string_count;
+            return Ok(());
+        }
+        let block = index / self.block_size;
+        let offset =
+            self.offsets.get(block as usize).copied().with_context(|| {
+                format!("Missing block offset {block} in {}", self.section_name)
+            })?;
+        self.reader.seek(SeekFrom::Current(
+            i64::try_from(offset).context("PFC block offset is too large to seek")?,
+        ))?;
+        self.bytes_consumed = offset;
+        self.blocks_decoded = block;
+        self.strings_yielded = block * self.block_size;
+        for _ in self.strings_yielded..index {
+            self.next().transpose()?;
+        }
+        Ok(())
+    }
+}
+
 impl<R: Read> Iterator for PfcSectionIterator<R> {
     type Item = Result<Vec<u8>>;
 
@@ -378,6 +417,29 @@ mod tests {
     use super::*;
     use crate::dictionary::pfc::PfcEncoder;
     use std::io::Cursor;
+
+    /// Positioning at any term yields exactly the section's suffix from it,
+    /// across block boundaries and at both ends.
+    #[test]
+    fn a_positioned_iterator_reads_the_suffix_from_any_term() {
+        let terms: Vec<String> = (0..23).map(|i| format!("term-{i:03}")).collect();
+        let mut encoder = PfcEncoder::with_block_size(4);
+        for term in &terms {
+            encoder.push(term);
+        }
+        let mut section = Vec::new();
+        encoder.write_to(&mut section).unwrap();
+        for start in 0..=terms.len() {
+            let mut reader = Cursor::new(section.clone());
+            let header = PfcSectionHeader::read_from(&mut reader, "test").unwrap();
+            let mut iterator = PfcSectionIterator::new(reader, header, "test");
+            iterator.seek_to(start as u64).unwrap();
+            let read: Vec<String> = iterator
+                .map(|term| String::from_utf8(term.unwrap()).unwrap())
+                .collect();
+            assert_eq!(read, terms[start..], "from {start}");
+        }
+    }
 
     /// The scan must describe a section the encoder just wrote, and land exactly
     /// on what follows it — the property every walk built from it depends on.

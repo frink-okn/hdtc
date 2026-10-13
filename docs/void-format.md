@@ -78,8 +78,11 @@ that class.
 ### 2.3 Classes and datatypes
 
 - **A class** is an IRI object of an `rdf:type` triple in the described
-  dataset. Blank-node and literal objects of `rdf:type` are not classes. They
-  create no class partition, and they do not make a subject or object typed.
+  dataset. Blank-node, literal and RDF 1.2 triple-term objects of `rdf:type`
+  are not classes — a triple term is no IRI, whatever IRI the dictionary
+  stores it under (`triple-terms-format.md` §2), and that encoding is never
+  written as a `void:class`. They create no class partition, and they do not
+  make a subject or object typed.
 - **An object with several classes** counts toward the object-class partition
   of each one. An object with none counts toward the single untyped partition,
   which has no `void:class`. That includes literals and untyped IRIs and blank

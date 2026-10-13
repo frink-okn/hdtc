@@ -23,14 +23,18 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 walkdir = "2"
-oxrdfio = "0.2"
+# RDF 1.2: triple terms and directional language tags (docs/triple-terms-format.md).
+oxrdfio = { version = "0.2", features = ["rdf-12"] }
 # The Turtle-family parsers are built from this vendored oxttl 0.2.3 so that
 # `with_max_buffer_size` can be set (src/rdf/parser.rs). It is a separate,
 # renamed package rather than a `[patch]` because a patch applies only to the
 # root manifest, and anything depending on hdtc would fail to build; oxrdfio
 # keeps using the registry oxttl for the formats hdtc does not build itself.
-oxttl = { package = "oxttl-hdtc", path = "vendor/oxttl" }
-oxrdf = "0.3"
+oxttl = { package = "oxttl-hdtc", path = "vendor/oxttl", features = ["rdf-12"] }
+# RDF/XML likewise, from a vendored oxrdfxml 0.2.3 that bounds triple-term
+# nesting (vendor/oxrdfxml/Cargo.toml).
+oxrdfxml = { package = "oxrdfxml-hdtc", path = "vendor/oxrdfxml", features = ["rdf-12"] }
+oxrdf = { version = "0.3", features = ["rdf-12"] }
 indicatif = "0.17"
 zstd = "0.13"
 crossbeam-channel = "0.5"

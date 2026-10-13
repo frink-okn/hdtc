@@ -96,6 +96,11 @@ A dictionary term qualifies iff it is an **absolute IRI**. Excluded:
   are dataset-local for the same reason and MUST be excluded when the producer
   applies a documented skolem prefix. A producer that does not skolemize has
   nothing to exclude on this rule.
+- **RDF 1.2 triple terms** — stored as IRIs under the reserved namespace
+  `urn:x-kgf:tt:` ([triple-terms-format.md](triple-terms-format.md) §2) but not
+  IRIs: such a string names a statement, not a resource. Recognised by that
+  prefix. Before hdtc reserved the namespace, source RDF could use it; such
+  IRIs in an HDT built then were keys, and are excluded when it is processed now.
 
 A role whose qualifying set is empty is **not** an error. It produces a
 well-formed file with `key_count = 0` (§5.3, §6.2).

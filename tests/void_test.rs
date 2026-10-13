@@ -1667,6 +1667,60 @@ fn test_void_blank_node_classes_excluded() {
     );
 }
 
+/// RDF 1.2 triple terms as `rdf:type` objects: bob's only type is a triple term,
+/// and alice knows bob. The triple term is stored under a minted IRI.
+const TRIPLE_TERM_CLASS_NT: &str = r#"<http://example.org/alice> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/Person> .
+<http://example.org/alice> <http://example.org/knows> <http://example.org/bob> .
+<http://example.org/bob> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <<( <http://example.org/a> <http://example.org/b> <http://example.org/c> )>> .
+<http://example.org/bob> <http://example.org/name> "Bob" .
+"#;
+
+/// A triple term is no class, as a blank node is not: no class partition, no
+/// typed subject, no typed target — and the IRI minted to store it is never
+/// written as a `void:class`.
+#[test]
+fn test_void_triple_term_classes_excluded() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let hdt_path = make_hdt(temp_dir.path(), TRIPLE_TERM_CLASS_NT, "void_tt_class");
+    let (ok, stdout, stderr) = run_void(&hdt_path, &["--dataset-uri", "http://example.org/ds"]);
+    assert!(ok, "hdtc void failed: {stderr}");
+    assert!(
+        !stdout.contains(hdtc::format::TRIPLE_TERM_NAMESPACE),
+        "the encoding leaked into VoID: {stdout}"
+    );
+
+    let triples = parse_ntriples(&stdout);
+    let smap = subject_map(&triples);
+    let ds = "<http://example.org/ds>";
+    let class_parts: Vec<String> = triples
+        .iter()
+        .filter(|(s, p, _)| s == ds && p == "http://rdfs.org/ns/void#classPartition")
+        .map(|(_, _, o)| o.clone())
+        .collect();
+    assert_eq!(class_parts.len(), 1, "Person only: {class_parts:?}");
+    let person = find_class_partition(&triples, &smap, ds, "<http://example.org/Person>")
+        .expect("the Person class partition");
+    assert_eq!(
+        get_void_int(&smap, &person, "http://rdfs.org/ns/void#entities"),
+        Some(1),
+        "alice alone is typed"
+    );
+
+    // alice knows bob, whose only "type" is a triple term: an untyped target.
+    let knows = find_property_partition(&triples, &smap, &person, "<http://example.org/knows>")
+        .expect("Person's knows partition");
+    let targets = objects_for(
+        &triples,
+        &knows,
+        "http://ldf.fi/void-ext#objectClassPartition",
+    );
+    assert_eq!(targets.len(), 1, "{targets:?}");
+    assert!(
+        objects_for(&triples, &targets[0], "http://rdfs.org/ns/void#class").is_empty(),
+        "the target is untyped"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Test: partition URI format matches Python tool (MD5-based URIs)
 // ---------------------------------------------------------------------------

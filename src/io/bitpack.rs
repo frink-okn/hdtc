@@ -75,11 +75,17 @@ impl<W: Write> BitPacker<W> {
     }
 
     /// Flush any partial word, zero-padded, and report the words written.
-    pub fn finish(mut self) -> Result<u64> {
+    pub fn finish(self) -> Result<u64> {
+        Ok(self.finish_into_inner()?.0)
+    }
+
+    /// As [`Self::finish`], returning the writer so the caller can flush it and
+    /// see the error a drop would swallow.
+    pub fn finish_into_inner(mut self) -> Result<(u64, W)> {
         if self.used > 0 {
             self.flush_word()?;
         }
-        Ok(self.words)
+        Ok((self.words, self.writer))
     }
 }
 

@@ -34,6 +34,7 @@ use crate::graph_index::{GraphIndex, GraphIndexSpace};
 use crate::permutation::{self, PermutationComponent, PermutationIndex};
 use crate::quads::transpose::{LayerSource, PositionMajorMemberships, layer_merge_reserve};
 use crate::quads::{GraphSidecarReader, GraphTerm, PositionGraphMembership};
+use crate::triple_terms::iri::is_triple_term_iri;
 
 // ---------------------------------------------------------------------------
 // ClassComboIndex: compact subject→classes mapping via combo deduplication
@@ -714,9 +715,12 @@ fn int_node(n: u64) -> String {
     format!("\"{n}\"^^<{XSD_INTEGER}>")
 }
 
-/// Return true if the raw HDT term bytes represent an IRI (not a blank node or literal).
+/// Return true if the raw HDT term bytes represent an IRI: not a blank node, a
+/// literal, or an RDF 1.2 triple term. A triple term is stored under an IRI
+/// minted from its content (`docs/triple-terms-format.md` §2), an encoding
+/// that names nothing in the described data, so it is no class.
 fn is_iri(term: &[u8]) -> bool {
-    !term.starts_with(b"_:") && !term.starts_with(b"\"")
+    !term.starts_with(b"_:") && !term.starts_with(b"\"") && !is_triple_term_iri(term)
 }
 
 /// Generate a partition node string: `<URI>` for URI mode, `_:bN` for blank-node mode.
@@ -846,7 +850,8 @@ fn build_class_combo_index(
 // Post–Pass 1: filter non-IRI classes
 // ---------------------------------------------------------------------------
 
-/// Remove non-IRI class IDs (blank nodes, literals) from the raw class combinations.
+/// Remove non-IRI class IDs (blank nodes, literals, triple terms) from the raw class
+/// combinations.
 ///
 /// The Python `void-hdt` tool only treats `URIRef` objects of `rdf:type` triples as
 /// valid classes.  Blank nodes used as `rdf:type` objects are common in OWL ontologies
@@ -867,7 +872,7 @@ fn filter_non_iri_classes(
     let mut term_buf = Vec::new();
     for &class_id in &all_class_ids {
         term_buf.clear();
-        resolver.object_term(class_id, &mut term_buf)?;
+        resolver.object_term_raw(class_id, &mut term_buf)?;
         if !is_iri(&term_buf) {
             non_iri_class_ids.insert(class_id);
         }
@@ -878,7 +883,7 @@ fn filter_non_iri_classes(
     }
 
     tracing::info!(
-        "  Filtering {} non-IRI class ID(s) (blank nodes / literals)",
+        "  Filtering {} non-IRI class ID(s) (blank nodes / literals / triple terms)",
         non_iri_class_ids.len()
     );
 
@@ -1500,9 +1505,9 @@ fn write_dataset_description(
 
         // Resolve the class IRI (class_id is an object ID in the HDT dictionary).
         class_buf.clear();
-        resolver.object_term(*class_id, &mut class_buf)?;
+        resolver.object_term_raw(*class_id, &mut class_buf)?;
         if !is_iri(&class_buf) {
-            continue; // Skip blank-node or literal "classes".
+            continue; // Skip blank-node, literal or triple-term "classes".
         }
         let class_iri = String::from_utf8_lossy(&class_buf).into_owned();
         let class_part_uri = format!("{dataset_uri}/class/{}", md5_hex(&class_iri));
@@ -1590,7 +1595,7 @@ fn write_dataset_description(
                 // Resolve target class IRI (if typed).
                 let target_iri_opt: Option<String> = if let Some(tc_id) = target_class_opt {
                     target_buf.clear();
-                    resolver.object_term(*tc_id, &mut target_buf)?;
+                    resolver.object_term_raw(*tc_id, &mut target_buf)?;
                     if is_iri(&target_buf) {
                         Some(String::from_utf8_lossy(&target_buf).into_owned())
                     } else {

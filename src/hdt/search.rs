@@ -19,7 +19,8 @@ use crate::hdt::index_reader::{
     open_index, open_index_section, read_index_z_range, read_predicate_count,
 };
 use crate::hdt::reader::{
-    BitmapTriplesScanner, DictionaryResolver, HdtSectionOffsets, open_hdt, write_triple_tab,
+    BitmapTriplesScanner, DictionaryResolver, HdtSectionOffsets, ObjectTerm, open_hdt,
+    write_triple_tab,
 };
 use crate::io::{StreamingBitmapDecoder, StreamingLogArrayDecoder};
 use crate::permutation::PermutationIndex;
@@ -44,7 +45,12 @@ pub enum QueryTerm {
     /// - IRIs: plain UTF-8 IRI string (no `<>` brackets)
     /// - Blank nodes: `_:id`
     /// - Literals: `"value"`, `"value"@lang`, or `"value"^^<type>`
+    ///
+    /// A ground triple term `<<( s p o )>>` is bound to the IRI that names it.
     Bound(Vec<u8>),
+    /// A triple term with wildcards inside, `<<( s ? ? )>>`; object position
+    /// only.
+    TripleTerm(Box<crate::triple_terms::search::InnerPattern>),
 }
 
 /// The fourth position in a quad pattern.
@@ -102,6 +108,8 @@ pub enum PatternKind {
 }
 
 impl PatternKind {
+    /// The kind of an ordinary pattern. A triple-term pattern has none: it is
+    /// answered before kinds are consulted.
     fn from_terms(s: &QueryTerm, p: &QueryTerm, o: &QueryTerm) -> Self {
         match (s, p, o) {
             (QueryTerm::Wildcard, QueryTerm::Wildcard, QueryTerm::Wildcard) => Self::ScanAll,
@@ -118,6 +126,7 @@ impl PatternKind {
             (QueryTerm::Wildcard, QueryTerm::Bound(_), QueryTerm::Bound(_)) => {
                 Self::PredicateObjectBound
             }
+            _ => unreachable!("a triple-term pattern has no kind"),
         }
     }
 }
@@ -140,6 +149,9 @@ pub fn parse_search_query(query: &str) -> Result<SearchQuery> {
         skip_query_whitespace(bytes, &mut pos);
         if pos >= bytes.len() {
             break;
+        }
+        if terms.len() < 2 && bytes[pos..].starts_with(b"<<(") {
+            bail!("A triple term may appear only in object position");
         }
 
         let term = parse_one_term(bytes, &mut pos)
@@ -216,9 +228,10 @@ fn parse_graph_term(bytes: &[u8], pos: &mut usize) -> Result<GraphQueryTerm> {
             *pos += 1;
             Ok(GraphQueryTerm::Wildcard)
         }
+        _ if bytes[*pos..].starts_with(b"<<(") => bail!("Graph position cannot be a triple term"),
         b'<' | b'_' => match parse_one_term(bytes, pos)? {
             QueryTerm::Bound(value) => Ok(GraphQueryTerm::Named(value)),
-            QueryTerm::Wildcard => unreachable!(),
+            QueryTerm::Wildcard | QueryTerm::TripleTerm(_) => unreachable!(),
         },
         b'"' => bail!("Graph position cannot be a literal"),
         _ => {
@@ -237,6 +250,9 @@ fn parse_graph_term(bytes: &[u8], pos: &mut usize) -> Result<GraphQueryTerm> {
 }
 
 fn parse_one_term(bytes: &[u8], pos: &mut usize) -> Result<QueryTerm> {
+    if bytes[*pos..].starts_with(b"<<(") {
+        return parse_triple_term(bytes, pos);
+    }
     match bytes[*pos] {
         b'?' | b'*' => {
             *pos += 1;
@@ -257,9 +273,10 @@ fn parse_one_term(bytes: &[u8], pos: &mut usize) -> Result<QueryTerm> {
             Ok(QueryTerm::Bound(iri))
         }
         b'_' if bytes.get(*pos + 1) == Some(&b':') => {
-            // Blank node: read until whitespace
+            // Blank node: read until whitespace, or the `)` that may close a
+            // triple term — a character no blank-node label contains.
             let start = *pos;
-            while *pos < bytes.len() && !bytes[*pos].is_ascii_whitespace() {
+            while *pos < bytes.len() && !bytes[*pos].is_ascii_whitespace() && bytes[*pos] != b')' {
                 *pos += 1;
             }
             Ok(QueryTerm::Bound(bytes[start..*pos].to_vec()))
@@ -274,6 +291,139 @@ fn parse_one_term(bytes: &[u8], pos: &mut usize) -> Result<QueryTerm> {
             pos
         ),
     }
+}
+
+/// One position inside a triple-term pattern.
+enum InnerTerm {
+    Wildcard,
+    Ground(crate::triple_terms::Component),
+}
+
+/// Parse `<<( s p o )>>` at `bytes[*pos..]`. A ground term becomes the IRI that
+/// names it; one with wildcards inside becomes a [`QueryTerm::TripleTerm`].
+/// Wildcards are allowed one level deep only: a nested triple term must be
+/// ground.
+fn parse_triple_term(bytes: &[u8], pos: &mut usize) -> Result<QueryTerm> {
+    use crate::triple_terms::{Component, Proposition, iri::iri_for};
+    let (subject, predicate, object) = parse_triple_term_positions(bytes, pos, 1)?;
+    let ground = |term: &InnerTerm| matches!(term, InnerTerm::Ground(_));
+    if ground(&subject) && ground(&predicate) && ground(&object) {
+        let take = |term: InnerTerm| match term {
+            InnerTerm::Ground(component) => component,
+            InnerTerm::Wildcard => unreachable!(),
+        };
+        let Component::Iri(predicate) = take(predicate) else {
+            unreachable!("a predicate is read as the string it is stored as")
+        };
+        let proposition = Proposition {
+            subject: take(subject),
+            predicate,
+            object: take(object),
+        };
+        return Ok(QueryTerm::Bound(iri_for(&proposition).into_bytes()));
+    }
+    let as_bytes = |term: InnerTerm| -> Option<Vec<u8>> {
+        match term {
+            InnerTerm::Wildcard => None,
+            InnerTerm::Ground(Component::Iri(iri)) => Some(iri.into_bytes()),
+            InnerTerm::Ground(Component::Blank(label)) => Some(format!("_:{label}").into_bytes()),
+            InnerTerm::Ground(Component::Literal(literal)) => Some(literal.into_bytes()),
+            InnerTerm::Ground(Component::Triple(nested)) => Some(iri_for(&nested).into_bytes()),
+        }
+    };
+    Ok(QueryTerm::TripleTerm(Box::new(
+        crate::triple_terms::search::InnerPattern {
+            subject: as_bytes(subject),
+            predicate: as_bytes(predicate),
+            object: as_bytes(object),
+        },
+    )))
+}
+
+/// The positions of the triple term at `bytes[*pos..]`, `depth` levels deep
+/// counting the outermost as the first. Deeper than the build accepts is
+/// refused, as the build refuses it (`docs/triple-terms-format.md` §2.4): such
+/// a term names nothing in any HDT, and following it would only exhaust the
+/// stack.
+fn parse_triple_term_positions(
+    bytes: &[u8],
+    pos: &mut usize,
+    depth: usize,
+) -> Result<(InnerTerm, InnerTerm, InnerTerm)> {
+    use crate::triple_terms::Component;
+    debug_assert!(bytes[*pos..].starts_with(b"<<("));
+    if depth > crate::triple_terms::iri::MAX_NESTING {
+        bail!(
+            "Triple term nested more than {} levels deep",
+            crate::triple_terms::iri::MAX_NESTING
+        );
+    }
+    *pos += 3;
+    let mut positions = Vec::with_capacity(3);
+    for index in 0..3 {
+        skip_query_whitespace(bytes, pos);
+        if *pos >= bytes.len() {
+            bail!("Unclosed triple term in query");
+        }
+        let term = if matches!(bytes[*pos], b'?' | b'*') {
+            *pos += 1;
+            InnerTerm::Wildcard
+        } else if bytes[*pos..].starts_with(b"<<(") {
+            if index != 2 {
+                bail!("A nested triple term may appear only in object position");
+            }
+            let (s, p, o) = parse_triple_term_positions(bytes, pos, depth + 1)?;
+            let mut ground = Vec::with_capacity(3);
+            for term in [s, p, o] {
+                match term {
+                    InnerTerm::Ground(component) => ground.push(component),
+                    InnerTerm::Wildcard => {
+                        bail!("Wildcards inside a nested triple term are not supported")
+                    }
+                }
+            }
+            let object = ground.pop().unwrap();
+            let Component::Iri(predicate) = ground.pop().unwrap() else {
+                unreachable!("a predicate is read as the string it is stored as")
+            };
+            InnerTerm::Ground(Component::Triple(Box::new(
+                crate::triple_terms::Proposition {
+                    subject: ground.pop().unwrap(),
+                    predicate,
+                    object,
+                },
+            )))
+        } else {
+            let QueryTerm::Bound(term) = parse_one_term(bytes, pos)? else {
+                bail!("Unexpected term inside a triple term");
+            };
+            // A triple term is named from hdtc's dictionary strings, so a
+            // literal inside one is taken in that form.
+            let term = match dictionary_form(&term) {
+                Some(encoded) if index != 1 => encoded,
+                _ => term,
+            };
+            let text = String::from_utf8(term).context("Non-UTF-8 term in query")?;
+            // As the build reads them: the predicate is the dictionary string
+            // as stored, and a subject or object is classified by its
+            // spelling — so a lenient IRI stored like a literal or a blank
+            // node (`<"q">`, `<_:p>`) is found where the build put it.
+            InnerTerm::Ground(match index {
+                1 => Component::Iri(text),
+                _ => Component::from_dictionary(text),
+            })
+        };
+        positions.push(term);
+    }
+    skip_query_whitespace(bytes, pos);
+    if !bytes[*pos..].starts_with(b")>>") {
+        bail!("Expected `)>>` to close the triple term");
+    }
+    *pos += 3;
+    let object = positions.pop().unwrap();
+    let predicate = positions.pop().unwrap();
+    let subject = positions.pop().unwrap();
+    Ok((subject, predicate, object))
 }
 
 /// Parse an N-Triples literal at `bytes[*pos..]`, advance `*pos` past it,
@@ -364,14 +514,53 @@ fn parse_nt_literal(bytes: &[u8], pos: &mut usize) -> Result<QueryTerm> {
         *pos += 1; // consume '>'
     }
 
-    // Reconstruct HDT literal: "raw_value" + optional suffix
-    let mut hdt_literal: Vec<u8> = Vec::with_capacity(1 + value.len() + 1 + suffix.len());
-    hdt_literal.push(b'"');
-    hdt_literal.extend_from_slice(&value);
-    hdt_literal.push(b'"');
-    hdt_literal.extend_from_slice(&suffix);
+    // The literal as written, raw value and suffix: what hdt-java and hdt-cpp
+    // store. [`locate_bound_object`] also tries hdtc's dictionary form.
+    let mut literal: Vec<u8> = Vec::with_capacity(1 + value.len() + 1 + suffix.len());
+    literal.push(b'"');
+    literal.extend_from_slice(&value);
+    literal.push(b'"');
+    literal.extend_from_slice(&suffix);
 
-    Ok(QueryTerm::Bound(hdt_literal))
+    Ok(QueryTerm::Bound(literal))
+}
+
+/// A literal in hdtc's dictionary form — the language tag folded to lower
+/// case and `xsd:string` dropped, as [`encode_literal`] writes it when data is
+/// loaded — or `None` if `term` is not a literal.
+///
+/// [`encode_literal`]: crate::dictionary::term::encode_literal
+pub(crate) fn dictionary_form(term: &[u8]) -> Option<Vec<u8>> {
+    use crate::dictionary::term::encode_literal;
+    fn part(bytes: &[u8]) -> Option<&str> {
+        std::str::from_utf8(bytes).ok()
+    }
+    let parsed = crate::text::analyzer::parse_literal(term)?;
+    let value = part(parsed.value)?;
+    let encoded = match (parsed.language, parsed.datatype) {
+        (Some(language), _) => encode_literal(value, Some(part(language)?), None),
+        (None, Some(datatype)) => encode_literal(value, None, Some(part(datatype)?)),
+        (None, None) => encode_literal(value, None, None),
+    };
+    Some(encoded.into_bytes())
+}
+
+/// Locate a bound object. A literal is looked up as the query spells it and
+/// then, when that is not found, in hdtc's dictionary form
+/// ([`dictionary_form`]): an HDT built by hdtc stores `"x"@EN` as `"x"@en` and
+/// `"x"^^xsd:string` as `"x"`, while hdt-java and hdt-cpp store a literal as
+/// it was written, so either spelling finds the term in either.
+pub(crate) fn locate_bound_object(
+    dictionary: &mut DictionaryResolver,
+    term: &[u8],
+) -> Result<Option<u64>> {
+    if let Some(id) = dictionary.locate_object(term)? {
+        return Ok(Some(id));
+    }
+    match dictionary_form(term) {
+        Some(encoded) if encoded != term => dictionary.locate_object(&encoded),
+        _ => Ok(None),
+    }
 }
 
 fn parse_hex_digits(bytes: &[u8], pos: &mut usize, n: usize) -> Result<u32> {
@@ -449,7 +638,7 @@ fn search_permutation_bound(
     let mut count = 0u64;
     let mut subject_buf = Vec::new();
     let mut predicate_buf = Vec::new();
-    let mut object_buf = Vec::new();
+    let mut object_buf = ObjectTerm::default();
     let mut previous_subject = 0u64;
     let mut previous_predicate = 0u64;
     let mut previous_object = 0u64;
@@ -555,7 +744,7 @@ fn search_predicate_bound(
     let mut count = 0u64;
     let mut remaining_offset = offset.unwrap_or(0);
     let mut s_buf = Vec::new();
-    let mut o_buf = Vec::new();
+    let mut o_buf = ObjectTerm::default();
     let mut prev_s = 0u64;
 
     'scan: loop {
@@ -730,7 +919,7 @@ fn search_object_bound(
     let mut remaining_offset = offset.unwrap_or(0);
     let mut s_buf = Vec::new();
     let mut p_buf = Vec::new();
-    let mut o_buf = Vec::new();
+    let mut o_buf = ObjectTerm::default();
     let mut prev_s = 0u64;
     let mut o_resolved = false;
 
@@ -1184,9 +1373,11 @@ pub fn search_hdt_streaming(
     let (s_term, p_term, o_term) =
         parse_query(query).with_context(|| format!("Invalid query: {query:?}"))?;
 
-    let kind = PatternKind::from_terms(&s_term, &p_term, &o_term);
-
-    let (offsets, mut dictionary) = open_hdt(hdt_path, memory_limit)
+    // Rendering triple terms takes its share of the limit out of the
+    // dictionary's, so the two stay within it together.
+    let triple_term_budget =
+        crate::triple_terms::reader::TripleTermDecoder::budget(hdt_path, memory_limit);
+    let (offsets, mut dictionary) = open_hdt(hdt_path, memory_limit - triple_term_budget)
         .with_context(|| format!("Failed to open HDT file {}", hdt_path.display()))?;
 
     // A zero-sized page is empty by definition. Stop before resolving terms or
@@ -1196,11 +1387,39 @@ pub fn search_hdt_streaming(
         write_empty_output_if_needed(output)?;
         return Ok(0);
     }
+    // Render triple terms in output.
+    dictionary.enable_triple_terms(hdt_path, triple_term_budget)?;
+
+    if let QueryTerm::TripleTerm(inner) = &o_term {
+        let bound = |term: &QueryTerm| match term {
+            QueryTerm::Bound(bytes) => Some(bytes.clone()),
+            _ => None,
+        };
+        let mut writer = crate::hdt::reader::make_writer(output)?;
+        let count = crate::triple_terms::search::search_inner_pattern(
+            hdt_path,
+            &mut dictionary,
+            bound(&s_term).as_deref(),
+            bound(&p_term).as_deref(),
+            inner,
+            &mut writer,
+            count_only,
+            offset,
+            limit,
+        )?;
+        if count_only {
+            writeln!(writer, "{count}")?;
+        }
+        writer.flush()?;
+        return Ok(count);
+    }
+    let kind = PatternKind::from_terms(&s_term, &p_term, &o_term);
 
     // Resolve bound terms to dictionary IDs. If any bound term is not found,
     // the result set is empty — return immediately (not an error).
     let s_id: Option<u64> = match &s_term {
         QueryTerm::Wildcard => None,
+        QueryTerm::TripleTerm(_) => unreachable!("answered above"),
         QueryTerm::Bound(bytes) => match dictionary.locate_subject(bytes)? {
             Some(id) => Some(id),
             None => {
@@ -1212,6 +1431,7 @@ pub fn search_hdt_streaming(
 
     let p_id: Option<u64> = match &p_term {
         QueryTerm::Wildcard => None,
+        QueryTerm::TripleTerm(_) => unreachable!("answered above"),
         QueryTerm::Bound(bytes) => match dictionary.locate_predicate(bytes)? {
             Some(id) => Some(id),
             None => {
@@ -1223,7 +1443,8 @@ pub fn search_hdt_streaming(
 
     let o_id: Option<u64> = match &o_term {
         QueryTerm::Wildcard => None,
-        QueryTerm::Bound(bytes) => match dictionary.locate_object(bytes)? {
+        QueryTerm::TripleTerm(_) => unreachable!("answered above"),
+        QueryTerm::Bound(bytes) => match locate_bound_object(&mut dictionary, bytes)? {
             Some(id) => Some(id),
             None => {
                 write_zero_count_if_needed(output, count_only)?;
@@ -1472,7 +1693,7 @@ pub fn search_hdt_streaming(
     let mut remaining_offset = offset.unwrap_or(0);
     let mut subject_buf = Vec::new();
     let mut predicate_buf = Vec::new();
-    let mut object_buf = Vec::new();
+    let mut object_buf = ObjectTerm::default();
 
     // Only resolve subject/predicate when the ID changes — avoids redundant
     // dictionary lookups for the common case of many triples per subject.

@@ -2,6 +2,7 @@
 
 use crate::dictionary::term::encode_literal;
 use crate::rdf::input::{Compression, RdfFormat, RdfInput};
+use crate::triple_terms::{self, Component, Proposition, PropositionRecord};
 use anyhow::{Context, Result};
 use crossbeam_channel::TrySendError;
 use oxrdf::{BlankNode, GraphName, Literal, NamedOrBlankNode, Quad, Term, Triple};
@@ -48,6 +49,10 @@ pub struct ParseOptions {
     /// fails, since the lexer cannot skip what it cannot buffer. See
     /// [`DEFAULT_MAX_TERM_BYTES`].
     pub max_term_bytes: usize,
+    /// Accept IRIs in the triple-term namespace. Only hdtc's own build of a
+    /// propositions HDT sets this: its input is what hdtc minted, and a nested
+    /// triple term is written there as its IRI.
+    pub trust_triple_term_iris: bool,
 }
 
 impl Default for ParseOptions {
@@ -60,6 +65,7 @@ impl Default for ParseOptions {
                 .unwrap_or(4),
             max_inflight_bytes: 256 * 1024 * 1024,
             max_term_bytes: DEFAULT_MAX_TERM_BYTES,
+            trust_triple_term_iris: false,
         }
     }
 }
@@ -124,6 +130,146 @@ pub struct ExtractedQuad {
     pub predicate: String,
     pub object: String,
     pub graph: Option<Arc<str>>,
+    /// When the object is a triple term: its proposition and every triple term
+    /// nested inside it, innermost first. `object` is then the term's IRI
+    /// ([`triple_terms::iri`]). Boxed so a quad without one pays a pointer.
+    pub triple_terms: Option<Box<TripleTermRecords>>,
+}
+
+/// The propositions a quad's triple-term object introduced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TripleTermRecords(pub Vec<PropositionRecord>);
+
+/// A statement whose triple term nests deeper than hdtc accepts. Skipped like
+/// a syntax error — the vendored Turtle-family parsers refuse the same depth as
+/// one, so this is reached only by syntaxes they do not cover — rather than
+/// failing the build.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "triple term nested more than {} levels deep",
+    triple_terms::iri::MAX_NESTING
+)]
+struct TooDeeplyNested;
+
+/// Refuse an IRI in the namespace hdtc mints triple-term IRIs in. Admitting it
+/// as data would let a source forge a triple term, or collide with one a later
+/// build mints (`docs/triple-terms-format.md` §2.3).
+fn check_not_reserved(iri: &str, trusted: bool) -> Result<()> {
+    if !trusted && iri.starts_with(triple_terms::TT_NAMESPACE) {
+        anyhow::bail!(
+            "<{iri}> is in the namespace {}, which hdtc reserves for the IRIs it \
+             mints for RDF 1.2 triple terms",
+            triple_terms::TT_NAMESPACE
+        );
+    }
+    Ok(())
+}
+
+fn subject_to_hdt_string(
+    subject: &NamedOrBlankNode,
+    blank_prefix: &str,
+    trusted: bool,
+) -> Result<String> {
+    Ok(match subject {
+        NamedOrBlankNode::BlankNode(b) => format!("_:{}{}", blank_prefix, b.as_str()),
+        NamedOrBlankNode::NamedNode(n) => {
+            check_not_reserved(n.as_str(), trusted)?;
+            n.as_str().to_string()
+        }
+    })
+}
+
+/// A term as a triple-term component: blank labels scoped by `blank_prefix`,
+/// literals in dictionary form, nested triple terms kept structurally. An IRI
+/// is read as the dictionary will hold it (`Component::from_dictionary`).
+fn component_of(term: &Term, blank_prefix: &str, trusted: bool, depth: usize) -> Result<Component> {
+    Ok(match term {
+        Term::NamedNode(n) => {
+            check_not_reserved(n.as_str(), trusted)?;
+            Component::from_dictionary(n.as_str().to_string())
+        }
+        Term::BlankNode(b) => Component::Blank(format!("{blank_prefix}{}", b.as_str())),
+        Term::Literal(l) => Component::Literal(literal_to_hdt_string(l, trusted)?),
+        Term::Triple(t) => Component::Triple(Box::new(proposition_of(
+            t,
+            blank_prefix,
+            trusted,
+            depth + 1,
+        )?)),
+    })
+}
+
+fn proposition_of(
+    triple: &Triple,
+    blank_prefix: &str,
+    trusted: bool,
+    depth: usize,
+) -> Result<Proposition> {
+    // `depth` counts the triple terms enclosing this one.
+    if depth >= triple_terms::iri::MAX_NESTING {
+        return Err(TooDeeplyNested.into());
+    }
+    let subject = match &triple.subject {
+        NamedOrBlankNode::NamedNode(n) => {
+            check_not_reserved(n.as_str(), trusted)?;
+            Component::from_dictionary(n.as_str().to_string())
+        }
+        NamedOrBlankNode::BlankNode(b) => Component::Blank(format!("{blank_prefix}{}", b.as_str())),
+    };
+    check_not_reserved(triple.predicate.as_str(), trusted)?;
+    Ok(Proposition {
+        subject,
+        predicate: triple.predicate.as_str().to_string(),
+        object: component_of(&triple.object, blank_prefix, trusted, depth)?,
+    })
+}
+
+/// Convert an object to its dictionary string. A triple term becomes its IRI,
+/// and its propositions are returned alongside.
+fn object_to_hdt_string(
+    object: &Term,
+    blank_prefix: &str,
+    trusted: bool,
+) -> Result<(String, Option<Box<TripleTermRecords>>)> {
+    Ok(match object {
+        Term::BlankNode(b) => (format!("_:{}{}", blank_prefix, b.as_str()), None),
+        Term::NamedNode(n) => {
+            check_not_reserved(n.as_str(), trusted)?;
+            (n.as_str().to_string(), None)
+        }
+        Term::Literal(l) => (literal_to_hdt_string(l, trusted)?, None),
+        Term::Triple(t) => {
+            let proposition = proposition_of(t, blank_prefix, trusted, 0)?;
+            let mut records = Vec::with_capacity(1);
+            let iri = triple_terms::iri::mint(&proposition, &mut records);
+            (iri, Some(Box::new(TripleTermRecords(records))))
+        }
+    })
+}
+
+/// One parsed quad in dictionary form.
+fn extract_quad(
+    quad: &Quad,
+    blank_prefix: &str,
+    graph_interner: &mut GraphInterner,
+    trusted: bool,
+) -> Result<ExtractedQuad> {
+    let subject = subject_to_hdt_string(&quad.subject, blank_prefix, trusted)?;
+    check_not_reserved(quad.predicate.as_str(), trusted)?;
+    let predicate = quad.predicate.as_str().to_string();
+    let (object, triple_terms) = object_to_hdt_string(&quad.object, blank_prefix, trusted)?;
+    if let GraphName::NamedNode(graph) = &quad.graph_name {
+        check_not_reserved(graph.as_str(), trusted)?;
+    }
+    let graph = extract_graph_name(&quad.graph_name, blank_prefix)
+        .map(|graph| graph_interner.intern(graph.as_ref()));
+    Ok(ExtractedQuad {
+        subject,
+        predicate,
+        object,
+        graph,
+        triple_terms,
+    })
 }
 
 #[derive(Default)]
@@ -178,6 +324,7 @@ fn to_oxrdf_format(format: RdfFormat) -> oxrdfio::RdfFormat {
         RdfFormat::JsonLd => oxrdfio::RdfFormat::JsonLd {
             profile: oxrdfio::JsonLdProfileSet::empty(),
         },
+        RdfFormat::TermRecords => unreachable!("term records have their own reader"),
     }
 }
 
@@ -263,6 +410,7 @@ where
         disambiguate_blank_nodes,
         base_uri,
         options.max_term_bytes,
+        options.trust_triple_term_iris,
         &mut callback,
     )
 }
@@ -441,6 +589,7 @@ fn stream_quads_sequential<F>(
     disambiguate_blank_nodes: bool,
     base_uri: Option<&str>,
     max_term_bytes: usize,
+    trusted: bool,
     callback: &mut F,
 ) -> Result<ParseStats>
 where
@@ -454,12 +603,14 @@ where
         disambiguate_blank_nodes,
         base_uri,
         max_term_bytes,
+        trusted,
         callback,
     )
 }
 
 /// The sequential parse over an already-open reader, split from
 /// [`stream_quads_sequential`] so a test can supply a reader that misbehaves.
+#[allow(clippy::too_many_arguments)]
 fn stream_quads_from_reader<F>(
     reader: impl Read,
     input: &RdfInput,
@@ -467,6 +618,7 @@ fn stream_quads_from_reader<F>(
     disambiguate_blank_nodes: bool,
     base_uri: Option<&str>,
     max_term_bytes: usize,
+    trusted: bool,
     callback: &mut F,
 ) -> Result<ParseStats>
 where
@@ -494,21 +646,27 @@ where
                     &quad.object,
                     &quad.graph_name,
                 );
+
+                let extracted =
+                    match extract_quad(&quad, &blank_prefix, &mut graph_interner, trusted) {
+                        Ok(extracted) => extracted,
+                        Err(e) if e.is::<TooDeeplyNested>() => {
+                            stats.errors += 1;
+                            if stats.errors <= 10 {
+                                tracing::warn!(
+                                    "Skipping statement in {}: {e}",
+                                    input.path.display()
+                                );
+                            }
+                            continue;
+                        }
+                        Err(e) => return Err(e.context(format!("{}", input.path.display()))),
+                    };
+                // Counted only for a statement kept, so the size describes
+                // the triples the HDT holds.
                 stats.original_ntriples_size += original_size;
-
-                let subject = term_to_hdt_string(&Term::from(quad.subject), &blank_prefix);
-                let predicate = quad.predicate.as_str().to_string();
-                let object = term_to_hdt_string(&quad.object, &blank_prefix);
-                let graph = extract_graph_name(&quad.graph_name, &blank_prefix)
-                    .map(|graph| graph_interner.intern(graph.as_ref()));
-
                 stats.quads += 1;
-                callback(ExtractedQuad {
-                    subject,
-                    predicate,
-                    object,
-                    graph,
-                })?;
+                callback(extracted)?;
             }
             Err(e) if e.is_interrupted() && interrupted < MAX_INTERRUPTED_RETRIES => {
                 interrupted += 1;
@@ -555,6 +713,13 @@ enum ParseError {
     #[error(transparent)]
     Turtle(#[from] oxttl::TurtleParseError),
     #[error(transparent)]
+    RdfXml(#[from] oxrdfxml::RdfXmlParseError),
+    /// A term record that does not read back. Records are written by the
+    /// build itself, so this is fatal: skipping one would silently drop a
+    /// proposition.
+    #[error("{0}")]
+    Record(String),
+    #[error(transparent)]
     Rdf(#[from] oxrdfio::RdfParseError),
     /// A well-formed N3 statement that is not an RDF quad (a variable, or a
     /// literal in subject position). Skippable, like a syntax error.
@@ -567,6 +732,7 @@ impl ParseError {
     fn io_error(&self) -> Option<&io::Error> {
         match self {
             Self::Turtle(oxttl::TurtleParseError::Io(e))
+            | Self::RdfXml(oxrdfxml::RdfXmlParseError::Io(e))
             | Self::Rdf(oxrdfio::RdfParseError::Io(e)) => Some(e),
             _ => None,
         }
@@ -590,7 +756,7 @@ impl ParseError {
     /// buffer per iteration. An interrupted read is the one I/O error retried
     /// first; the callers give up on it after [`MAX_INTERRUPTED_RETRIES`].
     fn is_fatal(&self) -> bool {
-        self.io_error().is_some()
+        self.io_error().is_some() || matches!(self, Self::Record(_))
     }
 
     /// The lexer refused a single term larger than its buffer — recognised by
@@ -613,6 +779,8 @@ impl ParseError {
             )
         } else if let Some(e) = self.io_error() {
             read_failure(e)
+        } else if matches!(self, Self::Record(_)) {
+            "a term record the build wrote does not read back".to_owned()
         } else {
             // Only the strict path sends a syntax error here; the lenient ones
             // skip it. The cause says what was wrong, and where.
@@ -687,6 +855,8 @@ enum FormatParser {
     NTriples(oxttl::NTriplesParser),
     NQuads(oxttl::NQuadsParser),
     N3(oxttl::N3Parser),
+    RdfXml(oxrdfxml::RdfXmlParser),
+    TermRecords,
     Generic(oxrdfio::RdfParser),
 }
 
@@ -699,6 +869,11 @@ fn n3_to_quad(quad: N3Quad) -> std::result::Result<Quad, ParseError> {
         N3Term::Literal(_) => {
             return Err(ParseError::N3(
                 "literals are not allowed in regular RDF subjects",
+            ));
+        }
+        N3Term::Triple(_) => {
+            return Err(ParseError::N3(
+                "triple terms are not allowed in regular RDF subjects",
             ));
         }
         N3Term::Variable(_) => {
@@ -719,6 +894,11 @@ fn n3_to_quad(quad: N3Quad) -> std::result::Result<Quad, ParseError> {
                 "literals are not allowed in regular RDF predicates",
             ));
         }
+        N3Term::Triple(_) => {
+            return Err(ParseError::N3(
+                "triple terms are not allowed in regular RDF predicates",
+            ));
+        }
         N3Term::Variable(_) => {
             return Err(ParseError::N3(
                 "variables are not allowed in regular RDF predicates",
@@ -729,6 +909,7 @@ fn n3_to_quad(quad: N3Quad) -> std::result::Result<Quad, ParseError> {
         N3Term::NamedNode(node) => Term::from(node),
         N3Term::BlankNode(node) => Term::from(node),
         N3Term::Literal(literal) => Term::from(literal),
+        N3Term::Triple(triple) => Term::Triple(triple),
         N3Term::Variable(_) => {
             return Err(ParseError::N3(
                 "variables are not allowed in regular RDF objects",
@@ -769,6 +950,14 @@ impl FormatParser {
             RdfFormat::NTriples => Self::NTriples(bounded!(oxttl::NTriplesParser::new())),
             RdfFormat::NQuads => Self::NQuads(bounded!(oxttl::NQuadsParser::new())),
             RdfFormat::N3 => Self::N3(bounded!(oxttl::N3Parser::new(), base)),
+            RdfFormat::TermRecords => Self::TermRecords,
+            RdfFormat::RdfXml => {
+                let parser = oxrdfxml::RdfXmlParser::new();
+                let parser = if lenient { parser.lenient() } else { parser };
+                Self::RdfXml(with_base(parser, base_uri, |parser, base| {
+                    parser.with_base_iri(base)
+                }))
+            }
             other => {
                 let mut parser = oxrdfio::RdfParser::from_format(to_oxrdf_format(other));
                 if lenient {
@@ -788,6 +977,10 @@ impl FormatParser {
             Self::NTriples(parser) => LenientQuads::NTriples(parser.for_reader(reader)),
             Self::NQuads(parser) => LenientQuads::NQuads(parser.for_reader(reader)),
             Self::N3(parser) => LenientQuads::N3(parser.for_reader(reader)),
+            Self::RdfXml(parser) => LenientQuads::RdfXml(parser.for_reader(reader)),
+            Self::TermRecords => {
+                LenientQuads::TermRecords(crate::rdf::records::RecordReader::new(reader))
+            }
             Self::Generic(parser) => LenientQuads::Generic(parser.for_reader(reader)),
         }
     }
@@ -801,6 +994,8 @@ enum LenientQuads<R: Read> {
     NTriples(oxttl::ntriples::ReaderNTriplesParser<R>),
     NQuads(oxttl::nquads::ReaderNQuadsParser<R>),
     N3(oxttl::n3::ReaderN3Parser<R>),
+    RdfXml(oxrdfxml::ReaderRdfXmlParser<R>),
+    TermRecords(crate::rdf::records::RecordReader<R>),
     Generic(oxrdfio::ReaderQuadParser<R>),
 }
 
@@ -823,6 +1018,14 @@ impl<R: Read> Iterator for LenientQuads<R> {
                 .next()?
                 .map_err(ParseError::Turtle)
                 .and_then(n3_to_quad),
+            Self::RdfXml(parser) => parser
+                .next()?
+                .map(|triple| triple.in_graph(GraphName::DefaultGraph))
+                .map_err(ParseError::RdfXml),
+            Self::TermRecords(reader) => reader
+                .next()?
+                .map(|triple| triple.in_graph(GraphName::DefaultGraph))
+                .map_err(|error| ParseError::Record(format!("{error:#}"))),
             Self::Generic(parser) => parser.next()?.map_err(ParseError::Rdf),
         })
     }
@@ -918,6 +1121,7 @@ where
         let blank_prefix = blank_prefix.clone();
         let format = input.format;
         let max_term_bytes = options.max_term_bytes;
+        let trusted = options.trust_triple_term_iris;
         let path = input.path.clone();
 
         worker_handles.push(std::thread::spawn(move || -> Result<()> {
@@ -958,22 +1162,25 @@ where
                                 &quad.object,
                                 &quad.graph_name,
                             );
-                            parsed.stats.original_ntriples_size += original_size;
 
-                            let subject =
-                                term_to_hdt_string(&Term::from(quad.subject), &blank_prefix);
-                            let predicate = quad.predicate.as_str().to_string();
-                            let object = term_to_hdt_string(&quad.object, &blank_prefix);
-                            let graph = extract_graph_name(&quad.graph_name, &blank_prefix)
-                                .map(|graph| graph_interner.intern(graph.as_ref()));
-
-                            parsed.stats.quads += 1;
-                            parsed.quads.push(ExtractedQuad {
-                                subject,
-                                predicate,
-                                object,
-                                graph,
-                            });
+                            match extract_quad(&quad, &blank_prefix, &mut graph_interner, trusted) {
+                                Ok(extracted) => {
+                                    parsed.stats.original_ntriples_size += original_size;
+                                    parsed.stats.quads += 1;
+                                    parsed.quads.push(extracted);
+                                }
+                                Err(e) if e.is::<TooDeeplyNested>() => {
+                                    parsed.stats.errors += 1;
+                                    if parsed.error_samples.len() < 12 {
+                                        parsed.error_samples.push(e.to_string());
+                                    }
+                                }
+                                Err(e) => {
+                                    aborted.store(true, std::sync::atomic::Ordering::Relaxed);
+                                    parsed.fatal = Some(format!("{}: {e:#}", path.display()));
+                                    break;
+                                }
+                            }
                         }
                         Err(e) => {
                             if e.is_fatal() {
@@ -1225,33 +1432,30 @@ fn line_start_in(bytes: &[u8]) -> usize {
         .map_or(0, |newline| newline + 1)
 }
 
-/// Convert an oxrdf Term to its HDT dictionary string form.
-///
-/// IRIs are stored without angle brackets; blank nodes keep their `_:` prefix
-/// after input scoping; literals follow [`encode_literal`].
-fn term_to_hdt_string(term: &Term, blank_prefix: &str) -> String {
-    match term {
-        Term::BlankNode(b) => format!("_:{}{}", blank_prefix, b.as_str()),
-        Term::NamedNode(n) => n.as_str().to_string(),
-        Term::Literal(l) => literal_to_hdt_string(l),
-    }
-}
-
 /// Convert a literal to its HDT dictionary string form.
 ///
 /// The convention itself — angle brackets around a datatype IRI, `xsd:string`
 /// dropped — belongs to [`encode_literal`], which downstream readers share
 /// through [`crate::format`]; this function only adapts oxrdf's literal to it.
-fn literal_to_hdt_string(l: &Literal) -> String {
-    encode_literal(l.value(), l.language(), Some(l.datatype().as_str()))
+/// An RDF 1.2 directional language-tagged string keeps its base direction
+/// after the tag, as N-Triples 1.2 writes it: `"…"@ar--rtl`.
+pub(crate) fn literal_to_hdt_string(l: &Literal, trusted: bool) -> Result<String> {
+    check_not_reserved(l.datatype().as_str(), trusted)?;
+    Ok(match (l.language(), l.direction()) {
+        (Some(language), Some(direction)) => {
+            encode_literal(l.value(), Some(&format!("{language}--{direction}")), None)
+        }
+        (language, _) => encode_literal(l.value(), language, Some(l.datatype().as_str())),
+    })
 }
 
 /// Calculate the N-Triples serialization size of a literal without allocating.
 fn literal_ntriples_size(l: &Literal) -> u64 {
     let value_len = l.value().len() as u64;
     if let Some(lang) = l.language() {
-        // "value"@lang
-        2 + value_len + 1 + lang.len() as u64 // 2 quotes + value + @ + language
+        // "value"@lang, or "value"@lang--dir for a directional string
+        let direction = l.direction().map_or(0, |d| 2 + d.to_string().len() as u64);
+        2 + value_len + 1 + lang.len() as u64 + direction
     } else {
         let dt = l.datatype().as_str();
         if dt == "http://www.w3.org/2001/XMLSchema#string" {
@@ -1262,6 +1466,30 @@ fn literal_ntriples_size(l: &Literal) -> u64 {
             2 + value_len + 4 + dt.len() as u64 // 2 quotes + ^^ + < + type + >
         }
     }
+}
+
+/// N-Triples 1.2 size of a triple term, `<<( s p o )>>`. Recursion stops at
+/// the nesting limit: deeper input is refused when it is converted.
+fn triple_term_ntriples_size(triple: &Triple) -> u64 {
+    triple_term_ntriples_size_within(triple, 0)
+}
+
+fn triple_term_ntriples_size_within(triple: &Triple, depth: usize) -> u64 {
+    if depth >= triple_terms::iri::MAX_NESTING {
+        return 0;
+    }
+    let subject = match &triple.subject {
+        NamedOrBlankNode::NamedNode(n) => 2 + n.as_str().len() as u64,
+        NamedOrBlankNode::BlankNode(b) => 2 + b.as_str().len() as u64,
+    };
+    let object = match &triple.object {
+        Term::NamedNode(n) => 2 + n.as_str().len() as u64,
+        Term::BlankNode(b) => 2 + b.as_str().len() as u64,
+        Term::Literal(l) => literal_ntriples_size(l),
+        Term::Triple(t) => triple_term_ntriples_size_within(t, depth + 1),
+    };
+    // "<<( " + s + " " + <p> + " " + o + " )>>"
+    4 + subject + 1 + 2 + triple.predicate.as_str().len() as u64 + 1 + object + 4
 }
 
 /// Calculate N-Triples serialization size for a quad's terms (before blank node prefixing).
@@ -1311,6 +1539,7 @@ fn calculate_original_ntriples_size(
             // Literals: "value" or "value"@lang or "value"^^<type>
             size += literal_ntriples_size(l);
         }
+        Term::Triple(t) => size += triple_term_ntriples_size(t),
     }
 
     // Graph (if present, not default)
@@ -1385,6 +1614,7 @@ mod tests {
         );
         let (_f, input) = make_temp_with(content.as_bytes(), ".ttl", RdfFormat::Turtle);
         let options = ParseOptions {
+            trust_triple_term_iris: false,
             max_term_bytes: 1024 * 1024,
             ..ParseOptions::default()
         };
@@ -1419,6 +1649,7 @@ mod tests {
             false,
             None,
             DEFAULT_MAX_TERM_BYTES,
+            false,
             &mut |_| Ok(()),
         )
         .unwrap_err();
@@ -1450,6 +1681,7 @@ mod tests {
             false,
             None,
             DEFAULT_MAX_TERM_BYTES,
+            false,
             &mut |_| Ok(()),
         )
         .unwrap_err();
@@ -1467,6 +1699,7 @@ mod tests {
         );
         let (_f, input) = make_temp_with(content.as_bytes(), ".ttl", RdfFormat::Turtle);
         let options = ParseOptions {
+            trust_triple_term_iris: false,
             max_term_bytes: 1024 * 1024,
             ..ParseOptions::default()
         };
@@ -1493,6 +1726,7 @@ mod tests {
             chunk_size_bytes: 4096,
             chunk_workers: 2,
             max_inflight_bytes: 64 * 1024 * 1024,
+            trust_triple_term_iris: false,
             max_term_bytes: 1024 * 1024,
         };
         let error = stream_quads_with_options(&input, 0, false, None, &options, |_| Ok(()))
@@ -1542,6 +1776,7 @@ mod tests {
             chunk_size_bytes: 64 * 1024,
             chunk_workers: 2,
             max_inflight_bytes: 64 * 1024 * 1024,
+            trust_triple_term_iris: false,
             max_term_bytes: bound,
         };
         let mut quads = 0usize;
@@ -1653,6 +1888,7 @@ mod tests {
             false,
             None,
             DEFAULT_MAX_TERM_BYTES,
+            false,
             &mut |q| {
                 quads.push(q);
                 Ok(())
@@ -1753,6 +1989,7 @@ mod tests {
             RdfFormat::TriG,
         );
         let options = ParseOptions {
+            trust_triple_term_iris: false,
             max_term_bytes: 1024 * 1024,
             ..ParseOptions::default()
         };
@@ -1775,6 +2012,7 @@ mod tests {
             chunk_size_bytes: 4096,
             chunk_workers: 2,
             max_inflight_bytes: 64 * 1024 * 1024,
+            trust_triple_term_iris: false,
             max_term_bytes: 1024 * 1024,
         };
         let error = stream_quads_with_options(&input, 0, false, None, &options, |_| Ok(()))
@@ -1795,6 +2033,7 @@ mod tests {
             chunk_size_bytes: 4096,
             chunk_workers: 2,
             max_inflight_bytes: 64 * 1024 * 1024,
+            trust_triple_term_iris: false,
             max_term_bytes: DEFAULT_MAX_TERM_BYTES,
         };
         let mut quads = Vec::new();
@@ -1865,6 +2104,7 @@ mod tests {
             chunk_size_bytes: 4096,
             chunk_workers: 2,
             max_inflight_bytes: 64 * 1024 * 1024,
+            trust_triple_term_iris: false,
             max_term_bytes: 1024 * 1024,
         };
 
@@ -1899,6 +2139,7 @@ mod tests {
         assert!(quads[0].object.len() > 17 * 1024 * 1024);
 
         let options = ParseOptions {
+            trust_triple_term_iris: false,
             max_term_bytes: 1024 * 1024,
             ..ParseOptions::default()
         };
@@ -2055,6 +2296,7 @@ _:b1 <http://example.org/type> <http://example.org/Thing> .
                 chunk_workers: 1,
                 max_inflight_bytes: 1024,
                 max_term_bytes: DEFAULT_MAX_TERM_BYTES,
+                trust_triple_term_iris: false,
             },
             |q| {
                 seq_quads.push(q);
@@ -2075,6 +2317,7 @@ _:b1 <http://example.org/type> <http://example.org/Thing> .
                 chunk_workers: 4,
                 max_inflight_bytes: 8 * 1024,
                 max_term_bytes: DEFAULT_MAX_TERM_BYTES,
+                trust_triple_term_iris: false,
             },
             |q| {
                 par_quads.push(q);
@@ -2116,6 +2359,7 @@ _:b1 <http://example.org/type> <http://example.org/Thing> .
                 chunk_workers: 3,
                 max_inflight_bytes: 4 * 1024,
                 max_term_bytes: DEFAULT_MAX_TERM_BYTES,
+                trust_triple_term_iris: false,
             },
             |q| {
                 quads.push(q);

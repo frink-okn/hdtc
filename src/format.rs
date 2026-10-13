@@ -35,7 +35,10 @@
 //!   load-bearing case is the text analyzer. `/search` is correct only if query
 //!   analysis is the same code that built the index; a divergence here does not
 //!   corrupt anything a checksum would catch, it silently returns the wrong
-//!   answers. [`TextSearcher`] exists so that no one is tempted.
+//!   answers. [`TextSearcher`] exists so that no one is tempted. The same
+//!   holds for [`triple_term_iri`]: a ground triple term in a request is found
+//!   by minting its IRI, and a second minting implementation that disagreed by
+//!   one byte would find nothing, silently.
 //!
 //! # Stability
 //!
@@ -154,6 +157,34 @@ pub use crate::graph_index::{
 };
 
 // ---------------------------------------------------------------------------
+// RDF 1.2 triple terms (.hdt.tt, .hdt.props.hdt)
+// ---------------------------------------------------------------------------
+//
+// A triple term is an IRI of `data.hdt` under [`TRIPLE_TERM_NAMESPACE`],
+// minted by [`triple_term_iri`] (`docs/triple-terms-format.md` §2) — the one
+// piece of runtime logic a reader must share, since a request naming a ground
+// triple term is answered by minting its IRI and looking that up. The index's
+// container is the permutation index's; [`read_triple_term_directory`] is
+// the mapped reader's open path, and the section constants address its runs
+// and layers. Unasserted propositions are an ordinary HDT with its own
+// permutation index, at [`propositions_hdt_path`].
+
+pub use crate::triple_terms::format::{
+    HAS_PROPOSITIONS as TRIPLE_TERM_HAS_PROPOSITIONS, Header as TripleTermHeader,
+    Section as TripleTermSection, SourceFacts as TripleTermSourceFacts,
+    canonical_path as triple_term_index_path, component as triple_term_component,
+    kind as triple_term_section_kind, propositions_path as propositions_hdt_path,
+    read_header_and_sections as read_triple_term_directory,
+    section_type as triple_term_section_type,
+};
+pub use crate::triple_terms::iri::{
+    Component as TripleTermComponent, MAX_NESTING as MAX_TRIPLE_TERM_NESTING,
+    Proposition as TripleTermProposition, TT_NAMESPACE as TRIPLE_TERM_NAMESPACE,
+    iri_for as triple_term_iri, is_encoded_literal, is_triple_term_iri,
+};
+pub use crate::triple_terms::validate::validate_triple_terms;
+
+// ---------------------------------------------------------------------------
 // Sketch artifacts (filters/)
 // ---------------------------------------------------------------------------
 
@@ -175,9 +206,9 @@ pub use crate::hdt::keyset::{
 
 pub use crate::text::{
     DEFAULT_MAX_LITERAL_BYTES, DEFAULT_UNTAGGED_LANGUAGE, DatatypeExclusions, LanguageCount,
-    MatchKind, MatchMode, TEXT_INDEX_SUFFIX, TextHit, TextManifest, TextMatchPage, TextQuery,
-    TextScanPosition, TextSearch, TextSearcher, default_text_index_path, normalize_language,
-    verify_text_index_binding,
+    MatchKind, MatchMode, PropositionsCoverage, TEXT_INDEX_SUFFIX, TextHit, TextManifest,
+    TextMatchPage, TextQuery, TextScanPosition, TextSearch, TextSearcher, default_text_index_path,
+    normalize_language, verify_text_index_binding,
 };
 
 // ---------------------------------------------------------------------------
