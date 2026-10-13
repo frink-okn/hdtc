@@ -89,75 +89,115 @@ impl PropositionHits {
         document > self.object_offset
     }
 
-    /// The `data.hdt` rows `(r, q, triple term)` for one hit, and how many
-    /// proposition occurrences of the literal were examined to find them.
-    pub(crate) fn rows(&mut self, document: u64, out: &mut Vec<(u64, u64, u64)>) -> Result<u64> {
+    /// Pass the `data.hdt` rows `(r, q, triple term)` of one hit to `visit`,
+    /// in order, until it returns false. Returns how many proposition
+    /// occurrences of the literal there are, and whether every row was
+    /// visited. Nothing is collected: a literal in millions of claims costs
+    /// the rows visited, not memory in proportion to them.
+    pub(crate) fn visit_rows(
+        &mut self,
+        document: u64,
+        mut visit: impl FnMut(u64, u64, u64) -> Result<bool>,
+    ) -> Result<(u64, bool)> {
+        self.resolve(document, &mut Sink::Visit(&mut visit))
+    }
+
+    /// The number of `data.hdt` rows one hit resolves to, and how many
+    /// proposition occurrences of the literal there are. Each triple term's
+    /// rows are counted from its group's size, never read.
+    pub(crate) fn count_rows(&mut self, document: u64) -> Result<(u64, u64)> {
+        let mut rows = 0;
+        let (examined, _) = self.resolve(document, &mut Sink::Count(&mut rows))?;
+        Ok((examined, rows))
+    }
+
+    fn resolve(&mut self, document: u64, sink: &mut Sink<'_>) -> Result<(u64, bool)> {
         let literal = document - self.object_offset;
         let predicate = match self.predicate {
-            Some(None) => return Ok(0),
+            Some(None) => return Ok((0, true)),
             Some(Some(p)) => Some(p),
             None => None,
         };
-        let mut found = Vec::new();
-        let examined =
-            self.props_groups
-                .for_object(literal, predicate, false, |s, p, position| {
-                    found.push((s, p, position));
-                    Ok(true)
-                })?;
+        let groups = self.props_groups.predicate_ranges(literal, predicate)?;
+        let examined = groups
+            .iter()
+            .map(|(_, positions)| positions.end - positions.start)
+            .sum();
         let object = match self.nesting.is_some() {
             true => Some(self.component(literal, false)?),
             false => None,
         };
-        for (s, p, position) in found {
-            let proposition = match &object {
-                Some(object) => Some(self.proposition(s, p, object.clone())?),
-                None => None,
-            };
-            self.climb(position, proposition, 1, out)?;
+        for (p, positions) in groups {
+            for position in positions {
+                let proposition = match &object {
+                    Some(object) => {
+                        let s = self.props_groups.subject_at(position)?;
+                        Some(self.proposition(s, p, object.clone())?)
+                    }
+                    None => None,
+                };
+                if !self.climb(position, proposition, 1, sink)? {
+                    return Ok((examined, false));
+                }
+            }
         }
-        Ok(examined)
+        Ok((examined, true))
     }
 
-    /// Emit the rows naming the proposition at OPS `position`, then follow
-    /// every unasserted proposition that names it in turn. `proposition` is
-    /// its content, present when there is nesting to follow; `depth` counts
-    /// the triple terms from the literal out to this one.
+    /// Pass on the rows naming the proposition at OPS `position`, then follow
+    /// every unasserted proposition that names it in turn; false once the sink
+    /// wants no more. `proposition` is its content, present when there is
+    /// nesting to follow; `depth` counts the triple terms from the literal out
+    /// to this one.
     fn climb(
         &mut self,
         position: u64,
         proposition: Option<Proposition>,
         depth: usize,
-        out: &mut Vec<(u64, u64, u64)>,
-    ) -> Result<()> {
+        sink: &mut Sink<'_>,
+    ) -> Result<bool> {
         if let Some(rank) = self.layer.rank_if_marked(self.index.file(), position)? {
             let term = self.layer.reverse(self.index.file(), rank)?;
-            self.data_groups.for_object(term, None, false, |r, q, _| {
-                out.push((r, q, term));
-                Ok(true)
-            })?;
+            match sink {
+                Sink::Count(rows) => {
+                    **rows += self
+                        .data_groups
+                        .for_object(term, None, true, |_, _, _| Ok(true))?;
+                }
+                Sink::Visit(visit) => {
+                    let mut more = true;
+                    self.data_groups.for_object(term, None, false, |r, q, _| {
+                        more = visit(r, q, term)?;
+                        Ok(more)
+                    })?;
+                    if !more {
+                        return Ok(false);
+                    }
+                }
+            }
         }
         let (Some(proposition), Some(dictionary)) = (proposition, self.nesting.as_mut()) else {
-            return Ok(());
+            return Ok(true);
         };
         if depth >= MAX_NESTING {
-            return Ok(());
+            return Ok(true);
         }
         let Some(name) = dictionary.locate_object(iri_for(&proposition).as_bytes())? else {
-            return Ok(());
+            return Ok(true);
         };
-        let mut containing = Vec::new();
-        self.props_groups
-            .for_object(name, None, false, |s, p, position| {
-                containing.push((s, p, position));
-                Ok(true)
-            })?;
+        // A term's containing propositions are few by predicate, though not by
+        // subject: only the per-predicate ranges are held.
         let inner = Component::Triple(Box::new(proposition));
-        for (s, p, position) in containing {
-            let outer = self.proposition(s, p, inner.clone())?;
-            self.climb(position, Some(outer), depth + 1, out)?;
+        for (p, positions) in self.props_groups.predicate_ranges(name, None)? {
+            for position in positions {
+                let s = self.props_groups.subject_at(position)?;
+                let outer = self.proposition(s, p, inner.clone())?;
+                if !self.climb(position, Some(outer), depth + 1, sink)? {
+                    return Ok(false);
+                }
+            }
         }
-        Ok(())
+        Ok(true)
     }
 
     /// A proposition of the propositions HDT, from its subject and predicate
@@ -197,4 +237,11 @@ impl PropositionHits {
             self.scratch.clone(),
         )?))
     }
+}
+
+/// Where resolved rows go: counted, or each handed to a visitor that says
+/// whether to go on.
+enum Sink<'a> {
+    Count(&'a mut u64),
+    Visit(&'a mut dyn FnMut(u64, u64, u64) -> Result<bool>),
 }

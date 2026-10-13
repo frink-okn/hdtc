@@ -867,7 +867,7 @@ fn filter_non_iri_classes(
     let mut term_buf = Vec::new();
     for &class_id in &all_class_ids {
         term_buf.clear();
-        resolver.object_term(class_id, &mut term_buf)?;
+        resolver.object_term_raw(class_id, &mut term_buf)?;
         if !is_iri(&term_buf) {
             non_iri_class_ids.insert(class_id);
         }
@@ -1500,7 +1500,7 @@ fn write_dataset_description(
 
         // Resolve the class IRI (class_id is an object ID in the HDT dictionary).
         class_buf.clear();
-        resolver.object_term(*class_id, &mut class_buf)?;
+        resolver.object_term_raw(*class_id, &mut class_buf)?;
         if !is_iri(&class_buf) {
             continue; // Skip blank-node or literal "classes".
         }
@@ -1590,7 +1590,7 @@ fn write_dataset_description(
                 // Resolve target class IRI (if typed).
                 let target_iri_opt: Option<String> = if let Some(tc_id) = target_class_opt {
                     target_buf.clear();
-                    resolver.object_term(*tc_id, &mut target_buf)?;
+                    resolver.object_term_raw(*tc_id, &mut target_buf)?;
                     if is_iri(&target_buf) {
                         Some(String::from_utf8_lossy(&target_buf).into_owned())
                     } else {

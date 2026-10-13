@@ -1,8 +1,8 @@
 //! Bounded-memory quad-pattern search over an HDT/graphs-sidecar pair.
 
 use crate::hdt::reader::{
-    BitmapTriplesScanner, DictionaryResolver, HdtSectionOffsets, OutputWriter, make_writer,
-    open_hdt, write_nt_object, write_nt_subject, write_triple_tab,
+    BitmapTriplesScanner, DictionaryResolver, HdtSectionOffsets, ObjectTerm, OutputWriter,
+    make_writer, open_hdt, write_nt_subject, write_object_term, write_triple_tab,
 };
 use crate::hdt::search::{GraphQueryTerm, QuadPattern, QueryTerm};
 use crate::quads::{GraphSidecarReader, GraphTerm, PositionGraphMembership};
@@ -311,7 +311,7 @@ where
     let mut count = 0u64;
     let mut subject_buf = Vec::new();
     let mut predicate_buf = Vec::new();
-    let mut object_buf = Vec::new();
+    let mut object_buf = ObjectTerm::default();
     let mut cached_graph: Option<(u64, GraphTerm)> = None;
 
     while let Some((subject, predicate, object)) = scanner.next_triple()? {
@@ -419,7 +419,7 @@ fn scan_wildcard_graph_direct(
     let mut count = 0u64;
     let mut subject_buf = Vec::new();
     let mut predicate_buf = Vec::new();
-    let mut object_buf = Vec::new();
+    let mut object_buf = ObjectTerm::default();
     let mut cached_graph: Option<(u64, GraphTerm)> = None;
 
     while let Some((subject, predicate, object)) = scanner.next_triple()? {
@@ -474,7 +474,7 @@ fn write_statement(
     writer: &mut impl Write,
     subject: &[u8],
     predicate: &[u8],
-    object: &[u8],
+    object: &ObjectTerm,
     graph: &GraphTerm,
 ) -> Result<()> {
     match graph {
@@ -484,7 +484,7 @@ fn write_statement(
             writer.write_all(b"\t<")?;
             writer.write_all(predicate)?;
             writer.write_all(b">\t")?;
-            write_nt_object(writer, object)?;
+            write_object_term(writer, object)?;
             writer.write_all(b"\t")?;
             write_nt_subject(writer, graph.as_bytes())?;
             writer.write_all(b"\t.\n")?;

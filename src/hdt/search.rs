@@ -19,7 +19,8 @@ use crate::hdt::index_reader::{
     open_index, open_index_section, read_index_z_range, read_predicate_count,
 };
 use crate::hdt::reader::{
-    BitmapTriplesScanner, DictionaryResolver, HdtSectionOffsets, open_hdt, write_triple_tab,
+    BitmapTriplesScanner, DictionaryResolver, HdtSectionOffsets, ObjectTerm, open_hdt,
+    write_triple_tab,
 };
 use crate::io::{StreamingBitmapDecoder, StreamingLogArrayDecoder};
 use crate::permutation::PermutationIndex;
@@ -304,7 +305,7 @@ enum InnerTerm {
 /// ground.
 fn parse_triple_term(bytes: &[u8], pos: &mut usize) -> Result<QueryTerm> {
     use crate::triple_terms::{Component, Proposition, iri::iri_for};
-    let (subject, predicate, object) = parse_triple_term_positions(bytes, pos)?;
+    let (subject, predicate, object) = parse_triple_term_positions(bytes, pos, 1)?;
     let ground = |term: &InnerTerm| matches!(term, InnerTerm::Ground(_));
     if ground(&subject) && ground(&predicate) && ground(&object) {
         let take = |term: InnerTerm| match term {
@@ -339,12 +340,24 @@ fn parse_triple_term(bytes: &[u8], pos: &mut usize) -> Result<QueryTerm> {
     )))
 }
 
+/// The positions of the triple term at `bytes[*pos..]`, `depth` levels deep
+/// counting the outermost as the first. Deeper than the build accepts is
+/// refused, as the build refuses it (`docs/triple-terms-format.md` §2.4): such
+/// a term names nothing in any HDT, and following it would only exhaust the
+/// stack.
 fn parse_triple_term_positions(
     bytes: &[u8],
     pos: &mut usize,
+    depth: usize,
 ) -> Result<(InnerTerm, InnerTerm, InnerTerm)> {
     use crate::triple_terms::Component;
     debug_assert!(bytes[*pos..].starts_with(b"<<("));
+    if depth > crate::triple_terms::iri::MAX_NESTING {
+        bail!(
+            "Triple term nested more than {} levels deep",
+            crate::triple_terms::iri::MAX_NESTING
+        );
+    }
     *pos += 3;
     let mut positions = Vec::with_capacity(3);
     for index in 0..3 {
@@ -359,7 +372,7 @@ fn parse_triple_term_positions(
             if index != 2 {
                 bail!("A nested triple term may appear only in object position");
             }
-            let (s, p, o) = parse_triple_term_positions(bytes, pos)?;
+            let (s, p, o) = parse_triple_term_positions(bytes, pos, depth + 1)?;
             let mut ground = Vec::with_capacity(3);
             for term in [s, p, o] {
                 match term {
@@ -625,7 +638,7 @@ fn search_permutation_bound(
     let mut count = 0u64;
     let mut subject_buf = Vec::new();
     let mut predicate_buf = Vec::new();
-    let mut object_buf = Vec::new();
+    let mut object_buf = ObjectTerm::default();
     let mut previous_subject = 0u64;
     let mut previous_predicate = 0u64;
     let mut previous_object = 0u64;
@@ -731,7 +744,7 @@ fn search_predicate_bound(
     let mut count = 0u64;
     let mut remaining_offset = offset.unwrap_or(0);
     let mut s_buf = Vec::new();
-    let mut o_buf = Vec::new();
+    let mut o_buf = ObjectTerm::default();
     let mut prev_s = 0u64;
 
     'scan: loop {
@@ -906,7 +919,7 @@ fn search_object_bound(
     let mut remaining_offset = offset.unwrap_or(0);
     let mut s_buf = Vec::new();
     let mut p_buf = Vec::new();
-    let mut o_buf = Vec::new();
+    let mut o_buf = ObjectTerm::default();
     let mut prev_s = 0u64;
     let mut o_resolved = false;
 
@@ -1680,7 +1693,7 @@ pub fn search_hdt_streaming(
     let mut remaining_offset = offset.unwrap_or(0);
     let mut subject_buf = Vec::new();
     let mut predicate_buf = Vec::new();
-    let mut object_buf = Vec::new();
+    let mut object_buf = ObjectTerm::default();
 
     // Only resolve subject/predicate when the ID changes — avoids redundant
     // dictionary lookups for the common case of many triples per subject.

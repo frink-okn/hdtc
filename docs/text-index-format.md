@@ -640,6 +640,10 @@ Object IDs are meaningful only against the HDT the index was built from. An
 index paired with a different HDT resolves to unrelated terms, which is the
 failure `source_digest` exists to make detectable.
 
+An index covering a propositions HDT (§2.4) addresses that HDT's literals by
+its object IDs too, so `propositions_digest` binds it the same way, with the
+same advisory standing; hdtc's binding check verifies both.
+
 ## 10. Versioning
 
 - Adding a manifest key is a compatible change; readers ignore unknown keys.

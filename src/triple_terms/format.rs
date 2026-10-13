@@ -108,6 +108,12 @@ pub fn sparse_high_bits(positions: u64, marked: u64, low_bits: u8) -> u64 {
     marked + ((positions - 1) >> low_bits) + 1
 }
 
+/// The most sections an index can have: each known type once, since a
+/// directory lists types in strictly ascending order and refuses unknown ones
+/// — three per run, and each of the six layer kinds for each of the six
+/// layers.
+pub const MAX_SECTION_COUNT: u32 = 2 * 3 + 6 * 6;
+
 pub const fn section_type(component: u32, kind: u32) -> u32 {
     (component << 8) | kind
 }
@@ -321,6 +327,17 @@ pub fn read_header_and_sections(path: &Path) -> Result<(Header, Vec<Section>)> {
             && header.footer_offset.checked_add(FOOTER_SIZE) == Some(header.sidecar_size)
             && header.footer_offset % 64 == 0,
         "triple-term index regions are not where the header says"
+    );
+    // Before the directory is read into memory: a checksum-correct header
+    // could otherwise declare billions of sections in a file of a few bytes.
+    ensure!(
+        header.section_count <= MAX_SECTION_COUNT,
+        "triple-term index declares {} sections; the format has {MAX_SECTION_COUNT} kinds",
+        header.section_count
+    );
+    ensure!(
+        header.directory_offset + header.directory_length <= header.footer_offset,
+        "triple-term index directory overlaps payloads or footer"
     );
     let mut footer = [0u8; 64];
     reader.seek(SeekFrom::Start(header.footer_offset))?;
@@ -825,6 +842,43 @@ mod tests {
             props: SourceFacts::default(),
         };
         (header, sections)
+    }
+
+    /// A header claiming more sections than the file holds is refused before
+    /// the directory is read: the claim is never trusted with an allocation.
+    #[test]
+    fn a_directory_larger_than_its_file_is_refused_before_it_is_read() {
+        for (section_count, refusal) in [(u32::MAX, "declares"), (MAX_SECTION_COUNT, "overlaps")] {
+            let mut header = [0u8; 256];
+            header[0..8].copy_from_slice(MAGIC);
+            put_u16(&mut header, 8, MAJOR_VERSION);
+            put_u16(&mut header, 10, MINOR_VERSION);
+            put_u32(&mut header, 12, HEADER_SIZE as u32);
+            put_u32(&mut header, 24, IRI_CONVENTION);
+            put_u32(&mut header, 28, IDENTITY_SHA256);
+            put_u32(&mut header, 32, crate::permutation::format::SUPERBLOCK_BITS);
+            put_u32(&mut header, 36, crate::permutation::format::SUBBLOCK_BITS);
+            put_u32(&mut header, 40, section_count);
+            put_u64(&mut header, 48, HEADER_SIZE + FOOTER_SIZE);
+            put_u64(&mut header, 56, HEADER_SIZE);
+            put_u64(
+                &mut header,
+                64,
+                u64::from(section_count) * DIRECTORY_ENTRY_SIZE + 4,
+            );
+            put_u64(&mut header, 72, HEADER_SIZE);
+            let checksum = crc32c(&header[..252]);
+            put_u32(&mut header, 252, checksum);
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            file.write_all(&header).unwrap();
+            file.write_all(&[0u8; FOOTER_SIZE as usize]).unwrap();
+            file.flush().unwrap();
+            let error = read_header_and_sections(file.path()).unwrap_err();
+            assert!(
+                error.to_string().contains(refusal),
+                "{section_count}: {error}"
+            );
+        }
     }
 
     /// A layer stored in the encoding its counts choose is accepted; the same

@@ -14,8 +14,8 @@
 
 use crate::hdt::index_reader::open_index;
 use crate::hdt::reader::{
-    BitmapTriplesScanner, DictionaryResolver, HdtSectionOffsets, make_writer, open_hdt,
-    write_nt_object, write_nt_subject, write_triple_tab,
+    BitmapTriplesScanner, DictionaryResolver, HdtSectionOffsets, ObjectTerm, make_writer, open_hdt,
+    write_nt_subject, write_object_term, write_triple_tab,
 };
 use crate::hdt::search::{Visit, resolve_index_path, resolve_object_page, scan_object_occurrences};
 use crate::permutation::PermutationIndex;
@@ -260,10 +260,17 @@ fn count_object_batch(
 ) -> Result<()> {
     resolver.prepare_ids(object_ids)?;
     for &object_id in object_ids {
-        let occurrences = resolver.occurrences(object_id, predicate_filter)?;
+        let (examined, rows) = match resolver.propositions_for(object_id) {
+            // Counted from group sizes: no row is read or held.
+            Some(props) => props.count_rows(object_id)?,
+            None => {
+                let occurrences = resolver.occurrences(object_id, predicate_filter)?;
+                (occurrences.examined, occurrences.pairs.len() as u64)
+            }
+        };
         outcome.literals_resolved += 1;
-        outcome.occurrences_examined += occurrences.examined;
-        outcome.rows += (occurrences.pairs.len() + occurrences.rows.len()) as u64;
+        outcome.occurrences_examined += examined;
+        outcome.rows += rows;
     }
     Ok(())
 }
@@ -526,40 +533,49 @@ fn emit_rows(
     }
     let object_ids: Vec<u64> = hits.iter().map(|hit| hit.object_id).collect();
     resolver.prepare_ids(&object_ids)?;
-    let mut object_buf = Vec::new();
+    let mut object_buf = ObjectTerm::default();
     let mut subject_buf = Vec::new();
     let mut predicate_buf = Vec::new();
 
     for hit in hits {
+        // A literal of the propositions HDT: its rows are streamed, each
+        // written as it is found, so a page costs the rows it takes.
+        if let Some(props) = resolver.propositions_for(hit.object_id) {
+            let (examined, complete) =
+                props.visit_rows(hit.object_id, |subject, predicate, object| {
+                    if state.remaining_skip > 0 {
+                        state.remaining_skip -= 1;
+                        return Ok(true);
+                    }
+                    state.outcome.rows += 1;
+                    dictionary.subject_term(subject, &mut subject_buf)?;
+                    dictionary.predicate_term(predicate, &mut predicate_buf)?;
+                    dictionary.object_term(object, &mut object_buf)?;
+                    if options.scores {
+                        write_scored_triple_tab(
+                            writer,
+                            &subject_buf,
+                            &predicate_buf,
+                            &object_buf,
+                            hit.score,
+                        )?;
+                    } else {
+                        write_triple_tab(writer, &subject_buf, &predicate_buf, &object_buf)?;
+                    }
+                    Ok(options.take.is_none_or(|take| state.outcome.rows < take))
+                })?;
+            state.outcome.literals_resolved += 1;
+            state.outcome.occurrences_examined += examined;
+            if !complete {
+                return Ok(true);
+            }
+            continue;
+        }
         // Collected rather than visited in place, because writing needs the
         // dictionary and the resolver may already be borrowing the HDT.
         let occurrences = resolver.occurrences(hit.object_id, options.predicate_filter)?;
         state.outcome.literals_resolved += 1;
         state.outcome.occurrences_examined += occurrences.examined;
-        for (subject, predicate, object) in occurrences.rows {
-            if state.remaining_skip > 0 {
-                state.remaining_skip -= 1;
-                continue;
-            }
-            state.outcome.rows += 1;
-            dictionary.subject_term(subject, &mut subject_buf)?;
-            dictionary.predicate_term(predicate, &mut predicate_buf)?;
-            dictionary.object_term(object, &mut object_buf)?;
-            if options.scores {
-                write_scored_triple_tab(
-                    writer,
-                    &subject_buf,
-                    &predicate_buf,
-                    &object_buf,
-                    hit.score,
-                )?;
-            } else {
-                write_triple_tab(writer, &subject_buf, &predicate_buf, &object_buf)?;
-            }
-            if options.take.is_some_and(|take| state.outcome.rows >= take) {
-                return Ok(true);
-            }
-        }
         if occurrences.pairs.is_empty() {
             continue;
         }
@@ -610,14 +626,14 @@ fn write_scored_triple_tab(
     writer: &mut impl Write,
     subject: &[u8],
     predicate: &[u8],
-    object: &[u8],
+    object: &ObjectTerm,
     score: f32,
 ) -> std::io::Result<()> {
     write_nt_subject(writer, subject)?;
     writer.write_all(b"\t<")?;
     writer.write_all(predicate)?;
     writer.write_all(b">\t")?;
-    write_nt_object(writer, object)?;
+    write_object_term(writer, object)?;
     writeln!(writer, "\t. # score={score:.4}")
 }
 
@@ -792,7 +808,6 @@ impl DataResolver {
             Self::Permutation(resolver) => {
                 if let Some(pairs) = resolver.occurrences.get(&object_id) {
                     return Ok(ResolvedOccurrences {
-                        rows: Vec::new(),
                         examined: pairs.len() as u64,
                         pairs: pairs
                             .iter()
@@ -812,18 +827,13 @@ impl DataResolver {
                         pairs.push((subject, predicate));
                     }
                 }
-                Ok(ResolvedOccurrences {
-                    pairs,
-                    examined,
-                    rows: Vec::new(),
-                })
+                Ok(ResolvedOccurrences { pairs, examined })
             }
             Self::Indexed(resolver) => {
                 // Resolved with the rest of the page unless its group was too
                 // large to hold; only then does it cost a pass of its own.
                 if let Some(pairs) = resolver.occurrences.get(&object_id) {
                     return Ok(ResolvedOccurrences {
-                        rows: Vec::new(),
                         examined: pairs.len() as u64,
                         pairs: pairs
                             .iter()
@@ -854,18 +864,13 @@ impl DataResolver {
                         Ok(Visit::Continue)
                     },
                 )?;
-                Ok(ResolvedOccurrences {
-                    pairs,
-                    examined,
-                    rows: Vec::new(),
-                })
+                Ok(ResolvedOccurrences { pairs, examined })
             }
             Self::Scanned(resolver) => {
                 let Some(pairs) = resolver.occurrences.get(&object_id) else {
                     return Ok(ResolvedOccurrences::default());
                 };
                 Ok(ResolvedOccurrences {
-                    rows: Vec::new(),
                     examined: pairs.len() as u64,
                     pairs: pairs
                         .iter()
@@ -885,9 +890,6 @@ struct ResolvedOccurrences {
     pairs: Vec<(u64, u64)>,
     /// Pair count before applying `--predicate`.
     examined: u64,
-    /// For a literal of an unasserted triple term: whole `data.hdt` rows whose
-    /// object is a triple term containing it. `pairs` is then empty.
-    rows: Vec<(u64, u64, u64)>,
 }
 
 /// Resolves hits to occurrences: in `data.hdt` for its own literals, and
@@ -935,22 +937,23 @@ impl OccurrenceResolver {
         }
     }
 
+    /// The resolver for a literal of the propositions HDT, which streams its
+    /// rows; `None` for a literal of `data.hdt`.
+    fn propositions_for(
+        &mut self,
+        object_id: u64,
+    ) -> Option<&mut crate::triple_terms::text::PropositionHits> {
+        self.propositions
+            .as_mut()
+            .filter(|props| props.covers(object_id))
+    }
+
+    /// The occurrences of a literal of `data.hdt`.
     fn occurrences(
         &mut self,
         object_id: u64,
         predicate_filter: Option<u64>,
     ) -> Result<ResolvedOccurrences> {
-        if let Some(props) = self.propositions.as_mut()
-            && props.covers(object_id)
-        {
-            let mut rows = Vec::new();
-            let examined = props.rows(object_id, &mut rows)?;
-            return Ok(ResolvedOccurrences {
-                pairs: Vec::new(),
-                examined,
-                rows,
-            });
-        }
         self.data.occurrences(object_id, predicate_filter)
     }
 }

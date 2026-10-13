@@ -349,6 +349,63 @@ fn search_refuses_misplaced_triple_terms() {
     // A predicate is read as stored, so one spelled like a literal is no
     // error: like an ordinary pattern's, it simply matches nothing here.
     assert!(search(&hdt, "? ? <<( ? \"lit\" ? )>>", &[]).is_empty());
+
+    // Nesting is bounded as the build bounds it: the deepest term accepted
+    // matches nothing here, one deeper is refused, and a query thousands of
+    // levels deep is refused too rather than exhausting the stack.
+    let nested = |depth: usize| {
+        let mut term = "<<( <http://ex/a> <http://ex/p> <http://ex/o> )>>".to_owned();
+        for _ in 1..depth {
+            term = format!("<<( <http://ex/a> <http://ex/p> {term} )>>");
+        }
+        format!("? ? {term}")
+    };
+    assert!(search(&hdt, &nested(64), &[]).is_empty());
+    for depth in [65, 5_000] {
+        let output = hdtc(&[
+            "search",
+            "-q",
+            hdt.to_str().unwrap(),
+            "--query",
+            &nested(depth),
+        ]);
+        assert_eq!(output.status.code(), Some(1), "{depth} levels");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("nested more than 64 levels"),
+            "{depth} levels: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+/// Output knows a rendered triple term from a dictionary string by its kind,
+/// not its spelling: lenient ingest stores the IRI `<\u003C\u003C(x)>` as
+/// `<<(x`, and it is still written as an IRI.
+#[test]
+fn an_iri_spelled_like_a_triple_term_is_written_as_an_iri() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.nt");
+    common::write_file(
+        &input,
+        format!(
+            "<http://ex/s> <http://ex/p> <\\u003C\\u003C(x)> .\n\
+             <http://ex/e> <{RDF_REIFIES}> <<( <http://ex/s> <http://ex/p> <http://ex/o> )>> .\n"
+        )
+        .as_bytes(),
+    );
+    let hdt = create(dir.path(), &[&input], "out.hdt");
+    assert!(tt_path(&hdt, ".tt").exists(), "triple terms are rendered");
+    let lines = dump(&hdt);
+    assert!(
+        lines.contains(&"<http://ex/s> <http://ex/p> <<<(x)> .".to_owned()),
+        "{lines:#?}"
+    );
+    assert!(
+        lines.contains(&format!(
+            "<http://ex/e> <{RDF_REIFIES}> <<( <http://ex/s> <http://ex/p> <http://ex/o> )>> ."
+        )),
+        "{lines:#?}"
+    );
 }
 
 const SECOND: &str = r#"@prefix : <http://ex/> .
@@ -1327,4 +1384,100 @@ fn a_small_memory_limit_decodes_every_triple_term_the_same() {
         "validate failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+/// A text index covering a propositions HDT addresses its literals by that
+/// HDT's object identifiers, so its binding covers that HDT too: one rebuilt
+/// beside an unchanged data HDT no longer verifies.
+#[test]
+fn a_text_index_binds_to_its_propositions_hdt() {
+    use hdtc::format::verify_text_index_binding;
+    let dir = tempfile::tempdir().unwrap();
+    let build = |name: &str, claim: &str| -> PathBuf {
+        let input = dir.path().join(format!("{name}.ttl"));
+        common::write_file(
+            &input,
+            format!(
+                "@prefix : <http://ex/> .\n\
+                 @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .\n\
+                 :e rdf:reifies <<( :s :label \"{claim}\" )>> .\n"
+            )
+            .as_bytes(),
+        );
+        let hdt = create(dir.path(), &[&input], &format!("{name}.hdt"));
+        let output = hdtc(&["text", "-q", hdt.to_str().unwrap()]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        hdt
+    };
+    let hdt = build("one", "a rumour");
+    let other = build("two", "another rumour");
+    let index = PathBuf::from(format!("{}.text", hdt.display()));
+    verify_text_index_binding(&index, &hdt).expect("an index binds to its own bundle");
+
+    std::fs::copy(tt_path(&other, ".props.hdt"), tt_path(&hdt, ".props.hdt")).unwrap();
+    let error = verify_text_index_binding(&index, &hdt).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("propositions SHA-256 binding mismatch"),
+        "{error:#}"
+    );
+    std::fs::remove_file(tt_path(&hdt, ".props.hdt")).unwrap();
+    assert!(verify_text_index_binding(&index, &hdt).is_err());
+}
+
+/// A literal in many unasserted claims resolves to their rows one at a time:
+/// a count reads none of them, and a page takes what it asks for wherever it
+/// starts, nested claims included.
+#[test]
+fn text_hits_in_many_claims_are_counted_and_paged() {
+    use std::fmt::Write as _;
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.ttl");
+    let mut ttl = String::from(
+        "@prefix : <http://ex/> .\n@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .\n",
+    );
+    for i in 0..300 {
+        let term = format!("<<( :s{i} :label \"common ground\" )>>");
+        writeln!(ttl, ":r{i} rdf:reifies {term} .").unwrap();
+        if i % 3 == 0 {
+            writeln!(ttl, ":q{i} rdf:reifies {term} .").unwrap();
+        }
+    }
+    writeln!(
+        ttl,
+        ":c :claims <<( :x :says <<( :s0 :label \"common ground\" )>> )>> ."
+    )
+    .unwrap();
+    common::write_file(&input, ttl.as_bytes());
+    let hdt = create(dir.path(), &[&input], "many.hdt");
+    let output = hdtc(&["text", "-q", hdt.to_str().unwrap()]);
+    assert!(output.status.success());
+
+    let text = |extra: &[&str]| -> Vec<String> {
+        let mut args = vec!["search", "-q", hdt.to_str().unwrap(), "--text", "common"];
+        args.extend_from_slice(extra);
+        let output = hdtc(&args);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    };
+    // 300 reifiers, 100 second reifiers, and the claim nesting one term.
+    assert_eq!(text(&["--count"]), vec!["401".to_owned()]);
+    let all = text(&[]);
+    assert_eq!(all.len(), 401);
+    assert!(all.iter().any(|line| line.starts_with("<http://ex/c>")));
+    assert_eq!(text(&["--limit", "5"]), all[..5]);
+    assert_eq!(text(&["--offset", "399", "--limit", "10"]), all[399..]);
 }

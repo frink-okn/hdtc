@@ -654,22 +654,19 @@ impl ObjectGroups {
         })
     }
 
-    /// Call `visit(subject, predicate, position)` for every triple with object
-    /// `object`, and predicate `predicate` when given, where `position` is the
-    /// triple's position in this permutation. With `count_only`, only the
-    /// number is computed: no subject is read.
-    pub(crate) fn for_object(
+    /// The positions of `object`'s triples, one range per predicate with that
+    /// predicate — only `predicate`'s when given — in this permutation's
+    /// order. An object's predicates are few, so they are returned whole; its
+    /// triples are not read.
+    pub(crate) fn predicate_ranges(
         &mut self,
         object: u64,
         predicate: Option<u64>,
-        count_only: bool,
-        mut visit: impl FnMut(u64, u64, u64) -> Result<bool>,
-    ) -> Result<u64> {
+    ) -> Result<Vec<(u64, std::ops::Range<u64>)>> {
         if object == 0 || object > self.objects {
-            return Ok(0);
+            return Ok(Vec::new());
         }
         let ys = self.y.group(&self.file, object)?;
-        // An object's predicates are few: read them whole.
         let width = u64::from(self.array_y.bits_per_entry);
         let first_bit = ys.start * width;
         let last_bit = ys.end * width;
@@ -691,8 +688,8 @@ impl ObjectGroups {
             }
             ((value >> (bit % 8)) & ((1u128 << width) - 1)) as u64
         };
-        let mut count = 0u64;
-        for y in ys.clone() {
+        let mut ranges = Vec::new();
+        for y in ys {
             let p = predicate_at(&self.scratch, y);
             if predicate.is_some_and(|wanted| wanted != p) {
                 continue;
@@ -702,19 +699,40 @@ impl ObjectGroups {
             } else {
                 self.z.select1(&self.file, y - 1)? + 1
             };
-            let z_end = self.z.select1(&self.file, y)? + 1;
-            count += z_end - z_start;
+            ranges.push((p, z_start..self.z.select1(&self.file, y)? + 1));
+        }
+        Ok(ranges)
+    }
+
+    /// The subject of the triple at `position`.
+    pub(crate) fn subject_at(&self, position: u64) -> Result<u64> {
+        read_packed_at_file(
+            &self.file,
+            self.array_z.offset,
+            self.array_z.bits_per_entry,
+            position,
+        )
+    }
+
+    /// Call `visit(subject, predicate, position)` for every triple with object
+    /// `object`, and predicate `predicate` when given, where `position` is the
+    /// triple's position in this permutation. With `count_only`, only the
+    /// number is computed: no subject is read.
+    pub(crate) fn for_object(
+        &mut self,
+        object: u64,
+        predicate: Option<u64>,
+        count_only: bool,
+        mut visit: impl FnMut(u64, u64, u64) -> Result<bool>,
+    ) -> Result<u64> {
+        let mut count = 0u64;
+        for (p, positions) in self.predicate_ranges(object, predicate)? {
+            count += positions.end - positions.start;
             if count_only {
                 continue;
             }
-            for z in z_start..z_end {
-                let subject = read_packed_at_file(
-                    &self.file,
-                    self.array_z.offset,
-                    self.array_z.bits_per_entry,
-                    z,
-                )?;
-                if !visit(subject, p, z)? {
+            for z in positions {
+                if !visit(self.subject_at(z)?, p, z)? {
                     return Ok(count);
                 }
             }

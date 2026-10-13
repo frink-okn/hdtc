@@ -607,11 +607,11 @@ pub struct DictionaryResolver {
 impl DictionaryResolver {
     /// Render triple-term IRIs as N-Triples 1.2 triple terms from now on.
     ///
-    /// [`Self::object_term`] then yields `<<( s p o )>>` text for an object
-    /// that names a triple term — already in N-Triples form, which
-    /// [`write_nt_object`] passes through — and the dictionary string for
-    /// everything else. A dictionary string never begins with `<`, so the two
-    /// cannot be confused. Returns whether the HDT has triple terms.
+    /// [`Self::object_term`] then yields the `<<( s p o )>>` text of an object
+    /// that names a triple term, marked as rendered, and the dictionary string
+    /// of everything else. The mark is what tells them apart: lenient ingest
+    /// can store an IRI that begins `<<(` too. Returns whether the HDT has
+    /// triple terms.
     pub fn enable_triple_terms(&mut self, hdt_path: &Path, memory_limit: usize) -> Result<bool> {
         let decoder =
             crate::triple_terms::reader::TripleTermDecoder::open(hdt_path, self, memory_limit)?;
@@ -650,19 +650,22 @@ impl DictionaryResolver {
         self.predicates.get_bytes(predicate_id, buf)
     }
 
-    /// Resolve an object ID to raw term bytes — or, when triple terms are
-    /// enabled and the object names one, to its N-Triples 1.2 rendering.
-    pub fn object_term(&mut self, object_id: u64, buf: &mut Vec<u8>) -> Result<()> {
+    /// Resolve an object ID for output: its dictionary string — or, when
+    /// triple terms are enabled and the object names one, its N-Triples 1.2
+    /// rendering, marked as such.
+    pub fn object_term(&mut self, object_id: u64, out: &mut ObjectTerm) -> Result<()> {
         if let Some(decoder) = self.triple_terms.as_ref()
             && decoder.is_data_term(object_id)
         {
             let mut decoder = self.triple_terms.take().expect("checked above");
-            buf.clear();
-            let rendered = decoder.render_data(self, object_id, buf);
+            out.bytes.clear();
+            out.triple_term = true;
+            let rendered = decoder.render_data(self, object_id, &mut out.bytes);
             self.triple_terms = Some(decoder);
             return rendered;
         }
-        self.object_term_raw(object_id, buf)
+        out.triple_term = false;
+        self.object_term_raw(object_id, &mut out.bytes)
     }
 
     /// Resolve an object ID to its dictionary string, never rendering it.
@@ -931,7 +934,7 @@ pub fn write_triple_tab(
     w: &mut impl Write,
     subject: &[u8],
     predicate: &[u8],
-    object: &[u8],
+    object: &ObjectTerm,
 ) -> std::io::Result<()> {
     write_nt_subject(w, subject)?;
     w.write_all(b"\t")?;
@@ -939,7 +942,7 @@ pub fn write_triple_tab(
     w.write_all(predicate)?;
     w.write_all(b">")?;
     w.write_all(b"\t")?;
-    write_nt_object(w, object)?;
+    write_object_term(w, object)?;
     w.write_all(b"\t.\n")
 }
 
@@ -954,15 +957,45 @@ pub(crate) fn write_nt_subject(w: &mut impl Write, term: &[u8]) -> std::io::Resu
     }
 }
 
-/// Write an object term (IRI, blank node, or literal) in N-Triples format.
+/// An object as output paths hold it: a dictionary string, or a triple term
+/// that [`DictionaryResolver::object_term`] has rendered as N-Triples 1.2.
+///
+/// The kind is carried beside the bytes rather than read from them, because a
+/// dictionary string can spell anything: lenient ingest stores the IRI
+/// `<\u003C\u003C(x)>` as `<<(x`, which must still be written as an IRI.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ObjectTerm {
+    bytes: Vec<u8>,
+    triple_term: bool,
+}
+
+impl ObjectTerm {
+    /// An object's dictionary string.
+    #[cfg(test)]
+    pub fn dictionary(bytes: impl Into<Vec<u8>>) -> Self {
+        Self {
+            bytes: bytes.into(),
+            triple_term: false,
+        }
+    }
+}
+
+/// Write an object for output: a rendered triple term as it stands, a
+/// dictionary string as [`write_nt_object`] writes it.
+pub(crate) fn write_object_term(w: &mut impl Write, object: &ObjectTerm) -> std::io::Result<()> {
+    if object.triple_term {
+        w.write_all(&object.bytes)
+    } else {
+        write_nt_object(w, &object.bytes)
+    }
+}
+
+/// Write an object's dictionary string (IRI, blank node, or literal) in
+/// N-Triples format.
 ///
 /// Literal values are escaped for N-Triples (HDT stores raw unescaped UTF-8).
 pub(crate) fn write_nt_object(w: &mut impl Write, term: &[u8]) -> std::io::Result<()> {
-    if term.starts_with(b"<<(") {
-        // A triple term rendered by `DictionaryResolver::object_term`: already
-        // N-Triples 1.2. No dictionary string begins with `<`.
-        w.write_all(term)
-    } else if term.starts_with(b"\"") {
+    if term.starts_with(b"\"") {
         write_nt_literal(w, term)
     } else if term.starts_with(b"_:") {
         w.write_all(term)
@@ -1391,7 +1424,7 @@ mod tests {
             &mut buf,
             b"http://example.org/s",
             b"http://example.org/p",
-            b"http://example.org/o",
+            &ObjectTerm::dictionary(&b"http://example.org/o"[..]),
         )
         .unwrap();
         assert_eq!(

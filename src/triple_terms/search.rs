@@ -24,7 +24,7 @@
 
 use super::format;
 use super::reader::{LayerCursor, Order, Source, Target, TripleTermIndex};
-use crate::hdt::reader::{DictionaryResolver, OutputWriter, write_triple_tab};
+use crate::hdt::reader::{DictionaryResolver, ObjectTerm, OutputWriter, write_triple_tab};
 use crate::permutation::{ObjectGroups, PermutationIndex, SpoAccess, canonical_path};
 use anyhow::{Context, Result};
 use std::path::Path;
@@ -95,7 +95,7 @@ struct Emitter<'a> {
     count: u64,
     subject: Vec<u8>,
     predicate: Vec<u8>,
-    object: Vec<u8>,
+    object: ObjectTerm,
 }
 
 impl Emitter<'_> {
@@ -191,7 +191,7 @@ pub(crate) fn search_inner_pattern(
         count: 0,
         subject: Vec::new(),
         predicate: Vec::new(),
-        object: Vec::new(),
+        object: Default::default(),
     };
     if !format::canonical_path(hdt_path).exists() {
         // No triple terms at all, so nothing can match.
