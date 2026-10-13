@@ -113,9 +113,12 @@ pub fn search_dataset_streaming(
     } else {
         memory_limit
     };
-    let (offsets, mut dictionary) = open_hdt(hdt_path, dictionary_budget)
+    // Rendering triple terms takes its share out of the dictionary's.
+    let triple_term_budget =
+        crate::triple_terms::reader::TripleTermDecoder::budget(hdt_path, dictionary_budget);
+    let (offsets, mut dictionary) = open_hdt(hdt_path, dictionary_budget - triple_term_budget)
         .with_context(|| format!("Failed to open HDT file {}", hdt_path.display()))?;
-    dictionary.enable_triple_terms(hdt_path, dictionary_budget / 8)?;
+    dictionary.enable_triple_terms(hdt_path, triple_term_budget)?;
     let Some(resolved) = resolve_triple_pattern(pattern, &mut dictionary)? else {
         return write_empty_result(output, count_only);
     };
@@ -264,13 +267,15 @@ fn resolve_triple_pattern(
         QueryTerm::TripleTerm(_) => {
             anyhow::bail!("wildcards inside a triple term are supported in triple patterns only")
         }
-        QueryTerm::Bound(term) => match dictionary.locate_object(term)? {
-            Some(id) => Some(id),
-            None => {
-                missing = true;
-                None
+        QueryTerm::Bound(term) => {
+            match crate::hdt::search::locate_bound_object(dictionary, term)? {
+                Some(id) => Some(id),
+                None => {
+                    missing = true;
+                    None
+                }
             }
-        },
+        }
     };
 
     Ok((!missing).then_some(ResolvedTriplePattern {

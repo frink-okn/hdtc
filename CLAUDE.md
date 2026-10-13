@@ -8,7 +8,7 @@ Converts input RDF files (any standard format) to HDT binary format, optimized f
 
 ## Key Technical Decisions
 
-- **RDF Parsing**: `oxrdfio` crate - supports all standard formats (N-Triples, N-Quads, Turtle, TriG, RDF/XML, JSON-LD, N3), streaming, actively maintained. The Turtle family (Turtle, TriG, N-Triples, N-Quads, N3) is built from a vendored oxttl (`vendor/oxttl`, a direct dependency renamed `oxttl-hdtc`) carrying an upstream backport (`with_max_buffer_size`, behind `--max-term-bytes`, default 256 MiB) plus five fixes of hdtc's own, listed in `vendor/oxttl/Cargo.toml`; an upstream release must cover all of them before the vendored copy is dropped
+- **RDF Parsing**: `oxrdfio` crate - supports all standard formats (N-Triples, N-Quads, Turtle, TriG, RDF/XML, JSON-LD, N3), streaming, actively maintained. The Turtle family (Turtle, TriG, N-Triples, N-Quads, N3) is built from a vendored oxttl (`vendor/oxttl`, a direct dependency renamed `oxttl-hdtc`) carrying an upstream backport (`with_max_buffer_size`, behind `--max-term-bytes`, default 256 MiB) plus six fixes of hdtc's own, listed in `vendor/oxttl/Cargo.toml`. RDF/XML is likewise built from a vendored oxrdfxml (`vendor/oxrdfxml`, renamed `oxrdfxml-hdtc`) carrying one fix of hdtc's own, the triple-term nesting bound, listed in its `Cargo.toml`. An upstream release must cover every listed fix before its vendored copy is dropped
 - **CLI**: `clap` with derive API
 - **HDT Format**: Fully compatible with hdt-java / hdt-cpp (standard binary format)
 - **Dictionary**: Four-section dictionary with Plain Front Coding (PFC)

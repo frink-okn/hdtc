@@ -107,14 +107,9 @@ pub enum PatternKind {
 }
 
 impl PatternKind {
+    /// The kind of an ordinary pattern. A triple-term pattern has none: it is
+    /// answered before kinds are consulted.
     fn from_terms(s: &QueryTerm, p: &QueryTerm, o: &QueryTerm) -> Self {
-        // A triple-term pattern is answered before kinds are consulted.
-        let bound = QueryTerm::Bound(Vec::new());
-        let o = if matches!(o, QueryTerm::TripleTerm(_)) {
-            &bound
-        } else {
-            o
-        };
         match (s, p, o) {
             (QueryTerm::Wildcard, QueryTerm::Wildcard, QueryTerm::Wildcard) => Self::ScanAll,
             (QueryTerm::Bound(_), QueryTerm::Wildcard, QueryTerm::Wildcard) => Self::SubjectBound,
@@ -130,7 +125,7 @@ impl PatternKind {
             (QueryTerm::Wildcard, QueryTerm::Bound(_), QueryTerm::Bound(_)) => {
                 Self::PredicateObjectBound
             }
-            _ => unreachable!("triple terms are rejected outside object position"),
+            _ => unreachable!("a triple-term pattern has no kind"),
         }
     }
 }
@@ -389,6 +384,12 @@ fn parse_triple_term_positions(
             let QueryTerm::Bound(term) = parse_one_term(bytes, pos)? else {
                 bail!("Unexpected term inside a triple term");
             };
+            // A triple term is named from hdtc's dictionary strings, so a
+            // literal inside one is taken in that form.
+            let term = match dictionary_form(&term) {
+                Some(encoded) if index != 1 => encoded,
+                _ => term,
+            };
             let text = String::from_utf8(term).context("Non-UTF-8 term in query")?;
             // As the build reads them: the predicate is the dictionary string
             // as stored, and a subject or object is classified by its
@@ -500,23 +501,53 @@ fn parse_nt_literal(bytes: &[u8], pos: &mut usize) -> Result<QueryTerm> {
         *pos += 1; // consume '>'
     }
 
-    // The dictionary form: `encode_literal` folds the language tag and drops
-    // `xsd:string`, exactly as the parser did when the data was loaded, so
-    // `"x"@EN` and `"x"^^xsd:string` find the terms stored as `"x"@en` and `"x"`.
-    let value = String::from_utf8(value).context("Non-UTF-8 literal in query")?;
-    let suffix = String::from_utf8(suffix).context("Non-UTF-8 literal suffix in query")?;
-    let encoded = if let Some(language) = suffix.strip_prefix('@') {
-        crate::dictionary::term::encode_literal(&value, Some(language), None)
-    } else if let Some(datatype) = suffix
-        .strip_prefix("^^<")
-        .and_then(|rest| rest.strip_suffix('>'))
-    {
-        crate::dictionary::term::encode_literal(&value, None, Some(datatype))
-    } else {
-        crate::dictionary::term::encode_literal(&value, None, None)
-    };
+    // The literal as written, raw value and suffix: what hdt-java and hdt-cpp
+    // store. [`locate_bound_object`] also tries hdtc's dictionary form.
+    let mut literal: Vec<u8> = Vec::with_capacity(1 + value.len() + 1 + suffix.len());
+    literal.push(b'"');
+    literal.extend_from_slice(&value);
+    literal.push(b'"');
+    literal.extend_from_slice(&suffix);
 
-    Ok(QueryTerm::Bound(encoded.into_bytes()))
+    Ok(QueryTerm::Bound(literal))
+}
+
+/// A literal in hdtc's dictionary form — the language tag folded to lower
+/// case and `xsd:string` dropped, as [`encode_literal`] writes it when data is
+/// loaded — or `None` if `term` is not a literal.
+///
+/// [`encode_literal`]: crate::dictionary::term::encode_literal
+pub(crate) fn dictionary_form(term: &[u8]) -> Option<Vec<u8>> {
+    use crate::dictionary::term::encode_literal;
+    fn part(bytes: &[u8]) -> Option<&str> {
+        std::str::from_utf8(bytes).ok()
+    }
+    let parsed = crate::text::analyzer::parse_literal(term)?;
+    let value = part(parsed.value)?;
+    let encoded = match (parsed.language, parsed.datatype) {
+        (Some(language), _) => encode_literal(value, Some(part(language)?), None),
+        (None, Some(datatype)) => encode_literal(value, None, Some(part(datatype)?)),
+        (None, None) => encode_literal(value, None, None),
+    };
+    Some(encoded.into_bytes())
+}
+
+/// Locate a bound object. A literal is looked up as the query spells it and
+/// then, when that is not found, in hdtc's dictionary form
+/// ([`dictionary_form`]): an HDT built by hdtc stores `"x"@EN` as `"x"@en` and
+/// `"x"^^xsd:string` as `"x"`, while hdt-java and hdt-cpp store a literal as
+/// it was written, so either spelling finds the term in either.
+pub(crate) fn locate_bound_object(
+    dictionary: &mut DictionaryResolver,
+    term: &[u8],
+) -> Result<Option<u64>> {
+    if let Some(id) = dictionary.locate_object(term)? {
+        return Ok(Some(id));
+    }
+    match dictionary_form(term) {
+        Some(encoded) if encoded != term => dictionary.locate_object(&encoded),
+        _ => Ok(None),
+    }
 }
 
 fn parse_hex_digits(bytes: &[u8], pos: &mut usize, n: usize) -> Result<u32> {
@@ -1329,9 +1360,11 @@ pub fn search_hdt_streaming(
     let (s_term, p_term, o_term) =
         parse_query(query).with_context(|| format!("Invalid query: {query:?}"))?;
 
-    let kind = PatternKind::from_terms(&s_term, &p_term, &o_term);
-
-    let (offsets, mut dictionary) = open_hdt(hdt_path, memory_limit)
+    // Rendering triple terms takes its share of the limit out of the
+    // dictionary's, so the two stay within it together.
+    let triple_term_budget =
+        crate::triple_terms::reader::TripleTermDecoder::budget(hdt_path, memory_limit);
+    let (offsets, mut dictionary) = open_hdt(hdt_path, memory_limit - triple_term_budget)
         .with_context(|| format!("Failed to open HDT file {}", hdt_path.display()))?;
 
     // A zero-sized page is empty by definition. Stop before resolving terms or
@@ -1341,9 +1374,8 @@ pub fn search_hdt_streaming(
         write_empty_output_if_needed(output)?;
         return Ok(0);
     }
-    // Render triple terms in output. Its propositions dictionary, when there
-    // is one, takes an eighth of the limit beside the main dictionary's.
-    dictionary.enable_triple_terms(hdt_path, memory_limit / 8)?;
+    // Render triple terms in output.
+    dictionary.enable_triple_terms(hdt_path, triple_term_budget)?;
 
     if let QueryTerm::TripleTerm(inner) = &o_term {
         let bound = |term: &QueryTerm| match term {
@@ -1368,6 +1400,7 @@ pub fn search_hdt_streaming(
         writer.flush()?;
         return Ok(count);
     }
+    let kind = PatternKind::from_terms(&s_term, &p_term, &o_term);
 
     // Resolve bound terms to dictionary IDs. If any bound term is not found,
     // the result set is empty — return immediately (not an error).
@@ -1398,7 +1431,7 @@ pub fn search_hdt_streaming(
     let o_id: Option<u64> = match &o_term {
         QueryTerm::Wildcard => None,
         QueryTerm::TripleTerm(_) => unreachable!("answered above"),
-        QueryTerm::Bound(bytes) => match dictionary.locate_object(bytes)? {
+        QueryTerm::Bound(bytes) => match locate_bound_object(&mut dictionary, bytes)? {
             Some(id) => Some(id),
             None => {
                 write_zero_count_if_needed(output, count_only)?;

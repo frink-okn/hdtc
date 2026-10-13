@@ -9,6 +9,9 @@
 //! twice) and removed by the sort that follows.
 //!
 //! An input without triple terms never touches the sink, so nothing is created.
+//!
+//! A spool's file is removed when the spool, or the writer still filling it,
+//! is dropped: a build that fails part way leaves none behind.
 
 use super::PropositionRecord;
 use anyhow::{Context, Result, ensure};
@@ -16,14 +19,15 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use tempfile::TempPath;
 
 /// Bytes a parser worker buffers before handing its records to the sink.
 pub const WORKER_FLUSH_BYTES: usize = 1 << 20;
 
-/// A finished spool on disk.
+/// A finished spool on disk, removed when dropped.
 #[derive(Debug)]
 pub struct PropositionSpool {
-    pub path: PathBuf,
+    path: TempPath,
     pub records: u64,
 }
 
@@ -32,16 +36,18 @@ impl PropositionSpool {
         SpoolReader::open(&self.path)
     }
 
-    pub fn remove(&self) {
-        if let Err(error) = std::fs::remove_file(&self.path) {
+    /// Remove the spool now rather than when it is dropped.
+    pub fn remove(self) {
+        if let Err(error) = self.path.close() {
             tracing::debug!("Failed to remove proposition spool: {error}");
         }
     }
 }
 
-/// A spool being written by one owner.
+/// A spool being written by one owner. Its file is removed if the writer is
+/// dropped unfinished.
 pub struct SpoolWriter {
-    path: PathBuf,
+    path: TempPath,
     encoder: zstd::Encoder<'static, BufWriter<File>>,
     records: u64,
     scratch: Vec<u8>,
@@ -51,6 +57,8 @@ impl SpoolWriter {
     pub fn create(path: PathBuf) -> Result<Self> {
         let file =
             File::create(&path).with_context(|| format!("Failed to create {}", path.display()))?;
+        // Owned from here, so an error below removes the file as well.
+        let path = TempPath::from_path(path);
         let encoder = zstd::Encoder::new(BufWriter::with_capacity(1 << 20, file), 1)?;
         Ok(Self {
             path,
@@ -244,5 +252,40 @@ mod tests {
         assert_eq!(spool.records, 1000);
         let back: Vec<_> = spool.reader().unwrap().collect::<Result<_>>().unwrap();
         assert_eq!(back, records);
+    }
+
+    /// A spool's file goes with it: dropped finished or unfinished, as a
+    /// failed build drops it, nothing is left in the temp directory.
+    #[test]
+    fn a_dropped_spool_leaves_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = PropositionRecord {
+            iri: "urn:x-kgf:tt:g:x".to_owned(),
+            subject: "http://ex/s".to_owned(),
+            predicate: "http://ex/p".to_owned(),
+            object: "http://ex/o".to_owned(),
+        };
+        let path = dir.path().join("unfinished.zst");
+        let mut writer = SpoolWriter::create(path.clone()).unwrap();
+        writer.push(&record).unwrap();
+        assert!(path.exists());
+        drop(writer);
+        assert!(!path.exists(), "an unfinished spool was left behind");
+
+        let path = dir.path().join("finished.zst");
+        let mut writer = SpoolWriter::create(path.clone()).unwrap();
+        writer.push(&record).unwrap();
+        let spool = writer.finish().unwrap();
+        assert!(path.exists());
+        drop(spool);
+        assert!(!path.exists(), "a finished spool was left behind");
+
+        let sink = PropositionSink::new(dir.path(), "sink.zst");
+        let mut encoded = Vec::new();
+        encode_record(&mut encoded, &record);
+        sink.append(&encoded, 1).unwrap();
+        assert!(dir.path().join("sink.zst").exists());
+        drop(sink);
+        assert!(!dir.path().join("sink.zst").exists());
     }
 }

@@ -60,9 +60,23 @@ pub struct TripleTermIndex {
     file: File,
     header: Header,
     sections: Vec<Section>,
+    /// Each run's subject, predicate and object arrays, data run first: found
+    /// once at open rather than on every decode.
+    runs: [[Section; 3]; 2],
 }
 
 fn read_packed(file: &File, section: &Section, index: u64) -> Result<u64> {
+    read_packed_with(section, index, |offset, bytes| {
+        Ok(file.read_exact_at(bytes, offset)?)
+    })
+}
+
+/// Entry `index` of a packed array, its bytes fetched by `read(offset, buf)`.
+fn read_packed_with(
+    section: &Section,
+    index: u64,
+    read: impl FnOnce(u64, &mut [u8]) -> Result<()>,
+) -> Result<u64> {
     ensure!(
         index < section.entry_count,
         "packed index {index} out of range in section {:#06x}",
@@ -76,7 +90,7 @@ fn read_packed(file: &File, section: &Section, index: u64) -> Result<u64> {
     let shift = (bit % 8) as u32;
     let needed = (u64::from(shift) + width).div_ceil(8) as usize;
     let mut bytes = [0u8; 9];
-    file.read_exact_at(&mut bytes[..needed], section.offset + bit / 8)?;
+    read(section.offset + bit / 8, &mut bytes[..needed])?;
     let mut value = 0u128;
     for (i, byte) in bytes[..needed].iter().enumerate() {
         value |= u128::from(*byte) << (i * 8);
@@ -87,6 +101,63 @@ fn read_packed(file: &File, section: &Section, index: u64) -> Result<u64> {
         (1u128 << width) - 1
     };
     Ok(((value >> shift) & mask) as u64)
+}
+
+/// Bytes per page of a [`RunCache`].
+const RUN_PAGE_BYTES: u64 = 4096;
+
+/// The run arrays' pages, held for decoding many triple terms: a decode whose
+/// pages are held costs no system call, where an uncached one costs three
+/// positioned reads and more for each nested term.
+///
+/// Direct-mapped over the stretch of the file the runs occupy, so a budget
+/// covering that stretch reads each page once, and a smaller one still serves
+/// a sequential walk of a run from a page per few hundred entries. Pages are
+/// read as they are first needed; memory grows to the budget, never past it.
+pub(crate) struct RunCache {
+    first_page: u64,
+    file_length: u64,
+    slots: Vec<Option<(u64, Box<[u8]>)>>,
+}
+
+impl RunCache {
+    /// Copy `out.len()` bytes of the index file from `offset` into `out`.
+    fn read(&mut self, file: &File, offset: u64, out: &mut [u8]) -> Result<()> {
+        let mut done = 0;
+        while done < out.len() {
+            let at = offset + done as u64;
+            let page = at / RUN_PAGE_BYTES;
+            let slot = (page.saturating_sub(self.first_page) % self.slots.len() as u64) as usize;
+            if !matches!(&self.slots[slot], Some((held, _)) if *held == page) {
+                let start = page * RUN_PAGE_BYTES;
+                ensure!(
+                    start < self.file_length,
+                    "run entry past the end of the index"
+                );
+                let length = RUN_PAGE_BYTES.min(self.file_length - start) as usize;
+                let mut bytes = vec![0u8; length].into_boxed_slice();
+                file.read_exact_at(&mut bytes, start)?;
+                self.slots[slot] = Some((page, bytes));
+            }
+            let Some((_, bytes)) = &self.slots[slot] else {
+                unreachable!("filled above")
+            };
+            let within = (at - page * RUN_PAGE_BYTES) as usize;
+            let take = (out.len() - done).min(bytes.len().saturating_sub(within));
+            ensure!(take > 0, "run entry past the end of the index");
+            out[done..done + take].copy_from_slice(&bytes[within..within + take]);
+            done += take;
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for RunCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunCache")
+            .field("slots", &self.slots.len())
+            .finish()
+    }
 }
 
 /// A layer: which positions of one HDT's triples in one order are marked,
@@ -178,6 +249,14 @@ impl Layer {
         if position == self.positions {
             return Ok(self.marked());
         }
+        Ok(Self::sparse_locate(file, sparse, position)?.0)
+    }
+
+    /// In a sparse layer, the rank of the first mark at or after `position`
+    /// within its bucket, the rank one past the bucket's last mark, and
+    /// `position`'s low bits: `position` is marked exactly when the first is
+    /// below the second and its low bits are the third.
+    fn sparse_locate(file: &File, sparse: &SparseLayer, position: u64) -> Result<(u64, u64, u64)> {
         // The marks in `position`'s bucket are those between the clear bits
         // closing the bucket before it and closing it; their low bits ascend.
         let bucket = position >> sparse.low_bits;
@@ -196,13 +275,30 @@ impl Layer {
                 high = mid;
             }
         }
-        Ok(low)
+        Ok((low, end, target))
+    }
+
+    /// The rank of `position` among the marks if it is marked, `None` if not:
+    /// a membership test and [`Self::rank1`] for the price of one rank.
+    pub fn rank_if_marked(&self, file: &File, position: u64) -> Result<Option<u64>> {
+        ensure!(position < self.positions, "bit position out of range");
+        let Some(sparse) = &self.sparse else {
+            let mut byte = [0u8; 1];
+            file.read_exact_at(&mut byte, self.bitmap.offset + position / 8)?;
+            if byte[0] >> (position % 8) & 1 == 0 {
+                return Ok(None);
+            }
+            return self.dense_rank1(file, position).map(Some);
+        };
+        let (rank, end, target) = Self::sparse_locate(file, sparse, position)?;
+        Ok((rank < end && read_packed(file, &sparse.low, rank)? == target).then_some(rank))
     }
 
     /// The position of the `rank`-th mark. Sparse, through the directory
     /// held in memory; dense, by loading the layer's directory for this one
-    /// call — fine for a test or a single lookup, not for a loop, where a
-    /// [`LayerCursor`] in select mode is the tool.
+    /// call — fine for a test, not for a loop, where a [`LayerCursor`] in
+    /// select mode is the tool.
+    #[cfg(test)]
     pub(crate) fn select1(&self, file: &File, rank: u64) -> Result<u64> {
         ensure!(rank < self.marked(), "select rank out of range");
         match &self.sparse {
@@ -247,18 +343,6 @@ impl Layer {
                 .iter()
                 .map(|b| u64::from(b.count_ones()))
                 .sum::<u64>())
-    }
-
-    /// Whether `position` is marked.
-    pub fn bit(&self, file: &File, position: u64) -> Result<bool> {
-        ensure!(position < self.positions, "bit position out of range");
-        if self.sparse.is_some() {
-            let rank = self.rank1(file, position)?;
-            return Ok(rank < self.marked() && self.select1(file, rank)? == position);
-        }
-        let mut byte = [0u8; 1];
-        file.read_exact_at(&mut byte, self.bitmap.offset + position / 8)?;
-        Ok(byte[0] >> (position % 8) & 1 == 1)
     }
 
     /// Marks counted by the rank directory: its sentinel, the bitmap's
@@ -323,31 +407,41 @@ impl TripleTermIndex {
             path.display(),
             hdt_path.display()
         );
-        let index = Self {
-            path,
-            file,
-            header,
-            sections,
-        };
-        for run in [component::DATA_RUN, component::PROPS_RUN] {
+        let run_sections = |run: u32, expected: u64| -> Result<[Section; 3]> {
+            let mut found = Vec::with_capacity(3);
             for k in [
                 kind::TARGET_SUBJECT,
                 kind::TARGET_PREDICATE,
                 kind::TARGET_OBJECT,
             ] {
-                let section = index.section(section_type(run, k))?;
-                let expected = if run == component::DATA_RUN {
-                    index.header.data.run_length
-                } else {
-                    index.header.props.run_length
-                };
+                let section = sections
+                    .binary_search_by_key(&section_type(run, k), |s| s.section_type)
+                    .map(|i| sections[i].clone())
+                    .map_err(|_| {
+                        anyhow::anyhow!(
+                            "missing triple-term index section {:#06x}",
+                            section_type(run, k)
+                        )
+                    })?;
                 ensure!(
                     section.entry_count == expected,
                     "triple-term run arrays do not match the run length"
                 );
+                found.push(section);
             }
-        }
-        Ok(index)
+            Ok(found.try_into().expect("three run arrays"))
+        };
+        let runs = [
+            run_sections(component::DATA_RUN, header.data.run_length)?,
+            run_sections(component::PROPS_RUN, header.props.run_length)?,
+        ];
+        Ok(Self {
+            path,
+            file,
+            header,
+            sections,
+            runs,
+        })
     }
 
     pub fn path(&self) -> &Path {
@@ -388,33 +482,74 @@ impl TripleTermIndex {
 
     /// The proposition of the triple-term IRI with object identifier `object`
     /// in `source`, or `None` if that identifier is not a triple-term IRI.
+    /// Three positioned reads: for decoding many terms, [`Self::cached_target`].
     pub fn target(&self, source: Source, object: u64) -> Result<Option<Target>> {
+        self.target_with(source, object, |section, at| {
+            read_packed(&self.file, section, at)
+        })
+    }
+
+    /// A cache for [`Self::cached_target`] holding at most `budget` bytes of
+    /// the run arrays' pages, and never more than they span.
+    pub(crate) fn run_cache(&self, budget: usize) -> RunCache {
+        let spans: Vec<(u64, u64)> = self
+            .runs
+            .iter()
+            .flatten()
+            .filter(|section| section.length > 0)
+            .map(|section| (section.offset, section.offset + section.length))
+            .collect();
+        let first = spans.iter().map(|span| span.0).min().unwrap_or(0) / RUN_PAGE_BYTES;
+        let last = spans
+            .iter()
+            .map(|span| span.1)
+            .max()
+            .unwrap_or(0)
+            .div_ceil(RUN_PAGE_BYTES);
+        let slots = (budget as u64 / RUN_PAGE_BYTES).clamp(1, last.saturating_sub(first).max(1));
+        RunCache {
+            first_page: first,
+            file_length: self.header.sidecar_size,
+            slots: std::iter::repeat_with(|| None)
+                .take(slots as usize)
+                .collect(),
+        }
+    }
+
+    /// As [`Self::target`], reading the run arrays through `cache`.
+    pub(crate) fn cached_target(
+        &self,
+        cache: &mut RunCache,
+        source: Source,
+        object: u64,
+    ) -> Result<Option<Target>> {
+        self.target_with(source, object, |section, at| {
+            read_packed_with(section, at, |offset, bytes| {
+                cache.read(&self.file, offset, bytes)
+            })
+        })
+    }
+
+    fn target_with(
+        &self,
+        source: Source,
+        object: u64,
+        mut read: impl FnMut(&Section, u64) -> Result<u64>,
+    ) -> Result<Option<Target>> {
         let run = self.run(source);
         if !run.contains(&object) {
             return Ok(None);
         }
-        let component = match source {
-            Source::Data => component::DATA_RUN,
-            Source::Propositions => component::PROPS_RUN,
+        let [subject, predicate, object_array] = match source {
+            Source::Data => &self.runs[0],
+            Source::Propositions => &self.runs[1],
         };
         let at = object - run.start;
-        let subject = read_packed(
-            &self.file,
-            self.section(section_type(component, kind::TARGET_SUBJECT))?,
-            at,
-        )?;
+        let subject = read(subject, at)?;
         Ok(Some(Target {
             subject: subject >> 1,
-            predicate: read_packed(
-                &self.file,
-                self.section(section_type(component, kind::TARGET_PREDICATE))?,
-                at,
-            )?,
-            object: read_packed(
-                &self.file,
-                self.section(section_type(component, kind::TARGET_OBJECT))?,
-                at,
-            )?,
+            predicate: read(predicate, at)?,
+            object: read(object_array, at)?,
             asserted: subject & 1 == 0,
         }))
     }
@@ -451,6 +586,8 @@ impl TripleTermIndex {
 pub struct TripleTermDecoder {
     index: TripleTermIndex,
     propositions: Option<DictionaryResolver>,
+    /// Output decodes every triple-term object it writes, in no useful order.
+    runs: RunCache,
     data_run: Range<u64>,
     scratch: Vec<u8>,
 }
@@ -468,9 +605,24 @@ impl std::fmt::Debug for TripleTermDecoder {
 }
 
 impl TripleTermDecoder {
+    /// The share of a command's `memory_limit` a decoder for `hdt_path`
+    /// takes: an eighth when the HDT has a triple-term index, nothing when
+    /// not. A caller takes it out of what it gives the HDT's own dictionary,
+    /// so the two together stay within the limit.
+    pub fn budget(hdt_path: &Path, memory_limit: usize) -> usize {
+        if format::canonical_path(hdt_path).exists() {
+            memory_limit / 8
+        } else {
+            0
+        }
+    }
+
     /// The decoder for `hdt_path`, or `None` when the HDT has no triple
     /// terms. An HDT whose dictionary holds triple-term IRIs but has no index
     /// beside it is an error: its triple terms could not be rendered.
+    ///
+    /// `memory_limit` bounds the propositions HDT's dictionary and the run
+    /// cache together.
     pub fn open(
         hdt_path: &Path,
         data: &mut DictionaryResolver,
@@ -487,15 +639,17 @@ impl TripleTermDecoder {
             return Ok(None);
         }
         let index = TripleTermIndex::open(hdt_path)?;
-        let propositions = if index.has_propositions() {
-            Some(open_hdt(&format::propositions_path(hdt_path), memory_limit)?.1)
+        let (propositions, runs) = if index.has_propositions() {
+            let dictionary = open_hdt(&format::propositions_path(hdt_path), memory_limit / 2)?.1;
+            (Some(dictionary), index.run_cache(memory_limit / 2))
         } else {
-            None
+            (None, index.run_cache(memory_limit))
         };
         let data_run = index.run(Source::Data);
         Ok(Some(Self {
             index,
             propositions,
+            runs,
             data_run,
             scratch: Vec::new(),
         }))
@@ -521,7 +675,7 @@ impl TripleTermDecoder {
     ) -> Result<()> {
         let target = self
             .index
-            .target(Source::Data, object)?
+            .cached_target(&mut self.runs, Source::Data, object)?
             .context("not a triple-term IRI")?;
         self.render_target(data, target, out, 0)
     }
@@ -552,7 +706,10 @@ impl TripleTermDecoder {
             out.extend_from_slice(&self.scratch);
             out.extend_from_slice(b"> ");
         }
-        match self.index.target(source, target.object)? {
+        match self
+            .index
+            .cached_target(&mut self.runs, source, target.object)?
+        {
             Some(nested) => self.render_target(data, nested, out, depth + 1)?,
             None => {
                 let dictionary = match source {

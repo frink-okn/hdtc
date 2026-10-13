@@ -15,7 +15,7 @@
 
 use super::format::{self, Section};
 use super::iri::{Component, Proposition, TT_NAMESPACE, iri_for};
-use super::reader::{Layer, LayerCursor, Order, Source, Target, TripleTermIndex};
+use super::reader::{Layer, LayerCursor, Order, RunCache, Source, Target, TripleTermIndex};
 use crate::hdt::artifacts::SourceIdentity;
 use crate::hdt::reader::{BitmapTriplesScanner, DictionaryResolver, open_hdt};
 use crate::io::crc_utils::CRC32C_ALGO;
@@ -37,7 +37,7 @@ fn component_of(
         depth < super::iri::MAX_NESTING,
         "triple terms nested too deeply"
     );
-    if let Some(nested) = index.target(source, object)? {
+    if let Some(nested) = index.cached_target(&mut dictionaries.runs, source, object)? {
         return Ok(Component::Triple(Box::new(proposition_of(
             index,
             dictionaries,
@@ -55,6 +55,8 @@ fn component_of(
 struct Dictionaries {
     data: DictionaryResolver,
     props: Option<DictionaryResolver>,
+    /// Decoding walks the runs in order, and nested terms out of it.
+    runs: RunCache,
 }
 
 impl Dictionaries {
@@ -166,6 +168,7 @@ fn ordered_triples<'a>(hdt: &'a Path, perm: &'a Path, order: Order) -> Result<Tr
 /// decoded: strictly increasing, each on a triple of the HDT.
 fn check_layer(
     index: &TripleTermIndex,
+    runs: &mut RunCache,
     source: Source,
     order: Order,
     hdt: &Path,
@@ -203,9 +206,11 @@ fn check_layer(
             continue;
         }
         let (s, p, o) = triple?;
-        let target = index.target(Source::Data, data_term)?.with_context(|| {
-            format!("{source:?} {order:?} reverse entry {rank} is no triple-term IRI")
-        })?;
+        let target = index
+            .cached_target(runs, Source::Data, data_term)?
+            .with_context(|| {
+                format!("{source:?} {order:?} reverse entry {rank} is no triple-term IRI")
+            })?;
         ensure!(
             (target.subject, target.predicate, target.object) == (s, p, o)
                 && target.asserted == (source == Source::Data),
@@ -264,6 +269,7 @@ fn check_rank_directories(index: &TripleTermIndex, temp_dir: &Path) -> Result<()
 /// holds exactly the unasserted targets; and none of those is in `data.hdt`.
 fn check_targets(
     index: &TripleTermIndex,
+    runs: &mut RunCache,
     hdt_path: &Path,
     props_path: &Path,
     temp_dir: &Path,
@@ -274,7 +280,7 @@ fn check_targets(
     let mut unasserted = Sorted::<Row<3>>::new(temp_dir, memory_limit / 4);
     for source in [Source::Data, Source::Propositions] {
         for object in index.run(source) {
-            let target = index.target(source, object)?.expect("in run");
+            let target = index.cached_target(runs, source, object)?.expect("in run");
             let row = Row([target.subject, target.predicate, target.object]);
             if target.asserted {
                 asserted.push(row)?;
@@ -394,7 +400,15 @@ pub fn validate_triple_terms(hdt_path: &Path, temp_dir: &Path, memory_limit: usi
     }
     check_payloads(index.path(), index.sections())?;
     check_rank_directories(&index, temp_dir)?;
-    check_targets(&index, hdt_path, &props_path, temp_dir, memory_limit)?;
+    let mut runs = index.run_cache(memory_limit / 8);
+    check_targets(
+        &index,
+        &mut runs,
+        hdt_path,
+        &props_path,
+        temp_dir,
+        memory_limit,
+    )?;
 
     let mut dictionaries = Dictionaries {
         data: open_hdt(hdt_path, memory_limit / 2)?.1,
@@ -403,6 +417,7 @@ pub fn validate_triple_terms(hdt_path: &Path, temp_dir: &Path, memory_limit: usi
         } else {
             None
         },
+        runs,
     };
 
     // Runs cover exactly the dictionaries' triple-term IRIs.
@@ -445,7 +460,9 @@ pub fn validate_triple_terms(hdt_path: &Path, temp_dir: &Path, memory_limit: usi
     let mut buf = Vec::new();
     for source in [Source::Data, Source::Propositions] {
         for object in index.run(source) {
-            let target = index.target(source, object)?.expect("in run");
+            let target = index
+                .cached_target(&mut dictionaries.runs, source, object)?
+                .expect("in run");
             let proposition = proposition_of(&index, &mut dictionaries, target, 0)?;
             let iri = iri_for(&proposition);
             dictionaries
@@ -470,10 +487,18 @@ pub fn validate_triple_terms(hdt_path: &Path, temp_dir: &Path, memory_limit: usi
 
     // Layers: each marked position's triple is named by its reverse entry.
     for order in [Order::Spo, Order::Pos, Order::Ops] {
-        check_layer(&index, Source::Data, order, hdt_path, data_layer_expected)?;
+        check_layer(
+            &index,
+            &mut dictionaries.runs,
+            Source::Data,
+            order,
+            hdt_path,
+            data_layer_expected,
+        )?;
         if index.has_propositions() {
             check_layer(
                 &index,
+                &mut dictionaries.runs,
                 Source::Propositions,
                 order,
                 &props_path,

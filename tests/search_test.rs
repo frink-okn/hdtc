@@ -1089,3 +1089,63 @@ fn test_dump_tab_delimited() {
         );
     }
 }
+
+/// A query literal is looked up as written, then in hdtc's dictionary form, so
+/// it finds the term in an HDT whatever its writer did: hdt-java and hdt-cpp
+/// store a literal as written, `"Paris"@en-GB`, where hdtc folds the tag and
+/// drops `xsd:string`.
+#[test]
+fn a_literal_is_found_as_written_and_in_dictionary_form() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let create = |name: &str, nt: &[u8]| -> std::path::PathBuf {
+        let input = temp_dir.path().join(format!("{name}.nt"));
+        write_file(&input, nt);
+        let output = temp_dir.path().join(format!("{name}.hdt"));
+        let status = Command::new(env!("CARGO_BIN_EXE_hdtc"))
+            .args([
+                "create",
+                "-q",
+                input.to_str().unwrap(),
+                "-o",
+                output.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            status.status.success(),
+            "{}",
+            String::from_utf8_lossy(&status.stderr)
+        );
+        output
+    };
+    let rows = |hdt: &Path, query: &str| -> usize {
+        let (ok, stdout, stderr) = run_search(hdt, query, &["-q", "--no-index"]);
+        assert!(ok, "search {query} failed: {stderr}");
+        stdout.lines().count()
+    };
+    let xsd_string = "^^<http://www.w3.org/2001/XMLSchema#string>";
+
+    // Dictionary strings spelled as another writer stores them. Lenient
+    // ingest keeps an IRI spelled like a literal byte for byte, which is
+    // exactly the string hdt-java writes for that literal.
+    let as_written = create(
+        "as-written",
+        b"<http://ex/a> <http://ex/name> <\\u0022Paris\\u0022@en-GB> .\n\
+          <http://ex/b> <http://ex/name> \
+          <\\u0022Lyon\\u0022^^\\u003Chttp://www.w3.org/2001/XMLSchema#string\\u003E> .\n",
+    );
+    assert_eq!(rows(&as_written, "? ? \"Paris\"@en-GB"), 1);
+    assert_eq!(rows(&as_written, &format!("? ? \"Lyon\"{xsd_string}")), 1);
+
+    // hdtc's own HDT stores the tag folded and `xsd:string` dropped; either
+    // spelling finds them.
+    let ours = create(
+        "ours",
+        b"<http://ex/a> <http://ex/name> \"Paris\"@en-GB .\n\
+          <http://ex/b> <http://ex/name> \"Lyon\" .\n",
+    );
+    assert_eq!(rows(&ours, "? ? \"Paris\"@en-GB"), 1);
+    assert_eq!(rows(&ours, "? ? \"Paris\"@en-gb"), 1);
+    assert_eq!(rows(&ours, &format!("? ? \"Lyon\"{xsd_string}")), 1);
+    assert_eq!(rows(&ours, "? ? \"Lyon\""), 1);
+}

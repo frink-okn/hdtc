@@ -22,8 +22,11 @@ pub fn export_dataset_nquads(
     let sort_budget = memory_limit
         .saturating_sub(dictionary_budget)
         .max(std::mem::size_of::<PositionGraphMembership>());
-    let (offsets, mut dictionary) = open_hdt(hdt_path, dictionary_budget)?;
-    dictionary.enable_triple_terms(hdt_path, dictionary_budget / 8)?;
+    // Rendering triple terms takes its share out of the dictionary's.
+    let triple_term_budget =
+        crate::triple_terms::reader::TripleTermDecoder::budget(hdt_path, dictionary_budget);
+    let (offsets, mut dictionary) = open_hdt(hdt_path, dictionary_budget - triple_term_budget)?;
+    dictionary.enable_triple_terms(hdt_path, triple_term_budget)?;
     let mut scanner = BitmapTriplesScanner::new(&offsets, hdt_path)?;
     let mut sidecar = GraphSidecarReader::open_for_hdt(hdt_path)?;
     ensure!(

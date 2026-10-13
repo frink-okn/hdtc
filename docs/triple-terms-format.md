@@ -407,8 +407,10 @@ decoded and tested.
 **Text search.** A text index over `data.hdt` also covers the literals of the
 propositions HDT (text-index-format.md §2.4), so a literal that occurs only
 inside unasserted claims is still found; it resolves through the propositions
-HDT's OPS group, its SPO layer and reverse entry, to the `data.hdt` triples that
-name the triple term.
+HDT's OPS group, its OPS layer and reverse entry, to the `data.hdt` triples that
+name the triple term. A term named only inside another unasserted one has no
+layer bit; its IRI, minted from its proposition, is an object of the propositions
+HDT, whose OPS group gives the propositions containing it, followed the same way.
 
 ## 11. Construction (non-normative)
 
@@ -467,3 +469,103 @@ rule). For ROBOKOP annotated (`N` = 1.40 G, `A` = 133 M, every triple term
 asserted) the layers are sparse with `l = 3`, 90 MB each against 183 MB dense,
 and the index 2.75 GB rather than 3.03 GB. With a tenth as many triple terms
 they would take 15 MB each, and with a hundredth, 2 MB.
+
+## 14. Conformance vectors (frozen)
+
+Minting (§2) is the computation every reader repeats: a request naming a ground
+triple term is answered by minting its IRI and looking it up, so an
+implementation that differs by one byte finds nothing and reports no error. An
+implementation that does not reproduce these names exactly is non-conforming.
+
+### 14.1 Ground terms
+
+Each case gives a proposition as dictionary strings, its canonical form (§2.1),
+and its name (§2.2). The subject is `http://example.org/s` and the predicate
+`http://example.org/p` unless stated.
+
+1. Object the IRI `http://example.org/o`:
+
+   ```text
+   <<( <http://example.org/s> <http://example.org/p> <http://example.org/o> )>>
+   urn:x-kgf:tt:g:fvxtId84dCWZVqoqeTsswQ
+   ```
+
+2. Object a literal tagged `en` whose value is `a "quoted"`, a tab, `value`, and
+   U+0001, all unescaped in the dictionary string; the canonical form writes
+   them with ECHAR and `\uXXXX` escapes:
+
+   ```text
+   <<( <http://example.org/s> <http://example.org/p> "a \"quoted\"\tvalue\u0001"@en )>>
+   urn:x-kgf:tt:g:Bx_CQjq3Ya6YxXQgcLzg9w
+   ```
+
+3. Object `"1"^^<http://www.w3.org/2001/XMLSchema#integer>`:
+
+   ```text
+   <<( <http://example.org/s> <http://example.org/p> "1"^^<http://www.w3.org/2001/XMLSchema#integer> )>>
+   urn:x-kgf:tt:g:y5St5jb79M3ebpnMPoBuWQ
+   ```
+
+4. Object the directional string `"x"@ar--rtl` (§2.5):
+
+   ```text
+   <<( <http://example.org/s> <http://example.org/p> "x"@ar--rtl )>>
+   urn:x-kgf:tt:g:loK46ocq8WJN4fBcDWLV-Q
+   ```
+
+5. Subject `http://example.org/a`, predicate `http://example.org/says`, object
+   the triple term of case 1, written inline:
+
+   ```text
+   <<( <http://example.org/a> <http://example.org/says> <<( <http://example.org/s> <http://example.org/p> <http://example.org/o> )>> )>>
+   urn:x-kgf:tt:g:qVlndSwYPCH7rjShVst4ow
+   ```
+
+6. Object the IRI `http://example.org/a b>c`, which lenient ingest can store,
+   holding a space and `>`:
+
+   ```text
+   <<( <http://example.org/s> <http://example.org/p> <http://example.org/a\u0020b\u003Ec> )>>
+   urn:x-kgf:tt:g:Ypfgb2OhKnA1YBJcbJiIBw
+   ```
+
+7. Object the string `"a"@EN`, stored from the IRI `<"a"@EN>`. hdtc's literal
+   encoding never writes a capital in a tag, so it is written as an IRI:
+
+   ```text
+   <<( <http://example.org/s> <http://example.org/p> <\u0022a\u0022@EN> )>>
+   urn:x-kgf:tt:g:zf8ysgjwgFaKZYeF7VyHJg
+   ```
+
+### 14.2 A term with blank nodes
+
+Subject `_:x`, predicate `http://example.org/p`, object the triple term with
+subject `_:odd:label%`, predicate `http://example.org/q`, and object `_:x`.
+`_:x` is met first and twice, so it is `_:b1` both times and its label leads;
+the second label is percent-encoded:
+
+```text
+skeleton  <<( _:b1 <http://example.org/p> <<( _:b2 <http://example.org/q> _:b1 )>> )>>
+name      urn:x-kgf:tt:b:dwPzmb2NNxF1JJ6e9mh4OA:x:odd%3Alabel%25
+```
+
+A merge that renames `_:x` to `_:f3_x` and `_:odd:label%` to
+`_:f3_odd:label%` renames the name in place, which is also the name of the
+renamed term:
+
+```text
+urn:x-kgf:tt:b:dwPzmb2NNxF1JJ6e9mh4OA:f3_x:f3_odd%3Alabel%25
+```
+
+### 14.3 Layer encodings
+
+The encoding §8.1 chooses for a layer of `N` positions with `M` set:
+
+| `N` | `M` | Encoding |
+|---:|---:|---|
+| 20 | 5 | dense |
+| 100 | 100 | dense |
+| 1,000,000 | 300,000 | dense |
+| 1,000,000 | 100,000 | sparse, `l = 3` |
+| 1,000,000 | 0 | sparse, `l = 19` |
+| 1,402,044,173 | 132,960,364 | sparse, `l = 3` |

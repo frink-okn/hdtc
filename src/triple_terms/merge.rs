@@ -144,9 +144,10 @@ pub(crate) fn rederive(
         // propositions HDT's own run. Those also named in data.hdt were written
         // above and are deduplicated with everything else.
         let mut buf = Vec::new();
+        let mut runs = index.run_cache(memory_limit / 8);
         for object in index.run(Source::Propositions) {
             let target = index
-                .target(Source::Propositions, object)?
+                .cached_target(&mut runs, Source::Propositions, object)?
                 .context("run entry without a target")?;
             props.object_term_raw(object, &mut buf)?;
             let iri = rename(buf.clone(), prefix)?;

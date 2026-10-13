@@ -576,6 +576,86 @@ mod tests {
         assert_eq!(renamed, sorted);
     }
 
+    /// `docs/triple-terms-format.md` §14: every case's canonical form and
+    /// name, frozen. A change here changes what every reader must mint, and
+    /// so the format.
+    #[test]
+    fn the_frozen_conformance_vectors_hold() {
+        let ex = |local: &str| format!("http://example.org/{local}");
+        let literal = |s: &str| Component::Literal(s.to_owned());
+        let ground = prop(iri(&ex("s")), &ex("p"), iri(&ex("o")));
+        let cases = [
+            (
+                ground.clone(),
+                "<<( <http://example.org/s> <http://example.org/p> <http://example.org/o> )>>",
+                "urn:x-kgf:tt:g:fvxtId84dCWZVqoqeTsswQ",
+            ),
+            (
+                prop(
+                    iri(&ex("s")),
+                    &ex("p"),
+                    literal("\"a \"quoted\"\tvalue\u{1}\"@en"),
+                ),
+                "<<( <http://example.org/s> <http://example.org/p> \"a \\\"quoted\\\"\\tvalue\\u0001\"@en )>>",
+                "urn:x-kgf:tt:g:Bx_CQjq3Ya6YxXQgcLzg9w",
+            ),
+            (
+                prop(
+                    iri(&ex("s")),
+                    &ex("p"),
+                    literal("\"1\"^^<http://www.w3.org/2001/XMLSchema#integer>"),
+                ),
+                "<<( <http://example.org/s> <http://example.org/p> \"1\"^^<http://www.w3.org/2001/XMLSchema#integer> )>>",
+                "urn:x-kgf:tt:g:y5St5jb79M3ebpnMPoBuWQ",
+            ),
+            (
+                prop(iri(&ex("s")), &ex("p"), literal("\"x\"@ar--rtl")),
+                "<<( <http://example.org/s> <http://example.org/p> \"x\"@ar--rtl )>>",
+                "urn:x-kgf:tt:g:loK46ocq8WJN4fBcDWLV-Q",
+            ),
+            (
+                prop(
+                    iri(&ex("a")),
+                    &ex("says"),
+                    Component::Triple(Box::new(ground)),
+                ),
+                "<<( <http://example.org/a> <http://example.org/says> \
+                 <<( <http://example.org/s> <http://example.org/p> <http://example.org/o> )>> )>>",
+                "urn:x-kgf:tt:g:qVlndSwYPCH7rjShVst4ow",
+            ),
+            (
+                prop(
+                    blank("x"),
+                    &ex("p"),
+                    Component::Triple(Box::new(prop(blank("odd:label%"), &ex("q"), blank("x")))),
+                ),
+                "<<( _:b1 <http://example.org/p> <<( _:b2 <http://example.org/q> _:b1 )>> )>>",
+                "urn:x-kgf:tt:b:dwPzmb2NNxF1JJ6e9mh4OA:x:odd%3Alabel%25",
+            ),
+            (
+                prop(iri(&ex("s")), &ex("p"), iri("http://example.org/a b>c")),
+                "<<( <http://example.org/s> <http://example.org/p> <http://example.org/a\\u0020b\\u003Ec> )>>",
+                "urn:x-kgf:tt:g:Ypfgb2OhKnA1YBJcbJiIBw",
+            ),
+            (
+                prop(iri(&ex("s")), &ex("p"), literal("\"a\"@EN")),
+                "<<( <http://example.org/s> <http://example.org/p> <\\u0022a\\u0022@EN> )>>",
+                "urn:x-kgf:tt:g:zf8ysgjwgFaKZYeF7VyHJg",
+            ),
+        ];
+        for (proposition, form, name) in cases {
+            assert_eq!(canonical(&proposition), form);
+            assert_eq!(iri_for(&proposition), name, "{form}");
+        }
+        assert_eq!(
+            prefix_labels(
+                b"urn:x-kgf:tt:b:dwPzmb2NNxF1JJ6e9mh4OA:x:odd%3Alabel%25",
+                "f3_"
+            ),
+            Some(b"urn:x-kgf:tt:b:dwPzmb2NNxF1JJ6e9mh4OA:f3_x:f3_odd%3Alabel%25".to_vec())
+        );
+    }
+
     #[test]
     fn minting_records_nested_terms_innermost_first() {
         let inner = prop(iri("http://ex/s"), "http://ex/p", iri("http://ex/o"));

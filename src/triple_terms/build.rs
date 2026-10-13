@@ -1150,7 +1150,7 @@ pub(crate) fn finish(
         previous = Some(record);
     }
     drop(_records_sorter);
-    for spool in &spools {
+    for spool in spools {
         spool.remove();
     }
     let distinct = writer.finish()?;
@@ -1183,10 +1183,11 @@ pub(crate) fn finish(
     let mut placed_unasserted = None;
     if unasserted_count > 0 {
         let started = std::time::Instant::now();
-        let records = temp_dir.join("tt-propositions.records.zst");
+        // Removed on drop, so a failed build below leaves no records behind.
+        let records = TempPath::from_path(temp_dir.join("tt-propositions.records.zst"));
         write_proposition_records(&distinct, &unasserted_ranks, &records)?;
         let (hdt, perm) = build_propositions_hdt(ctx, &records)?;
-        let _ = std::fs::remove_file(&records);
+        drop(records);
         props_shape = shape_of(&hdt, &mut open_hdt(&hdt, budget / 8)?.1)?;
         let (found, _) = place(
             &hdt,
@@ -1466,9 +1467,9 @@ mod tests {
                 }
                 let marked = marks.get(rank) == Some(&position);
                 assert_eq!(
-                    layer.bit(&file, position).unwrap(),
-                    marked,
-                    "bit({position})"
+                    layer.rank_if_marked(&file, position).unwrap(),
+                    marked.then_some(rank as u64),
+                    "rank_if_marked({position})"
                 );
                 if marked {
                     assert_eq!(layer.select1(&file, rank as u64).unwrap(), position);

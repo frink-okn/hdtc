@@ -141,8 +141,11 @@ own occurrences.
 A hit in the propositions space resolves not to the literal's own occurrences —
 those are propositions, never asserted — but to the triples of the data HDT
 whose object is a triple term containing it, found through the triple-term
-index: `r q <<( s p "literal" )>>`. A predicate filter (§7.3) then applies to
-the triple term's predicate `p`.
+index: `r q <<( s p "literal" )>>`. Containment is followed through unasserted
+triple terms at any depth, so a term named only inside another unasserted claim
+is reached through the claim that names it: `r q <<( s' p' <<( s p "literal"
+)>> )>>`. A predicate filter (§7.3) then applies to the predicate `p` of the
+triple term holding the literal.
 
 An HDT without a propositions HDT is indexed exactly as before.
 

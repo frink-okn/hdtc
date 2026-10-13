@@ -854,7 +854,10 @@ fn text_search_reaches_literals_of_unasserted_triple_terms() {
         format!(
             "{TURTLE}:alice :label \"Alice the asserted\"@en .\n\
              :e5 rdf:reifies <<( :bob :label \"Bob the rumoured\"@en )>> .\n\
-             :e6 rdf:reifies <<( :alice :label \"Alice the asserted\"@en )>> .\n"
+             :e6 rdf:reifies <<( :alice :label \"Alice the asserted\"@en )>> .\n\
+             :e7 :claims <<( :carol :says <<( :dan :label \"Dan the doubly nested\"@en )>> )>> .\n\
+             :e8 rdf:reifies <<( :erin :label \"Erin twice named\"@en )>> .\n\
+             :e9 :claims <<( :frank :says <<( :erin :label \"Erin twice named\"@en )>> )>> .\n"
         )
         .as_bytes(),
     );
@@ -910,8 +913,36 @@ fn text_search_reaches_literals_of_unasserted_triple_terms() {
         text("asserted", &[]),
         vec!["<http://ex/alice> <http://ex/label> \"Alice the asserted\"@en .".to_owned()]
     );
-    // Nested two levels down inside an unasserted claim is still reachable.
+    // A literal that needed escaping is reachable too.
     assert_eq!(text("quoted", &[]).len(), 1);
+    // Named only inside another unasserted claim, so no triple of data.hdt
+    // has its triple term as object: reached through the claim naming it.
+    assert_eq!(
+        text("doubly", &[]),
+        vec![
+            "<http://ex/e7> <http://ex/claims> <<( <http://ex/carol> <http://ex/says> \
+             <<( <http://ex/dan> <http://ex/label> \"Dan the doubly nested\"@en )>> )>> ."
+                .to_owned()
+        ]
+    );
+    assert_eq!(text("doubly", &["--count"]), vec!["1".to_owned()]);
+    // A predicate filter applies to the predicate holding the literal.
+    assert_eq!(text("doubly", &["--predicate", "http://ex/label"]).len(), 1);
+    assert!(text("doubly", &["--predicate", "http://ex/says"]).is_empty());
+    // Named directly and inside another claim: both name a triple term
+    // containing the literal.
+    assert_eq!(
+        text("twice", &[]),
+        vec![
+            format!(
+                "<http://ex/e8> <{RDF_REIFIES}> \
+                 <<( <http://ex/erin> <http://ex/label> \"Erin twice named\"@en )>> ."
+            ),
+            "<http://ex/e9> <http://ex/claims> <<( <http://ex/frank> <http://ex/says> \
+             <<( <http://ex/erin> <http://ex/label> \"Erin twice named\"@en )>> )>> ."
+                .to_owned(),
+        ]
+    );
 
     // Their documents are a segment of their own, after data.hdt's, so a
     // query leaves them out by each segment's column bounds rather than by
@@ -1236,4 +1267,64 @@ fn a_set_unused_bit_fails_validation() {
     assert!(!output.status.success(), "a set unused bit was accepted");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("unused high bits"), "{stderr}");
+}
+
+/// Rendering and validation read the runs through a page cache. Under a memory
+/// limit too small to hold them, pages are evicted and read again, and every
+/// triple term still renders and validates as it does with room to spare.
+#[test]
+fn a_small_memory_limit_decodes_every_triple_term_the_same() {
+    use std::fmt::Write as _;
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("many.nt");
+    let mut nt = String::new();
+    for i in 0..20_000 {
+        // Every third proposition asserted, every tenth nested in a claim.
+        if i % 3 == 0 {
+            writeln!(nt, "<http://ex/s{i}> <http://ex/p> <http://ex/o{i}> .").unwrap();
+        }
+        let term = format!("<<( <http://ex/s{i}> <http://ex/p> \"v{i}\" )>>");
+        if i % 10 == 0 {
+            writeln!(
+                nt,
+                "<http://ex/r{i}> <http://ex/claims> <<( <http://ex/x{i}> <http://ex/says> {term} )>> ."
+            )
+            .unwrap();
+        } else {
+            writeln!(nt, "<http://ex/r{i}> <{RDF_REIFIES}> {term} .").unwrap();
+        }
+    }
+    common::write_file(&input, nt.as_bytes());
+    let hdt = create(dir.path(), &[&input], "many.hdt");
+
+    let roomy = dump(&hdt);
+    let output = hdtc(&["dump", "-q", "--memory-limit", "1M", hdt.to_str().unwrap()]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mut tight: Vec<String> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| line.replace('\t', " "))
+        .collect();
+    tight.sort();
+    assert_eq!(tight.len(), roomy.len());
+    assert!(tight == roomy, "a tight dump differs from a roomy one");
+
+    let output = hdtc(&[
+        "validate",
+        "-q",
+        "--memory-limit",
+        "1M",
+        hdt.to_str().unwrap(),
+        "--temp-dir",
+        dir.path().join("validate").to_str().unwrap(),
+    ]);
+    assert!(
+        output.status.success(),
+        "validate failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

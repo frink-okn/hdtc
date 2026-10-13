@@ -646,7 +646,6 @@ where
                     &quad.object,
                     &quad.graph_name,
                 );
-                stats.original_ntriples_size += original_size;
 
                 let extracted =
                     match extract_quad(&quad, &blank_prefix, &mut graph_interner, trusted) {
@@ -663,6 +662,9 @@ where
                         }
                         Err(e) => return Err(e.context(format!("{}", input.path.display()))),
                     };
+                // Counted only for a statement kept, so the size describes
+                // the triples the HDT holds.
+                stats.original_ntriples_size += original_size;
                 stats.quads += 1;
                 callback(extracted)?;
             }
@@ -1160,10 +1162,10 @@ where
                                 &quad.object,
                                 &quad.graph_name,
                             );
-                            parsed.stats.original_ntriples_size += original_size;
 
                             match extract_quad(&quad, &blank_prefix, &mut graph_interner, trusted) {
                                 Ok(extracted) => {
+                                    parsed.stats.original_ntriples_size += original_size;
                                     parsed.stats.quads += 1;
                                     parsed.quads.push(extracted);
                                 }

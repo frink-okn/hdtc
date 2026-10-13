@@ -654,15 +654,16 @@ impl ObjectGroups {
         })
     }
 
-    /// Call `visit(subject, predicate)` for every triple with object `object`,
-    /// and predicate `predicate` when given. With `count_only`, only the
+    /// Call `visit(subject, predicate, position)` for every triple with object
+    /// `object`, and predicate `predicate` when given, where `position` is the
+    /// triple's position in this permutation. With `count_only`, only the
     /// number is computed: no subject is read.
     pub(crate) fn for_object(
         &mut self,
         object: u64,
         predicate: Option<u64>,
         count_only: bool,
-        mut visit: impl FnMut(u64, u64) -> Result<bool>,
+        mut visit: impl FnMut(u64, u64, u64) -> Result<bool>,
     ) -> Result<u64> {
         if object == 0 || object > self.objects {
             return Ok(0);
@@ -713,7 +714,7 @@ impl ObjectGroups {
                     self.array_z.bits_per_entry,
                     z,
                 )?;
-                if !visit(subject, p)? {
+                if !visit(subject, p, z)? {
                     return Ok(count);
                 }
             }

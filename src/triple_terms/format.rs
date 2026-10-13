@@ -696,7 +696,8 @@ mod tests {
 
     /// The smaller encoding wins, with whole bits of low part: sparse at
     /// low densities, dense from about a quarter up, dense when there is
-    /// nothing to cover, and never sparse with no low bits.
+    /// nothing to cover, and never sparse with no low bits. The named cases
+    /// are frozen in `docs/triple-terms-format.md` §14.3.
     #[test]
     fn a_layer_is_stored_in_the_smaller_encoding() {
         assert_eq!(layer_encoding(0, 0), LayerEncoding::Dense);

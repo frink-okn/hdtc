@@ -98,8 +98,18 @@ pub fn search_text_streaming(options: &TextSearchOptions<'_>) -> Result<u64> {
         propositions: true,
     };
 
-    let (offsets, mut dictionary) = open_hdt(options.hdt_path, options.memory_limit)
-        .with_context(|| format!("Failed to open HDT file {}", options.hdt_path.display()))?;
+    // Hits on the propositions HDT's literals resolve and render through the
+    // triple-term index, whose share of the limit comes out of the dictionary's.
+    let triple_term_budget = match searcher.manifest().propositions {
+        Some(_) => crate::triple_terms::reader::TripleTermDecoder::budget(
+            options.hdt_path,
+            options.memory_limit,
+        ),
+        None => 0,
+    };
+    let (offsets, mut dictionary) =
+        open_hdt(options.hdt_path, options.memory_limit - triple_term_budget)
+            .with_context(|| format!("Failed to open HDT file {}", options.hdt_path.display()))?;
 
     // A predicate the dataset does not use cannot match anything, which is an
     // empty result rather than an error.
@@ -122,10 +132,15 @@ pub fn search_text_streaming(options: &TextSearchOptions<'_>) -> Result<u64> {
     }
 
     let skip = options.offset.unwrap_or(0);
-    let mut resolver = OccurrenceResolver::open(options, &offsets, searcher.manifest())?;
+    let mut resolver = OccurrenceResolver::open(
+        options,
+        &offsets,
+        searcher.manifest(),
+        triple_term_budget / 2,
+    )?;
     if resolver.propositions.is_some() {
         // Rows from unasserted triple terms carry the triple term as object.
-        dictionary.enable_triple_terms(options.hdt_path, options.memory_limit / 8)?;
+        dictionary.enable_triple_terms(options.hdt_path, triple_term_budget / 2)?;
     }
 
     // Counting needs neither scores nor ranking. Stream the matching document
@@ -883,17 +898,20 @@ struct OccurrenceResolver {
 }
 
 impl OccurrenceResolver {
+    /// `propositions_budget` bounds the propositions HDT's dictionary, which
+    /// resolving a hit on one of its literals may read.
     fn open(
         options: &TextSearchOptions<'_>,
         offsets: &HdtSectionOffsets,
         manifest: &crate::text::TextManifest,
+        propositions_budget: usize,
     ) -> Result<Self> {
         let propositions = match &manifest.propositions {
             Some(coverage) => Some(crate::triple_terms::text::PropositionHits::open(
                 options.hdt_path,
                 coverage.object_offset,
                 options.predicate,
-                options.memory_limit,
+                propositions_budget,
             )?),
             None => None,
         };

@@ -131,25 +131,40 @@ impl Emitter<'_> {
     }
 }
 
+/// One HDT's permutation index and SPO access, opened once per query: the
+/// SPO access holds rank directories in memory.
+struct HdtAccess {
+    perm: PermutationIndex,
+    spo: SpoAccess,
+}
+
+impl HdtAccess {
+    fn open(hdt_path: &Path) -> Result<Self> {
+        let perm = PermutationIndex::open(&canonical_path(hdt_path), hdt_path)?;
+        let spo = SpoAccess::open(&perm, hdt_path)?;
+        Ok(Self { perm, spo })
+    }
+}
+
 /// One HDT that holds propositions, with the inner pattern resolved there.
-struct PropositionSource {
+struct PropositionSource<'a> {
     source: Source,
     triples: u64,
-    spo: SpoAccess,
-    perm: PermutationIndex,
+    hdt: &'a HdtAccess,
     resolved: Resolved,
 }
 
-impl PropositionSource {
+impl PropositionSource<'_> {
     /// The inner pattern's range in this HDT, and the object to probe for when
     /// the range is a subject's group but the predicate is unbound (`s ? o`).
     fn range(&self) -> Result<(Order, std::ops::Range<u64>, Option<u64>)> {
         let r = self.resolved;
+        let HdtAccess { perm, spo } = self.hdt;
         Ok(match (r.subject, r.predicate, r.object) {
-            (Some(s), Some(p), o) => (Order::Spo, self.spo.range(s, Some(p), o)?, None),
-            (Some(s), None, o) => (Order::Spo, self.spo.range(s, None, None)?, o),
-            (None, Some(p), o) => (Order::Pos, self.perm.index_range(Some(p), o)?.1, None),
-            (None, None, Some(o)) => (Order::Ops, self.perm.index_range(None, Some(o))?.1, None),
+            (Some(s), Some(p), o) => (Order::Spo, spo.range(s, Some(p), o)?, None),
+            (Some(s), None, o) => (Order::Spo, spo.range(s, None, None)?, o),
+            (None, Some(p), o) => (Order::Pos, perm.index_range(Some(p), o)?.1, None),
+            (None, None, Some(o)) => (Order::Ops, perm.index_range(None, Some(o))?.1, None),
             (None, None, None) => (Order::Spo, 0..self.triples, None),
         })
     }
@@ -197,9 +212,9 @@ pub(crate) fn search_inner_pattern(
         },
         None => None,
     };
-    let data_perm = PermutationIndex::open(&canonical_path(hdt_path), hdt_path)
-        .context("triple-term patterns need the permutation index")?;
-    let data_spo = SpoAccess::open(&data_perm, hdt_path)?;
+    let data =
+        HdtAccess::open(hdt_path).context("triple-term patterns need the permutation index")?;
+    let (data_perm, data_spo) = (&data.perm, &data.spo);
 
     // Every inner position a wildcard: one contiguous range, no layer.
     if inner.subject.is_none() && inner.predicate.is_none() && inner.object.is_none() {
@@ -215,12 +230,12 @@ pub(crate) fn search_inner_pattern(
         }
         let (groups, range) = match outer_predicate {
             Some(p) => {
-                let groups = ObjectGroups::open_pos(&data_perm)?;
+                let groups = ObjectGroups::open_pos(data_perm)?;
                 let range = groups.second_range(p, run)?;
                 (groups, range)
             }
             None => {
-                let groups = ObjectGroups::open(&data_perm)?;
+                let groups = ObjectGroups::open(data_perm)?;
                 let range = groups.objects_range(run)?;
                 (groups, range)
             }
@@ -238,32 +253,30 @@ pub(crate) fn search_inner_pattern(
     }
 
     // Each HDT that holds propositions, with the inner pattern resolved in it.
+    let props_resolved = match dictionary.propositions_mut() {
+        Some(props) if index.has_propositions() => resolve(props, inner)?,
+        _ => None,
+    };
+    let props = match props_resolved {
+        Some(_) => Some(HdtAccess::open(&format::propositions_path(hdt_path))?),
+        None => None,
+    };
     let mut sources = Vec::with_capacity(2);
     if let Some(resolved) = resolve(dictionary, inner)? {
         sources.push(PropositionSource {
             source: Source::Data,
             triples: index.header().data.triples,
-            spo: SpoAccess::open(&data_perm, hdt_path)?,
-            perm: data_perm.clone(),
+            hdt: &data,
             resolved,
         });
     }
-    if index.has_propositions() {
-        let resolved = match dictionary.propositions_mut() {
-            Some(props) => resolve(props, inner)?,
-            None => None,
-        };
-        if let Some(resolved) = resolved {
-            let props_path = format::propositions_path(hdt_path);
-            let perm = PermutationIndex::open(&canonical_path(&props_path), &props_path)?;
-            sources.push(PropositionSource {
-                source: Source::Propositions,
-                triples: index.header().props.triples,
-                spo: SpoAccess::open(&perm, &props_path)?,
-                perm,
-                resolved,
-            });
-        }
+    if let (Some(resolved), Some(props)) = (props_resolved, props.as_ref()) {
+        sources.push(PropositionSource {
+            source: Source::Propositions,
+            triples: index.header().props.triples,
+            hdt: props,
+            resolved,
+        });
     }
 
     // How many triple terms each side would visit.
@@ -312,22 +325,22 @@ pub(crate) fn search_inner_pattern(
     }
 
     // Inner first.
-    let mut groups = ObjectGroups::open(&data_perm)?;
+    let mut groups = ObjectGroups::open(data_perm)?;
     'sources: for (source, layer, range, probe) in planned {
         // The layer planning opened: a sparse one holds its directory, read once.
         let mut cursor = LayerCursor::from_layer(index.path(), &layer, range)?;
         while let Some((position, term)) = cursor.next()? {
             if let Some(object) = probe
-                && source.spo.object_at(position)? != object
+                && source.hdt.spo.object_at(position)? != object
             {
                 continue;
             }
             if count_only && outer_subject.is_none() {
-                emitter.add(groups.for_object(term, outer_predicate, true, |_, _| Ok(true))?);
+                emitter.add(groups.for_object(term, outer_predicate, true, |_, _, _| Ok(true))?);
                 continue;
             }
             let mut more = true;
-            groups.for_object(term, outer_predicate, false, |subject, predicate| {
+            groups.for_object(term, outer_predicate, false, |subject, predicate, _| {
                 if outer_subject.is_some_and(|s| s != subject) {
                     return Ok(true);
                 }
