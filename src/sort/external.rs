@@ -127,12 +127,11 @@ impl ExternalSorter {
     /// Not rayon's `par_sort_unstable`: its stack depth grows with the data,
     /// and a chunk is the whole sort budget. See `parallel_sort`.
     fn flush_chunk<T: Sortable>(&mut self, buffer: &mut Vec<T>) -> Result<()> {
-        super::parallel_sort::sort_unstable(buffer);
-        // Nothing downstream checks order, so a chunk out of order would
-        // become a corrupt HDT rather than an error. A parallel read-only pass
-        // costs a few seconds even on a whole-budget chunk.
+        // Some consumers check their input's order, but not all: BitmapTriples
+        // construction takes the SPO stream on trust, so a chunk out of order
+        // would become a corrupt HDT rather than an error.
         anyhow::ensure!(
-            super::parallel_sort::is_sorted(buffer),
+            super::parallel_sort::sort_unstable(buffer),
             "Sort chunk {} came out of order",
             self.chunk_counter
         );

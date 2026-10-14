@@ -1205,7 +1205,7 @@ where
             Ok(())
         };
         let handle = std::thread::Builder::new()
-            .name(format!("parse-chunk-{worker}"))
+            .name(format!("parse-chunk-{file_index}.{worker}"))
             .spawn(parse_chunks)
             .context("Failed to spawn parser chunk worker thread")?;
         worker_handles.push(handle);
@@ -2114,10 +2114,14 @@ mod tests {
         };
 
         let (done_tx, done_rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let result = stream_quads_with_options(&input, 0, false, None, &options, |_| Ok(()));
-            let _ = done_tx.send(result.map(|_| ()).map_err(|e| e.to_string()));
-        });
+        std::thread::Builder::new()
+            .name("parse-test".to_string())
+            .spawn(move || {
+                let result =
+                    stream_quads_with_options(&input, 0, false, None, &options, |_| Ok(()));
+                let _ = done_tx.send(result.map(|_| ()).map_err(|e| e.to_string()));
+            })
+            .expect("spawn the parse thread");
         let outcome = done_rx
             .recv_timeout(std::time::Duration::from_secs(60))
             .expect("parallel parse did not finish: workers deadlocked");

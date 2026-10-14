@@ -28,8 +28,9 @@ struct Tuning {
     /// Slices up to this length are sorted sequentially: below it, splitting
     /// costs more than it parallelizes.
     sequential_len: usize,
-    /// Partition and swap work is never cut finer than this many items. At
-    /// least one.
+    /// The partition pass's pieces are at least this long, bar the last. At
+    /// least one. The swap pass's pairs are at most one piece long, and can
+    /// be shorter: a stray range cut by a piece boundary may be a single item.
     min_piece_len: usize,
 }
 
@@ -52,31 +53,44 @@ const SAMPLE_LEN: usize = 255;
 /// up the slack when pieces come out uneven.
 const PIECES_PER_THREAD: usize = 4;
 
-/// Sort `v` unstably, in place, on the current rayon pool.
-pub(crate) fn sort_unstable<T: Ord + Send + Clone>(v: &mut [T]) {
-    sort_tuned(v, TUNING);
+/// Sort `v` unstably, in place, on the current rayon pool, and report whether
+/// it came out sorted.
+///
+/// It always does unless this module has a bug, and a caller about to write
+/// the result where nothing else checks its order should treat `false` as an
+/// error. The check is a parallel read-only pass, skipped when `v` was already
+/// sorted on entry, since the entry check covered it.
+pub(crate) fn sort_unstable<T: Ord + Send + Clone>(v: &mut [T]) -> bool {
+    match sort_tuned(v, TUNING) {
+        None => true,
+        Some(_depth) => is_sorted_in_pieces(v, TUNING.piece_len(v.len())),
+    }
 }
 
-/// Whether `v` is sorted, checked in parallel. Mutable only because `T` need
-/// not be `Sync`, so pieces must be handed out exclusively.
-pub(crate) fn is_sorted<T: Ord + Send>(v: &mut [T]) -> bool {
-    is_sorted_in_pieces(v, TUNING.piece_len(v.len()))
-}
-
-fn sort_tuned<T: Ord + Send + Clone>(v: &mut [T], tuning: Tuning) {
+/// Sort `v` under the given thresholds. Returns `None` if `v` was already
+/// sorted, and otherwise how many levels deep `split` recursed.
+fn sort_tuned<T: Ord + Send + Clone>(v: &mut [T], tuning: Tuning) -> Option<u32> {
     // Splitting would partition an already-sorted slice once per level, where
     // a read-only pass can tell. Unsorted input fails the check at once.
     if is_sorted_in_pieces(v, tuning.piece_len(v.len())) {
-        return;
+        return None;
     }
-    let pieces = (rayon::current_num_threads() * PIECES_PER_THREAD).next_power_of_two();
-    split(v, pieces.trailing_zeros(), tuning);
+    Some(split(v, split_levels(), tuning))
 }
 
-fn split<T: Ord + Send + Clone>(v: &mut [T], levels: u32, tuning: Tuning) {
+/// How many levels `split` may recurse: enough for `PIECES_PER_THREAD` pieces
+/// per thread. The thread count alone sets it.
+fn split_levels() -> u32 {
+    (rayon::current_num_threads() * PIECES_PER_THREAD)
+        .next_power_of_two()
+        .trailing_zeros()
+}
+
+/// Returns how many levels deep it split, which is at most `levels`.
+fn split<T: Ord + Send + Clone>(v: &mut [T], levels: u32, tuning: Tuning) -> u32 {
     if levels == 0 || v.len() <= tuning.sequential_len {
         v.sort_unstable();
-        return;
+        return 0;
     }
     let (pivot, common) = sample_pivot(v);
     let piece_len = tuning.piece_len(v.len());
@@ -90,10 +104,11 @@ fn split<T: Ord + Send + Clone>(v: &mut [T], levels: u32, tuning: Tuning) {
         0
     };
     let right = &mut rest[equal..];
-    rayon::join(
+    let (left_depth, right_depth) = rayon::join(
         || split(left, levels - 1, tuning),
         || split(right, levels - 1, tuning),
     );
+    1 + left_depth.max(right_depth)
 }
 
 /// The median of a pseudo-random sample of `v`, and whether it fills an eighth
@@ -241,6 +256,7 @@ mod tests {
     fn pool(threads: usize, stack_size: usize) -> rayon::ThreadPool {
         rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
+            .thread_name(|index| format!("sort-test-{index}"))
             .stack_size(stack_size)
             .build()
             .unwrap()
@@ -298,7 +314,7 @@ mod tests {
                     let mut expected = input.clone();
                     expected.sort_unstable();
                     let mut actual = input;
-                    pool.install(|| sort_unstable(&mut actual));
+                    assert!(pool.install(|| sort_unstable(&mut actual)));
                     assert!(actual == expected, "{name}, {len} items, {threads} threads");
                 }
             }
@@ -317,7 +333,7 @@ mod tests {
         let mut expected = input.clone();
         expected.sort_unstable();
         let mut actual = input;
-        pool(4, 2 << 20).install(|| sort_unstable(&mut actual));
+        assert!(pool(4, 2 << 20).install(|| sort_unstable(&mut actual)));
         assert_eq!(actual, expected);
     }
 
@@ -424,6 +440,33 @@ mod tests {
         }
     }
 
+    /// The bound this module exists for: `split` recurses no deeper than the
+    /// thread count allows, whatever the data. With thresholds this small,
+    /// splitting until the pieces were short would go many levels deeper.
+    #[test]
+    fn split_depth_is_set_by_the_thread_count() {
+        let tuning = Tuning {
+            sequential_len: 4,
+            min_piece_len: 1,
+        };
+        for threads in [1, 2, 5, 8] {
+            let pool = pool(threads, 2 << 20);
+            let levels = pool.install(split_levels);
+            for (name, input) in patterns(20_000) {
+                let mut v = input;
+                let depth = pool.install(|| sort_tuned(&mut v, tuning));
+                let case = format!("{name}, {threads} threads");
+                assert!(v.is_sorted(), "{case}");
+                assert!(depth.unwrap_or(0) <= levels, "{case}: {depth:?} > {levels}");
+                // Random input splits evenly to the bound, so the bound is
+                // what stopped it.
+                if name == "random" {
+                    assert_eq!(depth, Some(levels), "{case}");
+                }
+            }
+        }
+    }
+
     /// Thresholds shrunk so that inputs of a few thousand items split to full
     /// depth and partition in many pieces, over random lengths, thresholds,
     /// thread counts, and value ranges from two values to all distinct.
@@ -507,9 +550,11 @@ mod tests {
     }
 
     /// The input that takes rayon's `par_sort_unstable` megabytes deep, and
-    /// inputs long enough to split, all sort on 128 KiB worker stacks. Should
-    /// this module ever hand its slices back to rayon's sort, the first case
-    /// overflows the stack and aborts the test binary.
+    /// inputs long enough to split, all sort on 128 KiB worker stacks. The
+    /// first is shorter than `sequential_len`, so it goes straight to the leaf
+    /// sort: should this module ever hand its slices back to rayon's sort,
+    /// there or in place of `split`, it overflows the stack and aborts the
+    /// test binary. `split_depth_is_set_by_the_thread_count` covers `split`.
     #[test]
     fn sorts_on_small_stacks() {
         let pool = pool(4, 128 << 10);
@@ -520,7 +565,7 @@ mod tests {
             let mut expected = input.clone();
             expected.sort_unstable();
             let mut actual = input;
-            pool.install(|| sort_unstable(&mut actual));
+            assert!(pool.install(|| sort_unstable(&mut actual)));
             assert!(actual == expected, "{name}");
         }
     }

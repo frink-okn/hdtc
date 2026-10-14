@@ -20,6 +20,11 @@ use std::thread::JoinHandle;
 /// round and group alone would overwrite each other.
 static NEXT_MERGE_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Numbers merge trees, so that the names of their threads tell apart trees
+/// that run at the same time: the vocabulary merge's groups, side-by-side
+/// sorters, and the triple-term joins.
+static NEXT_TREE_ID: AtomicU64 = AtomicU64::new(1);
+
 /// Default maximum fan-in per merge round. With a binary tree over 512 leaves,
 /// this spawns at most ~1023 threads — well within OS limits.
 pub const DEFAULT_MAX_FANIN: usize = 512;
@@ -222,18 +227,23 @@ fn build_single_round<T: Mergeable>(
     config: &MergeTreeConfig,
 ) -> Result<MergeTreeHandle<T>> {
     let mut handles: Vec<JoinHandle<()>> = Vec::new();
+    let tree = NEXT_TREE_ID.fetch_add(1, AtomicOrdering::Relaxed);
+    tracing::debug!(
+        "Merge tree {tree}: {} sources, threads merge-{tree}-*",
+        sources.len()
+    );
 
     // Spawn leaf threads, one per source
     let leaf_receivers: Vec<Receiver<Result<T>>> = sources
         .into_iter()
         .enumerate()
         .map(|(index, source)| {
-            spawn_leaf_thread(index, source, config.channel_capacity, &mut handles)
+            spawn_leaf_thread(tree, index, source, config.channel_capacity, &mut handles)
         })
         .collect::<Result<_>>()?;
 
     // Build binary merge tree over the leaf receivers
-    let root_rx = build_binary_tree(leaf_receivers, config.channel_capacity, &mut handles)?;
+    let root_rx = build_binary_tree(tree, leaf_receivers, config.channel_capacity, &mut handles)?;
 
     Ok(MergeTreeHandle {
         rx: root_rx,
@@ -320,6 +330,7 @@ fn spawn_merge_thread(
 /// Spawn a leaf thread that reads from a `MergeSource` and sends items
 /// into a bounded channel.
 fn spawn_leaf_thread<T: Mergeable>(
+    tree: u64,
     index: usize,
     source: MergeSource<T>,
     channel_capacity: usize,
@@ -327,7 +338,7 @@ fn spawn_leaf_thread<T: Mergeable>(
 ) -> Result<Receiver<Result<T>>> {
     let (tx, rx) = bounded(channel_capacity);
 
-    let handle = spawn_merge_thread(format!("merge-leaf-{index}"), move || {
+    let handle = spawn_merge_thread(format!("merge-{tree}-leaf-{index}"), move || {
         let result = match source {
             MergeSource::File(path) => read_mergeable_file(&path, &tx),
             MergeSource::Factory(factory) => read_from_factory(factory, &tx),
@@ -393,6 +404,7 @@ fn read_from_factory<T: Mergeable>(
 ///
 /// Returns the root receiver that yields all items in sorted order.
 fn build_binary_tree<T: Mergeable>(
+    tree: u64,
     mut layer: Vec<Receiver<Result<T>>>,
     channel_capacity: usize,
     handles: &mut Vec<JoinHandle<()>>,
@@ -426,9 +438,10 @@ fn build_binary_tree<T: Mergeable>(
 
             // Spawn a 2-way merge thread for this pair
             let (tx, rx) = bounded(channel_capacity);
-            let handle = spawn_merge_thread(format!("merge-node-{node_count}"), move || {
-                two_way_merge::<T>(left, right, tx);
-            })?;
+            let handle =
+                spawn_merge_thread(format!("merge-{tree}-node-{node_count}"), move || {
+                    two_way_merge::<T>(left, right, tx);
+                })?;
             node_count += 1;
             handles.push(handle);
             next_layer.push(rx);
@@ -795,7 +808,7 @@ mod tests {
                 .into_iter()
                 .map(|base| {
                     let dir = temp_dir.path();
-                    scope.spawn(move || -> Result<Vec<TestItem>> {
+                    let merge = move || -> Result<Vec<TestItem>> {
                         let config = MergeTreeConfig::new(dir)
                             .with_max_fanin(3)
                             .with_channel_capacity(2);
@@ -804,7 +817,11 @@ mod tests {
                             .collect();
                         let handle = build_merge_tree(sources, &config)?;
                         MergeTreeIterator::new(handle).collect()
-                    })
+                    };
+                    std::thread::Builder::new()
+                        .name(format!("merge-test-{base}"))
+                        .spawn_scoped(scope, merge)
+                        .expect("spawn a merge thread")
                 })
                 .collect();
             merges

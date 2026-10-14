@@ -705,6 +705,7 @@ fn parser_stage(
     // the rest of a build that is already lost.
     let aborted = Arc::new(AtomicBool::new(false));
 
+    let mut spawn_error = None;
     for worker in 0..file_workers {
         let file_rx = file_rx.clone();
         let stats_tx = stats_tx.clone();
@@ -809,11 +810,22 @@ fn parser_stage(
                 }
             }
         };
-        let handle = std::thread::Builder::new()
+        match std::thread::Builder::new()
             .name(format!("parse-file-{worker}"))
             .spawn(parse_files)
-            .context("Failed to spawn parser worker thread")?;
-        worker_handles.push(handle);
+        {
+            Ok(handle) => worker_handles.push(handle),
+            Err(error) => {
+                spawn_error = Some(error);
+                break;
+            }
+        }
+    }
+    if let Some(error) = spawn_error {
+        // Every input is already queued, so the workers that did start would
+        // otherwise parse all of them before the failure surfaced.
+        aborted.store(true, Ordering::Relaxed);
+        return Err(error).context("Failed to spawn parser worker thread");
     }
     drop(stats_tx);
 
