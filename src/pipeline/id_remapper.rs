@@ -250,6 +250,7 @@ pub fn id_remapper_stage(
 
     let results: Vec<Result<usize>> = rayon::ThreadPoolBuilder::new()
         .num_threads(num_threads)
+        .thread_name(|index| format!("remap-{index}"))
         .build()?
         .install(|| {
             use rayon::prelude::*;

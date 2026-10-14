@@ -688,14 +688,17 @@ pub(super) fn place(
     // The two joins read different dictionary sections and sort different
     // keys, so they run side by side.
     let (subject_ids, object_ids) = std::thread::scope(|scope| {
-        let subject_ids =
-            scope.spawn(|| join_role(hdt, Role::Subject, subjects, temp_dir, budget / 6));
+        let join_subjects = || join_role(hdt, Role::Subject, subjects, temp_dir, budget / 6);
+        let subject_ids = std::thread::Builder::new()
+            .name("tt-join-subject".to_string())
+            .spawn_scoped(scope, join_subjects)
+            .context("Failed to spawn subject join thread")?;
         let object_ids = join_role(hdt, Role::Object, objects, temp_dir, budget / 6);
         let subject_ids = subject_ids
             .join()
             .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-        (subject_ids, object_ids)
-    });
+        Ok::<_, anyhow::Error>((subject_ids, object_ids))
+    })?;
     let (subject_ids, object_ids) = (subject_ids?, object_ids?);
 
     // Zip the three identifier streams by rank.
@@ -975,18 +978,26 @@ impl LayerEntries {
             count,
         } = self;
         let (spo, pos, ops) = std::thread::scope(|scope| {
-            let spo = scope.spawn(|| -> Result<Vec<DraftSection>> {
+            let build_spo = || -> Result<Vec<DraftSection>> {
                 let mut layer =
                     LayerWriter::new(temp_dir, orders[0], triples, count, reverse_width)?;
                 layer_from_spo(&mut layer, spo)?;
                 layer.finish(temp_dir)
-            });
-            let pos = scope.spawn(|| -> Result<Vec<DraftSection>> {
+            };
+            let spo = std::thread::Builder::new()
+                .name("tt-layer-spo".to_string())
+                .spawn_scoped(scope, build_spo)
+                .context("Failed to spawn SPO layer thread")?;
+            let build_pos = || -> Result<Vec<DraftSection>> {
                 let mut layer =
                     LayerWriter::new(temp_dir, orders[1], triples, count, reverse_width)?;
                 layer_from_permutation(perm, hdt, PermutationComponent::Pos, &mut layer, pos)?;
                 layer.finish(temp_dir)
-            });
+            };
+            let pos = std::thread::Builder::new()
+                .name("tt-layer-pos".to_string())
+                .spawn_scoped(scope, build_pos)
+                .context("Failed to spawn POS layer thread")?;
             let mut layer = LayerWriter::new(temp_dir, orders[2], triples, count, reverse_width)?;
             let ops = layer_from_permutation(perm, hdt, PermutationComponent::Ops, &mut layer, ops)
                 .and_then(|()| layer.finish(temp_dir));

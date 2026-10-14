@@ -20,12 +20,29 @@ use std::thread::JoinHandle;
 /// round and group alone would overwrite each other.
 static NEXT_MERGE_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Numbers merge trees, so that the names of their threads tell apart trees
+/// that run at the same time: the vocabulary merge's groups, side-by-side
+/// sorters, and the triple-term joins.
+static NEXT_TREE_ID: AtomicU64 = AtomicU64::new(1);
+
 /// Default maximum fan-in per merge round. With a binary tree over 512 leaves,
 /// this spawns at most ~1023 threads — well within OS limits.
 pub const DEFAULT_MAX_FANIN: usize = 512;
 
 /// Default channel capacity between merge tree nodes.
 const DEFAULT_CHANNEL_CAPACITY: usize = 256;
+
+/// Stack size of every merge-tree thread.
+///
+/// A round runs up to `2 * max_fanin - 1` threads, 1,023 at the default
+/// fan-in, and where the kernel enforces strict overcommit each one's whole
+/// stack counts against the commit limit. Left to the default, they would take
+/// 2 MiB each, or whatever `RUST_MIN_STACK` says, so a stack raised for some
+/// other thread would be multiplied by a thousand here. They need little: a
+/// leaf decodes one source and a node runs a two-way merge, and neither
+/// recurses. In debug builds, whose frames are the larger, the test suite
+/// overflows a leaf at 32 KiB and passes at 48 KiB.
+const MERGE_THREAD_STACK_BYTES: usize = 256 * 1024;
 
 // ---------------------------------------------------------------------------
 // Mergeable trait
@@ -210,15 +227,23 @@ fn build_single_round<T: Mergeable>(
     config: &MergeTreeConfig,
 ) -> Result<MergeTreeHandle<T>> {
     let mut handles: Vec<JoinHandle<()>> = Vec::new();
+    let tree = NEXT_TREE_ID.fetch_add(1, AtomicOrdering::Relaxed);
+    tracing::debug!(
+        "Merge tree {tree}: {} sources, threads merge-{tree}-*",
+        sources.len()
+    );
 
     // Spawn leaf threads, one per source
     let leaf_receivers: Vec<Receiver<Result<T>>> = sources
         .into_iter()
-        .map(|source| spawn_leaf_thread(source, config.channel_capacity, &mut handles))
+        .enumerate()
+        .map(|(index, source)| {
+            spawn_leaf_thread(tree, index, source, config.channel_capacity, &mut handles)
+        })
         .collect::<Result<_>>()?;
 
     // Build binary merge tree over the leaf receivers
-    let root_rx = build_binary_tree(leaf_receivers, config.channel_capacity, &mut handles);
+    let root_rx = build_binary_tree(tree, leaf_receivers, config.channel_capacity, &mut handles)?;
 
     Ok(MergeTreeHandle {
         rx: root_rx,
@@ -290,16 +315,30 @@ fn build_multi_round<T: Mergeable>(
 // Leaf thread spawning
 // ---------------------------------------------------------------------------
 
+/// Spawn a named merge-tree thread with the tree's small stack.
+fn spawn_merge_thread(
+    name: String,
+    body: impl FnOnce() + Send + 'static,
+) -> Result<JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name(name.clone())
+        .stack_size(MERGE_THREAD_STACK_BYTES)
+        .spawn(body)
+        .with_context(|| format!("Failed to spawn merge tree thread {name}"))
+}
+
 /// Spawn a leaf thread that reads from a `MergeSource` and sends items
 /// into a bounded channel.
 fn spawn_leaf_thread<T: Mergeable>(
+    tree: u64,
+    index: usize,
     source: MergeSource<T>,
     channel_capacity: usize,
     handles: &mut Vec<JoinHandle<()>>,
 ) -> Result<Receiver<Result<T>>> {
     let (tx, rx) = bounded(channel_capacity);
 
-    let handle = std::thread::spawn(move || {
+    let handle = spawn_merge_thread(format!("merge-{tree}-leaf-{index}"), move || {
         let result = match source {
             MergeSource::File(path) => read_mergeable_file(&path, &tx),
             MergeSource::Factory(factory) => read_from_factory(factory, &tx),
@@ -307,7 +346,7 @@ fn spawn_leaf_thread<T: Mergeable>(
         if let Err(e) = result {
             let _ = tx.send(Err(e));
         }
-    });
+    })?;
 
     handles.push(handle);
     Ok(rx)
@@ -365,14 +404,17 @@ fn read_from_factory<T: Mergeable>(
 ///
 /// Returns the root receiver that yields all items in sorted order.
 fn build_binary_tree<T: Mergeable>(
+    tree: u64,
     mut layer: Vec<Receiver<Result<T>>>,
     channel_capacity: usize,
     handles: &mut Vec<JoinHandle<()>>,
-) -> Receiver<Result<T>> {
+) -> Result<Receiver<Result<T>>> {
     if layer.is_empty() {
         let (_tx, rx) = bounded(1);
-        return rx;
+        return Ok(rx);
     }
+
+    let mut node_count = 0usize;
 
     // Reduce pairwise until a single receiver remains
     while layer.len() > 1 {
@@ -396,9 +438,11 @@ fn build_binary_tree<T: Mergeable>(
 
             // Spawn a 2-way merge thread for this pair
             let (tx, rx) = bounded(channel_capacity);
-            let handle = std::thread::spawn(move || {
-                two_way_merge::<T>(left, right, tx);
-            });
+            let handle =
+                spawn_merge_thread(format!("merge-{tree}-node-{node_count}"), move || {
+                    two_way_merge::<T>(left, right, tx);
+                })?;
+            node_count += 1;
             handles.push(handle);
             next_layer.push(rx);
         }
@@ -406,9 +450,9 @@ fn build_binary_tree<T: Mergeable>(
         layer = next_layer;
     }
 
-    layer
+    Ok(layer
         .pop()
-        .expect("non-empty layer after tree construction")
+        .expect("non-empty layer after tree construction"))
 }
 
 /// Perform a 2-way merge of two sorted input channels into a single output.
@@ -764,7 +808,7 @@ mod tests {
                 .into_iter()
                 .map(|base| {
                     let dir = temp_dir.path();
-                    scope.spawn(move || -> Result<Vec<TestItem>> {
+                    let merge = move || -> Result<Vec<TestItem>> {
                         let config = MergeTreeConfig::new(dir)
                             .with_max_fanin(3)
                             .with_channel_capacity(2);
@@ -773,7 +817,11 @@ mod tests {
                             .collect();
                         let handle = build_merge_tree(sources, &config)?;
                         MergeTreeIterator::new(handle).collect()
-                    })
+                    };
+                    std::thread::Builder::new()
+                        .name(format!("merge-test-{base}"))
+                        .spawn_scoped(scope, merge)
+                        .expect("spawn a merge thread")
                 })
                 .collect();
             merges
