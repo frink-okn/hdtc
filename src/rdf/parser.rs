@@ -1112,7 +1112,7 @@ where
     let aborted = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     let mut worker_handles = Vec::with_capacity(chunk_workers);
-    for _ in 0..chunk_workers {
+    for worker in 0..chunk_workers {
         let task_rx = task_rx.clone();
         let result_tx = result_tx.clone();
         let budget = Arc::clone(&budget);
@@ -1124,7 +1124,7 @@ where
         let trusted = options.trust_triple_term_iris;
         let path = input.path.clone();
 
-        worker_handles.push(std::thread::spawn(move || -> Result<()> {
+        let parse_chunks = move || -> Result<()> {
             for task in task_rx {
                 let chunk_len = task.bytes.len();
                 // One interner per bounded parser chunk shares common graph names
@@ -1203,7 +1203,12 @@ where
                 }
             }
             Ok(())
-        }));
+        };
+        let handle = std::thread::Builder::new()
+            .name(format!("parse-chunk-{worker}"))
+            .spawn(parse_chunks)
+            .context("Failed to spawn parser chunk worker thread")?;
+        worker_handles.push(handle);
     }
     drop(result_tx);
 

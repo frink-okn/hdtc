@@ -705,7 +705,7 @@ fn parser_stage(
     // the rest of a build that is already lost.
     let aborted = Arc::new(AtomicBool::new(false));
 
-    for _ in 0..file_workers {
+    for worker in 0..file_workers {
         let file_rx = file_rx.clone();
         let stats_tx = stats_tx.clone();
         let assembler = Arc::clone(&assembler);
@@ -714,7 +714,7 @@ fn parser_stage(
         let aborted = Arc::clone(&aborted);
         let proposition_sink = Arc::clone(&proposition_sink);
 
-        worker_handles.push(std::thread::spawn(move || {
+        let parse_files = move || {
             for (file_index, input, source_assignment) in file_rx {
                 if aborted.load(Ordering::Relaxed) {
                     break;
@@ -808,7 +808,12 @@ fn parser_stage(
                     return;
                 }
             }
-        }));
+        };
+        let handle = std::thread::Builder::new()
+            .name(format!("parse-file-{worker}"))
+            .spawn(parse_files)
+            .context("Failed to spawn parser worker thread")?;
+        worker_handles.push(handle);
     }
     drop(stats_tx);
 
@@ -1367,7 +1372,7 @@ pub fn run_pipeline(
     let total_input_count = inputs.len() + hdt_inputs.len();
     let proposition_sink = Arc::new(PropositionSink::new(temp_dir, "propositions.zst"));
     let parser_sink = Arc::clone(&proposition_sink);
-    let parser_handle = std::thread::spawn(move || {
+    let parse = move || {
         parser_stage(
             inputs_owned,
             batch_size,
@@ -1380,18 +1385,26 @@ pub fn run_pipeline(
             total_input_count,
             parser_sink,
         )
-    });
+    };
+    let parser_handle = std::thread::Builder::new()
+        .name("parser".to_string())
+        .spawn(parse)
+        .context("Failed to spawn parser thread")?;
 
-    let builder_handle = std::thread::spawn(move || {
+    let build_vocab = move || {
         if let Err(e) = vocab_builder_stage(batch_rx, processed_tx, include_graphs) {
             tracing::error!("Vocab builder stage failed: {}", e);
             return Err(e);
         }
         Ok(())
-    });
+    };
+    let builder_handle = std::thread::Builder::new()
+        .name("vocab-builder".to_string())
+        .spawn(build_vocab)
+        .context("Failed to spawn vocab builder thread")?;
 
     let temp_dir_owned = temp_dir.to_path_buf();
-    let writer_handle = std::thread::spawn(move || {
+    let write_vocab = move || {
         if let Err(e) =
             vocab_writer_stage(processed_rx, complete_tx, temp_dir_owned, include_graphs)
         {
@@ -1399,7 +1412,11 @@ pub fn run_pipeline(
             return Err(e);
         }
         Ok(())
-    });
+    };
+    let writer_handle = std::thread::Builder::new()
+        .name("vocab-writer".to_string())
+        .spawn(write_vocab)
+        .context("Failed to spawn vocab writer thread")?;
 
     // Collect batch completions
     let mut batches: Vec<BatchComplete> = Vec::new();
@@ -1690,14 +1707,18 @@ pub fn run_pipeline(
     // Spawn remapper in separate thread
     let remap_threads = stage56_budget.remap_threads;
     tracing::debug!("Stage 5 remapper threads: {}", remap_threads);
-    let remapper_handle = std::thread::spawn(move || {
+    let remap = move || {
         id_remapper::id_remapper_stage(
             remap_rx,
             global_quad_tx,
             remap_threads,
             STAGE5_TO_STAGE6_CHUNK_SIZE,
         )
-    });
+    };
+    let remapper_handle = std::thread::Builder::new()
+        .name("remapper".to_string())
+        .spawn(remap)
+        .context("Failed to spawn remapper thread")?;
 
     // Stage 6: External sort + BitmapTriples construction
     tracing::info!("Stage 6: Sorting global-ID quad memberships in SPO+G order");

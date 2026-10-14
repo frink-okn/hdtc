@@ -1,7 +1,6 @@
 //! Generic external merge sort implementation.
 
 use anyhow::{Context, Result};
-use rayon::slice::ParallelSliceMut;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::fs::File;
@@ -124,8 +123,19 @@ impl ExternalSorter {
     }
 
     /// Sort and write a chunk to a temporary file with zstd compression.
+    ///
+    /// Not rayon's `par_sort_unstable`: its stack depth grows with the data,
+    /// and a chunk is the whole sort budget. See `parallel_sort`.
     fn flush_chunk<T: Sortable>(&mut self, buffer: &mut Vec<T>) -> Result<()> {
-        buffer.par_sort_unstable();
+        super::parallel_sort::sort_unstable(buffer);
+        // Nothing downstream checks order, so a chunk out of order would
+        // become a corrupt HDT rather than an error. A parallel read-only pass
+        // costs a few seconds even on a whole-budget chunk.
+        anyhow::ensure!(
+            super::parallel_sort::is_sorted(buffer),
+            "Sort chunk {} came out of order",
+            self.chunk_counter
+        );
 
         let chunk_path = self.temp_dir.join(format!(
             "sort_{}_chunk_{:06}.tmp.zst",

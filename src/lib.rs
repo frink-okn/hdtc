@@ -282,6 +282,18 @@ pub fn run() -> Result<()> {
         tracing::debug!(%error, "Using existing tracing subscriber");
     }
 
+    // Name rayon's workers, so that a crash report or a thread listing says
+    // which pool a thread belongs to rather than `<unknown>`. The stack size is
+    // left at the default: nothing hdtc runs on the pool recurses with the data
+    // (see `sort::parallel_sort`), and the default still honors
+    // `RUST_MIN_STACK`. An embedder that already built the global pool keeps it.
+    if let Err(error) = rayon::ThreadPoolBuilder::new()
+        .thread_name(|index| format!("rayon-{index}"))
+        .build_global()
+    {
+        tracing::debug!(%error, "Using existing rayon global pool");
+    }
+
     if let Some((old, target)) = raised_fd_limit {
         tracing::debug!(old, target, "Raised file descriptor limit");
     }

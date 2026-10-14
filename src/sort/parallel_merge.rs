@@ -27,6 +27,18 @@ pub const DEFAULT_MAX_FANIN: usize = 512;
 /// Default channel capacity between merge tree nodes.
 const DEFAULT_CHANNEL_CAPACITY: usize = 256;
 
+/// Stack size of every merge-tree thread.
+///
+/// A round runs up to `2 * max_fanin - 1` threads, 1,023 at the default
+/// fan-in, and where the kernel enforces strict overcommit each one's whole
+/// stack counts against the commit limit. Left to the default, they would take
+/// 2 MiB each, or whatever `RUST_MIN_STACK` says, so a stack raised for some
+/// other thread would be multiplied by a thousand here. They need little: a
+/// leaf decodes one source and a node runs a two-way merge, and neither
+/// recurses. In debug builds, whose frames are the larger, the test suite
+/// overflows a leaf at 32 KiB and passes at 48 KiB.
+const MERGE_THREAD_STACK_BYTES: usize = 256 * 1024;
+
 // ---------------------------------------------------------------------------
 // Mergeable trait
 // ---------------------------------------------------------------------------
@@ -214,11 +226,14 @@ fn build_single_round<T: Mergeable>(
     // Spawn leaf threads, one per source
     let leaf_receivers: Vec<Receiver<Result<T>>> = sources
         .into_iter()
-        .map(|source| spawn_leaf_thread(source, config.channel_capacity, &mut handles))
+        .enumerate()
+        .map(|(index, source)| {
+            spawn_leaf_thread(index, source, config.channel_capacity, &mut handles)
+        })
         .collect::<Result<_>>()?;
 
     // Build binary merge tree over the leaf receivers
-    let root_rx = build_binary_tree(leaf_receivers, config.channel_capacity, &mut handles);
+    let root_rx = build_binary_tree(leaf_receivers, config.channel_capacity, &mut handles)?;
 
     Ok(MergeTreeHandle {
         rx: root_rx,
@@ -290,16 +305,29 @@ fn build_multi_round<T: Mergeable>(
 // Leaf thread spawning
 // ---------------------------------------------------------------------------
 
+/// Spawn a named merge-tree thread with the tree's small stack.
+fn spawn_merge_thread(
+    name: String,
+    body: impl FnOnce() + Send + 'static,
+) -> Result<JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name(name.clone())
+        .stack_size(MERGE_THREAD_STACK_BYTES)
+        .spawn(body)
+        .with_context(|| format!("Failed to spawn merge tree thread {name}"))
+}
+
 /// Spawn a leaf thread that reads from a `MergeSource` and sends items
 /// into a bounded channel.
 fn spawn_leaf_thread<T: Mergeable>(
+    index: usize,
     source: MergeSource<T>,
     channel_capacity: usize,
     handles: &mut Vec<JoinHandle<()>>,
 ) -> Result<Receiver<Result<T>>> {
     let (tx, rx) = bounded(channel_capacity);
 
-    let handle = std::thread::spawn(move || {
+    let handle = spawn_merge_thread(format!("merge-leaf-{index}"), move || {
         let result = match source {
             MergeSource::File(path) => read_mergeable_file(&path, &tx),
             MergeSource::Factory(factory) => read_from_factory(factory, &tx),
@@ -307,7 +335,7 @@ fn spawn_leaf_thread<T: Mergeable>(
         if let Err(e) = result {
             let _ = tx.send(Err(e));
         }
-    });
+    })?;
 
     handles.push(handle);
     Ok(rx)
@@ -368,11 +396,13 @@ fn build_binary_tree<T: Mergeable>(
     mut layer: Vec<Receiver<Result<T>>>,
     channel_capacity: usize,
     handles: &mut Vec<JoinHandle<()>>,
-) -> Receiver<Result<T>> {
+) -> Result<Receiver<Result<T>>> {
     if layer.is_empty() {
         let (_tx, rx) = bounded(1);
-        return rx;
+        return Ok(rx);
     }
+
+    let mut node_count = 0usize;
 
     // Reduce pairwise until a single receiver remains
     while layer.len() > 1 {
@@ -396,9 +426,10 @@ fn build_binary_tree<T: Mergeable>(
 
             // Spawn a 2-way merge thread for this pair
             let (tx, rx) = bounded(channel_capacity);
-            let handle = std::thread::spawn(move || {
+            let handle = spawn_merge_thread(format!("merge-node-{node_count}"), move || {
                 two_way_merge::<T>(left, right, tx);
-            });
+            })?;
+            node_count += 1;
             handles.push(handle);
             next_layer.push(rx);
         }
@@ -406,9 +437,9 @@ fn build_binary_tree<T: Mergeable>(
         layer = next_layer;
     }
 
-    layer
+    Ok(layer
         .pop()
-        .expect("non-empty layer after tree construction")
+        .expect("non-empty layer after tree construction"))
 }
 
 /// Perform a 2-way merge of two sorted input channels into a single output.

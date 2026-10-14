@@ -69,6 +69,8 @@ Key design points:
 - Logging: `tracing` crate
 - Testing: standard `#[cfg(test)]` modules + integration tests in `tests/`
 - No `unsafe` code unless absolutely necessary and well-justified
+- Threads: spawn through `std::thread::Builder` with a name, and give rayon pools a `thread_name`, so a crash report names the thread that died. Merge-tree threads also get an explicit small stack (`MERGE_THREAD_STACK_BYTES`): a round runs ~1,000 of them, and strict-overcommit hosts charge every stack byte
+- Sorting large slices: use `sort::parallel_sort::sort_unstable`, never rayon's `par_sort_unstable`, whose stack depth grows with the data. A 7.7-billion-triple Wikidata sort chunk overflowed rayon's 2 MiB worker stacks
 - Blank node disambiguation: prefix blank node IDs with per-file identifier
 - **Formatting**: Run `cargo fmt --all` before every commit to autoformat all Rust files.
 - **Clippy**: Run `cargo clippy` before committing and fix all warnings. Zero warnings required.
