@@ -22,7 +22,7 @@ use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 const PFC_SECTION_TYPE: u8 = 0x02;
-use crate::hdt::pfc_reader::PfcSection;
+use crate::hdt::pfc_reader::{EMBEDDED_NUL_HINT, PfcSection};
 use crate::hdt::sections::scan_hdt_sections;
 
 // ---------------------------------------------------------------------------
@@ -508,12 +508,17 @@ impl PfcSectionIndex {
             if i == 0 {
                 term.clear();
             } else {
-                let (shared, consumed) = decode_vbyte(&data[pos..])?;
+                let (shared, consumed) = decode_vbyte(&data[pos..]).with_context(|| {
+                    format!(
+                        "Malformed shared-prefix length at entry {i} of {} block {block_index}; {EMBEDDED_NUL_HINT}",
+                        self.section_name
+                    )
+                })?;
                 pos += consumed;
                 let shared = shared as usize;
                 if shared > term.len() {
                     bail!(
-                        "Invalid shared prefix length {} in {} block {block_index} (prev len {})",
+                        "Invalid shared prefix length {} at entry {i} of {} block {block_index} (prev len {}); {EMBEDDED_NUL_HINT}",
                         shared,
                         self.section_name,
                         term.len()
@@ -1184,6 +1189,29 @@ mod tests {
         let index =
             PfcSectionIndex::read_from(&mut reader, temp.path(), "test", 64 * 1024).unwrap();
         (temp, index)
+    }
+
+    /// The indexed reader names the entry that does not decode, as the
+    /// sequential one does.
+    #[test]
+    fn an_embedded_nul_is_reported_with_its_section_block_and_entry() {
+        let mut temp = tempfile::NamedTempFile::new().unwrap();
+        let mut encoder = PfcEncoder::new();
+        for term in crate::dictionary::pfc::TERMS_WITH_NUL {
+            encoder.push_unchecked(term);
+        }
+        encoder.write_to(&mut temp).unwrap();
+        temp.flush().unwrap();
+        let mut reader = File::open(temp.path()).unwrap();
+        let mut index =
+            PfcSectionIndex::read_from(&mut reader, temp.path(), "objects", 64 * 1024).unwrap();
+        let mut buf = Vec::new();
+        let message = index.get_bytes(3, &mut buf).unwrap_err().to_string();
+        assert!(
+            message.starts_with("Malformed shared-prefix length at entry 2 of objects block 0"),
+            "{message}"
+        );
+        assert!(message.contains(EMBEDDED_NUL_HINT), "{message}");
     }
 
     #[test]

@@ -26,7 +26,8 @@ use crate::quads::{
     SourceGraphAssignment, canonical_sidecar_path,
 };
 use crate::rdf::{
-    DEFAULT_MAX_TERM_BYTES, ExtractedQuad, ParseOptions, RdfInput, stream_quads_with_options,
+    DEFAULT_MAX_TERM_BYTES, ExtractedQuad, ParseOptions, ParseStats, RdfInput,
+    stream_quads_with_options,
 };
 use crate::sort::{ExternalSorter, Sortable};
 use crate::triple_terms::spool::{self, PropositionSink, PropositionSpool};
@@ -697,7 +698,7 @@ fn parser_stage(
     }
     drop(file_tx);
 
-    let (stats_tx, stats_rx) = crossbeam_channel::unbounded::<(usize, Result<u64>)>();
+    let (stats_tx, stats_rx) = crossbeam_channel::unbounded::<(usize, Result<ParseStats>)>();
     let mut worker_handles = Vec::with_capacity(file_workers);
     // Set by the first worker whose input fails. A parse error is fatal now (a
     // term past `--max-term-bytes`, an unreadable file), so the other workers
@@ -793,7 +794,7 @@ fn parser_stage(
                         assembler.push_many(chunk)?;
                     }
                     proposition_sink.append(&staged_propositions, staged_proposition_count)?;
-                    Ok(stats.original_ntriples_size)
+                    Ok(stats)
                 });
 
                 // The first failure is the build's error; a later one is either
@@ -836,12 +837,16 @@ fn parser_stage(
     }
 
     let mut ntriples_size = 0u64;
+    let mut nul_replaced = 0u64;
     let mut outcomes = 0usize;
     let mut first_error = None;
     for (file_index, parse_result) in stats_rx {
         outcomes += 1;
         match parse_result {
-            Ok(size) => ntriples_size += size,
+            Ok(stats) => {
+                ntriples_size += stats.original_ntriples_size;
+                nul_replaced += stats.nul_replaced;
+            }
             Err(e) => {
                 if first_error.is_none() {
                     first_error =
@@ -873,6 +878,11 @@ fn parser_stage(
         total_quads,
         if include_graphs { "quads" } else { "triples" }
     );
+    if nul_replaced > 0 {
+        tracing::warn!(
+            "Replaced U+0000 with U+FFFD in {nul_replaced} statement(s) across all inputs"
+        );
+    }
     tracing::debug!("N-Triples size: {} bytes", ntriples_size);
     Ok(ntriples_size)
 }

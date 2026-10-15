@@ -15,6 +15,12 @@ use std::io::{Read, Seek, SeekFrom};
 
 const PFC_SECTION_TYPE: u8 = 0x02;
 
+/// Said of a front-coded entry that does not decode. A term holding U+0000
+/// reads as a short term and then a bad entry: the reader ends the term at the
+/// `0x00` and decodes the rest of it as the next entry's shared-prefix length.
+pub(crate) const EMBEDDED_NUL_HINT: &str =
+    "the term before it may hold U+0000, which hdtc up to 1.3.1 wrote unchanged";
+
 /// Metadata about a PFC section, read from the preamble.
 pub struct PfcSectionHeader {
     pub string_count: u64,
@@ -224,7 +230,12 @@ impl<R: Read> PfcSectionIterator<R> {
                 continue;
             }
 
-            let (shared, consumed) = decode_vbyte(&data[pos..])?;
+            let (shared, consumed) = decode_vbyte(&data[pos..]).with_context(|| {
+                format!(
+                    "Malformed shared-prefix length at entry {i} of {} block {block_index}; {EMBEDDED_NUL_HINT}",
+                    self.section_name
+                )
+            })?;
             pos += consumed;
             let rel_end = data[pos..].iter().position(|&b| b == 0).with_context(|| {
                 format!(
@@ -239,7 +250,7 @@ impl<R: Read> PfcSectionIterator<R> {
             let shared = shared as usize;
             if shared > prev_bytes.len() {
                 bail!(
-                    "Invalid shared prefix length {} in {} block {} (prev len {})",
+                    "Invalid shared prefix length {} at entry {i} of {} block {} (prev len {}); {EMBEDDED_NUL_HINT}",
                     shared,
                     self.section_name,
                     block_index,
@@ -415,8 +426,31 @@ pub fn skip_pfc_section<R: Read + Seek>(reader: &mut R, section_name: &str) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dictionary::pfc::PfcEncoder;
+    use crate::dictionary::pfc::{PfcEncoder, TERMS_WITH_NUL};
     use std::io::Cursor;
+
+    /// A term holding U+0000, written unchanged, reads as "alpha" and then an
+    /// entry that does not decode; the error names where.
+    #[test]
+    fn an_embedded_nul_is_reported_with_its_section_block_and_entry() {
+        let mut encoder = PfcEncoder::new();
+        for term in TERMS_WITH_NUL {
+            encoder.push_unchecked(term);
+        }
+        let mut section = Vec::new();
+        encoder.write_to(&mut section).unwrap();
+        let mut reader = Cursor::new(section);
+        let header = PfcSectionHeader::read_from(&mut reader, "objects").unwrap();
+        let error = PfcSectionIterator::new(reader, header, "objects")
+            .collect::<Result<Vec<_>>>()
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.starts_with("Malformed shared-prefix length at entry 2 of objects block 0"),
+            "{message}"
+        );
+        assert!(message.contains(EMBEDDED_NUL_HINT), "{message}");
+    }
 
     /// Positioning at any term yields exactly the section's suffix from it,
     /// across block boundaries and at both ends.

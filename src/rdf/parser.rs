@@ -2,6 +2,7 @@
 
 use crate::dictionary::term::encode_literal;
 use crate::rdf::input::{Compression, RdfFormat, RdfInput};
+use crate::rdf::nul;
 use crate::triple_terms::{self, Component, Proposition, PropositionRecord};
 use anyhow::{Context, Result};
 use crossbeam_channel::TrySendError;
@@ -82,6 +83,8 @@ struct ChunkParsed {
     quads: Vec<ExtractedQuad>,
     stats: ParseStats,
     error_samples: Vec<String>,
+    /// The first few [`nul::replace_in_quad`] notes, logged in input order.
+    nul_notes: Vec<String>,
     /// Set when the chunk hit an error the parser cannot get past
     /// ([`ParseError::is_fatal`]); the message ends the whole input.
     fatal: Option<String>,
@@ -639,6 +642,7 @@ where
         match result {
             Ok(quad) => {
                 interrupted = 0;
+                let (quad, nul_note) = nul::replace_in_quad(quad);
                 // Calculate original N-Triples size BEFORE adding blank node prefix
                 let original_size = calculate_original_ntriples_size(
                     &quad.subject,
@@ -662,6 +666,12 @@ where
                         }
                         Err(e) => return Err(e.context(format!("{}", input.path.display()))),
                     };
+                if let Some(note) = nul_note {
+                    stats.nul_replaced += 1;
+                    if stats.nul_replaced <= nul::LOGGED_PER_INPUT {
+                        tracing::warn!("{}: {note}", input.path.display());
+                    }
+                }
                 // Counted only for a statement kept, so the size describes
                 // the triples the HDT holds.
                 stats.original_ntriples_size += original_size;
@@ -691,15 +701,7 @@ where
         }
     }
 
-    if stats.errors > 0 {
-        tracing::warn!(
-            "{}: parsed {} quads, skipped {} errors",
-            input.path.display(),
-            stats.quads,
-            stats.errors
-        );
-    }
-
+    log_input_summary(&input.path, &stats);
     Ok(stats)
 }
 
@@ -1069,11 +1071,21 @@ where
             }
         }
 
+        // Numbered after every replacement in the chunks before, logged or
+        // not, so at most the input's first few are logged.
+        for (ordinal, note) in (stats.nul_replaced + 1..).zip(&chunk.nul_notes) {
+            if ordinal > nul::LOGGED_PER_INPUT {
+                break;
+            }
+            tracing::warn!("{}: {note}", input.path.display());
+        }
+
         for quad in chunk.quads {
             callback(quad)?;
         }
         stats.quads += chunk.stats.quads;
         stats.errors += chunk.stats.errors;
+        stats.nul_replaced += chunk.stats.nul_replaced;
         stats.original_ntriples_size += chunk.stats.original_ntriples_size;
         *next_sequence += 1;
     }
@@ -1135,6 +1147,7 @@ where
                     quads: Vec::new(),
                     stats: ParseStats::default(),
                     error_samples: Vec::new(),
+                    nul_notes: Vec::new(),
                     fatal: None,
                 };
                 if aborted.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1156,6 +1169,7 @@ where
                 for result in parser.for_reader(task.bytes.as_slice()) {
                     match result {
                         Ok(quad) => {
+                            let (quad, nul_note) = nul::replace_in_quad(quad);
                             let original_size = calculate_original_ntriples_size(
                                 &quad.subject,
                                 &quad.predicate,
@@ -1165,6 +1179,12 @@ where
 
                             match extract_quad(&quad, &blank_prefix, &mut graph_interner, trusted) {
                                 Ok(extracted) => {
+                                    if let Some(note) = nul_note {
+                                        parsed.stats.nul_replaced += 1;
+                                        if (parsed.nul_notes.len() as u64) < nul::LOGGED_PER_INPUT {
+                                            parsed.nul_notes.push(note);
+                                        }
+                                    }
                                     parsed.stats.original_ntriples_size += original_size;
                                     parsed.stats.quads += 1;
                                     parsed.quads.push(extracted);
@@ -1332,15 +1352,7 @@ where
         return Err(e);
     }
 
-    if stats.errors > 0 {
-        tracing::warn!(
-            "{}: parsed {} quads, skipped {} errors",
-            input.path.display(),
-            stats.quads,
-            stats.errors
-        );
-    }
-
+    log_input_summary(&input.path, &stats);
     Ok(stats)
 }
 
@@ -1573,13 +1585,35 @@ fn calculate_original_ntriples_size(
 pub struct ParseStats {
     pub quads: u64,
     pub errors: u64,
+    /// Statements kept with U+0000 replaced by U+FFFD ([`nul`]).
+    pub nul_replaced: u64,
     pub original_ntriples_size: u64, // N-Triples serialization size (before blank node prefixing)
+}
+
+/// What an input's parse skipped or changed, once it ends.
+fn log_input_summary(path: &Path, stats: &ParseStats) {
+    if stats.errors > 0 {
+        tracing::warn!(
+            "{}: parsed {} quads, skipped {} errors",
+            path.display(),
+            stats.quads,
+            stats.errors
+        );
+    }
+    if stats.nul_replaced > 0 {
+        tracing::warn!(
+            "{}: replaced U+0000 with U+FFFD in {} statement(s); an HDT dictionary cannot store U+0000",
+            path.display(),
+            stats.nul_replaced
+        );
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use flate2::{Compression as GzipLevel, write::GzEncoder};
+    use std::collections::HashSet;
     use std::io::Write;
 
     fn make_temp_nt(content: &str) -> (tempfile::NamedTempFile, RdfInput) {
@@ -2381,5 +2415,122 @@ _:b1 <http://example.org/type> <http://example.org/Thing> .
         assert_eq!(stats.errors, 0);
         assert_eq!(stats.original_ntriples_size, content.len() as u64);
         assert_eq!(quads.len(), 120);
+    }
+
+    /// Options for the sequential path, or for the parallel one with chunks
+    /// small enough that statements land in several.
+    fn path_options(parallel: bool) -> ParseOptions {
+        ParseOptions {
+            enable_ntnq_parallel: parallel,
+            chunk_size_bytes: 256,
+            chunk_workers: if parallel { 4 } else { 1 },
+            max_inflight_bytes: 8 * 1024,
+            max_term_bytes: DEFAULT_MAX_TERM_BYTES,
+            trust_triple_term_iris: false,
+        }
+    }
+
+    fn parse_with(input: &RdfInput, options: &ParseOptions) -> (ParseStats, Vec<ExtractedQuad>) {
+        let mut quads = Vec::new();
+        let stats = stream_quads_with_options(input, 0, false, None, options, |q| {
+            quads.push(q);
+            Ok(())
+        })
+        .unwrap();
+        (stats, quads)
+    }
+
+    /// U+0000, escaped or raw, is replaced with U+FFFD in every position, and
+    /// counted — past the few that are logged — the same on both paths.
+    #[test]
+    fn nul_in_terms_is_replaced_and_counted_on_both_parse_paths() {
+        let mut content = Vec::new();
+        for i in 0..40 {
+            writeln!(
+                content,
+                r#"<http://example.org/s{i}> <http://example.org/p> "plain {i}" ."#
+            )
+            .unwrap();
+            if i % 2 == 0 {
+                writeln!(
+                    content,
+                    r#"<http://example.org/s{i}> <http://example.org/p> "escaped\u0000{i}" ."#
+                )
+                .unwrap();
+            }
+        }
+        content.extend_from_slice(
+            b"<http://example.org/raw> <http://example.org/p> \"raw\x00byte\" .\n",
+        );
+        content.extend_from_slice(
+            br#"<http://example.org/iri\u0000> <http://example.org/p> "x"^^<http://example.org/dt\u0000> .
+"#,
+        );
+        let (_f, input) = make_temp_with(&content, ".nt", RdfFormat::NTriples);
+
+        let (seq_stats, seq_quads) = parse_with(&input, &path_options(false));
+        let (par_stats, par_quads) = parse_with(&input, &path_options(true));
+
+        // 20 escaped, one raw, one in an IRI and a datatype: more than are logged.
+        const { assert!(22 > nul::LOGGED_PER_INPUT) };
+        for stats in [&seq_stats, &par_stats] {
+            assert_eq!(stats.quads, 62);
+            assert_eq!(stats.errors, 0);
+            assert_eq!(stats.nul_replaced, 22);
+        }
+        assert_eq!(seq_quads, par_quads);
+        assert_eq!(
+            seq_stats.original_ntriples_size,
+            par_stats.original_ntriples_size
+        );
+        for quad in &seq_quads {
+            for term in [&quad.subject, &quad.predicate, &quad.object] {
+                assert!(!term.contains('\0'), "{term:?}");
+            }
+        }
+        let objects: HashSet<&str> = seq_quads.iter().map(|q| q.object.as_str()).collect();
+        assert!(objects.contains("\"escaped\u{FFFD}0\""));
+        assert!(objects.contains("\"raw\u{FFFD}byte\""));
+        assert!(objects.contains("\"x\"^^<http://example.org/dt\u{FFFD}>"));
+        assert!(
+            seq_quads
+                .iter()
+                .any(|q| q.subject == "http://example.org/iri\u{FFFD}")
+        );
+    }
+
+    /// The graph name of an N-Quads statement is covered too.
+    #[test]
+    fn nul_in_a_graph_name_is_replaced() {
+        let content =
+            br#"<http://example.org/s> <http://example.org/p> "o" <http://example.org/g\u0000> .
+"#;
+        let (_f, input) = make_temp_with(content, ".nq", RdfFormat::NQuads);
+        for parallel in [false, true] {
+            let (stats, quads) = parse_with(&input, &path_options(parallel));
+            assert_eq!(stats.nul_replaced, 1);
+            assert_eq!(
+                quads[0].graph.as_deref(),
+                Some("http://example.org/g\u{FFFD}")
+            );
+        }
+    }
+
+    /// A triple term is minted from its replaced proposition, so it is the
+    /// same triple term as one written with U+FFFD in the first place, and its
+    /// records hold no U+0000.
+    #[test]
+    fn nul_inside_a_triple_term_is_replaced_before_minting() {
+        let with_nul = br#"<http://example.org/s> <http://example.org/p> <<( <http://example.org/a> <http://example.org/b> "c\u0000" )>> .
+"#;
+        let with_replacement = "<http://example.org/s> <http://example.org/p> <<( <http://example.org/a> <http://example.org/b> \"c\u{FFFD}\" )>> .\n";
+        let (_f1, nul_input) = make_temp_with(with_nul, ".nt", RdfFormat::NTriples);
+        let (_f2, replaced_input) = make_temp_nt(with_replacement);
+        let (stats, nul_quads) = parse_with(&nul_input, &path_options(false));
+        let (_, replaced_quads) = parse_with(&replaced_input, &path_options(false));
+        assert_eq!(stats.nul_replaced, 1);
+        assert_eq!(nul_quads, replaced_quads);
+        let records = nul_quads[0].triple_terms.as_ref().unwrap();
+        assert!(!format!("{records:?}").contains("\\0"), "{records:?}");
     }
 }

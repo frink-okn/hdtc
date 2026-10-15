@@ -2891,7 +2891,12 @@ fn decode_pfc_block(bytes: &[u8], count: u64) -> Result<Vec<String>> {
             position = end + 1;
             value
         } else {
-            let (shared, consumed) = decode_vbyte(&bytes[position..])?;
+            let (shared, consumed) = decode_vbyte(&bytes[position..]).with_context(|| {
+                format!(
+                    "malformed graph PFC shared-prefix length at entry {index}; {}",
+                    crate::hdt::pfc_reader::EMBEDDED_NUL_HINT
+                )
+            })?;
             position += consumed;
             let shared = usize::try_from(shared).context("graph PFC prefix too large")?;
             ensure!(shared <= previous.len(), "invalid graph PFC shared prefix");

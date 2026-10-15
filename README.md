@@ -19,7 +19,7 @@ Development of hdtc is done primarily through Claude Code.
 - **VoID statistics** — compute dataset-level, property, and class partition statistics as N-Triples, optionally with a `void:subset` for every named graph of a quads HDT
 - **Namespace inventories** — count distinct subject, predicate, object, and graph-wide IRIs against curated YAML or JSON prefix tables
 - **Structural validation** — walk an HDT's triple structures and checksums, plus discovered graph and permutation sidecars, end to end
-- **Resilient parsing** — skips malformed triples with warnings, reports total skipped at the end
+- **Resilient parsing** — skips malformed triples with warnings, reports total skipped at the end; replaces U+0000, which HDT cannot store, with U+FFFD
 - **[RDF 1.2 triple terms](#rdf-12-triple-terms)** — `<<( s p o )>>` terms, reification, and annotation syntax are stored beside a standard HDT, rendered back as N-Triples 1.2, and indexed for patterns inside triple terms
 - **[Named graphs](#named-graphs)** — optional packed `<data.hdt>.graphs` sidecars preserve N-Quads/TriG datasets while the standard HDT remains the deduplicated triples union
 - **[Membership and overlap sketches](#membership-and-overlap-sketches)** — build source-bound binary fuse filters and bottom-k MinHash files directly from an HDT dictionary
@@ -203,6 +203,19 @@ parses it without a term bound, so what `header` accepts stays readable. hdtc
 builds the Turtle-family parsers from a vendored oxttl (`vendor/oxttl`, package
 `oxttl-hdtc`) that exposes this bound; see its `Cargo.toml` for what was
 changed. RDF/XML and JSON-LD have no such bound and are unaffected.
+
+**U+0000 in terms.** An HDT dictionary ends every string at a `0x00` byte, so
+it cannot store a term containing U+0000. RDF has no use for the character
+either: `xsd:string` and `rdf:langString` exclude it, an IRI cannot contain it,
+and RDF/XML cannot express it. N-Triples, Turtle and JSON-LD can still write
+it, as `\u0000` or as a raw byte, and Wikidata dumps do. hdtc replaces every
+U+0000 with U+FFFD (REPLACEMENT CHARACTER) as it parses, wherever it appears,
+and keeps the statement. It logs the first ten affected statements per input
+by subject and predicate, so you can find them in the source, then logs a
+count per input and for the whole build. Before this, hdtc wrote the term
+unchanged. `create` succeeded, but every later read of the dictionary failed,
+usually with `VByte value exceeds u64 range`. Readers now name the section,
+block and entry where decoding failed. Rebuild an HDT that fails this way.
 
 ### Index: Creating indexes
 

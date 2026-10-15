@@ -829,6 +829,74 @@ another bad line here
     );
 }
 
+/// U+0000, which a PFC dictionary cannot store, is replaced with U+FFFD as
+/// the input is parsed, so the dictionary reads back. On this input `create`
+/// used to succeed and every later reader of the dictionary — `text`, `dump` —
+/// fail with "VByte value exceeds u64 range".
+#[test]
+fn test_nul_in_terms_is_replaced() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let nt_path = temp_dir.path().join("nul.nt");
+    let mut nt_content = br#"<http://example.org/s1> <http://example.org/p> "alpha" .
+<http://example.org/s2> <http://example.org/p> "alpha\u0000embedded nul in an ascii literal" .
+<http://example.org/s3> <http://example.org/p> "alphabet soup" .
+<http://example.org/s4> <http://example.org/p> "alphanumeric" .
+<http://example.org/s5> <http://example.org/p> "alpine" .
+"#
+    .to_vec();
+    nt_content
+        .extend_from_slice(b"<http://example.org/s6> <http://example.org/p> \"raw\x00byte\" .\n");
+    write_file(&nt_path, &nt_content);
+
+    let (success, stderr, _) = run_hdtc(temp_dir.path(), &[nt_path.as_path()], "nul.hdt");
+    assert!(success, "hdtc create failed: {stderr}");
+    assert!(
+        stderr.contains(
+            "U+0000 replaced with U+FFFD in the object of the statement \
+             <http://example.org/s2> <http://example.org/p>"
+        ),
+        "Expected the statement to be named, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("replaced U+0000 with U+FFFD in 2 statement(s)"),
+        "Expected the count, got:\n{stderr}"
+    );
+
+    let hdt_path = temp_dir.path().join("nul.hdt");
+    let dump = Command::new(env!("CARGO_BIN_EXE_hdtc"))
+        .args(["dump", hdt_path.to_str().unwrap()])
+        .output()
+        .expect("Failed to execute hdtc dump");
+    assert!(
+        dump.status.success(),
+        "hdtc dump failed: {}",
+        String::from_utf8_lossy(&dump.stderr)
+    );
+    let dumped = String::from_utf8(dump.stdout).unwrap();
+    assert_eq!(dumped.lines().count(), 6, "{dumped}");
+    assert!(dumped.contains("\"alpha\u{FFFD}embedded nul in an ascii literal\""));
+    assert!(dumped.contains("\"raw\u{FFFD}byte\""));
+    assert!(dumped.contains("\"alphabet soup\""));
+
+    let text_path = temp_dir.path().join("nul.hdt.text");
+    let text = Command::new(env!("CARGO_BIN_EXE_hdtc"))
+        .args([
+            "text",
+            hdt_path.to_str().unwrap(),
+            "--output",
+            text_path.to_str().unwrap(),
+            "--max-literal-bytes",
+            "4096",
+        ])
+        .output()
+        .expect("Failed to execute hdtc text");
+    assert!(
+        text.status.success(),
+        "hdtc text failed: {}",
+        String::from_utf8_lossy(&text.stderr)
+    );
+}
+
 /// Test that a single triple produces a valid HDT.
 #[test]
 fn test_single_triple() {
