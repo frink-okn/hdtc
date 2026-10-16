@@ -6,7 +6,7 @@
 
 use crate::hdt::reader::sha256_to_end;
 use crate::io::crc_utils::{CRC32C_ALGO, crc8, crc32c};
-use crate::io::{ControlInfo, decode_vbyte, encode_vbyte, read_vbyte};
+use crate::io::{ControlInfo, encode_vbyte, read_vbyte};
 use crate::quads::writer::canonical_sidecar_path;
 use crate::sort::{ExternalSorter, Sortable};
 use anyhow::{Context, Result, bail, ensure};
@@ -2222,7 +2222,7 @@ impl GraphSidecarReader {
         )?;
         let base_id = block * self.dictionary.block_size;
         let count = (self.dictionary.string_count - base_id).min(self.dictionary.block_size);
-        decode_pfc_block(&bytes, count)
+        decode_pfc_block(&bytes, block, count)
     }
 }
 
@@ -2876,46 +2876,22 @@ fn disk_log_get(file: &mut File, array: DiskLogArray, index: u64) -> Result<u64>
     Ok(((u128::from_le_bytes(bytes) >> shift) & mask) as u64)
 }
 
-fn decode_pfc_block(bytes: &[u8], count: u64) -> Result<Vec<String>> {
+fn decode_pfc_block(bytes: &[u8], block: u64, count: u64) -> Result<Vec<String>> {
     let mut output = Vec::with_capacity(count as usize);
-    let mut position = 0usize;
-    let mut previous = Vec::new();
-    for index in 0..count {
-        let value = if index == 0 {
-            let end = bytes[position..]
-                .iter()
-                .position(|byte| *byte == 0)
-                .context("unterminated graph PFC base string")?
-                + position;
-            let value = bytes[position..end].to_vec();
-            position = end + 1;
-            value
-        } else {
-            let (shared, consumed) = decode_vbyte(&bytes[position..]).with_context(|| {
-                format!(
-                    "malformed graph PFC shared-prefix length at entry {index}; {}",
-                    crate::hdt::pfc_reader::EMBEDDED_NUL_HINT
-                )
-            })?;
-            position += consumed;
-            let shared = usize::try_from(shared).context("graph PFC prefix too large")?;
-            ensure!(shared <= previous.len(), "invalid graph PFC shared prefix");
-            let end = bytes[position..]
-                .iter()
-                .position(|byte| *byte == 0)
-                .context("unterminated graph PFC suffix")?
-                + position;
-            let mut value = previous[..shared].to_vec();
-            value.extend_from_slice(&bytes[position..end]);
-            position = end + 1;
-            value
-        };
-        let text =
-            String::from_utf8(value.clone()).context("graph dictionary term is not UTF-8")?;
-        previous = value;
-        output.push(text);
-    }
-    ensure!(position == bytes.len(), "trailing bytes in graph PFC block");
+    let mut term = Vec::new();
+    crate::hdt::pfc_reader::decode_block(
+        "graph dictionary",
+        block,
+        bytes,
+        count,
+        &mut term,
+        |value| {
+            output.push(
+                String::from_utf8(value.to_vec()).context("graph dictionary term is not UTF-8")?,
+            );
+            Ok(())
+        },
+    )?;
     Ok(output)
 }
 

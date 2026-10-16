@@ -226,7 +226,7 @@ impl StreamingPfcEncoder {
     /// Strings MUST be added in sorted order. A string holding U+0000 is
     /// refused: the encoding ends each string at a `0x00` byte, so a reader
     /// would end the term there and misread the rest of the block. The parser
-    /// replaces the character (`rdf::nul`), so reaching this is a bug, and it
+    /// removes the character (`rdf::nul`), so reaching this is a bug, and it
     /// fails here rather than in whatever reads the dictionary later.
     pub fn push(&mut self, s: &str) -> io::Result<()> {
         if s.as_bytes().contains(&0) {

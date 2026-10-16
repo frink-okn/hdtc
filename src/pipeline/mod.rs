@@ -837,7 +837,7 @@ fn parser_stage(
     }
 
     let mut ntriples_size = 0u64;
-    let mut nul_replaced = 0u64;
+    let mut nul_removed = 0u64;
     let mut outcomes = 0usize;
     let mut first_error = None;
     for (file_index, parse_result) in stats_rx {
@@ -845,7 +845,7 @@ fn parser_stage(
         match parse_result {
             Ok(stats) => {
                 ntriples_size += stats.original_ntriples_size;
-                nul_replaced += stats.nul_replaced;
+                nul_removed += stats.nul_removed;
             }
             Err(e) => {
                 if first_error.is_none() {
@@ -878,10 +878,8 @@ fn parser_stage(
         total_quads,
         if include_graphs { "quads" } else { "triples" }
     );
-    if nul_replaced > 0 {
-        tracing::warn!(
-            "Replaced U+0000 with U+FFFD in {nul_replaced} statement(s) across all inputs"
-        );
+    if nul_removed > 0 {
+        tracing::warn!("Removed U+0000 from {nul_removed} statement(s) across all inputs");
     }
     tracing::debug!("N-Triples size: {} bytes", ntriples_size);
     Ok(ntriples_size)

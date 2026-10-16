@@ -829,12 +829,28 @@ another bad line here
     );
 }
 
-/// U+0000, which a PFC dictionary cannot store, is replaced with U+FFFD as
-/// the input is parsed, so the dictionary reads back. On this input `create`
-/// used to succeed and every later reader of the dictionary — `text`, `dump` —
-/// fail with "VByte value exceeds u64 range".
+fn hdtc(args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_hdtc"))
+        .args(args)
+        .output()
+        .expect("Failed to execute hdtc")
+}
+
+fn assert_ok(output: &std::process::Output, what: &str) -> String {
+    assert!(
+        output.status.success(),
+        "hdtc {what} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout.clone()).unwrap()
+}
+
+/// U+0000, which a PFC dictionary cannot store, is removed as the input is
+/// parsed, so the dictionary reads back. On this input `create` used to
+/// succeed and every later reader of the dictionary — `text`, `dump` — fail
+/// with "VByte value exceeds u64 range".
 #[test]
-fn test_nul_in_terms_is_replaced() {
+fn test_nul_in_terms_is_removed() {
     let temp_dir = tempfile::tempdir().unwrap();
     let nt_path = temp_dir.path().join("nul.nt");
     let mut nt_content = br#"<http://example.org/s1> <http://example.org/p> "alpha" .
@@ -852,49 +868,78 @@ fn test_nul_in_terms_is_replaced() {
     assert!(success, "hdtc create failed: {stderr}");
     assert!(
         stderr.contains(
-            "U+0000 replaced with U+FFFD in the object of the statement \
+            "U+0000 removed from the object of the statement \
              <http://example.org/s2> <http://example.org/p>"
         ),
         "Expected the statement to be named, got:\n{stderr}"
     );
     assert!(
-        stderr.contains("replaced U+0000 with U+FFFD in 2 statement(s)"),
+        stderr.contains("removed U+0000 from 2 statement(s)"),
         "Expected the count, got:\n{stderr}"
     );
 
-    let hdt_path = temp_dir.path().join("nul.hdt");
-    let dump = Command::new(env!("CARGO_BIN_EXE_hdtc"))
-        .args(["dump", hdt_path.to_str().unwrap()])
-        .output()
-        .expect("Failed to execute hdtc dump");
-    assert!(
-        dump.status.success(),
-        "hdtc dump failed: {}",
-        String::from_utf8_lossy(&dump.stderr)
-    );
-    let dumped = String::from_utf8(dump.stdout).unwrap();
+    let hdt = temp_dir.path().join("nul.hdt");
+    let hdt = hdt.to_str().unwrap();
+    let dumped = assert_ok(&hdtc(&["dump", hdt]), "dump");
     assert_eq!(dumped.lines().count(), 6, "{dumped}");
-    assert!(dumped.contains("\"alpha\u{FFFD}embedded nul in an ascii literal\""));
-    assert!(dumped.contains("\"raw\u{FFFD}byte\""));
+    assert!(dumped.contains("\"alphaembedded nul in an ascii literal\""));
+    assert!(dumped.contains("\"rawbyte\""));
     assert!(dumped.contains("\"alphabet soup\""));
 
-    let text_path = temp_dir.path().join("nul.hdt.text");
-    let text = Command::new(env!("CARGO_BIN_EXE_hdtc"))
-        .args([
+    let text = temp_dir.path().join("nul.hdt.text");
+    assert_ok(
+        &hdtc(&[
             "text",
-            hdt_path.to_str().unwrap(),
+            hdt,
             "--output",
-            text_path.to_str().unwrap(),
+            text.to_str().unwrap(),
             "--max-literal-bytes",
             "4096",
-        ])
-        .output()
-        .expect("Failed to execute hdtc text");
-    assert!(
-        text.status.success(),
-        "hdtc text failed: {}",
-        String::from_utf8_lossy(&text.stderr)
+        ]),
+        "text",
     );
+
+    // A query spelling the term as the source did finds it.
+    let count = assert_ok(
+        &hdtc(&[
+            "search",
+            hdt,
+            "--no-index",
+            "--count",
+            "--query",
+            r#"? ? "alpha\u0000embedded nul in an ascii literal""#,
+        ]),
+        "search",
+    );
+    assert_eq!(count.trim(), "1");
+}
+
+/// A graph name loses only the character, so it stays an absolute IRI and the
+/// quads HDT passes hdtc's own strict validation.
+#[test]
+fn test_nul_in_a_graph_name_keeps_the_quads_hdt_valid() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let nq_path = temp_dir.path().join("nul.nq");
+    write_file(
+        &nq_path,
+        br#"<http://example.org/s> <http://example.org/p> "o" <http://example.org/g\u0000> .
+"#,
+    );
+    let hdt = temp_dir.path().join("nul.hdt");
+    assert_ok(
+        &hdtc(&[
+            "create",
+            nq_path.to_str().unwrap(),
+            "-o",
+            hdt.to_str().unwrap(),
+            "--mode",
+            "quads",
+            "--temp-dir",
+            temp_dir.path().join("work").to_str().unwrap(),
+        ]),
+        "create",
+    );
+    assert_ok(&hdtc(&["validate", hdt.to_str().unwrap()]), "validate");
 }
 
 /// Test that a single triple produces a valid HDT.

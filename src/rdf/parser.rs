@@ -83,7 +83,7 @@ struct ChunkParsed {
     quads: Vec<ExtractedQuad>,
     stats: ParseStats,
     error_samples: Vec<String>,
-    /// The first few [`nul::replace_in_quad`] notes, logged in input order.
+    /// The first few [`nul::remove_from_quad`] notes, logged in input order.
     nul_notes: Vec<String>,
     /// Set when the chunk hit an error the parser cannot get past
     /// ([`ParseError::is_fatal`]); the message ends the whole input.
@@ -272,6 +272,39 @@ fn extract_quad(
         object,
         graph,
         triple_terms,
+    })
+}
+
+/// A parsed quad, ready for the dictionary.
+struct Converted {
+    quad: ExtractedQuad,
+    /// N-Triples size of the statement as stored, before blank-node prefixing.
+    ntriples_size: u64,
+    nul: nul::Removal,
+}
+
+/// The one conversion both parse paths apply to a parsed quad: U+0000 removed
+/// ([`nul`]), the size measured on what is stored, then [`extract_quad`].
+/// `want_note` asks for a note naming the statement if U+0000 was removed.
+fn convert_quad(
+    quad: Quad,
+    blank_prefix: &str,
+    graph_interner: &mut GraphInterner,
+    trusted: bool,
+    want_note: bool,
+) -> Result<Converted> {
+    let (quad, nul) = nul::remove_from_quad(quad, want_note);
+    let ntriples_size = calculate_original_ntriples_size(
+        &quad.subject,
+        &quad.predicate,
+        &quad.object,
+        &quad.graph_name,
+    );
+    let quad = extract_quad(&quad, blank_prefix, graph_interner, trusted)?;
+    Ok(Converted {
+        quad,
+        ntriples_size,
+        nul,
     })
 }
 
@@ -642,41 +675,28 @@ where
         match result {
             Ok(quad) => {
                 interrupted = 0;
-                let (quad, nul_note) = nul::replace_in_quad(quad);
-                // Calculate original N-Triples size BEFORE adding blank node prefix
-                let original_size = calculate_original_ntriples_size(
-                    &quad.subject,
-                    &quad.predicate,
-                    &quad.object,
-                    &quad.graph_name,
-                );
-
-                let extracted =
-                    match extract_quad(&quad, &blank_prefix, &mut graph_interner, trusted) {
-                        Ok(extracted) => extracted,
-                        Err(e) if e.is::<TooDeeplyNested>() => {
-                            stats.errors += 1;
-                            if stats.errors <= 10 {
-                                tracing::warn!(
-                                    "Skipping statement in {}: {e}",
-                                    input.path.display()
-                                );
-                            }
-                            continue;
+                let want_note = stats.nul_removed < nul::LOGGED_PER_INPUT;
+                let mut converted = match convert_quad(
+                    quad,
+                    &blank_prefix,
+                    &mut graph_interner,
+                    trusted,
+                    want_note,
+                ) {
+                    Ok(converted) => converted,
+                    Err(e) if e.is::<TooDeeplyNested>() => {
+                        stats.errors += 1;
+                        if stats.errors <= 10 {
+                            tracing::warn!("Skipping statement in {}: {e}", input.path.display());
                         }
-                        Err(e) => return Err(e.context(format!("{}", input.path.display()))),
-                    };
-                if let Some(note) = nul_note {
-                    stats.nul_replaced += 1;
-                    if stats.nul_replaced <= nul::LOGGED_PER_INPUT {
-                        tracing::warn!("{}: {note}", input.path.display());
+                        continue;
                     }
+                    Err(e) => return Err(e.context(format!("{}", input.path.display()))),
+                };
+                if let Some(note) = stats.count_kept(&mut converted) {
+                    tracing::warn!("{}: {note}", input.path.display());
                 }
-                // Counted only for a statement kept, so the size describes
-                // the triples the HDT holds.
-                stats.original_ntriples_size += original_size;
-                stats.quads += 1;
-                callback(extracted)?;
+                callback(converted.quad)?;
             }
             Err(e) if e.is_interrupted() && interrupted < MAX_INTERRUPTED_RETRIES => {
                 interrupted += 1;
@@ -1071,9 +1091,9 @@ where
             }
         }
 
-        // Numbered after every replacement in the chunks before, logged or
-        // not, so at most the input's first few are logged.
-        for (ordinal, note) in (stats.nul_replaced + 1..).zip(&chunk.nul_notes) {
+        // Numbered after every removal in the chunks before, logged or not,
+        // so at most the input's first few are logged.
+        for (ordinal, note) in (stats.nul_removed + 1..).zip(&chunk.nul_notes) {
             if ordinal > nul::LOGGED_PER_INPUT {
                 break;
             }
@@ -1085,7 +1105,7 @@ where
         }
         stats.quads += chunk.stats.quads;
         stats.errors += chunk.stats.errors;
-        stats.nul_replaced += chunk.stats.nul_replaced;
+        stats.nul_removed += chunk.stats.nul_removed;
         stats.original_ntriples_size += chunk.stats.original_ntriples_size;
         *next_sequence += 1;
     }
@@ -1169,25 +1189,22 @@ where
                 for result in parser.for_reader(task.bytes.as_slice()) {
                     match result {
                         Ok(quad) => {
-                            let (quad, nul_note) = nul::replace_in_quad(quad);
-                            let original_size = calculate_original_ntriples_size(
-                                &quad.subject,
-                                &quad.predicate,
-                                &quad.object,
-                                &quad.graph_name,
-                            );
-
-                            match extract_quad(&quad, &blank_prefix, &mut graph_interner, trusted) {
-                                Ok(extracted) => {
-                                    if let Some(note) = nul_note {
-                                        parsed.stats.nul_replaced += 1;
-                                        if (parsed.nul_notes.len() as u64) < nul::LOGGED_PER_INPUT {
-                                            parsed.nul_notes.push(note);
-                                        }
+                            // Up to the per-input cap from each chunk: which
+                            // chunks the input's first few fall in is not
+                            // known until they are put back in order.
+                            let want_note = (parsed.nul_notes.len() as u64) < nul::LOGGED_PER_INPUT;
+                            match convert_quad(
+                                quad,
+                                &blank_prefix,
+                                &mut graph_interner,
+                                trusted,
+                                want_note,
+                            ) {
+                                Ok(mut converted) => {
+                                    if let Some(note) = parsed.stats.count_kept(&mut converted) {
+                                        parsed.nul_notes.push(note);
                                     }
-                                    parsed.stats.original_ntriples_size += original_size;
-                                    parsed.stats.quads += 1;
-                                    parsed.quads.push(extracted);
+                                    parsed.quads.push(converted.quad);
                                 }
                                 Err(e) if e.is::<TooDeeplyNested>() => {
                                     parsed.stats.errors += 1;
@@ -1585,9 +1602,23 @@ fn calculate_original_ntriples_size(
 pub struct ParseStats {
     pub quads: u64,
     pub errors: u64,
-    /// Statements kept with U+0000 replaced by U+FFFD ([`nul`]).
-    pub nul_replaced: u64,
+    /// Statements kept with U+0000 removed from them ([`nul`]).
+    pub nul_removed: u64,
     pub original_ntriples_size: u64, // N-Triples serialization size (before blank node prefixing)
+}
+
+impl ParseStats {
+    /// Count a statement kept, handing back its U+0000 note if it has one.
+    /// Counted only for a statement kept, so the size describes the triples
+    /// the HDT holds.
+    fn count_kept(&mut self, converted: &mut Converted) -> Option<String> {
+        self.quads += 1;
+        self.original_ntriples_size += converted.ntriples_size;
+        if converted.nul.removed {
+            self.nul_removed += 1;
+        }
+        converted.nul.note.take()
+    }
 }
 
 /// What an input's parse skipped or changed, once it ends.
@@ -1600,11 +1631,11 @@ fn log_input_summary(path: &Path, stats: &ParseStats) {
             stats.errors
         );
     }
-    if stats.nul_replaced > 0 {
+    if stats.nul_removed > 0 {
         tracing::warn!(
-            "{}: replaced U+0000 with U+FFFD in {} statement(s); an HDT dictionary cannot store U+0000",
+            "{}: removed U+0000 from {} statement(s); an HDT dictionary cannot store it",
             path.display(),
-            stats.nul_replaced
+            stats.nul_removed
         );
     }
 }
@@ -2440,10 +2471,10 @@ _:b1 <http://example.org/type> <http://example.org/Thing> .
         (stats, quads)
     }
 
-    /// U+0000, escaped or raw, is replaced with U+FFFD in every position, and
-    /// counted — past the few that are logged — the same on both paths.
+    /// U+0000, escaped or raw, is removed from every position, and counted —
+    /// past the few that are logged — the same on both paths.
     #[test]
-    fn nul_in_terms_is_replaced_and_counted_on_both_parse_paths() {
+    fn nul_in_terms_is_removed_and_counted_on_both_parse_paths() {
         let mut content = Vec::new();
         for i in 0..40 {
             writeln!(
@@ -2476,7 +2507,7 @@ _:b1 <http://example.org/type> <http://example.org/Thing> .
         for stats in [&seq_stats, &par_stats] {
             assert_eq!(stats.quads, 62);
             assert_eq!(stats.errors, 0);
-            assert_eq!(stats.nul_replaced, 22);
+            assert_eq!(stats.nul_removed, 22);
         }
         assert_eq!(seq_quads, par_quads);
         assert_eq!(
@@ -2489,47 +2520,44 @@ _:b1 <http://example.org/type> <http://example.org/Thing> .
             }
         }
         let objects: HashSet<&str> = seq_quads.iter().map(|q| q.object.as_str()).collect();
-        assert!(objects.contains("\"escaped\u{FFFD}0\""));
-        assert!(objects.contains("\"raw\u{FFFD}byte\""));
-        assert!(objects.contains("\"x\"^^<http://example.org/dt\u{FFFD}>"));
+        assert!(objects.contains("\"escaped0\""));
+        assert!(objects.contains("\"rawbyte\""));
+        assert!(objects.contains("\"x\"^^<http://example.org/dt>"));
         assert!(
             seq_quads
                 .iter()
-                .any(|q| q.subject == "http://example.org/iri\u{FFFD}")
+                .any(|q| q.subject == "http://example.org/iri")
         );
     }
 
     /// The graph name of an N-Quads statement is covered too.
     #[test]
-    fn nul_in_a_graph_name_is_replaced() {
+    fn nul_in_a_graph_name_is_removed() {
         let content =
             br#"<http://example.org/s> <http://example.org/p> "o" <http://example.org/g\u0000> .
 "#;
         let (_f, input) = make_temp_with(content, ".nq", RdfFormat::NQuads);
         for parallel in [false, true] {
             let (stats, quads) = parse_with(&input, &path_options(parallel));
-            assert_eq!(stats.nul_replaced, 1);
-            assert_eq!(
-                quads[0].graph.as_deref(),
-                Some("http://example.org/g\u{FFFD}")
-            );
+            assert_eq!(stats.nul_removed, 1);
+            assert_eq!(quads[0].graph.as_deref(), Some("http://example.org/g"));
         }
     }
 
-    /// A triple term is minted from its replaced proposition, so it is the
-    /// same triple term as one written with U+FFFD in the first place, and its
+    /// A triple term is minted from its cleaned proposition, so it is the same
+    /// triple term as one written without U+0000 in the first place, and its
     /// records hold no U+0000.
     #[test]
-    fn nul_inside_a_triple_term_is_replaced_before_minting() {
+    fn nul_inside_a_triple_term_is_removed_before_minting() {
         let with_nul = br#"<http://example.org/s> <http://example.org/p> <<( <http://example.org/a> <http://example.org/b> "c\u0000" )>> .
 "#;
-        let with_replacement = "<http://example.org/s> <http://example.org/p> <<( <http://example.org/a> <http://example.org/b> \"c\u{FFFD}\" )>> .\n";
+        let without = "<http://example.org/s> <http://example.org/p> <<( <http://example.org/a> <http://example.org/b> \"c\" )>> .\n";
         let (_f1, nul_input) = make_temp_with(with_nul, ".nt", RdfFormat::NTriples);
-        let (_f2, replaced_input) = make_temp_nt(with_replacement);
+        let (_f2, clean_input) = make_temp_nt(without);
         let (stats, nul_quads) = parse_with(&nul_input, &path_options(false));
-        let (_, replaced_quads) = parse_with(&replaced_input, &path_options(false));
-        assert_eq!(stats.nul_replaced, 1);
-        assert_eq!(nul_quads, replaced_quads);
+        let (_, clean_quads) = parse_with(&clean_input, &path_options(false));
+        assert_eq!(stats.nul_removed, 1);
+        assert_eq!(nul_quads, clean_quads);
         let records = nul_quads[0].triple_terms.as_ref().unwrap();
         assert!(!format!("{records:?}").contains("\\0"), "{records:?}");
     }

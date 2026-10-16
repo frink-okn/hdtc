@@ -10,16 +10,75 @@ use crate::io::{
     LogArrayReader, LogArraySection, decode_vbyte, encode_vbyte, read_vbyte, read_vbyte_recording,
     scan_log_array_section, verify_preamble_crc8,
 };
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use std::io::{Read, Seek, SeekFrom};
 
 const PFC_SECTION_TYPE: u8 = 0x02;
 
-/// Said of a front-coded entry that does not decode. A term holding U+0000
-/// reads as a short term and then a bad entry: the reader ends the term at the
-/// `0x00` and decodes the rest of it as the next entry's shared-prefix length.
+/// Said of a front-coded block that does not decode. A term holding U+0000
+/// reads as a short term and then as garbage: the reader ends the term at the
+/// `0x00` and decodes the rest of it as the next entry's shared-prefix length,
+/// or, in a block's last entry, leaves it over.
 pub(crate) const EMBEDDED_NUL_HINT: &str =
-    "the term before it may hold U+0000, which hdtc up to 1.3.1 wrote unchanged";
+    "a term in it may hold U+0000, which hdtc up to 1.3.1 wrote unchanged; rebuild the HDT";
+
+/// Decode one front-coded block of `entries` terms, handing each to `visit`
+/// in order. Each term is decoded in place over its predecessor in `term`, so
+/// decoding allocates nothing per term.
+///
+/// The block must hold exactly its entries: bytes left over are an error, so
+/// a term holding U+0000 in a block's last entry is not read back silently
+/// cut short. A decoding error names the section, block and entry, with
+/// [`EMBEDDED_NUL_HINT`]; an error from `visit` is passed through unchanged.
+pub(crate) fn decode_block(
+    section_name: &str,
+    block_index: u64,
+    data: &[u8],
+    entries: u64,
+    term: &mut Vec<u8>,
+    mut visit: impl FnMut(&[u8]) -> Result<()>,
+) -> Result<()> {
+    let malformed = |what: std::fmt::Arguments| {
+        anyhow!("{section_name} block {block_index} does not decode: {what}; {EMBEDDED_NUL_HINT}")
+    };
+    let mut pos = 0usize;
+    for i in 0..entries {
+        if pos >= data.len() {
+            return Err(malformed(format_args!("it ends before entry {i}")));
+        }
+        if i == 0 {
+            term.clear();
+        } else {
+            let (shared, consumed) = decode_vbyte(&data[pos..]).map_err(|e| {
+                malformed(format_args!(
+                    "entry {i} has a malformed shared-prefix length ({e})"
+                ))
+            })?;
+            pos += consumed;
+            let shared = usize::try_from(shared).unwrap_or(usize::MAX);
+            if shared > term.len() {
+                return Err(malformed(format_args!(
+                    "entry {i} shares {shared} bytes with a previous term of {}",
+                    term.len()
+                )));
+            }
+            term.truncate(shared);
+        }
+        let Some(len) = data[pos..].iter().position(|&b| b == 0) else {
+            return Err(malformed(format_args!("entry {i} has no terminator")));
+        };
+        term.extend_from_slice(&data[pos..pos + len]);
+        pos += len + 1;
+        visit(term)?;
+    }
+    if pos != data.len() {
+        return Err(malformed(format_args!(
+            "{} bytes follow its last entry",
+            data.len() - pos
+        )));
+    }
+    Ok(())
+}
 
 /// Metadata about a PFC section, read from the preamble.
 pub struct PfcSectionHeader {
@@ -201,70 +260,20 @@ impl<R: Read> PfcSectionIterator<R> {
         self.bytes_consumed += block_len as u64;
 
         let base = block_index * self.block_size;
-        let max_entries = (self.string_count - base).min(self.block_size) as usize;
-        let mut entries = Vec::with_capacity(max_entries);
-
-        let mut pos = 0usize;
-        let mut prev_bytes = Vec::<u8>::new();
-        for i in 0..max_entries {
-            if pos >= data.len() {
-                bail!(
-                    "Unexpected end of block in {} at entry {}",
-                    self.section_name,
-                    i
-                );
-            }
-
-            if i == 0 {
-                let rel_end = data[pos..].iter().position(|&b| b == 0).with_context(|| {
-                    format!(
-                        "Missing null terminator in {} block {}",
-                        self.section_name, block_index
-                    )
-                })?;
-                let end_pos = pos + rel_end;
-                let term_bytes = data[pos..end_pos].to_vec();
-                pos = end_pos + 1;
-                prev_bytes = term_bytes.clone();
-                entries.push(term_bytes);
-                continue;
-            }
-
-            let (shared, consumed) = decode_vbyte(&data[pos..]).with_context(|| {
-                format!(
-                    "Malformed shared-prefix length at entry {i} of {} block {block_index}; {EMBEDDED_NUL_HINT}",
-                    self.section_name
-                )
-            })?;
-            pos += consumed;
-            let rel_end = data[pos..].iter().position(|&b| b == 0).with_context(|| {
-                format!(
-                    "Missing null terminator in {} block {}",
-                    self.section_name, block_index
-                )
-            })?;
-            let end_pos = pos + rel_end;
-            let suffix = &data[pos..end_pos];
-            pos = end_pos + 1;
-
-            let shared = shared as usize;
-            if shared > prev_bytes.len() {
-                bail!(
-                    "Invalid shared prefix length {} at entry {i} of {} block {} (prev len {}); {EMBEDDED_NUL_HINT}",
-                    shared,
-                    self.section_name,
-                    block_index,
-                    prev_bytes.len()
-                );
-            }
-
-            let mut value_bytes = Vec::with_capacity(shared + suffix.len());
-            value_bytes.extend_from_slice(&prev_bytes[..shared]);
-            value_bytes.extend_from_slice(suffix);
-            prev_bytes.clone_from(&value_bytes);
-            entries.push(value_bytes);
-        }
-
+        let count = (self.string_count - base).min(self.block_size);
+        let mut entries = Vec::with_capacity(count as usize);
+        let mut term = Vec::new();
+        decode_block(
+            &self.section_name,
+            block_index,
+            &data,
+            count,
+            &mut term,
+            |value| {
+                entries.push(value.to_vec());
+                Ok(())
+            },
+        )?;
         Ok(entries)
     }
 }
@@ -429,27 +438,44 @@ mod tests {
     use crate::dictionary::pfc::{PfcEncoder, TERMS_WITH_NUL};
     use std::io::Cursor;
 
-    /// A term holding U+0000, written unchanged, reads as "alpha" and then an
-    /// entry that does not decode; the error names where.
-    #[test]
-    fn an_embedded_nul_is_reported_with_its_section_block_and_entry() {
+    fn iterate(terms: &[&str]) -> Result<Vec<Vec<u8>>> {
         let mut encoder = PfcEncoder::new();
-        for term in TERMS_WITH_NUL {
-            encoder.push_unchecked(term);
+        for term in terms {
+            encoder.push_unchecked(*term);
         }
         let mut section = Vec::new();
         encoder.write_to(&mut section).unwrap();
         let mut reader = Cursor::new(section);
         let header = PfcSectionHeader::read_from(&mut reader, "objects").unwrap();
-        let error = PfcSectionIterator::new(reader, header, "objects")
-            .collect::<Result<Vec<_>>>()
-            .unwrap_err();
-        let message = error.to_string();
+        PfcSectionIterator::new(reader, header, "objects").collect()
+    }
+
+    /// A term holding U+0000, written unchanged, reads as "alpha" and then an
+    /// entry that does not decode; the error names where.
+    #[test]
+    fn an_embedded_nul_is_reported_with_its_section_block_and_entry() {
+        let message = iterate(&TERMS_WITH_NUL).unwrap_err().to_string();
         assert!(
-            message.starts_with("Malformed shared-prefix length at entry 2 of objects block 0"),
+            message.starts_with(
+                "objects block 0 does not decode: entry 2 has a malformed shared-prefix length"
+            ),
             "{message}"
         );
-        assert!(message.contains(EMBEDDED_NUL_HINT), "{message}");
+        assert!(message.ends_with(EMBEDDED_NUL_HINT), "{message}");
+    }
+
+    /// In a block's last entry, U+0000 leaves the rest of the term over
+    /// rather than spoiling a next entry; that is refused too, not read back
+    /// as a term cut short.
+    #[test]
+    fn an_embedded_nul_in_a_blocks_last_entry_is_reported() {
+        let message = iterate(&["alpha\0tail"]).unwrap_err().to_string();
+        assert_eq!(
+            message,
+            format!(
+                "objects block 0 does not decode: 5 bytes follow its last entry; {EMBEDDED_NUL_HINT}"
+            )
+        );
     }
 
     /// Positioning at any term yields exactly the section's suffix from it,
