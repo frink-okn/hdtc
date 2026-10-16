@@ -576,6 +576,11 @@ fn parse_hex_digits(bytes: &[u8], pos: &mut usize, n: usize) -> Result<u32> {
 }
 
 fn push_codepoint(buf: &mut Vec<u8>, codepoint: u32) -> Result<()> {
+    // `create` removes U+0000 from every term it parses (`rdf::nul`), so a
+    // query spelling a term the way its source did must drop it too.
+    if codepoint == 0 {
+        return Ok(());
+    }
     let ch = char::from_u32(codepoint)
         .with_context(|| format!("Invalid Unicode codepoint: U+{codepoint:04X}"))?;
     let mut tmp = [0u8; 4];

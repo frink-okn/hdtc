@@ -10,8 +10,8 @@
 
 use crate::io::crc_utils::crc8;
 use crate::io::{
-    ControlInfo, LogArrayReader, StreamingBitmapDecoder, StreamingLogArrayDecoder, decode_vbyte,
-    encode_vbyte, read_vbyte,
+    ControlInfo, LogArrayReader, StreamingBitmapDecoder, StreamingLogArrayDecoder, encode_vbyte,
+    read_vbyte,
 };
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
@@ -22,7 +22,7 @@ use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 const PFC_SECTION_TYPE: u8 = 0x02;
-use crate::hdt::pfc_reader::PfcSection;
+use crate::hdt::pfc_reader::{PfcSection, decode_block};
 use crate::hdt::sections::scan_hdt_sections;
 
 // ---------------------------------------------------------------------------
@@ -485,54 +485,23 @@ impl PfcSectionIndex {
         (self.string_count - block_index * self.block_size).min(self.block_size)
     }
 
-    /// Decode one front-coded block, handing each term to `visit` in order.
-    ///
-    /// Each term is decoded in place over its predecessor in `term`, so decoding
-    /// allocates nothing per term.
+    /// Decode block `block_index`, handing each term to `visit` in order
+    /// ([`decode_block`]).
     fn decode_terms(
         &self,
         block_index: u64,
         data: &[u8],
         term: &mut Vec<u8>,
-        mut visit: impl FnMut(&[u8]) -> Result<()>,
+        visit: impl FnMut(&[u8]) -> Result<()>,
     ) -> Result<()> {
-        let mut pos = 0usize;
-        for i in 0..self.block_entries(block_index) {
-            if pos >= data.len() {
-                bail!(
-                    "Unexpected end of block in {} at entry {i}",
-                    self.section_name
-                );
-            }
-
-            if i == 0 {
-                term.clear();
-            } else {
-                let (shared, consumed) = decode_vbyte(&data[pos..])?;
-                pos += consumed;
-                let shared = shared as usize;
-                if shared > term.len() {
-                    bail!(
-                        "Invalid shared prefix length {} in {} block {block_index} (prev len {})",
-                        shared,
-                        self.section_name,
-                        term.len()
-                    );
-                }
-                term.truncate(shared);
-            }
-
-            let rel_end = data[pos..].iter().position(|&b| b == 0).with_context(|| {
-                format!(
-                    "Missing null terminator in {} block {block_index}",
-                    self.section_name
-                )
-            })?;
-            term.extend_from_slice(&data[pos..pos + rel_end]);
-            pos += rel_end + 1;
-            visit(term)?;
-        }
-        Ok(())
+        decode_block(
+            self.section_name,
+            block_index,
+            data,
+            self.block_entries(block_index),
+            term,
+            visit,
+        )
     }
 
     /// The byte range of block `block_index` within the string buffer.
@@ -1184,6 +1153,34 @@ mod tests {
         let index =
             PfcSectionIndex::read_from(&mut reader, temp.path(), "test", 64 * 1024).unwrap();
         (temp, index)
+    }
+
+    /// The indexed reader names the entry that does not decode, as the
+    /// sequential one does.
+    #[test]
+    fn an_embedded_nul_is_reported_with_its_section_block_and_entry() {
+        let mut temp = tempfile::NamedTempFile::new().unwrap();
+        let mut encoder = PfcEncoder::new();
+        for term in crate::dictionary::pfc::TERMS_WITH_NUL {
+            encoder.push_unchecked(term);
+        }
+        encoder.write_to(&mut temp).unwrap();
+        temp.flush().unwrap();
+        let mut reader = File::open(temp.path()).unwrap();
+        let mut index =
+            PfcSectionIndex::read_from(&mut reader, temp.path(), "objects", 64 * 1024).unwrap();
+        let mut buf = Vec::new();
+        let message = index.get_bytes(3, &mut buf).unwrap_err().to_string();
+        assert!(
+            message.starts_with(
+                "objects block 0 does not decode: entry 2 has a malformed shared-prefix length"
+            ),
+            "{message}"
+        );
+        assert!(
+            message.ends_with(crate::hdt::pfc_reader::EMBEDDED_NUL_HINT),
+            "{message}"
+        );
     }
 
     #[test]

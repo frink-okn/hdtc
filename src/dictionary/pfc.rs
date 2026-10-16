@@ -23,6 +23,17 @@ const PFC_SECTION_TYPE: u8 = 0x02;
 /// Default number of strings per block.
 const DEFAULT_BLOCK_SIZE: usize = 16;
 
+/// Sorted terms, the second holding U+0000: a dictionary written with it
+/// unchanged, as hdtc up to 1.3.1 wrote one, for readers' tests.
+#[cfg(test)]
+pub(crate) const TERMS_WITH_NUL: [&str; 5] = [
+    "alpha",
+    "alpha\0embedded nul in an ascii literal",
+    "alphabet soup",
+    "alphanumeric",
+    "alpine",
+];
+
 /// Encoder for building a PFC dictionary section (used in tests).
 #[cfg(test)]
 pub struct PfcEncoder {
@@ -51,6 +62,14 @@ impl PfcEncoder {
     /// Add a string to the dictionary section.
     /// Strings MUST be added in sorted order.
     pub fn push(&mut self, s: impl Into<String>) {
+        let s = s.into();
+        assert!(!s.contains('\0'), "PFC strings cannot hold U+0000");
+        self.push_unchecked(s);
+    }
+
+    /// Add a string without refusing U+0000, as hdtc up to 1.3.1 did, so a
+    /// test can write the section a reader must diagnose.
+    pub fn push_unchecked(&mut self, s: impl Into<String>) {
         let s = s.into();
         debug_assert!(
             self.strings
@@ -204,8 +223,22 @@ impl StreamingPfcEncoder {
 
     /// Add a string to the dictionary section.
     ///
-    /// Strings MUST be added in sorted order.
+    /// Strings MUST be added in sorted order. A string holding U+0000 is
+    /// refused: the encoding ends each string at a `0x00` byte, so a reader
+    /// would end the term there and misread the rest of the block. The parser
+    /// removes the character (`rdf::nul`), so reaching this is a bug, and it
+    /// fails here rather than in whatever reads the dictionary later.
     pub fn push(&mut self, s: &str) -> io::Result<()> {
+        if s.as_bytes().contains(&0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{} dictionary section: term {} contains U+0000, which PFC cannot store",
+                    self.section_name,
+                    crate::rdf::nul::excerpt(s)
+                ),
+            ));
+        }
         debug_assert!(
             self.last_string
                 .as_ref()
@@ -744,5 +777,17 @@ mod tests {
             .collect();
         let refs: Vec<&str> = strings.iter().map(|s| s.as_str()).collect();
         assert_streaming_matches_inmemory(&refs);
+    }
+
+    #[test]
+    fn test_streaming_refuses_a_term_holding_nul() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let mut streaming = StreamingPfcEncoder::new(temp_dir.path(), "objects").unwrap();
+        streaming.push("\"alpha\"").unwrap();
+        let error = streaming.push("\"alpha\0beta\"").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        let message = error.to_string();
+        assert!(message.contains("objects dictionary section"), "{message}");
+        assert!(message.contains("alpha\\u0000beta"), "{message}");
     }
 }

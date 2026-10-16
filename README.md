@@ -19,7 +19,7 @@ Development of hdtc is done primarily through Claude Code.
 - **VoID statistics** — compute dataset-level, property, and class partition statistics as N-Triples, optionally with a `void:subset` for every named graph of a quads HDT
 - **Namespace inventories** — count distinct subject, predicate, object, and graph-wide IRIs against curated YAML or JSON prefix tables
 - **Structural validation** — walk an HDT's triple structures and checksums, plus discovered graph and permutation sidecars, end to end
-- **Resilient parsing** — skips malformed triples with warnings, reports total skipped at the end
+- **Resilient parsing** — skips malformed triples with warnings, reports total skipped at the end; removes U+0000, which HDT cannot store
 - **[RDF 1.2 triple terms](#rdf-12-triple-terms)** — `<<( s p o )>>` terms, reification, and annotation syntax are stored beside a standard HDT, rendered back as N-Triples 1.2, and indexed for patterns inside triple terms
 - **[Named graphs](#named-graphs)** — optional packed `<data.hdt>.graphs` sidecars preserve N-Quads/TriG datasets while the standard HDT remains the deduplicated triples union
 - **[Membership and overlap sketches](#membership-and-overlap-sketches)** — build source-bound binary fuse filters and bottom-k MinHash files directly from an HDT dictionary
@@ -203,6 +203,26 @@ parses it without a term bound, so what `header` accepts stays readable. hdtc
 builds the Turtle-family parsers from a vendored oxttl (`vendor/oxttl`, package
 `oxttl-hdtc`) that exposes this bound; see its `Cargo.toml` for what was
 changed. RDF/XML and JSON-LD have no such bound and are unaffected.
+
+**U+0000 in terms.** An HDT dictionary ends every string at a `0x00` byte, so
+it cannot store a term containing U+0000. RDF has no use for the character
+either: `xsd:string` and `rdf:langString` exclude it, an IRI cannot contain it,
+and RDF/XML cannot express it. N-Triples, Turtle and JSON-LD can still write
+it, as `\u0000` or as a raw byte, and Wikidata dumps do. hdtc removes every
+U+0000 as it parses, wherever it appears, and keeps the statement:
+`"a\u0000b"` is stored as `"ab"`. Removing the character, rather than putting
+U+FFFD in its place, leaves an IRI as valid as it was (U+FFFD is not a legal
+IRI character) and never makes a term longer. A term that becomes equal to
+another is that term. hdtc logs the first ten affected statements per input by
+subject and predicate, so you can find them in the source, then logs a count
+per input and for the whole build. `search --query` drops `\u0000` the same
+way, so a term spelled as its source spelled it still matches.
+
+hdtc up to 1.3.1 wrote such a term unchanged. `create` succeeded, but later
+reads of the dictionary failed, usually with `VByte value exceeds u64 range`.
+When the term was the last in its block, they read it back cut short instead.
+Readers now refuse such a block, naming its section, block and entry. Rebuild
+an HDT that fails this way.
 
 ### Index: Creating indexes
 
