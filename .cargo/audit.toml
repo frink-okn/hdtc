@@ -1,0 +1,17 @@
+# Configuration for `cargo audit`, which CI runs against this Cargo.lock.
+#
+# Every ignore here names the advisory, why it does not reach hdtc, and what
+# removes it. Drop the entry once that happens, so an advisory that later
+# becomes reachable fails the audit again.
+
+[advisories]
+ignore = [
+    # quick-xml 0.37.5: quadratic duplicate-attribute check and unbounded
+    # namespace allocation, both in the XML reader. This copy is linked only by
+    # the registry oxrdfxml that oxrdfio depends on, and hdtc never asks oxrdfio
+    # to parse RDF/XML: `src/rdf/parser.rs` sends RDF/XML to the vendored
+    # oxrdfxml-hdtc, which is on quick-xml 0.41 and not affected. No released
+    # oxrdfio depends on a quick-xml past 0.37; the entry goes when one does.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+]

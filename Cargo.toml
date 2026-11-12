@@ -10,8 +10,12 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 crc = "3"
 flate2 = "1"
-bzip2 = "0.5"
-xz2 = "0.1"
+# Both compile the C library from the source their -sys crate bundles instead of
+# linking a system copy found through pkg-config, so an `hdtc` binary needs only
+# glibc and libgcc_s at run time wherever it was built. The same holds for any
+# crate that links hdtc as a library.
+bzip2 = { version = "0.5", features = ["static"] }
+xz2 = { version = "0.1", features = ["static"] }
 rayon = "1"
 same-file = "1"
 serde = { version = "1", features = ["derive"] }
