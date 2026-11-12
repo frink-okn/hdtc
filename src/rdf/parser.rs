@@ -2260,6 +2260,47 @@ mod tests {
         assert_eq!(quads[1].object, "\"hello\"");
     }
 
+    /// Entities a DOCTYPE declares expand alike in element text and in
+    /// attribute values, including one whose value escapes `&` or `<`. The
+    /// attribute path parses an entity's value as XML again; handed the
+    /// resolved value, it read that `&` as the start of a reference and
+    /// refused the statement.
+    #[test]
+    fn rdfxml_entities_expand_alike_in_text_and_attributes() {
+        let content = r#"<?xml version="1.0"?>
+<!DOCTYPE rdf:RDF [
+  <!ENTITY ex "http://example.org/">
+  <!ENTITY query "http://example.org/q?a=1&amp;b=2">
+  <!ENTITY angle "x &lt;y&gt;">
+]>
+<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" xmlns:ex="&ex;">
+  <rdf:Description rdf:about="&ex;s" ex:attr="&angle;">
+    <ex:text>&angle;</ex:text>
+    <ex:link rdf:resource="&query;"/>
+  </rdf:Description>
+</rdf:RDF>
+"#;
+        let (_f, input) = make_temp_with(content.as_bytes(), ".rdf", RdfFormat::RdfXml);
+        let mut quads = Vec::new();
+        let stats = stream_quads(&input, 0, true, None, |q| {
+            quads.push(q);
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(stats.errors, 0);
+        let objects: HashMap<&str, &str> = quads
+            .iter()
+            .map(|q| (q.predicate.as_str(), q.object.as_str()))
+            .collect();
+        assert_eq!(objects["http://example.org/attr"], "\"x <y>\"");
+        assert_eq!(objects["http://example.org/text"], "\"x <y>\"");
+        assert_eq!(
+            objects["http://example.org/link"],
+            "http://example.org/q?a=1&b=2"
+        );
+    }
+
     #[test]
     fn test_blank_node_disambiguation() {
         let content = "_:b1 <http://example.org/p> _:b2 .\n";

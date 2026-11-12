@@ -1,0 +1,34 @@
+# Checks Cargo.lock against the RustSec advisory database. It is separate from
+# the Rust workflow because it fails for a different reason: that one fails when
+# a change is wrong, and this fails when a crate the lockfile already pins turns
+# out to be vulnerable, which can happen with no change here at all. Hence the
+# weekly run as well as the run on each change. Advisories accepted on purpose,
+# each with its reason, are listed in .cargo/audit.toml.
+name: Audit
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "23 7 * * 1"
+  workflow_dispatch:
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out hdtc
+        uses: actions/checkout@v4
+
+      # A prebuilt binary, where `cargo install` would compile it on every run.
+      # Pinned so that a new release of the tool cannot fail this with no change
+      # here. The advisory database is deliberately not pinned; following it is
+      # the point.
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit@0.23.0
+
+      - name: cargo audit
+        run: cargo-audit audit

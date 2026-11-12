@@ -5,7 +5,8 @@
 # only to hdtc's own build. oxrdfio keeps the registry oxrdfxml, which hdtc no
 # longer uses to parse.
 #
-# Changes from the released 0.2.3, all in `src/parser.rs`:
+# Changes from the released 0.2.3, in `src/parser.rs` and the quick-xml
+# requirement below:
 #
 # 1. `rdf:parseType="Triple"` property elements nested more than 64 levels
 #    deep (`MAX_TRIPLE_TERM_NESTING`, `src/lib.rs`) are a syntax error, as is
@@ -14,9 +15,29 @@
 #    `Clone` and `Drop` recurse, so a few hundred kilobytes of nesting
 #    overflowed the thread stack and aborted the process. The same bound as
 #    vendor/oxttl change 7; hdtc accepts that depth.
+# 2. quick-xml 0.41 instead of 0.37. 0.37 has a quadratic duplicate-attribute
+#    check and unbounded namespace-declaration allocation in its reader
+#    (RUSTSEC-2026-0194, RUSTSEC-2026-0195), both fixed only from 0.41, and no
+#    released oxrdfxml has moved past 0.37. The parser changes are upstream's,
+#    from oxigraph pull requests 1711 (quick-xml 0.39) and 1716 (0.40); 0.41
+#    needed no further change upstream or here. The largest is that 0.39
+#    reports entity and character references as their own events rather than
+#    inside text, so the parser now resolves them itself. Two behaviours change
+#    with it, both toward XML 1.0: a tab or newline written literally in an
+#    attribute value is normalized to a space (a character reference such as
+#    `&#10;` is not), and an element's text may mix CDATA sections with plain
+#    text instead of being refused.
+# 3. A custom entity referenced in an attribute value resolves to its value
+#    escaped once (`EntityRegistry`). quick-xml 0.39 parses an entity's value
+#    again inside an attribute, so the resolved value of an entity declared as
+#    `a &amp; b` failed there as an unterminated reference. Upstream's
+#    development branch (oxigraph 0.6.0-dev, 2026-11) resolves entities in
+#    attributes the same way, so an upstream release on quick-xml 0.41 or later
+#    still needs checking for this.
 #
 # Replacing this directory with an upstream release requires that release to
-# cover change 1; check before dropping it.
+# cover changes 1 and 3 and to depend on quick-xml 0.41 or later; check before
+# dropping it.
 #
 # The manifest below is the crates.io-normalized one from the 0.2.3 package,
 # with the package and library renamed.
@@ -73,7 +94,7 @@ version = "0.2.11"
 version = "=0.3.3"
 
 [dependencies.quick-xml]
-version = "0.37"
+version = "0.41"
 
 [dependencies.thiserror]
 version = ">=1.0.50, <3.0"
